@@ -20,8 +20,13 @@ PREFIX = "jenkins-ci-"
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--apply", action="store_true", help="actually destroy (default: dry run)")
-    parser.add_argument("--prefix", default=PREFIX)
+    parser.add_argument("--prefix", default=PREFIX,
+                        help=f"destroy VMs whose name starts with this (default: {PREFIX!r})")
     args = parser.parse_args()
+
+    # Every name starts with "", so an empty prefix matches the entire pool.
+    if args.apply and not args.prefix:
+        parser.error("refusing --apply with an empty --prefix: it matches every VM on the pool")
 
     with Xapi() as x:
         sr = x.default_sr()
@@ -29,12 +34,12 @@ def main():
         vdis_before = x.vdi_count(sr)
 
         doomed = []
-        for vm in x.call("VM.get_all"):
-            rec = x.call("VM.get_record", vm)
+        for vm, rec in x.call("VM.get_all_records").items():
             if rec["is_a_template"] or rec["is_control_domain"]:
                 continue
             if rec["name_label"].startswith(args.prefix):
                 doomed.append((vm, rec))
+        doomed.sort(key=lambda pair: pair[1]["name_label"])
 
         print(f"SR free before : {free_before / 2**30:.2f} GiB   VDIs: {vdis_before}")
         print(f"matching '{args.prefix}*': {len(doomed)} VM(s)")
