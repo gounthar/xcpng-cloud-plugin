@@ -127,14 +127,29 @@ def main():
         print(f"baseline: {free_before / 2**30:.2f} GiB free, {vdis_before} VDIs\n")
 
         results = []
-        for i in range(args.clones):
-            results.append(one_cycle(x, source, sr, i + 1, full_copy=False, cow=cow))
-        for i in range(args.copies):
-            results.append(one_cycle(x, source, sr, 100 + i, full_copy=True, cow=cow))
+        failed = []
 
+        def cycle(index, full_copy):
+            # one_cycle tears its own VM down on the way out, so a failure leaks nothing.
+            # What a failure must not do is skip the SR accounting below: the orphan check
+            # is the reason this script exists, and the cycles that already passed have
+            # evidence worth reading. Record it and carry on.
+            try:
+                results.append(one_cycle(x, source, sr, index, full_copy=full_copy, cow=cow))
+            except XapiError as e:
+                failed.append(index)
+                print(f"  cycle {index} failed: {e}", file=sys.stderr)
+
+        for i in range(args.clones):
+            cycle(i + 1, full_copy=False)
+        for i in range(args.copies):
+            cycle(100 + i, full_copy=True)
+
+        attempted = args.clones + args.copies
         vdis_after = x.vdi_count(sr)
         free_after = x.sr_free_bytes(sr)
-        print(f"\nafter {len(results)} cycles: {free_after / 2**30:.2f} GiB free, {vdis_after} VDIs")
+        print(f"\nafter {len(results)}/{attempted} cycles: "
+              f"{free_after / 2**30:.2f} GiB free, {vdis_after} VDIs")
         print(f"VDI delta: {vdis_after - vdis_before:+d}   "
               f"space delta: {(free_after - free_before) / 2**30:+.3f} GiB")
 
@@ -151,10 +166,16 @@ def main():
         if clones:
             verdict = "PASS" if med <= 90 else "FAIL"
             print(f"\nKILL CRITERION (clone->online <= 90s): {verdict}  [{med:.2f}s]")
+
+        rc = 0
+        if failed:
+            print(f"{len(failed)} of {attempted} cycles failed: "
+                  f"{', '.join(str(i) for i in failed)}", file=sys.stderr)
+            rc = 1
         if vdis_after != vdis_before:
             print("ORPHANED VDIs - teardown is leaking.", file=sys.stderr)
-            return 1
-    return 0
+            rc = 1
+        return rc
 
 
 if __name__ == "__main__":
