@@ -1,0 +1,5 @@
+<?jelly escape-by-default='true'?>
+<div>
+  Provisions ephemeral Jenkins build agents on an XCP-ng pool, reacting to the build queue
+  and destroying each agent (and its disks) once it goes idle.
+</div>
