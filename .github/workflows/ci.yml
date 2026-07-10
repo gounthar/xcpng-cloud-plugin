@@ -56,8 +56,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      # python -m pip, so the install targets the interpreter setup-python configured
+      # rather than whatever pip happens to be first on the runner's PATH.
       - name: Install pytest
-        run: pip install --disable-pip-version-check pytest
+        run: python -m pip install --disable-pip-version-check pytest
 
       - name: Test
         run: python -m pytest tools/tests -q
