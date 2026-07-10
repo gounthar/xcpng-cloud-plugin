@@ -1,7 +1,8 @@
 ---
-# owner is intentionally omitted: the workflow passes it as --set github.owner=${{ github.repository_owner }}
-# so this keeps targeting the right repository if the plugin is transferred to the jenkinsci org.
-# A hardcoded owner here would silently keep opening pull requests against gounthar's fork.
+# owner is intentionally omitted: the workflow injects it with
+# --values-inline '{"github":{"owner":"${{ github.repository_owner }}"}}' so this keeps targeting the
+# right repository if the plugin is transferred to the jenkinsci org. A hardcoded owner here would
+# silently keep opening pull requests against gounthar's fork.
 github:
   user: "GitHub Actions"
   email: "41898282+github-actions[bot]@users.noreply.github.com"

@@ -1,18 +1,20 @@
 #!/bin/bash
 #
-# Provisions a Debian 12 (bookworm) VM into a Jenkins agent golden image.
+# Provisions a Debian VM into a Jenkins agent golden image. Runs on bookworm (12) and trixie (13);
+# the Packer template and CI both build on trixie.
 #
 # Run as root inside the VM, either from Packer's shell provisioner or by hand. Idempotent:
 # running it twice is a no-op. The env-var switches exist so CI can exercise the Java path in a
-# plain debian:12 container, where there is no CD-ROM and no cloud-init to clean.
+# plain debian:13 container, where there is no CD-ROM and no cloud-init to clean.
 #
 #   SKIP_GUEST_TOOLS=1   do not install xe-guest-utilities from /dev/sr0
 #   SKIP_CLEANUP=1       do not run cloud-init clean or reset machine identity
 #
 # Why Temurin and not the distro JDK: Jenkins core is compiled at class-file major 65, so an agent
-# needs a Java 21 JVM. Debian 12 ships no openjdk-21 at all, not even in bookworm-backports. An
-# agent on Java 17 opens its WebSocket, logs "Connected", then dies in a silent reconnect loop
-# with UnsupportedClassVersionError. The controller and agents must run the same Java major.
+# needs a Java 21 JVM. Bookworm ships no openjdk-21 at all, not even in bookworm-backports; trixie
+# does, but Temurin pins the vendor and version to match the controller on either base. An agent on
+# Java 17 opens its WebSocket, logs "Connected", then dies in a silent reconnect loop with
+# UnsupportedClassVersionError. The controller and agents must run the same Java major.
 
 set -euo pipefail
 
@@ -29,13 +31,11 @@ require_root() {
 }
 
 require_deps() {
-    local missing=()
-    for cmd in curl apt-get dpkg; do
-        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
-    done
-    if [ ${#missing[@]} -gt 0 ]; then
-        die "missing: ${missing[*]}. Install with: apt-get install -y ${missing[*]}"
-    fi
+    # apt-get and dpkg are part of any Debian base, so checking them is pointless and, worse, the
+    # old message told you to `apt-get install apt-get`, which is not a package. curl is the only
+    # real prerequisite the base cloud image can lack; it comes from the curl package.
+    command -v apt-get >/dev/null 2>&1 || die "apt-get not found: this is not a Debian system"
+    command -v curl >/dev/null 2>&1 || die "curl not found. Install it with: apt-get install -y curl"
 }
 
 install_java() {

@@ -110,7 +110,7 @@ jobs:
 
       # Pinned. `releases/latest` would resolve differently on every run, so a green CI would
       # stop being evidence that this template validates against a known Packer. Bumped by
-      # updatecli (.github/updatecli/packer.yaml), which dependabot cannot do for a curl'd binary.
+      # updatecli (updatecli/updatecli.d/packer.yaml), which dependabot cannot do for a curl'd binary.
       - name: Install Packer
         env:
           PACKER_VERSION: 1.15.4  # updatecli: hashicorp/packer
