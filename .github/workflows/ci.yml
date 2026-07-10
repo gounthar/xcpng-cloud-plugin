@@ -1,0 +1,42 @@
+# Builds and tests on every push and pull request.
+#
+# Plugins inside the jenkinsci org do this on ci.jenkins.io instead, via a Jenkinsfile
+# holding a single buildPlugin() call. ci.jenkins.io does not build repositories outside
+# that org, so while this lives under a personal account, nothing would compile or test
+# the code without this workflow. If the plugin is ever donated, replace this with a
+# Jenkinsfile: buildPlugin() covers more platforms and JDKs than a hand-rolled job.
+---
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: JDK 21
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 21 only, and not by preference: maven-hpi-plugin refuses to build at all on 17
+      # ("Java 21 or later is necessary to build this plugin"), and the parent POM pins
+      # maven.compiler.release to 21. The 2.555.3 LTS baseline governs what Jenkins runs
+      # on, not what compiles the plugin. proxmox-cloud-plugin builds on 21 alone too.
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      # verify, not test: it also runs the static analysis the parent POM binds and
+      # packages the .hpi, which is where index.jelly and config.jelly path errors surface.
+      - name: Build, test and package
+        run: mvn -B -ntp verify

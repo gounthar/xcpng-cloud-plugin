@@ -1,0 +1,23 @@
+# Dependabot, not updatecli.
+#
+# Of 87 maintained jenkinsci plugin repositories sampled, 26 carry a dependabot config and
+# exactly zero use updatecli. updatecli is the jenkins-infra tool: it lives in the site and
+# Docker image repositories, where a version has to be chased across a Dockerfile, a shell
+# script and a YAML manifest at once. A plugin has one pom.xml, and dependabot reads it.
+#
+# Weekly rather than the daily interval several org repos use. This is a spike with one
+# open pull request; a daily bump would be most of its traffic.
+---
+version: 2
+
+updates:
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
