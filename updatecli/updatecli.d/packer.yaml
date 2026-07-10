@@ -1,0 +1,79 @@
+---
+# Dependabot cannot see either of these versions. One lives in a `run:` step that curls a zip from
+# releases.hashicorp.com; the other lives in HCL. There is no manifest for dependabot to parse.
+# That is the whole reason this repo carries updatecli while no other jenkinsci plugin repo does:
+# everything dependabot *can* read (pom.xml, GitHub Actions) is left to dependabot.
+
+name: 'deps(image): bump Packer and the vatesfr/xenserver builder'
+
+scms:
+  default:
+    kind: github
+    spec:
+      user: "{{ .github.user }}"
+      email: "{{ .github.email }}"
+      owner: "{{ .github.owner }}"
+      repository: "{{ .github.repository }}"
+      token: "{{ requiredEnv .github.token }}"
+      username: "{{ .github.username }}"
+      branch: "{{ .github.branch }}"
+
+sources:
+  packerLatestVersion:
+    name: "Latest Packer CLI release"
+    kind: githubrelease
+    spec:
+      owner: "hashicorp"
+      repository: "packer"
+      token: "{{ requiredEnv .github.token }}"
+      username: "{{ .github.username }}"
+      # versionfilter, not versioning. The latter is the older spelling and is silently ignored.
+      versionfilter:
+        kind: semver
+    transformers:
+      - trimprefix: "v"
+
+  xenserverPluginLatestVersion:
+    name: "Latest vatesfr/packer-plugin-xenserver release"
+    kind: githubrelease
+    spec:
+      owner: "vatesfr"
+      repository: "packer-plugin-xenserver"
+      token: "{{ requiredEnv .github.token }}"
+      username: "{{ .github.username }}"
+      versionfilter:
+        kind: semver
+    transformers:
+      - trimprefix: "v"
+
+targets:
+  packerCli:
+    name: "PACKER_VERSION in the ci workflow"
+    kind: file
+    scmid: default
+    sourceid: packerLatestVersion
+    spec:
+      file: ".github/workflows/ci.yml"
+      matchpattern: 'PACKER_VERSION: .*'
+      replacepattern: 'PACKER_VERSION: {{ source "packerLatestVersion" }}  # updatecli: hashicorp/packer'
+
+  xenserverPlugin:
+    name: "required_plugins version in the Packer template"
+    kind: file
+    scmid: default
+    sourceid: xenserverPluginLatestVersion
+    spec:
+      file: "image/xcpng-jenkins-agent.pkr.hcl"
+      matchpattern: 'version = "= .*"'
+      replacepattern: 'version = "= {{ source "xenserverPluginLatestVersion" }}"'
+
+actions:
+  default:
+    kind: github/pullrequest
+    scmid: default
+    title: >-
+      deps(image): bump Packer to {{ source "packerLatestVersion" }}
+      and the xenserver builder to {{ source "xenserverPluginLatestVersion" }}
+    spec:
+      labels:
+        - dependencies

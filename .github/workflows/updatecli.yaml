@@ -1,0 +1,49 @@
+# Bumps versions dependabot cannot see.
+#
+# Dependabot reads pom.xml and the `uses:` lines in these workflows, and it owns those. It cannot
+# read a version inside a `run:` step that curls a zip, nor one inside Packer HCL. Those two live
+# in updatecli/updatecli.d/packer.yaml.
+#
+# Layout and wiring copied from jenkins-infra/jenkins.io and jenkins-docs/quickstart-tutorials,
+# which is where this pattern is actually maintained.
+---
+name: updatecli
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Once a week. A spike does not need daily dependency churn.
+    - cron: '0 2 * * 1'
+  pull_request:
+    paths:
+      - 'updatecli/**'
+      - '.github/workflows/updatecli.yaml'
+
+permissions:
+  contents: read
+
+jobs:
+  updatecli:
+    runs-on: ubuntu-latest
+    # Never run against a fork: it would try to open pull requests on someone else's repository.
+    if: github.repository_owner == 'gounthar'
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned. Dependabot's github-actions ecosystem keeps this one current.
+      - name: Install Updatecli
+        uses: updatecli/updatecli-action@v3.3.0
+
+      - name: Diff
+        run: updatecli pipeline diff --config ./updatecli/updatecli.d --values ./updatecli/values.github-action.yaml
+        env:
+          UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: updatecli pipeline apply --config ./updatecli/updatecli.d --values ./updatecli/values.github-action.yaml
+        env:
+          UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
