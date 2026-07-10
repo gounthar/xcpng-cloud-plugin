@@ -119,7 +119,9 @@ build {
 
   // Everything durable about the image. Exercised by CI on every push, in a debian:13 container.
   provisioner "shell" {
-    script          = "image/provision.sh"
-    execute_command = "echo 'debian' | sudo -S bash '{{ .Path }}'"
+    script = "image/provision.sh"
+    # The preseed grants debian passwordless sudo, so no password needs piping in. provision.sh
+    # then locks that sudo grant during template cleanup, so it does not survive into clones.
+    execute_command = "sudo bash '{{ .Path }}'"
   }
 }

@@ -16,9 +16,11 @@
 # NOT YET WIRED UP. This is M3 groundwork. M2 was performed by hand, on purpose.
 
 write_files:
+  # Owned by debian directly at 0400: the service runs as debian and only reads it. This is why
+  # there is no setfacl below and no acl package: cloud-init creates the user before write_files.
   - path: /etc/jenkins-agent.secret
-    permissions: '0600'
-    owner: root:root
+    permissions: '0400'
+    owner: debian:debian
     content: "{{AGENT_SECRET}}"
 
   - path: /etc/systemd/system/jenkins-agent.service
@@ -32,7 +34,9 @@ write_files:
       [Service]
       User=debian
       WorkingDirectory=/home/debian/agent
-      ExecStartPre=/usr/bin/curl -sSfL -o /home/debian/agent/agent.jar {{JENKINS_URL}}jnlpJars/agent.jar
+      # Only fetch agent.jar when it is missing or empty. With Restart=on-failure/RestartSec=5, an
+      # unconditional download would hammer the controller in a tight loop while the agent flaps.
+      ExecStartPre=/bin/sh -c 'test -s /home/debian/agent/agent.jar || curl -sSfL -o /home/debian/agent/agent.jar {{JENKINS_URL}}jnlpJars/agent.jar'
       # -webSocket tunnels the agent connection over the controller's HTTP port, so no separate
       # inbound JNLP TCP port has to be opened or forwarded.
       # -secret @file keeps the secret out of /proc/*/cmdline.
@@ -50,6 +54,5 @@ write_files:
 
 runcmd:
   - [ install, -d, -o, debian, -g, debian, -m, '0700', /home/debian/agent ]
-  - [ setfacl, -m, 'u:debian:r', /etc/jenkins-agent.secret ]
   - [ systemctl, daemon-reload ]
   - [ systemctl, enable, --now, jenkins-agent.service ]

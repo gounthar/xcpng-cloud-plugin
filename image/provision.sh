@@ -53,9 +53,11 @@ install_java() {
     echo "deb [signed-by=${ADOPTIUM_KEYRING}] https://packages.adoptium.net/artifactory/deb ${codename} main" \
         > "$ADOPTIUM_LIST"
 
+    # -q, not -qq: -qq swallows error output too, so a flaky mirror or a repo outage would fail
+    # with empty logs. -q keeps the messages and only drops the progress animation.
     log "installing temurin-${JAVA_MAJOR}-jre"
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "temurin-${JAVA_MAJOR}-jre"
+    apt-get update -q
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -q "temurin-${JAVA_MAJOR}-jre"
 }
 
 verify_java() {
@@ -75,10 +77,27 @@ install_guest_tools() {
     log "installing xe-guest-utilities from /dev/sr0"
     mkdir -p /mnt/gt
     mount -o ro /dev/sr0 /mnt/gt
-    dpkg -i "/mnt/gt/${GUEST_TOOLS_DEB}"
-    umount /mnt/gt
-    rmdir /mnt/gt
+    # set -e would otherwise leave /dev/sr0 mounted on a failed install, and the next run's mkdir
+    # -p/mount would inherit the mess. Unmount on any exit from here on.
+    trap 'umount /mnt/gt 2>/dev/null || true; rmdir /mnt/gt 2>/dev/null || true' RETURN
+
+    # apt-get, not dpkg -i: the .deb may pull dependencies, which dpkg does not resolve and apt does.
+    apt-get install -y -q "/mnt/gt/${GUEST_TOOLS_DEB}"
+
     systemctl enable --now xe-linux-distribution
+}
+
+harden_credentials() {
+    # The build path leaves a login every clone would inherit: preseed sets user `debian` with
+    # password `debian` and drops passwordless sudo in /etc/sudoers.d/debian, for Packer's SSH
+    # provisioner. The inbound agent runs as `debian` under systemd and needs neither, so a
+    # template must not ship them. Lock password auth and remove the sudoers grant.
+    #
+    # Locking does not disable the account: systemd still starts services as `debian`, and SSH key
+    # auth still works if a key is ever added. It disables only password login.
+    log "locking the build-time debian password and removing passwordless sudo"
+    passwd -l debian 2>/dev/null || true
+    rm -f /etc/sudoers.d/debian
 }
 
 cleanup_for_template() {
@@ -111,6 +130,7 @@ main() {
     if [ "${SKIP_CLEANUP:-0}" = "1" ]; then
         log "skipping template cleanup (SKIP_CLEANUP=1)"
     else
+        harden_credentials
         cleanup_for_template
         touch /var/lib/golden-image-ready
     fi
