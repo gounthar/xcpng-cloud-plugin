@@ -33,11 +33,22 @@ class XapiError(RuntimeError):
         self.data = data
 
 
+def _from_env(name):
+    """Credentials live in the environment, so a missing one is a user error, not a bug."""
+    try:
+        return os.environ[name]
+    except KeyError:
+        raise XapiError(
+            "MISSING_ENV",
+            f"{name} is not set. Export XCPNG_HOST, XCPNG_USER and XCPNG_PASS.",
+        ) from None
+
+
 class Xapi:
     def __init__(self, host=None, user=None, password=None, trust_self_signed=None):
-        self.host = host or os.environ["XCPNG_HOST"]
-        self._user = user or os.environ["XCPNG_USER"]
-        self._password = password or os.environ["XCPNG_PASS"]
+        self.host = host or _from_env("XCPNG_HOST")
+        self._user = user or _from_env("XCPNG_USER")
+        self._password = password or _from_env("XCPNG_PASS")
         self.session = None
 
         # Pools typically present a self-signed cert, but trusting it must be a deliberate,
@@ -92,8 +103,15 @@ class Xapi:
             # JSONDecodeError, and UnicodeDecodeError from a non-UTF-8 body. Both ValueError,
             # neither a subclass of the other.
             raise XapiError("MALFORMED_RESPONSE", f"{method}: {e}") from e
+        # A bare JSON scalar (5, null, true) is not iterable, so `"error" in payload` would
+        # raise TypeError rather than an XapiError. A list or string happens to survive that
+        # and falls through to NO_RESULT, but only by accident. Check the shape once.
+        if not isinstance(payload, dict):
+            raise XapiError("MALFORMED_RESPONSE", f"{method}: expected a JSON object, got {type(payload).__name__}")
         if "error" in payload:
             err = payload["error"]
+            if not isinstance(err, dict):
+                raise XapiError("UNKNOWN", f"{method}: {err}")
             raise XapiError(err.get("message", "UNKNOWN"), err.get("data"))
         if "result" not in payload:
             raise XapiError("NO_RESULT", f"{method}: {payload}")
