@@ -1,0 +1,162 @@
+"""Guards on the measurement harness.
+
+Its published numbers are load-bearing for the writeup, so the ways it can quietly lie
+matter as much as the ways it can crash.
+"""
+
+import pytest
+
+import measure_clone
+from xapi import XapiError
+
+
+class CycleXapi:
+    """Enough XAPI for one_cycle. Set boot_fails or teardown_fails to steer it."""
+
+    def __init__(self, boot_fails=False, teardown_fails=False):
+        self.boot_fails = boot_fails
+        self.teardown_fails = teardown_fails
+        self.destroyed = False
+
+    def sr_free_bytes(self, sr):
+        return 10 * 2**30
+
+    def await_task(self, task):
+        return "OpaqueRef:vm"
+
+    def destroy_with_disks(self, vm):
+        self.destroyed = True
+        if self.teardown_fails:
+            raise XapiError("VM_DESTROY_FAILED", vm)
+        return ["vdi-1"]
+
+    def call(self, method, *params):
+        if method in ("Async.VM.clone", "Async.VM.copy"):
+            return "OpaqueRef:task"
+        if method == "VM.start":
+            if self.boot_fails:
+                raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
+            return None
+        if method == "VM.get_power_state":
+            return "Running"
+        if method == "VM.get_guest_metrics":
+            return "OpaqueRef:gm"
+        if method == "VM_guest_metrics.get_networks":
+            return {"0/ip": "10.0.0.5"}
+        raise AssertionError(method)
+
+
+@pytest.mark.parametrize(
+    "cow, full_copy, expected",
+    [
+        (True, False, "VM.clone (CoW)"),
+        (False, False, "VM.clone (full)"),
+        (True, True, "VM.copy (full)"),
+        (False, True, "VM.copy (full)"),
+    ],
+)
+def test_clone_mode_is_labelled_from_the_sr_type(cow, full_copy, expected):
+    """On an LVM SR, VM.clone full-copies. Labelling its timings CoW corrupts the verdict."""
+    result = measure_clone.one_cycle(CycleXapi(), "src", "sr", 1, full_copy=full_copy, cow=cow)
+    assert result["mode"] == expected
+
+
+def test_probe_vm_is_destroyed_when_boot_fails():
+    """A BOOT_TIMEOUT that skipped teardown would leave the probe running on the pool."""
+    x = CycleXapi(boot_fails=True)
+    with pytest.raises(XapiError, match="BOOT_TIMEOUT"):
+        measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True)
+    assert x.destroyed, "the probe VM leaked on the failure path"
+
+
+def test_a_failing_teardown_does_not_mask_the_original_error():
+    """Report the BOOT_TIMEOUT that caused the unwind, not the teardown error it triggered."""
+    x = CycleXapi(boot_fails=True, teardown_fails=True)
+    with pytest.raises(XapiError) as caught:
+        measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True)
+    assert caught.value.message == "BOOT_TIMEOUT"
+
+
+# -- main(): the orphan check must survive a failed cycle -------------------
+
+class MainXapi:
+    def __init__(self, vdis_before=5, vdis_after=5):
+        self._before, self._after = vdis_before, vdis_after
+        self._seen = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def default_sr(self):
+        return "OpaqueRef:sr"
+
+    def sr_free_bytes(self, sr):
+        return 10 * 2**30
+
+    def vdi_count(self, sr):
+        self._seen += 1
+        return self._before if self._seen == 1 else self._after
+
+    def call(self, method, *params):
+        if method == "VM.get_by_name_label":
+            return ["OpaqueRef:src"]
+        if method == "VM.get_power_state":
+            return "Halted"
+        if method == "SR.get_type":
+            return "ext"
+        raise AssertionError(method)
+
+
+@pytest.fixture
+def harness(monkeypatch):
+    def _harness(xapi, cycle):
+        monkeypatch.setattr(measure_clone, "Xapi", lambda *a, **k: xapi)
+        monkeypatch.setattr(measure_clone, "one_cycle", cycle)
+        monkeypatch.setattr(
+            measure_clone.sys, "argv",
+            ["measure_clone.py", "--clones", "3", "--copies", "0"],
+        )
+
+    return _harness
+
+
+def test_a_failed_cycle_still_reports_the_cycles_that_passed(harness, capsys):
+    """Issue #2: one bad cycle used to unwind past the VDI-delta check entirely."""
+    def cycle(x, source, sr, index, full_copy, cow):
+        if index == 2:
+            raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
+        return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
+
+    harness(MainXapi(), cycle)
+    rc = measure_clone.main()
+    out = capsys.readouterr()
+
+    assert "after 2/3 cycles" in out.out, "the summary never ran for the passing cycles"
+    assert "KILL CRITERION" in out.out, "the verdict was skipped"
+    assert "1 of 3 cycles failed: 2" in out.err
+    assert rc == 1, "a failed cycle must exit non-zero"
+
+
+def test_orphaned_vdis_are_still_caught_when_a_cycle_fails(harness, capsys):
+    """The orphan check is why this script exists. A failed cycle must not hide a leak."""
+    def cycle(x, source, sr, index, full_copy, cow):
+        if index == 1:
+            raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
+        return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
+
+    harness(MainXapi(vdis_before=5, vdis_after=7), cycle)
+    rc = measure_clone.main()
+
+    assert "ORPHANED VDIs" in capsys.readouterr().err
+    assert rc == 1
+
+
+def test_a_clean_run_exits_zero(harness):
+    def cycle(x, source, sr, index, full_copy, cow):
+        return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
+
+    harness(MainXapi(), cycle)
+    assert measure_clone.main() == 0
