@@ -1,0 +1,31 @@
+# The Jenkins security scan: static analysis tuned for the vulnerability classes that
+# actually bite Jenkins plugins (Stapler request handling, missing permission checks,
+# CSRF, unsafe deserialisation). It runs as a reusable workflow owned by jenkins-infra,
+# so this file stays a single uses: block and never needs updating by hand.
+#
+# 71 of the 87 maintained jenkinsci plugin repositories sampled carry this file. It is the
+# single most common workflow in the org, ahead of continuous delivery.
+#
+# Docs: https://www.jenkins.io/redirect/jenkins-security-scan/
+---
+name: Jenkins Security Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  security-events: write
+  contents: read
+  actions: read
+
+jobs:
+  security-scan:
+    uses: jenkins-infra/jenkins-security-scan/.github/workflows/jenkins-security-scan.yaml@v2
+    with:
+      java-cache: maven
+      java-version: 21
