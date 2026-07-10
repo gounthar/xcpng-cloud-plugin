@@ -158,4 +158,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except XapiError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)

@@ -85,8 +85,11 @@ def main():
             print("WARNING: VDI count rose. Disks were orphaned.", file=sys.stderr)
             rc = 1
         return rc
-    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except XapiError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
