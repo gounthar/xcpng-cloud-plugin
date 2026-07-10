@@ -40,3 +40,26 @@ jobs:
       # packages the .hpi, which is where index.jelly and config.jelly path errors surface.
       - name: Build, test and package
         run: mvn -B -ntp verify
+
+  # tools/ destroys VMs and their disks on a live hypervisor. Every bug review found in it
+  # was on an error path, which is exactly what never gets exercised by hand. These tests
+  # run against a fake XAPI: they guard control flow, not the XAPI contract. The contract is
+  # checked by pointing the tools at the lab pool, which is what the tools are for.
+  tools:
+    name: tools (python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # python -m pip, so the install targets the interpreter setup-python configured
+      # rather than whatever pip happens to be first on the runner's PATH.
+      - name: Install pytest
+        run: python -m pip install --disable-pip-version-check pytest
+
+      - name: Test
+        run: python -m pytest tools/tests -q
