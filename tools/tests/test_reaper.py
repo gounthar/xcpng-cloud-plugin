@@ -7,7 +7,7 @@ report as destroyed something that survived?
 import pytest
 
 import reaper
-from conftest import FakeXapi, vm_record
+from fakes import FakeXapi, vm_record
 
 
 @pytest.fixture
@@ -48,18 +48,33 @@ def test_snapshots_templates_and_the_control_domain_are_spared(pool):
     """A snapshot is a VM object, inherits a matching name, and reports Halted like a dead agent.
 
     Destroying one takes the operator's restore point with it.
+
+    Every spared record here carries a prefix-matching name on purpose. Give the template a
+    realistic name like `jenkins-golden-debian` and the prefix alone spares it, so the
+    is_a_template guard is never reached and could be deleted with the suite still green.
+    `jenkins-ci-control-domain` is not a name dom0 would ever have; it is the only way to
+    prove the flag, rather than the name, is what saves it.
     """
     fake = pool(
         {
             "vm-agent": vm_record("jenkins-ci-agent-3"),
             "vm-snap": vm_record("jenkins-ci-agent-3-preupgrade", snapshot=True),
+            "vm-template": vm_record("jenkins-ci-golden-template", template=True),
+            "vm-dom0": vm_record("jenkins-ci-control-domain", control_domain=True),
             "vm-golden": vm_record("jenkins-golden-debian", template=True),
-            "vm-dom0": vm_record("Control domain on host", control_domain=True),
             "vm-prod": vm_record("production-db"),
         }
     )
     assert reaper.main() == 0
     assert fake.destroyed == ["vm-agent"]
+
+
+@pytest.mark.parametrize("flag", ["snapshot", "template", "control_domain"])
+def test_each_guard_is_load_bearing_on_a_matching_name(pool, flag):
+    """Each flag alone must spare a VM whose name matches the prefix."""
+    fake = pool({"vm-x": vm_record("jenkins-ci-agent-9", **{flag: True})})
+    assert reaper.main() == 0
+    assert fake.destroyed == [], f"the {flag} guard did not spare a prefix-matching VM"
 
 
 def test_a_stuck_vm_does_not_abandon_the_rest_of_the_sweep(pool, capsys):

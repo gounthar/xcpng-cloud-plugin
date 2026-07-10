@@ -101,10 +101,16 @@ def test_missing_env_var_is_named(monkeypatch):
 
 
 def test_missing_env_var_does_not_leak_the_password(monkeypatch):
+    """The password must be present and unmentioned, or this asserts nothing.
+
+    Delete XCPNG_USER, not XCPNG_PASS: the failure has to happen while the password is
+    actually in the environment, otherwise the assertion below is vacuously true and would
+    survive an error handler that echoed os.environ wholesale.
+    """
     monkeypatch.setenv("XCPNG_HOST", "pool.invalid")
-    monkeypatch.setenv("XCPNG_USER", "root")
-    monkeypatch.delenv("XCPNG_PASS", raising=False)
-    with pytest.raises(XapiError) as caught:
+    monkeypatch.delenv("XCPNG_USER", raising=False)
+    monkeypatch.setenv("XCPNG_PASS", "hunter2")
+    with pytest.raises(XapiError, match="XCPNG_USER is not set") as caught:
         Xapi()
     assert "hunter2" not in str(caught.value)
 
