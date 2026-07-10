@@ -63,3 +63,71 @@ jobs:
 
       - name: Test
         run: python -m pytest tools/tests -q
+
+  # The golden image cannot be built here: an XCP-ng template lives in an SR on a pool, and there is
+  # no pool. What CI can do is execute image/provision.sh, which is everything durable about the
+  # image, and assert the Java that lands on it can actually run a Jenkins agent. That is the exact
+  # bug that cost an afternoon: the image shipped openjdk-17, and Jenkins core is class-file 65.
+  image:
+    name: golden image recipe
+    runs-on: ubuntu-latest
+    container:
+      image: debian:13
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootstrap the container
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates
+
+      - name: Provision (Java path; no CD-ROM and no cloud-init in a container)
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: bash image/provision.sh
+
+      - name: The JVM must be able to load Jenkins core (class-file major 65)
+        run: |
+          major="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
+          echo "java major: $major"
+          test "$major" -ge 21 || {
+            echo "::error::agent JVM is Java $major; Jenkins core is class-file 65 and needs 21+"
+            exit 1
+          }
+
+      - name: provision.sh is idempotent
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: bash image/provision.sh
+
+  packer:
+    name: packer validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned. `releases/latest` would resolve differently on every run, so a green CI would
+      # stop being evidence that this template validates against a known Packer. Bumped by
+      # updatecli (.github/updatecli/packer.yaml), which dependabot cannot do for a curl'd binary.
+      - name: Install Packer
+        env:
+          PACKER_VERSION: 1.15.4  # updatecli: hashicorp/packer
+        run: |
+          curl -fsSL -o /tmp/packer.zip \
+            "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip"
+          sudo unzip -qo /tmp/packer.zip -d /usr/local/bin
+          packer --version
+
+      # Schema-checks every field against the real vatesfr/xenserver builder. It does not, and
+      # cannot, build: there is no pool. `packer build` remains unrun. See the template's header.
+      - name: Init and validate
+        env:
+          PKR_VAR_remote_host: pool.invalid
+          PKR_VAR_remote_username: root
+          PKR_VAR_remote_password: unused-by-validate
+        run: |
+          packer init image/
+          packer fmt -check -diff image/
+          packer validate image/

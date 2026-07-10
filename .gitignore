@@ -14,3 +14,5 @@ CONTEXT.md
 *.credentials.json
 *.pem
 golden_key*
+packer_cache/
+packer-jenkins-agent/
