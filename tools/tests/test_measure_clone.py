@@ -112,15 +112,24 @@ class MainXapi:
 
 @pytest.fixture
 def harness(monkeypatch):
-    def _harness(xapi, cycle):
+    def _harness(xapi, cycle, clones=3, copies=0):
         monkeypatch.setattr(measure_clone, "Xapi", lambda *a, **k: xapi)
         monkeypatch.setattr(measure_clone, "one_cycle", cycle)
         monkeypatch.setattr(
             measure_clone.sys, "argv",
-            ["measure_clone.py", "--clones", "3", "--copies", "0"],
+            ["measure_clone.py", "--clones", str(clones), "--copies", str(copies)],
         )
 
     return _harness
+
+
+def _passing_cycle(x, source, sr, index, full_copy, cow):
+    mode = "VM.copy (full)" if full_copy else "VM.clone (CoW)"
+    return {"mode": mode, "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
+
+
+def _always_fails(x, source, sr, index, full_copy, cow):
+    raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
 
 
 def test_a_failed_cycle_still_reports_the_cycles_that_passed(harness, capsys):
@@ -155,8 +164,32 @@ def test_orphaned_vdis_are_still_caught_when_a_cycle_fails(harness, capsys):
 
 
 def test_a_clean_run_exits_zero(harness):
-    def cycle(x, source, sr, index, full_copy, cow):
-        return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
-
-    harness(MainXapi(), cycle)
+    harness(MainXapi(), _passing_cycle)
     assert measure_clone.main() == 0
+
+
+def test_every_clone_cycle_failing_still_states_the_verdict(harness, capsys):
+    """Only reachable since cycles stopped aborting the run.
+
+    An absent KILL CRITERION line reads as a skipped check. A clone that never boots has
+    not met the criterion, so say FAIL out loud rather than going quiet.
+    """
+    harness(MainXapi(), _always_fails, clones=3, copies=0)
+    rc = measure_clone.main()
+    out = capsys.readouterr()
+
+    assert "KILL CRITERION" in out.out, "the verdict vanished when every clone failed"
+    assert "FAIL" in out.out
+    assert "no clone cycle completed" in out.out
+    assert "after 0/3 cycles" in out.out
+    assert rc == 1
+
+
+def test_no_verdict_when_no_clone_cycles_were_requested(harness, capsys):
+    """--clones 0 means the criterion was not attempted, which is not the same as failing."""
+    harness(MainXapi(), _passing_cycle, clones=0, copies=1)
+    rc = measure_clone.main()
+    out = capsys.readouterr()
+
+    assert "KILL CRITERION" not in out.out
+    assert rc == 0

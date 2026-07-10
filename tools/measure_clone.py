@@ -166,6 +166,12 @@ def main():
         if clones:
             verdict = "PASS" if med <= 90 else "FAIL"
             print(f"\nKILL CRITERION (clone->online <= 90s): {verdict}  [{med:.2f}s]")
+        elif args.clones:
+            # Every clone cycle failed. Only reachable since cycles stopped aborting the
+            # run. Printing nothing here would be the same silence the per-cycle accounting
+            # above exists to kill: a missing verdict reads as a skipped check rather than
+            # as a criterion that was not met. A clone that never boots fails the criterion.
+            print("\nKILL CRITERION (clone->online <= 90s): FAIL  [no clone cycle completed]")
 
         rc = 0
         if failed:
