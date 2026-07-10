@@ -27,8 +27,12 @@ permissions:
 jobs:
   updatecli:
     runs-on: ubuntu-latest
-    # Never run against a fork: it would try to open pull requests on someone else's repository.
-    if: github.repository_owner == 'gounthar'
+    # Never run against a fork: it would try to open pull requests on the upstream repository.
+    # Check fork status, not the owner name: a hardcoded owner would skip the whole job the day
+    # this transfers to the jenkinsci org, the same brittleness the values file was changed to
+    # avoid. If an event ever lacks a repository object, `null == false` is false and the job
+    # skips, which is the safe direction.
+    if: github.event.repository.fork == false
     permissions:
       contents: write
       pull-requests: write

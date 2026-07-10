@@ -62,7 +62,7 @@ template field.
 1. Create a VM from the shipped **Debian Trixie 13** template, or import a Debian generic cloud
    image. Give it a disk on a **file-based SR** (`ext`, `nfs`): `VM.clone` is copy-on-write there.
    On an LVM SR it silently becomes a full copy, and the whole performance story evaporates.
-2. Install `sudo curl ca-certificates cloud-init acl`.
+2. Install `sudo curl ca-certificates cloud-init`.
 3. Attach `guest-tools.iso` to the VM's CD drive.
 4. Run `image/provision.sh` as root inside the VM. It installs Temurin 21 from Adoptium, installs
    `xe-guest-utilities` from the CD, resets cloud-init and the machine identity, and drops a

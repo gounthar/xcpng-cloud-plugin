@@ -76,13 +76,18 @@ install_guest_tools() {
     [ -e /dev/sr0 ] || die "no /dev/sr0: attach guest-tools.iso, or set SKIP_GUEST_TOOLS=1"
     log "installing xe-guest-utilities from /dev/sr0"
     mkdir -p /mnt/gt
-    mount -o ro /dev/sr0 /mnt/gt
-    # set -e would otherwise leave /dev/sr0 mounted on a failed install, and the next run's mkdir
-    # -p/mount would inherit the mess. Unmount on any exit from here on.
-    trap 'umount /mnt/gt 2>/dev/null || true; rmdir /mnt/gt 2>/dev/null || true' RETURN
 
-    # apt-get, not dpkg -i: the .deb may pull dependencies, which dpkg does not resolve and apt does.
-    apt-get install -y -q "/mnt/gt/${GUEST_TOOLS_DEB}"
+    # A subshell with an EXIT trap, not `trap ... RETURN`: under `set -e`, a failing command aborts
+    # the shell rather than returning from the function, so a RETURN trap never fires and /dev/sr0
+    # stays mounted for the next run to trip over. An EXIT trap in a subshell fires on both the
+    # clean exit and the set -e abort. Verified against `set -e` + a failing install.
+    (
+        trap 'umount /mnt/gt 2>/dev/null || true' EXIT
+        mount -o ro /dev/sr0 /mnt/gt
+        # apt-get, not dpkg -i: the .deb may pull dependencies, which dpkg does not resolve.
+        apt-get install -y -q "/mnt/gt/${GUEST_TOOLS_DEB}"
+    )
+    rmdir /mnt/gt 2>/dev/null || true
 
     systemctl enable --now xe-linux-distribution
 }
