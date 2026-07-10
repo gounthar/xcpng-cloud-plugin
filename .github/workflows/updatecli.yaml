@@ -1,0 +1,63 @@
+# Bumps versions dependabot cannot see.
+#
+# Dependabot reads pom.xml and the `uses:` lines in these workflows, and it owns those. It cannot
+# read a version inside a `run:` step that curls a zip, nor one inside Packer HCL. Those two live
+# in updatecli/updatecli.d/packer.yaml.
+#
+# Layout and wiring copied from jenkins-infra/jenkins.io and jenkins-docs/quickstart-tutorials,
+# which is where this pattern is actually maintained.
+---
+name: updatecli
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Once a week. A spike does not need daily dependency churn.
+    - cron: '0 2 * * 1'
+
+# Deliberately not on pull_request. The targets carry `scmid: default`, so updatecli resolves their
+# file paths against the remote default branch, not the pull request's checkout. A pull request that
+# introduces or moves a target therefore always fails the diff, because the file it points at does
+# not exist on main yet. That is a check nobody can turn green, which is worse than no check.
+# Run it on a schedule, and by hand after a target moves.
+
+permissions:
+  contents: read
+
+jobs:
+  updatecli:
+    runs-on: ubuntu-latest
+    # Never run against a fork: it would try to open pull requests on the upstream repository.
+    # Check fork status, not the owner name: a hardcoded owner would skip the whole job the day
+    # this transfers to the jenkinsci org, the same brittleness the values file was changed to
+    # avoid. If an event ever lacks a repository object, `null == false` is false and the job
+    # skips, which is the safe direction.
+    if: github.event.repository.fork == false
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned. Dependabot's github-actions ecosystem keeps this one current.
+      - name: Install Updatecli
+        uses: updatecli/updatecli-action@v3.3.0
+
+      - name: Diff
+        run: |
+          updatecli pipeline diff \
+            --config ./updatecli/updatecli.d \
+            --values ./updatecli/values.github-action.yaml \
+            --values-inline '{"github":{"owner":"${{ github.repository_owner }}"}}'
+        env:
+          UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply
+        if: github.ref == 'refs/heads/main'
+        run: |
+          updatecli pipeline apply \
+            --config ./updatecli/updatecli.d \
+            --values ./updatecli/values.github-action.yaml \
+            --values-inline '{"github":{"owner":"${{ github.repository_owner }}"}}'
+        env:
+          UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
