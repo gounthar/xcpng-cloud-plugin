@@ -40,12 +40,20 @@ jobs:
         uses: updatecli/updatecli-action@v3.3.0
 
       - name: Diff
-        run: updatecli pipeline diff --config ./updatecli/updatecli.d --values ./updatecli/values.github-action.yaml
+        run: |
+          updatecli pipeline diff \
+            --config ./updatecli/updatecli.d \
+            --values ./updatecli/values.github-action.yaml \
+            --values-inline '{"github":{"owner":"${{ github.repository_owner }}"}}'
         env:
           UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Apply
         if: github.ref == 'refs/heads/main'
-        run: updatecli pipeline apply --config ./updatecli/updatecli.d --values ./updatecli/values.github-action.yaml
+        run: |
+          updatecli pipeline apply \
+            --config ./updatecli/updatecli.d \
+            --values ./updatecli/values.github-action.yaml \
+            --values-inline '{"github":{"owner":"${{ github.repository_owner }}"}}'
         env:
           UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
