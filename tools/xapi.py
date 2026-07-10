@@ -15,6 +15,7 @@ import json
 import os
 import re
 import ssl
+import sys
 import time
 import urllib.request
 
@@ -32,17 +33,29 @@ class XapiError(RuntimeError):
 
 
 class Xapi:
-    def __init__(self, host=None, user=None, password=None, trust_self_signed=True):
+    def __init__(self, host=None, user=None, password=None, trust_self_signed=None):
         self.host = host or os.environ["XCPNG_HOST"]
         self._user = user or os.environ["XCPNG_USER"]
         self._password = password or os.environ["XCPNG_PASS"]
         self.session = None
 
+        # Pools typically present a self-signed cert, but trusting it must be a deliberate,
+        # visible act rather than the default. Same posture the plugin's trustSelfSigned
+        # checkbox will have: opt-in, off by default, and it says so out loud.
+        if trust_self_signed is None:
+            trust_self_signed = os.environ.get("XCPNG_TRUST_SELF_SIGNED", "").lower() in (
+                "1", "true", "yes",
+            )
+
         self._ctx = ssl.create_default_context()
         if trust_self_signed:
-            # Opt-in, never silent. The plugin surfaces this as a visible checkbox.
             self._ctx.check_hostname = False
             self._ctx.verify_mode = ssl.CERT_NONE
+            print(
+                f"warning: TLS verification disabled for {self.host} "
+                f"(XCPNG_TRUST_SELF_SIGNED). Traffic is exposed to interception.",
+                file=sys.stderr,
+            )
         self._id = 0
 
     # -- plumbing ---------------------------------------------------------

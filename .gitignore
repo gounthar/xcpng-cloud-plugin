@@ -5,3 +5,11 @@ work/
 .flattened-pom.xml
 __pycache__/
 *.pyc
+
+# Never commit: secrets, and local working context.
+.env
+CLAUDE.md
+CONTEXT.md
+*.credentials.json
+*.pem
+golden_key*
