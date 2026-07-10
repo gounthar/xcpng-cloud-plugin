@@ -16,9 +16,12 @@ class XcpngCloudTest {
     }
 
     /**
-     * Saving the global config and reading it back must preserve every field. This is the
-     * guard that later stops a secret from being persisted into the plugin's own config.xml:
-     * once credentialsId lands here, this test asserts an ID round-trips and nothing else does.
+     * Saving the global config and reading it back must preserve every field.
+     *
+     * <p>This asserts round-tripping only. It cannot detect a secret written into the plugin's
+     * config.xml, because a getter returns the same value whether or not the secret reached
+     * disk. Guarding that needs a test which reads the persisted XML and asserts the plaintext
+     * is absent from it. Worth writing when credentialsId lands.
      */
     @Test
     void configRoundTrip(JenkinsRule r) throws Exception {
