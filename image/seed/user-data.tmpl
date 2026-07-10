@@ -1,0 +1,55 @@
+#cloud-config
+#
+# Per-clone seed. NOT the image build recipe: everything durable (Temurin 21, guest tools) is
+# already on the golden image via image/provision.sh. This carries only what differs per agent,
+# which is the controller URL, the agent name, and the JNLP secret.
+#
+# Rendered by the plugin at provision time. Placeholders:
+#   {{INSTANCE_ID}}    the VM's XAPI UUID. See meta-data.tmpl and the warning below.
+#   {{JENKINS_URL}}    e.g. https://ci.example.com/jenkins/
+#   {{AGENT_NAME}}     the Jenkins node name
+#   {{AGENT_SECRET}}   the node's JNLP secret
+#
+# The secret reaches the guest through a NoCloud seed on a CD, which means it is readable by
+# anything that can attach that VDI. Ephemeral agents make this tolerable; a warm pool would not.
+#
+# NOT YET WIRED UP. This is M3 groundwork. M2 was performed by hand, on purpose.
+
+write_files:
+  - path: /etc/jenkins-agent.secret
+    permissions: '0600'
+    owner: root:root
+    content: "{{AGENT_SECRET}}"
+
+  - path: /etc/systemd/system/jenkins-agent.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Jenkins inbound agent
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      User=debian
+      WorkingDirectory=/home/debian/agent
+      ExecStartPre=/usr/bin/curl -sSfL -o /home/debian/agent/agent.jar {{JENKINS_URL}}jnlpJars/agent.jar
+      # -webSocket tunnels the agent connection over the controller's HTTP port, so no separate
+      # inbound JNLP TCP port has to be opened or forwarded.
+      # -secret @file keeps the secret out of /proc/*/cmdline.
+      ExecStart=/usr/bin/java -jar /home/debian/agent/agent.jar \
+        -webSocket \
+        -url {{JENKINS_URL}} \
+        -secret @/etc/jenkins-agent.secret \
+        -name {{AGENT_NAME}} \
+        -workDir /home/debian/agent
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [ install, -d, -o, debian, -g, debian, -m, '0700', /home/debian/agent ]
+  - [ setfacl, -m, 'u:debian:r', /etc/jenkins-agent.secret ]
+  - [ systemctl, daemon-reload ]
+  - [ systemctl, enable, --now, jenkins-agent.service ]
