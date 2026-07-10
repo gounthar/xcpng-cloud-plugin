@@ -11,13 +11,13 @@ Note the two XAPI transports return *different* error envelopes:
 This client speaks JSON-RPC only.
 """
 
+import http.client
 import json
 import os
 import re
 import ssl
 import sys
 import time
-import urllib.error
 import urllib.request
 
 OPAQUE_REF = re.compile(r"OpaqueRef:[0-9a-fA-F-]+")
@@ -72,14 +72,25 @@ class Xapi:
         try:
             with urllib.request.urlopen(req, context=self._ctx, timeout=30) as r:
                 payload = json.load(r)
-        except urllib.error.URLError as e:
-            # The pool's self-signed cert lands here now that verification is on by default.
-            # Name the escape hatch rather than dumping an SSL traceback.
+        except OSError as e:
+            # urlopen returns once the headers land; json.load then reads the body, and the
+            # timeout above applies per socket operation. So a stall mid-body raises
+            # TimeoutError, and a dropped connection raises ConnectionResetError, neither of
+            # which is a URLError. All three are OSError, which is also URLError's base, so
+            # one clause covers the connect and read phases alike.
+            reason = getattr(e, "reason", None)
+            if reason is None:
+                reason = str(e) or e.__class__.__name__
             hint = ""
-            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+            if isinstance(reason, ssl.SSLCertVerificationError):
                 hint = "; set XCPNG_TRUST_SELF_SIGNED=1 to accept a self-signed pool cert"
-            raise XapiError("TRANSPORT_ERROR", f"{method}: {e.reason}{hint}") from e
-        except json.JSONDecodeError as e:
+            raise XapiError("TRANSPORT_ERROR", f"{method}: {reason}{hint}") from e
+        except http.client.HTTPException as e:
+            # IncompleteRead and friends are HTTPException, not OSError.
+            raise XapiError("TRANSPORT_ERROR", f"{method}: truncated response: {e}") from e
+        except ValueError as e:
+            # JSONDecodeError, and UnicodeDecodeError from a non-UTF-8 body. Both ValueError,
+            # neither a subclass of the other.
             raise XapiError("MALFORMED_RESPONSE", f"{method}: {e}") from e
         if "error" in payload:
             err = payload["error"]
