@@ -25,6 +25,11 @@ permissions:
 
 jobs:
   security-scan:
+    # The scan runs fine on a private repo, but its last step uploads SARIF to code
+    # scanning, which private repositories only get with GitHub Advanced Security. The
+    # upload fails, so the job fails, so the check is red forever and everyone learns to
+    # ignore it. Skip while private. Every jenkinsci repo carrying this file is public.
+    if: ${{ github.event.repository.private == false }}
     uses: jenkins-infra/jenkins-security-scan/.github/workflows/jenkins-security-scan.yaml@v2
     with:
       java-cache: maven
