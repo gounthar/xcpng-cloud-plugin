@@ -17,6 +17,7 @@ import re
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.request
 
 OPAQUE_REF = re.compile(r"OpaqueRef:[0-9a-fA-F-]+")
@@ -68,11 +69,23 @@ class Xapi:
             data=body.encode(),
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, context=self._ctx, timeout=30) as r:
-            payload = json.load(r)
+        try:
+            with urllib.request.urlopen(req, context=self._ctx, timeout=30) as r:
+                payload = json.load(r)
+        except urllib.error.URLError as e:
+            # The pool's self-signed cert lands here now that verification is on by default.
+            # Name the escape hatch rather than dumping an SSL traceback.
+            hint = ""
+            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+                hint = "; set XCPNG_TRUST_SELF_SIGNED=1 to accept a self-signed pool cert"
+            raise XapiError("TRANSPORT_ERROR", f"{method}: {e.reason}{hint}") from e
+        except json.JSONDecodeError as e:
+            raise XapiError("MALFORMED_RESPONSE", f"{method}: {e}") from e
         if "error" in payload:
             err = payload["error"]
             raise XapiError(err.get("message", "UNKNOWN"), err.get("data"))
+        if "result" not in payload:
+            raise XapiError("NO_RESULT", f"{method}: {payload}")
         return payload["result"]
 
     def call(self, method, *params):
@@ -144,14 +157,26 @@ class Xapi:
         return vdis
 
     def destroy_with_disks(self, vm):
-        """The teardown the blog post is about. Returns the VDIs destroyed."""
+        """The teardown the blog post is about. Returns the VDIs actually destroyed.
+
+        Every VDI is attempted even after one fails: giving up halfway is how disks get
+        orphaned. Failures are reported but not raised, so a reap sweep over many VMs is
+        not halted by one stuck disk. The caller's VDI-count delta is what proves the
+        teardown was clean.
+        """
         vdis = self.disk_vdis(vm)  # capture first
         if self.call("VM.get_power_state", vm) != "Halted":
             self.call("VM.hard_shutdown", vm)
         self.call("VM.destroy", vm)
+        destroyed = []
         for vdi in vdis:  # then reap the disks the VM left behind
-            self.call("VDI.destroy", vdi)
-        return vdis
+            try:
+                self.call("VDI.destroy", vdi)
+            except XapiError as e:
+                print(f"warning: VDI {vdi} survived teardown: {e}", file=sys.stderr)
+            else:
+                destroyed.append(vdi)
+        return destroyed
 
     def sr_free_bytes(self, sr):
         self.call("SR.scan", sr)
