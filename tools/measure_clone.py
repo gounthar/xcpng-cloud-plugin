@@ -48,9 +48,13 @@ def wait_ip(x, vm, timeout=IP_TIMEOUT):
     return None
 
 
-def one_cycle(x, source, sr, index, full_copy):
+def one_cycle(x, source, sr, index, full_copy, cow):
     name = f"jenkins-ci-probe-{index}"
-    mode = "VM.copy (full)" if full_copy else "VM.clone (CoW)"
+    if full_copy:
+        mode = "VM.copy (full)"
+    else:
+        # On an LVM SR, VM.clone full-copies too. Do not label its timings CoW.
+        mode = "VM.clone (CoW)" if cow else "VM.clone (full)"
     free_start = x.sr_free_bytes(sr)
 
     t0 = time.monotonic()
@@ -115,9 +119,9 @@ def main():
 
         results = []
         for i in range(args.clones):
-            results.append(one_cycle(x, source, sr, i + 1, full_copy=False))
+            results.append(one_cycle(x, source, sr, i + 1, full_copy=False, cow=cow))
         for i in range(args.copies):
-            results.append(one_cycle(x, source, sr, 100 + i, full_copy=True))
+            results.append(one_cycle(x, source, sr, 100 + i, full_copy=True, cow=cow))
 
         vdis_after = x.vdi_count(sr)
         free_after = x.sr_free_bytes(sr)
@@ -125,12 +129,13 @@ def main():
         print(f"VDI delta: {vdis_after - vdis_before:+d}   "
               f"space delta: {(free_after - free_before) / 2**30:+.3f} GiB")
 
-        clones = [r for r in results if "CoW" in r["mode"]]
-        copies = [r for r in results if "full" in r["mode"]]
+        clones = [r for r in results if r["mode"].startswith("VM.clone")]
+        copies = [r for r in results if r["mode"].startswith("VM.copy")]
         if clones:
             med = statistics.median(r["online"] for r in clones)
             cl = statistics.median(r["clone"] for r in clones)
-            print(f"\nCoW  median clone={cl:.2f}s  median clone->online={med:.2f}s")
+            print(f"\n{'CoW ' if cow else 'full'} median clone={cl:.2f}s  "
+                  f"median clone->online={med:.2f}s")
         if copies:
             print(f"full median clone={statistics.median(r['clone'] for r in copies):.2f}s  "
                   f"clone->online={statistics.median(r['online'] for r in copies):.2f}s")
