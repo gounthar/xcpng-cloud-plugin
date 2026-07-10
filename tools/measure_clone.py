@@ -68,18 +68,27 @@ def one_cycle(x, source, sr, index, full_copy, cow):
     free_after_clone = x.sr_free_bytes(sr)
     disk_cost = (free_start - free_after_clone) / 2**20  # MiB
 
+    # Past this point the VM exists, so teardown has to happen on every path out.
+    # A BOOT_TIMEOUT that skipped it would leave the probe running and quietly
+    # invalidate the orphan check this script exists to perform.
     t1 = time.monotonic()
-    x.call("VM.start", vm, False, False)
-    wait_running(x, vm)
-    t_boot = time.monotonic() - t1
+    try:
+        x.call("VM.start", vm, False, False)
+        wait_running(x, vm)
+        t_boot = time.monotonic() - t1
 
-    t2 = time.monotonic()
-    ip = wait_ip(x, vm)
-    t_ip = time.monotonic() - t2
-
-    t3 = time.monotonic()
-    vdis = x.destroy_with_disks(vm)
-    t_teardown = time.monotonic() - t3
+        t2 = time.monotonic()
+        ip = wait_ip(x, vm)
+        t_ip = time.monotonic() - t2
+    finally:
+        t3 = time.monotonic()
+        try:
+            vdis = x.destroy_with_disks(vm)
+        except XapiError as e:
+            # Never mask whatever sent us here. reaper.py reclaims jenkins-ci-* probes.
+            print(f"warning: teardown of {name!r} failed: {e}", file=sys.stderr)
+            vdis = []
+        t_teardown = time.monotonic() - t3
 
     total = t_clone + t_boot + t_ip
     print(f"  {mode:16} clone={t_clone:6.2f}s boot={t_boot:6.2f}s ip={t_ip:6.2f}s "
