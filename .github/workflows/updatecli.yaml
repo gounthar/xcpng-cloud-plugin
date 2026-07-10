@@ -14,10 +14,12 @@ on:
   schedule:
     # Once a week. A spike does not need daily dependency churn.
     - cron: '0 2 * * 1'
-  pull_request:
-    paths:
-      - 'updatecli/**'
-      - '.github/workflows/updatecli.yaml'
+
+# Deliberately not on pull_request. The targets carry `scmid: default`, so updatecli resolves their
+# file paths against the remote default branch, not the pull request's checkout. A pull request that
+# introduces or moves a target therefore always fails the diff, because the file it points at does
+# not exist on main yet. That is a check nobody can turn green, which is worse than no check.
+# Run it on a schedule, and by hand after a target moves.
 
 permissions:
   contents: read
@@ -43,7 +45,7 @@ jobs:
           UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Apply
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: github.ref == 'refs/heads/main'
         run: updatecli pipeline apply --config ./updatecli/updatecli.d --values ./updatecli/values.github-action.yaml
         env:
           UPDATECLI_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
