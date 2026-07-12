@@ -105,18 +105,34 @@ by a full `export_raw_vdi` read-back whose sha512 matches the source. A 3 GiB im
 over LAN. Note: `physical_utilisation` reads stale until `SR.scan`; always scan before trusting VDI
 stats or booting.
 
-**Not solved — booting the imported disk.** A freshly-imported, pristine Debian genericcloud image
-(Bookworm or Trixie) does not reliably UEFI-boot as a fresh XCP-ng guest. It reaches `Running`, burns a
-few CPU-seconds, then stalls pre-kernel: empty `ttyS0`, MAC never on the bridge. Ruled out by controlled
-tests (not reasoning): the import (byte-perfect), the VM assembly (`VM.clone` and `xe vm-install` both),
-the UEFI NVRAM (empty is fine — `varstored` seeds defaults), Secure Boot (on and off), `device-model`,
-and the image version (golden's source raw is sha512-identical to a fresh download). The disk's ESP
-carries a real `\EFI\BOOT\BOOTX64.EFI`, so the removable-media loader exists.
+**Booting the imported disk — a working recipe exists, but it is fragile.** A freshly-imported,
+pristine Debian genericcloud image on a *lone* disk does not UEFI-boot as a fresh XCP-ng guest: it
+reaches `Running`, burns a few CPU-seconds, then stalls pre-kernel (empty `ttyS0`, MAC never on the
+bridge). Golden's exact device layout, however, boots reproducibly (4/4 across two sessions):
 
-The one recipe observed to boot — golden's own: root disk + a CD in the `cdn` boot order (giving OVMF a
-device-enumeration path to the disk's loader) + a cloud-init seed — **could not be reproduced across
-sessions**: the byte-identical image with that exact recipe booted in one session and stalled in another.
-The lever was never isolated, so this path is not dependable.
+- `xe vm-install "Debian Bookworm 12"`, **not** `VM.clone`;
+- root `deb.raw` at **device 0**, bootable;
+- the cloud-init seed as a **data disk at device 1** (RO);
+- `guest-tools.iso` as a **CD at device 3**, boot order `cdn`;
+- 2 vCPU, set **before the first boot**.
+
+Mechanism: a single disk with an uninitialised UEFI boot-option list is not auto-booted by this pool's
+OVMF; a CD in the `cdn` order gives OVMF a device-enumeration path that then reaches the disk's
+`\EFI\BOOT\BOOTX64.EFI` removable-media loader. Ruled out by controlled tests (not reasoning): the
+import (byte-perfect), the UEFI NVRAM (empty is fine — `varstored` seeds defaults), Secure Boot,
+`device-model`, and the image version (golden's source raw is sha512-identical to a fresh download).
+
+**Two fragile levers make this undependable to hand-roll:**
+
+1. *Boot-then-reconfigure poisons it.* Booting once at 1 vCPU (a stall), then setting 2 vCPU and
+   restarting, does not recover — only a clean 2-vCPU first boot works. Do not reconfigure a UEFI VM
+   between boots.
+2. *The seed ISO's build silently gates the OS boot.* With golden's exact recipe and only the seed VDI
+   varied: golden's own `cidata.iso` boots (4/4); every seed built here with
+   `genisoimage -volid cidata -joliet -rock` stalls (0/3) — heavy **and** a minimal seed byte-for-byte
+   the same 374 KB size as golden's. Same tool, same size, differing only in the file-data and
+   directory-record bytes. A cloud-init *data disk*'s ISO structure silently determining whether the
+   *root* disk boots is a deep, unexplained OVMF quirk. Golden's seed-build command was not recovered.
 
 **Use these instead:**
 
