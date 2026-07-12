@@ -50,12 +50,20 @@ packer build image/
 The build produces a template named `jenkins-agent-debian13`, which is what you put in the cloud's
 template field.
 
-> **Honesty about state.** `packer validate` passes, and CI runs it on every push. **`packer build`
-> has not been run against a pool.** The unverified part is `boot_command` plus `image/http/preseed.cfg`,
-> that is, whether the Debian installer can be driven over XCP-ng's VNC console. Everything durable
-> about the image is in `image/provision.sh`, which CI executes for real inside a `debian:13`
-> container on every push. If the Packer path fights you, use the manual path below, which was
-> performed by hand and does work.
+> **Honesty about state (updated 2026-07-12).** `packer validate` passes and CI runs it on every push.
+> `packer build` has now been run against the lab pool, and the previously-unverified step **works**:
+> the builder uploaded the netinst ISO to the `local-iso` SR, created the VM, connected VNC, and drove
+> the Debian installer via `boot_command` — the installer kernel loaded. The build then blocked at the
+> **preseed fetch**, for an environment reason, not a template one: the builder serves
+> `image/http/preseed.cfg` over HTTP on the machine running `packer`, and when that machine is behind
+> WSL2 NAT the building VM on the LAN cannot reach it (confirmed: dom0 could not reach the packer HTTP
+> port on either the WSL or Windows address). This is the same inbound-reachability wall as the M2
+> agent. **Run `packer build` from a host the pool can reach on the LAN** — either WSL2 mirrored
+> networking, a `netsh portproxy` for the packer HTTP port (pin `http_port_min`/`max` so it is stable),
+> or, cleanest, a golden-image **clone as the builder** (pool-adjacent, disposable, CI-shaped). The
+> `boot_command`/preseed pairing itself is validated up to that fetch. Everything durable about the
+> image is in `image/provision.sh`, which CI executes for real inside a `debian:13` container on every
+> push. The manual path below also works.
 
 ## Building it by hand
 
