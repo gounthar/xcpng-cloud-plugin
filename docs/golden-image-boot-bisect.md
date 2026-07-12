@@ -253,3 +253,22 @@ an exact-but-unknown seed-ISO build). That is disqualifying for a plugin that mu
 **Clone golden (proven, repeatable) or run the bootstrap through the XO backend** (which builds the seed
 and VM correctly). Do not hand-roll a raw-XAPI from-scratch bootstrap on top of these levers. This is
 also captured in the tracked `golden-image.md`.
+
+### VFAT sidestep tested — also stalls; it is content, not the filesystem (2026-07-12)
+
+The other session proposed building the NoCloud seed as VFAT instead of ISO9660, in case an OVMF
+ISO9660-driver quirk on the dev1 data disk was stalling dev0. Tested with my `provision.sh` content:
+`truncate -s 1M` + `mkfs.vfat -n cidata` + `mcopy` the same user-data/meta-data, imported as the dev1
+data disk, golden's exact recipe. **Stalled** (8.7 CPU-s flat, no IP). So the filesystem is exonerated
+too — ISO9660 **and** VFAT both stall with my content. golden's content boots on either.
+
+Tally: golden's seed content boots (4/4 + the other session's rebuild); mine stalls **0/4** (heavy ISO,
+minimal ISO byte-identical in size to golden's, and VFAT). It is the user-data **content**, independent
+of build tool, size, and filesystem. Neither session can explain how a cloud-init data disk's *content*
+gates a pre-kernel OVMF boot of the root disk — but the reproductions are unanimous. Isolating *which
+bytes* of golden's 912-byte user-data matter would need a content bisect (many boots); not pursued.
+
+**This does not change the recommendation — it hardens it.** The from-scratch raw-XAPI bootstrap depends
+on a seed whose content must match an unknown-good reference or the OS silently won't boot. Use
+`xe vm-install` + clone-golden (reliable), the Packer installer path (robust boot entry), or the XO
+backend. Do not hand-roll it.
