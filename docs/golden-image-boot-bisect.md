@@ -1,5 +1,14 @@
 # Why the `import_raw_vdi` bootstrap does not boot: a bisect
 
+> **SUPERSEDED (2026-07-12, evening) — the premise below is wrong. The VMs were booting the whole
+> time.** A VNC capture of a "stalling" VM shows a full Debian 12 login prompt (`localhost login:`).
+> There is no pre-kernel OVMF stall. Every "no boot" verdict in this document was inferred from
+> indirect proxies (empty `ttyS0`, low CPU-seconds, MAC-not-in-fdb, no reported IP) that are *equally
+> consistent with a booted, idle VM that never brought up networking*. The real issue is
+> **cloud-init not configuring the network** on fresh/reassembled VMs, not firmware. See the
+> "Correction — we never had a boot problem" section at the end. Read that first; treat the OVMF /
+> seed-content / device-model theorising below as a record of a wrong turn, not as findings.*
+
 *Recorded 2026-07-12 from the `vates-2` session, against the lab pool (XCP-ng 8.3.0, XAPI 26.1).
 Two controlled experiments on real hardware. Every test VM was destroyed by ref in a `finally`;
 `jenkins-golden-debian` and `jenkins-ci-m2-probe` were never touched.*
@@ -272,3 +281,57 @@ bytes* of golden's 912-byte user-data matter would need a content bisect (many b
 on a seed whose content must match an unknown-good reference or the OS silently won't boot. Use
 `xe vm-install` + clone-golden (reliable), the Packer installer path (robust boot entry), or the XO
 backend. Do not hand-roll it.
+
+## Correction — we never had a boot problem (2026-07-12, evening)
+
+We looked at the screen for the first time. It changes everything above.
+
+A fresh bare import of golden's exact source disk (`/var/tmp/deb.raw`, device 0 only — a proven
+"staller") was booted, and its qemu VNC framebuffer captured over an SSH-forwarded unix socket
+(`-vnc unix:/var/run/xen/vnc-<domid>` → `vncdo capture`). The screen showed:
+
+```
+Debian GNU/Linux 12 localhost tty1
+localhost login: _
+```
+
+**The VM booted.** OVMF → grub → kernel → systemd → a getty login prompt on tty1. There is no
+pre-kernel OVMF stall, no firmware bug, no hardware quirk. Every "no boot" in this document was a
+misread of indirect signals:
+
+| what we measured | what we concluded | what it actually was |
+|---|---|---|
+| `ttyS0` empty | not reaching kernel | console is on **tty1 (VGA)**, not serial |
+| ~5–9 CPU-s, flat | pre-kernel stall | **booted and idle at a login prompt** |
+| MAC never in bridge fdb | not booting | **networking never came up** (no DHCP traffic) |
+| no guest-reported IP | stalled | no network → guest agent has nothing to report |
+| — | — | hostname is `localhost` → **cloud-init never applied its per-instance config** |
+
+### What the real problem is
+
+The genericcloud Debian image boots fine but relies on **cloud-init** to configure networking. A
+fresh import with no working datasource (or a datasource cloud-init doesn't apply) comes up with no
+network → no DHCP → no IP → looks, through our proxies, exactly like a boot stall. golden's *clones*
+work because they inherit golden's already-configured network state, persisted on disk from its first
+cloud-init run. The whole "seed content gates a pre-kernel OVMF boot" saga was really "seed content
+gates whether cloud-init brings up the network" — mundane and well-understood, not exotic.
+
+- **Certain** (the screenshot proves it): the VM boots to a login prompt. Not a boot stall.
+- **Strong but not yet proven when this was written**: the cause is cloud-init not configuring the
+  network (hostname `localhost` + zero network traffic). Inferred, not yet confirmed by logging in and
+  reading `ip a` / `cloud-init status`. The confirming test — a fresh import given a proper cloud-init
+  DHCP network config — is being run next.
+
+### Methodological lesson (the expensive one)
+
+We reasoned from four indirect proxies for a full day and never once looked at the console. One VNC
+capture settled it in seconds. **Look at the actual screen first.** For a "won't boot" VM on this
+stack that is: `xe vm-list params=dom-id` → on dom0 `-vnc unix:/var/run/xen/vnc-<domid>` → SSH-forward
+the unix socket → `vncdo capture`. Step one, not step fifty.
+
+### Impact on the plugin recommendation
+
+The recommendation to **clone golden** (or drive the bootstrap through the XO backend) still stands —
+but for a plain reason now, not a scary one: clones carry a working, cloud-init-configured network;
+a from-scratch VM needs a correct cloud-init **network** config to get one. No OVMF fragility, no
+unknown-good seed magic. The from-scratch path is ordinary once it's given network config.
