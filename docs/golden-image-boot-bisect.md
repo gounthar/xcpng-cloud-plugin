@@ -208,3 +208,48 @@ pin the single factor, bisect: `vm-install` + CD-only, then `vm-install` + seed-
 
 This supersedes the earlier "build via the Debian installer" suggestion — unnecessary. The cloud
 image boots fine; it just needs the CD (extra boot device) present at first boot.
+
+## Isolated further — the seed ISO build is the fragile lever (import-code session, 2026-07-12)
+
+Reconciling a discrepancy from the RESOLVED section above: my earlier `vm-install`-Bookworm run *with*
+seed and CD **stalled**, contradicting the reproduced boot. Chased it down by running golden's exact
+recipe with golden's **literal** dom0 artifacts and varying one thing at a time. Two levers found; the
+"single lever not isolated" caveat is now largely resolved.
+
+**Confirmed: golden's exact layout boots.** `xe vm-install "Debian Bookworm 12"` + `/var/tmp/deb.raw`
+import (dev 0, bootable) + `/var/tmp/cidata.iso` seed (dev 1, RO data disk) + `guest-tools.iso` CD
+(dev 3) + 2 vCPU + `cdn` → **booted**, `0/ip 192.168.1.152`. So the recipe is dependable — 4/4 across
+both sessions with golden's own artifacts.
+
+**Lever 1 — boot-then-reconfigure poisons the VM.** My original stall booted once at 1 vCPU (the
+template default → stall), then set 2 vCPU and restarted → still stalled. A *clean* 2-vCPU first boot
+works. Set the vCPU count (and everything else) **before the first `vm-start`**; do not reconfigure a
+UEFI VM between boots.
+
+**Lever 2 — the seed ISO's build silently gates the OS boot.** Holding golden's exact recipe fixed and
+varying **only the seed VDI**:
+
+| seed at device 1 | boots? |
+|---|---|
+| golden's `/var/tmp/cidata.iso` | **yes** (this run + 3 prior = **4/4**) |
+| mine, `genisoimage -volid cidata -joliet -rock`, 9 KB user-data (provision.sh embedded), 382976 B | **no** (×2, fresh, clean 2-vCPU) |
+| mine, same `genisoimage` flags, 284 B user-data, **374784 B — byte-identical size to golden's** | **no** |
+
+So **0/3 for every seed built here, 4/4 for golden's** — p≈0.008 for a coin-flip, i.e. not the boot
+race the caveat feared. Not size, not content-length (the minimal seed matches golden's byte size). Both
+ISOs are `genisoimage`, no MBR/partition table; they differ only in the file-data and directory-record
+regions (first byte diff at 33589). **A cloud-init *data disk*'s ISO structure decides whether OVMF
+boots the *root* disk** — a deep, unexplained OVMF block-enumeration quirk.
+
+**Open:** golden's exact `cidata.iso` build command was not in the artifacts. If it is `cloud-localds`,
+or `genisoimage`/`xorriso` with different flags (charset, no `-joliet`/`-rock`), that is the missing
+reproducible detail — a fresh seed built that way should boot. Until then, a hand-built seed is a
+coin-flip-worse-than-coin-flip lever.
+
+### Bottom line for the plugin
+
+The recipe boots, but it now rests on two undocumented fragile levers (clean-first-boot ordering, and
+an exact-but-unknown seed-ISO build). That is disqualifying for a plugin that must be reliable.
+**Clone golden (proven, repeatable) or run the bootstrap through the XO backend** (which builds the seed
+and VM correctly). Do not hand-roll a raw-XAPI from-scratch bootstrap on top of these levers. This is
+also captured in the tracked `golden-image.md`.
