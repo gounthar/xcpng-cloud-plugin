@@ -92,3 +92,41 @@ the one cached on disk. Pin a constant id and the first clone works. Then boot t
 with that same seed attached, and from then on **every clone silently skips cloud-init**: no secret
 is written, no agent starts, and nothing appears in any log. The VM simply sits there. This is why
 `provision.sh` runs `cloud-init clean` before the image is templated.
+
+## Automated bootstrap via `import_raw_vdi` — investigated, not recommended over raw XAPI
+
+The idea of having the plugin build the golden image itself — import a Debian cloud disk, boot it,
+let cloud-init run `provision.sh`, then templatize — was investigated end-to-end against the lab pool
+(XCP-ng 8.3.0, XAPI 26.1). The detailed bisect is in `golden-image-boot-bisect.md`. Summary:
+
+**Proven and reliable — the import.** `VDI.create` (`virtual_size` == the raw's exact byte length) +
+`PUT /import_raw_vdi?...&format=raw` streams a raw/vhd cloud disk onto the pool byte-perfectly. Verified
+by a full `export_raw_vdi` read-back whose sha512 matches the source. A 3 GiB image streams in ~31 s
+over LAN. Note: `physical_utilisation` reads stale until `SR.scan`; always scan before trusting VDI
+stats or booting.
+
+**Not solved — booting the imported disk.** A freshly-imported, pristine Debian genericcloud image
+(Bookworm or Trixie) does not reliably UEFI-boot as a fresh XCP-ng guest. It reaches `Running`, burns a
+few CPU-seconds, then stalls pre-kernel: empty `ttyS0`, MAC never on the bridge. Ruled out by controlled
+tests (not reasoning): the import (byte-perfect), the VM assembly (`VM.clone` and `xe vm-install` both),
+the UEFI NVRAM (empty is fine — `varstored` seeds defaults), Secure Boot (on and off), `device-model`,
+and the image version (golden's source raw is sha512-identical to a fresh download). The disk's ESP
+carries a real `\EFI\BOOT\BOOTX64.EFI`, so the removable-media loader exists.
+
+The one recipe observed to boot — golden's own: root disk + a CD in the `cdn` boot order (giving OVMF a
+device-enumeration path to the disk's loader) + a cloud-init seed — **could not be reproduced across
+sessions**: the byte-identical image with that exact recipe booted in one session and stalled in another.
+The lever was never isolated, so this path is not dependable.
+
+**Use these instead:**
+
+- **Clone the golden template** (`VM.clone`). Proven to boot repeatedly (this is what the plugin does
+  at provision time anyway). If you need a working agent image now, this is it.
+- **Build with Packer** (the installer path, `image/xcpng-jenkins-agent.pkr.hcl`). The Debian installer
+  sets up the boot entry that a raw cloud image lacks.
+- **The Xen Orchestra backend**, if a from-scratch bootstrap is ever pursued. XO imports a cloud disk,
+  creates the VM, injects cloud-init, and boots it correctly — it already solves the exact step that is
+  unreliable over raw XAPI. This is the recommended home for any future automated bootstrap.
+
+Bottom line: `import_raw_vdi` works, but a Tier-2 "plugin builds its own golden image from a cloud disk"
+feature should **not** be built over raw XAPI. Clone the golden image, or defer the bootstrap to XO.
