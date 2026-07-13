@@ -33,7 +33,7 @@ class XcpngCloudTest {
                 "xcpng-root",
                 true,
                 3,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2))));
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 4, 8192))));
         r.configRoundtrip();
 
         XcpngCloud reloaded = (XcpngCloud) r.jenkins.clouds.getByName("xcpng");
@@ -48,6 +48,9 @@ class XcpngCloudTest {
         assertEquals("jenkins-golden-debian", template.getTemplateName());
         assertEquals("xcpng-linux", template.getLabelString());
         assertEquals(2, template.getNumExecutors());
+        assertEquals(4, template.getNumCpus());
+        assertEquals(8192, template.getMemoryMb());
+        assertEquals(8192L * 1024 * 1024, template.getMemoryBytes());
     }
 
     /**
@@ -69,7 +72,7 @@ class XcpngCloudTest {
                 "xcpng-root",
                 true,
                 2,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1))));
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048))));
         r.jenkins.save();
 
         Path configXml = r.jenkins.getRootDir().toPath().resolve("config.xml");
@@ -133,6 +136,23 @@ class XcpngCloudTest {
         assertEquals(1, cloud.getMaxInstances(), "a missing maxInstances must clamp to 1, not 0");
     }
 
+    /**
+     * A template persisted before the sizing fields existed reloads with {@code numCpus}/{@code
+     * memoryMb} at 0. {@code readResolve} must clamp them to the defaults so provisioning never builds
+     * an invalid {@link io.jenkins.plugins.xcpng.client.ProvisionSpec}.
+     */
+    @Test
+    void legacyTemplateWithoutSizingClampsToDefaults(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                + "  <templateName>jenkins-golden-debian</templateName>\n"
+                + "  <labelString>xcpng-linux</labelString>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+        XcpngTemplate t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertEquals(1, t.getNumExecutors(), "missing executors must clamp to 1");
+        assertEquals(2, t.getNumCpus(), "missing vCPUs must clamp to the default, not 0");
+        assertEquals(2048, t.getMemoryMb(), "missing memory must clamp to the default, not 0");
+    }
+
     @Test
     void provisioningIsInertUntilWired(JenkinsRule r) {
         XcpngCloud cloud = new XcpngCloud(
@@ -141,7 +161,7 @@ class XcpngCloudTest {
                 "xcpng-root",
                 false,
                 2,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1)));
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048)));
         assertEquals(0, cloud.provision(new hudson.slaves.Cloud.CloudState(null, 0), 4).size());
     }
 }
