@@ -88,6 +88,11 @@ public final class XapiClient implements HypervisorClient {
         } catch (IOException e) {
             throw new HypervisorException(method + ": transport error: " + e.getMessage(), e);
         }
+        if (responseBody == null) {
+            // Any transport must hand back a body to parse. Guard here so a null (from HttpTransport
+            // or any other implementation) surfaces as a clear failure instead of an NPE in readTree.
+            throw new HypervisorException(method + ": transport returned no response body");
+        }
         JsonNode payload;
         try {
             payload = MAPPER.readTree(responseBody);
@@ -437,7 +442,13 @@ public final class XapiClient implements HypervisorClient {
                 throw new IOException("HTTP " + status + " from " + endpoint + ": "
                         + body.substring(0, Math.min(body.length(), 200)));
             }
-            return resp.body();
+            String responseBody = resp.body();
+            if (responseBody == null) {
+                // ofString() should not, but HttpResponse#body is nullable; treat an absent body as an
+                // IO failure so it surfaces as a transport error rather than a null slipping upward.
+                throw new IOException("empty response body from " + endpoint);
+            }
+            return responseBody;
         }
 
         private static SSLContext trustAllContext() {

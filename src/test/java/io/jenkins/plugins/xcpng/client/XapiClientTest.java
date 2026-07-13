@@ -200,6 +200,13 @@ class XapiClientTest {
     }
 
     @Test
+    void aNullResponseBodyIsSurfacedNotAnNpe() {
+        XapiClient c = new XapiClient(body -> null, "root", "pw");
+        HypervisorException e = assertThrows(HypervisorException.class, c::ping);
+        assertTrue(e.getMessage().contains("no response body"), e.getMessage());
+    }
+
+    @Test
     void aStaleSessionTriggersOneReloginThenSucceeds() {
         // First authenticated pool.get_all fails SESSION_INVALID; the client must log in again and retry.
         int[] poolCalls = {0};
