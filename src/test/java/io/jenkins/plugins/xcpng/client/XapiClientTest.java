@@ -64,6 +64,19 @@ class XapiClientTest {
     }
 
     @Test
+    void cloneDestroysThePartialCloneWhenTheDiskLayoutIsRejected() {
+        ScriptedTransport t = new ScriptedTransport();
+        t.extraDisk = true; // two disks, so a diskBytes resize can't pick one and the spec is rejected
+        XapiClient c = new XapiClient(t, "root", "pw");
+        HypervisorException e = assertThrows(HypervisorException.class,
+                () -> c.cloneFromTemplate(new VmRef("OpaqueRef:tmpl"),
+                        new ProvisionSpec("agent", 2, 2048L, 8_000_000_000L, null, null)));
+        assertTrue(e.getMessage().contains("expected one disk"), e.getMessage());
+        // The clone already existed when the spec was rejected, so it must be torn down, not leaked.
+        assertTrue(t.methods().contains("VM.destroy"), "the rejected clone must be destroyed");
+    }
+
+    @Test
     void aFailedTaskThrows() {
         ScriptedTransport t = new ScriptedTransport();
         t.taskStatus = "failure";
@@ -219,6 +232,7 @@ class XapiClientTest {
         String taskStatus = "success";
         boolean vdiDestroyFails = false;
         boolean hostIsSlave = false;
+        boolean extraDisk = false;
 
         @Override
         public String post(String body) {
@@ -255,7 +269,9 @@ class XapiClientTest {
                 case "VM.get_power_state" -> powerState;
                 case "VM.get_guest_metrics" -> "OpaqueRef:gm";
                 case "VM_guest_metrics.get_networks" -> Map.of("0/ip", "192.168.1.50");
-                case "VM.get_VBDs" -> List.of("OpaqueRef:vbd-disk", "OpaqueRef:vbd-cd");
+                case "VM.get_VBDs" -> extraDisk
+                        ? List.of("OpaqueRef:vbd-disk", "OpaqueRef:vbd-disk2", "OpaqueRef:vbd-cd")
+                        : List.of("OpaqueRef:vbd-disk", "OpaqueRef:vbd-cd");
                 case "VBD.get_type" -> req.get("params").get(1).asText().contains("cd") ? "CD" : "Disk";
                 case "VBD.get_VDI" -> "OpaqueRef:vdi-disk";
                 case "pool.get_all" -> List.of();

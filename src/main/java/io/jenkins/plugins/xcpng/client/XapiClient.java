@@ -233,22 +233,36 @@ public final class XapiClient implements HypervisorClient {
         }
         String task = call("Async.VM.clone", template.value(), spec.name()).asText();
         String vm = awaitTaskRef(task);
-        // VM.clone of a template yields a template; make it a runnable VM, then size it. VM.clone
-        // copies the source's vCPU and memory, so each clone overrides them here.
-        call("VM.set_is_a_template", vm, false);
-        call("VM.set_VCPUs_max", vm, String.valueOf(spec.vcpus()));
-        call("VM.set_VCPUs_at_startup", vm, String.valueOf(spec.vcpus()));
-        String mem = String.valueOf(spec.memoryBytes());
-        call("VM.set_memory_limits", vm, mem, mem, mem, mem);
-        if (spec.diskBytes() != null) {
-            // Grow the single root disk; a genericcloud image auto-expands its root FS on first boot.
-            // Refuse ambiguity rather than resize an arbitrary disk.
-            List<String> disks = diskVdis(vm);
-            if (disks.size() != 1) {
-                throw new HypervisorException("cannot honour diskBytes: expected one disk on the clone, found "
-                        + disks.size());
+        // The clone exists now, so anything past this point that throws (a rejected disk layout, a
+        // set_* call that fails) would leave a VM and its disks behind. Destroy the clone on any such
+        // failure before rethrowing, the same self-cleanup the bootstrap path owes its own VDIs.
+        try {
+            // VM.clone of a template yields a template; make it a runnable VM, then size it. VM.clone
+            // copies the source's vCPU and memory, so each clone overrides them here.
+            call("VM.set_is_a_template", vm, false);
+            call("VM.set_VCPUs_max", vm, String.valueOf(spec.vcpus()));
+            call("VM.set_VCPUs_at_startup", vm, String.valueOf(spec.vcpus()));
+            String mem = String.valueOf(spec.memoryBytes());
+            call("VM.set_memory_limits", vm, mem, mem, mem, mem);
+            if (spec.diskBytes() != null) {
+                // Grow the single root disk; a genericcloud image auto-expands its root FS on first boot.
+                // Refuse ambiguity rather than resize an arbitrary disk.
+                List<String> disks = diskVdis(vm);
+                if (disks.size() != 1) {
+                    throw new HypervisorException("cannot honour diskBytes: expected one disk on the clone, found "
+                            + disks.size());
+                }
+                call("VDI.resize", disks.get(0), String.valueOf(spec.diskBytes()));
             }
-            call("VDI.resize", disks.get(0), String.valueOf(spec.diskBytes()));
+        } catch (RuntimeException e) {
+            try {
+                destroyWithDisks(new VmRef(vm));
+            } catch (RuntimeException cleanup) {
+                // Best effort. The original failure is what the caller needs, so keep it and just note
+                // that the half-configured clone could not be reclaimed.
+                LOGGER.warning("could not clean up partly configured clone " + vm + ": " + cleanup.getMessage());
+            }
+            throw e;
         }
         return new VmRef(vm);
     }
