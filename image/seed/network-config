@@ -6,7 +6,7 @@
 # network up; a fresh `import_raw_vdi` disk has no persisted network state, so without this file the
 # VM boots to a login prompt with no DHCP, no address, and no agent that can reach the controller.
 # It looks like a boot stall through every indirect signal (empty serial console, low CPU, MAC
-# absent from the bridge) but the VM is up — it just has no network. Proven on the lab pool: adding
+# absent from the bridge) but the VM is up and just has no network. Proven on the lab pool: adding
 # exactly this file to the seed turned a "staller" into a VM that DHCPs and reports traffic.
 #
 # A clone of the golden image already carries golden's persisted network config on disk, so it does

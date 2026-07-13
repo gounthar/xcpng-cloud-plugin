@@ -9,7 +9,7 @@
 // STATUS. `packer validate` passes and CI runs it on every push. `packer build` HAS now been run
 // against the lab pool: the builder uploaded the netinst ISO, created the VM, connected VNC, and
 // drove the Debian installer via boot_command (the installer kernel loaded). It then blocked at the
-// preseed HTTP fetch — an environment wall, not a template one: packer serves the preseed on the
+// preseed HTTP fetch, an environment wall, not a template one: packer serves the preseed on the
 // host running it, unreachable from the pool when that host is behind WSL2 NAT. Run `packer build`
 // from a pool-reachable host (WSL2 mirrored networking, a netsh portproxy, or a golden-image clone
 // as the builder). Everything durable about the image lives in image/provision.sh, which CI executes

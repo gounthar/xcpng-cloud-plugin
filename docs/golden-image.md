@@ -53,12 +53,12 @@ template field.
 > **Honesty about state (updated 2026-07-12).** `packer validate` passes and CI runs it on every push.
 > `packer build` has now been run against the lab pool, and the previously-unverified step **works**:
 > the builder uploaded the netinst ISO to the `local-iso` SR, created the VM, connected VNC, and drove
-> the Debian installer via `boot_command` — the installer kernel loaded. The build then blocked at the
+> the Debian installer via `boot_command`, and the installer kernel loaded. The build then blocked at the
 > **preseed fetch**, for an environment reason, not a template one: the builder serves
 > `image/http/preseed.cfg` over HTTP on the machine running `packer`, and when that machine is behind
 > WSL2 NAT the building VM on the LAN cannot reach it (confirmed: dom0 could not reach the packer HTTP
 > port on either the WSL or Windows address). This is the same inbound-reachability wall as the M2
-> agent. **Run `packer build` from a host the pool can reach on the LAN** — either WSL2 mirrored
+> agent. **Run `packer build` from a host the pool can reach on the LAN**: either WSL2 mirrored
 > networking, a `netsh portproxy` for the packer HTTP port (pin `http_port_min`/`max` so it is stable),
 > or, cleanest, a golden-image **clone as the builder** (pool-adjacent, disposable, CI-shaped). The
 > `boot_command`/preseed pairing itself is validated up to that fetch. Everything durable about the
@@ -94,7 +94,7 @@ ships no `openjdk-21`, not even in `bookworm-backports`.
 `image/seed/` holds the files that make up the per-clone NoCloud seed. Three files:
 `user-data.tmpl` and `meta-data.tmpl` are rendered per clone; `network-config` is static. None is
 part of the image. **These are groundwork, not a wired code path yet:** rendering them and attaching
-the seed is M3 — `provision()` is still inert and `user-data.tmpl` is marked `NOT YET WIRED UP`.
+the seed is M3 work. `provision()` is still inert and `user-data.tmpl` is marked `NOT YET WIRED UP`.
 
 `meta-data.tmpl` carries `instance-id`, and it must be **unique per clone**. Use the VM's XAPI UUID.
 
@@ -109,29 +109,29 @@ cannot omit**. A pristine cloud image relies on cloud-init to bring the network 
 imported disk has no persisted network state, so without a `network-config` in the seed the VM boots
 to a login prompt with no DHCP, no address, and no agent that can reach the controller. Through
 indirect signals (empty serial console, low CPU, MAC absent from the bridge) that looks like a boot
-stall — it is not; the VM is up with no network. Proven on the lab pool: a fresh import that
+stall, but it is not: the VM is up with no network. Proven on the lab pool: a fresh import that
 "stalled" through all those proxies came up as `<hostname> login:` with a real DHCP lease the moment
 a `network-config` (`dhcp4: true`, `match: name "e*"`) was added to its seed. A **clone** of the
 golden image already carries a working network config on disk and does not strictly need it; the seed
-ships it anyway, because DHCP-on-the-first-ethernet is what both paths want.
+ships it anyway, because DHCP on an ethernet interface is what both paths want.
 
 ## Automated bootstrap via `import_raw_vdi`
 
 > **Corrected 2026-07-12.** An earlier version of this section claimed a fresh import "does not boot"
 > and that the seed content "gates a pre-kernel OVMF boot." Both are wrong. The VMs booted the whole
-> time — a VNC capture of a supposed "staller" showed a Debian login prompt. The real cause is mundane:
+> time. A VNC capture of a supposed "staller" showed a Debian login prompt. The real cause is mundane:
 > **cloud-init network configuration**, not firmware. Full record in the "Correction" section of
 > `golden-image-boot-bisect.md`. What follows is the corrected understanding.
 
 **The import is proven and reliable.** `VDI.create` (`virtual_size` == the raw's exact byte length) +
 `PUT /import_raw_vdi?...&format=raw` streams a raw/vhd cloud disk onto the pool byte-perfectly, verified
 by a full `export_raw_vdi` sha512 round-trip. ~31 s for 3 GiB over LAN. `physical_utilisation` reads
-stale until `SR.scan` — always scan before trusting VDI stats.
+stale until `SR.scan`, so always scan before trusting VDI stats.
 
-**The imported disk boots.** A fresh import boots normally: OVMF → grub → kernel → systemd → a login
-prompt (confirmed by console capture). There is no firmware / NVRAM / Secure-Boot / device-model
-fragility — a full day of contrary theorising was a misdiagnosis from indirect signals, see the bisect
-record. What a fresh import lacks is **network**: the genericcloud image relies on cloud-init to bring
+**The imported disk boots.** A fresh import boots normally: OVMF hands off to grub, then the kernel,
+systemd, and a login prompt (confirmed by console capture). There is no firmware / NVRAM / Secure-Boot
+/ device-model fragility. A full day of contrary theorising was a misdiagnosis from indirect signals;
+see the bisect record. What a fresh import lacks is **network**: the genericcloud image relies on cloud-init to bring
 it up, and a fresh VM whose cloud-init did not apply a working network config comes up with no DHCP, no
 IP, and no guest-reported address. Through indirect proxies (`ttyS0` is on VGA not serial, low idle CPU,
 MAC absent from the bridge) that looks like a boot stall, but is not. golden's *clones* work because
@@ -143,8 +143,8 @@ beside `user-data` and `meta-data`, and cloud-init applies it as long as the `in
 and unique per clone (the silent-skip trap above). These are seed *files*; assembling and attaching
 the NoCloud seed is still M3, so nothing in the plugin consumes them yet. Verified **by hand** on the
 lab pool: a fresh bare `import_raw_vdi` disk (golden's pristine source, no persisted network) plus a
-seed carrying this exact `network-config` booted and brought up DHCP — the guest MAC was learned on
-the `xenbr0` bridge and the vif showed real bidirectional traffic — where the same disk with a seed
+seed carrying this exact `network-config` booted and brought up DHCP (the guest MAC was learned on
+the `xenbr0` bridge and the vif showed real bidirectional traffic), where the same disk with a seed
 lacking `network-config` came up networkless. When M3 wires the seed, the from-scratch path works;
 until then the reliable path is to clone the golden template.
 
@@ -164,7 +164,7 @@ that is out of v0 scope.
   golden clone is ideal). Installer-made disks carry a persisted network config, so no clone-time
   cloud-init-network step is needed.
 - **The Xen Orchestra backend.** XO does import + VM-create + cloud-init injection + boot as first-class
-  operations — the cleanest home for an automated bootstrap if one is built.
+  operations, the cleanest home for an automated bootstrap if one is built.
 
 Bottom line: `import_raw_vdi` works and the VMs boot. A from-scratch bootstrap needs a correct
 cloud-init network config, which is ordinary. Clone golden for the simplest reliable path; use Packer
@@ -172,4 +172,4 @@ cloud-init network config, which is ordinary. Clone golden for the simplest reli
 
 Methodological note, earned expensively: this section was rewritten after a day of misdiagnosis that
 never once looked at the VM console. For a "won't boot" VM on this stack, **capture the screen first**
-(`xe vm-list params=dom-id` → dom0 `vnc-<domid>` unix socket → `vncdo capture`) before theorising.
+(`xe vm-list params=dom-id`, then grab the `vnc-<domid>` unix socket on dom0 and run `vncdo capture`) before theorising.
