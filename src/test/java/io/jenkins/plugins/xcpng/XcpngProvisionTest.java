@@ -3,6 +3,7 @@ package io.jenkins.plugins.xcpng;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.model.Label;
@@ -73,6 +74,18 @@ class XcpngProvisionTest {
                 fake.calls().indexOf("start:vm/xcpng-agent-1/1")
                         < fake.calls().indexOf("destroyWithDisks:vm/xcpng-agent-1/1"),
                 fake.calls().toString());
+    }
+
+    @Test
+    void aCloneThatFailsToStartIsDestroyedNotLeaked(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        assertThrows(Exception.class, () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1"));
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:vm/xcpng-agent-1/1"),
+                "a clone that fails to start must be destroyed, not leaked: " + fake.calls());
     }
 
     @Test

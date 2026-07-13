@@ -63,6 +63,12 @@ public class XcpngAgent extends AbstractCloudSlave {
         return vmRef;
     }
 
+    /** Name of the cloud that provisioned this agent, used to attribute it against that cloud's cap. */
+    @NonNull
+    public String getCloudName() {
+        return cloudName;
+    }
+
     /** The cloud that provisioned this agent, or null if it has since been removed from the config. */
     @CheckForNull
     public XcpngCloud getCloud() {

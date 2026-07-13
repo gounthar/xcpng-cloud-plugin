@@ -166,16 +166,35 @@ public class XcpngCloud extends Cloud {
      * fake client and assert the clone/start call sequence.
      */
     Node provisionNode(@NonNull XcpngTemplate template, @NonNull String displayName) throws Exception {
-        final VmRef clone;
         try (HypervisorClient client = openClient()) {
             VmRef templateRef = client.resolveTemplate(template.getTemplateName());
             ProvisionSpec spec = new ProvisionSpec(
                     displayName, template.getNumCpus(), template.getMemoryBytes(), null, null, null);
-            clone = client.cloneFromTemplate(templateRef, spec);
-            client.start(clone);
+            VmRef clone = client.cloneFromTemplate(templateRef, spec);
+            try {
+                client.start(clone);
+                XcpngAgent agent = new XcpngAgent(displayName, name, clone.value(), template, RETENTION_IDLE_MINUTES);
+                LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
+                return agent;
+            } catch (Exception e) {
+                // The clone exists but never became a usable agent. Destroy it so a failed provision does
+                // not leak a VM and its disks: the reaper iterates VMs by agent, so a clone attached to no
+                // agent is invisible to it and would leak indefinitely.
+                LOGGER.log(
+                        Level.WARNING,
+                        e,
+                        () -> "Provision of " + displayName + " failed after clone; destroying VM " + clone.value());
+                try {
+                    client.destroyWithDisks(clone);
+                } catch (RuntimeException cleanup) {
+                    LOGGER.log(
+                            Level.WARNING,
+                            cleanup,
+                            () -> "Could not clean up VM " + clone.value() + " after a failed provision");
+                }
+                throw e;
+            }
         }
-        LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
-        return new XcpngAgent(displayName, name, clone.value(), template, RETENTION_IDLE_MINUTES);
     }
 
     /**
@@ -221,11 +240,14 @@ public class XcpngCloud extends Cloud {
         return label == null || label.matches(Label.parse(template.getLabelString()));
     }
 
-    /** Instance-cap headroom: the configured maximum minus the agents this cloud already runs. */
+    /**
+     * Instance-cap headroom: the configured maximum minus the agents <em>this</em> cloud already runs.
+     * Filtered by cloud name so one XCP-ng cloud does not throttle another that shares the controller.
+     */
     private int availableCapacity() {
         int active = 0;
         for (Node node : Jenkins.get().getNodes()) {
-            if (node instanceof XcpngAgent) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
                 active++;
             }
         }
