@@ -157,6 +157,17 @@ class XapiClientTest {
     }
 
     @Test
+    void destroyWithDisksDestroysASharedVdiOnlyOnce() {
+        ScriptedTransport t = new ScriptedTransport();
+        t.extraDisk = true; // two Disk VBDs
+        t.sharedVdi = true; // both mapping to the same VDI ref
+        XapiClient c = new XapiClient(t, "root", "pw");
+        c.destroyWithDisks(new VmRef("OpaqueRef:vm-1")); // must not throw a false leak
+        assertEquals(1, t.methods().stream().filter("VDI.destroy"::equals).count(),
+                "a VDI shared by several VBDs must be destroyed exactly once");
+    }
+
+    @Test
     void primaryIpIsEmptyWhenHalted() {
         ScriptedTransport t = new ScriptedTransport();
         t.powerState = "Halted";
@@ -240,6 +251,7 @@ class XapiClientTest {
         boolean vdiDestroyFails = false;
         boolean hostIsSlave = false;
         boolean extraDisk = false;
+        boolean sharedVdi = false;
 
         @Override
         public String post(String body) {
@@ -280,7 +292,12 @@ class XapiClientTest {
                         ? List.of("OpaqueRef:vbd-disk", "OpaqueRef:vbd-disk2", "OpaqueRef:vbd-cd")
                         : List.of("OpaqueRef:vbd-disk", "OpaqueRef:vbd-cd");
                 case "VBD.get_type" -> req.get("params").get(1).asText().contains("cd") ? "CD" : "Disk";
-                case "VBD.get_VDI" -> "OpaqueRef:vdi-disk";
+                case "VBD.get_VDI" -> {
+                    String vbd = req.get("params").get(1).asText();
+                    // Distinct VDI per disk VBD so a two-disk clone reads as two disks; sharedVdi maps
+                    // both disk VBDs to the same ref to exercise the dedupe path.
+                    yield (sharedVdi || !vbd.contains("disk2")) ? "OpaqueRef:vdi-disk" : "OpaqueRef:vdi-disk2";
+                }
                 case "pool.get_all" -> List.of();
                 default -> ""; // set_*, resize, destroy, task.destroy, hard_shutdown all return void-ish
             };

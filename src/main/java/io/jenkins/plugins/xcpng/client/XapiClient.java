@@ -14,9 +14,11 @@ import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -347,7 +349,10 @@ public final class XapiClient implements HypervisorClient {
     }
 
     private List<String> diskVdis(String vm) {
-        List<String> vdis = new ArrayList<>();
+        // A VDI must appear once even if several Disk VBDs map to it (a multi-attached disk, or a pool
+        // that reports a duplicate VBD->VDI mapping). A set keyed on the ref keeps destroyWithDisks from
+        // destroying the same VDI twice, where the second destroy fails and looks like a leak.
+        Set<String> vdis = new LinkedHashSet<>();
         for (JsonNode vbd : call("VM.get_VBDs", vm)) {
             if (!"Disk".equals(call("VBD.get_type", vbd.asText()).asText(""))) {
                 continue;
@@ -361,7 +366,7 @@ public final class XapiClient implements HypervisorClient {
                 vdis.add(vdi);
             }
         }
-        return vdis;
+        return new ArrayList<>(vdis);
     }
 
     @Override
