@@ -10,13 +10,14 @@
 # exactly this file to the seed turned a "staller" into a VM that DHCPs and reports traffic.
 #
 # A clone of the golden image already carries golden's persisted network config on disk, so it does
-# not strictly need this. Shipping it in every seed is still correct: a DHCP-on-first-ethernet
-# config is what both paths want, and it makes the seed a complete datasource for the from-scratch
-# import path as well as the clone path.
+# not strictly need this. Shipping it in every seed is still correct: a DHCP-on-ethernet config is
+# what both paths want, and it makes the seed a complete datasource for the from-scratch import path
+# as well as the clone path.
 #
 # `match: name: "e*"` covers both the classic `eth0` and predictable `en*` names without pinning one.
-# It is static — there is nothing per-agent here — so the plugin attaches it verbatim; only
-# user-data and meta-data carry rendered placeholders.
+# It is static, nothing per-agent here, so when the plugin wires up the seed at M3 it attaches this
+# file verbatim while user-data and meta-data carry rendered placeholders. Not wired up yet:
+# provision() is inert today, same as user-data.tmpl.
 #
 ---
 version: 2
