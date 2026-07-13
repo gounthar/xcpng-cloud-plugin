@@ -153,15 +153,4 @@ class XcpngCloudTest {
         assertEquals(2048, t.getMemoryMb(), "missing memory must clamp to the default, not 0");
     }
 
-    @Test
-    void provisioningIsInertUntilWired(JenkinsRule r) {
-        XcpngCloud cloud = new XcpngCloud(
-                "xcpng",
-                "https://pool.example.test",
-                "xcpng-root",
-                false,
-                2,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048)));
-        assertEquals(0, cloud.provision(new hudson.slaves.Cloud.CloudState(null, 0), 4).size());
-    }
 }

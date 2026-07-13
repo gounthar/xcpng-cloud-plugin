@@ -6,10 +6,11 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 /**
  * What to make when cloning a template, in backend-neutral terms.
  *
- * <p>Sizing lives here, not on the template: {@code VM.clone} copies the source's vCPU and memory,
- * so each clone overrides them. Sizes are in bytes at this seam; the config layer converts from the
- * MiB/GiB a human types. {@code diskBytes} null means "inherit the template's disk" (a genericcloud
- * root filesystem auto-grows on first boot when the disk is larger).
+ * <p>This record is the backend-neutral carrier for sizing: {@code VM.clone} copies the source's vCPU
+ * and memory, so each clone overrides them from the values an operator set on the agent template. Sizes
+ * are in bytes at this seam; the config layer converts from the MiB/GiB a human types. {@code diskBytes}
+ * null means "inherit the template's disk" (a genericcloud root filesystem auto-grows on first boot when
+ * the disk is larger).
  *
  * <p>{@code placementHint} is an opaque string; null means "let the pool schedule". {@code userData}
  * (a cloud-init NoCloud payload) is optional and the XAPI backend ignores it in v0 (the seed is

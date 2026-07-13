@@ -8,12 +8,18 @@ import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.model.Computer;
 import hudson.model.Descriptor;
+import hudson.model.Label;
+import hudson.model.Node;
 import hudson.security.ACL;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
+import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.ProvisionSpec;
+import io.jenkins.plugins.xcpng.client.VmRef;
 import io.jenkins.plugins.xcpng.client.XapiClient;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -21,6 +27,8 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -38,12 +46,23 @@ import org.kohsuke.stapler.verb.POST;
  * instance cap, and the agent templates. The secret itself is resolved from the credentials store at
  * point of use and never written here.
  *
- * <p>M3 slice 3: the configuration model and its {@code doTestConnection}. Wiring
- * {@link #provision} to the build queue is the next slice, so provisioning stays inert here.
+ * <p>M3 slice 4: {@link #provision} clones the matching template, starts it, and hands back a
+ * single-use inbound {@link XcpngAgent}. The clone's VM is destroyed with its disks when the agent
+ * terminates (after one build, or an idle timeout).
  */
 public class XcpngCloud extends Cloud {
 
     private static final Logger LOGGER = Logger.getLogger(XcpngCloud.class.getName());
+
+    /**
+     * Idle timeout before an agent that connected but never received work is reclaimed. A constant in
+     * v0: the dominant path is single-use (destroyed after one build), and this is only the safety net.
+     * A per-cloud form field is a later refinement.
+     */
+    private static final int RETENTION_IDLE_MINUTES = 10;
+
+    /** Names provisioned VMs and agents uniquely within a controller run. */
+    private static final AtomicInteger PROVISION_COUNTER = new AtomicInteger();
 
     private final String poolUrl;
     private final String credentialsId;
@@ -52,6 +71,13 @@ public class XcpngCloud extends Cloud {
     // that predates these fields (the constructor does not run on deserialization).
     private int maxInstances;
     private List<XcpngTemplate> templates;
+
+    /**
+     * How a live client is opened. Null in production, where {@link #openClient()} builds an
+     * {@link XapiClient} from the configured credentials; a test injects an in-memory fake here.
+     * Transient: it is behaviour, not configuration, and must never be persisted to {@code config.xml}.
+     */
+    private transient HypervisorClientFactory clientFactory;
 
     @DataBoundConstructor
     public XcpngCloud(
@@ -110,12 +136,111 @@ public class XcpngCloud extends Cloud {
 
     @Override
     public boolean canProvision(CloudState state) {
-        return false;
+        return templateFor(state.getLabel()) != null && availableCapacity() > 0;
     }
 
     @Override
     public Collection<NodeProvisioner.PlannedNode> provision(CloudState state, int excessWorkload) {
-        return List.of();
+        XcpngTemplate template = templateFor(state.getLabel());
+        if (template == null) {
+            return List.of();
+        }
+        List<NodeProvisioner.PlannedNode> planned = new ArrayList<>();
+        int capacity = availableCapacity();
+        int remaining = excessWorkload;
+        // One VM per planned node; each serves numExecutors of the excess workload. Stop when the
+        // workload is met or the instance cap is reached, whichever comes first.
+        while (remaining > 0 && planned.size() < capacity) {
+            final String displayName = "xcpng-" + template.getTemplateName() + "-" + PROVISION_COUNTER.incrementAndGet();
+            Future<Node> future = Computer.threadPoolForRemoting.submit(() -> provisionNode(template, displayName));
+            planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
+            remaining -= template.getNumExecutors();
+        }
+        return planned;
+    }
+
+    /**
+     * Clone the template, start it, and wrap the running VM in a single-use inbound agent. Called on a
+     * background thread by {@link #provision}; the returned {@link Node} is added to Jenkins by the
+     * node provisioner once this future completes. Package-visible so a test can drive it against a
+     * fake client and assert the clone/start call sequence.
+     */
+    Node provisionNode(@NonNull XcpngTemplate template, @NonNull String displayName) throws Exception {
+        final VmRef clone;
+        try (HypervisorClient client = openClient()) {
+            VmRef templateRef = client.resolveTemplate(template.getTemplateName());
+            ProvisionSpec spec = new ProvisionSpec(
+                    displayName, template.getNumCpus(), template.getMemoryBytes(), null, null, null);
+            clone = client.cloneFromTemplate(templateRef, spec);
+            client.start(clone);
+        }
+        LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
+        return new XcpngAgent(displayName, name, clone.value(), template, RETENTION_IDLE_MINUTES);
+    }
+
+    /**
+     * Open a session to the pool. In production this builds an {@link XapiClient} from the configured
+     * username/password credential; a test injects a fake via {@link #setClientFactory}. The caller
+     * owns the returned client and must close it.
+     */
+    @NonNull
+    HypervisorClient openClient() {
+        if (clientFactory != null) {
+            return clientFactory.open(this);
+        }
+        StandardUsernamePasswordCredentials credentials =
+                DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
+        if (credentials == null) {
+            throw new IllegalStateException("No XAPI credentials configured for cloud '" + name + "'.");
+        }
+        return new XapiClient(
+                poolUrl,
+                credentials.getUsername(),
+                credentials.getPassword().getPlainText(),
+                trustSelfSigned);
+    }
+
+    /** Test seam: replace how a client is opened with an in-memory fake. */
+    void setClientFactory(HypervisorClientFactory clientFactory) {
+        this.clientFactory = clientFactory;
+    }
+
+    /** The first template whose labels satisfy {@code label}; null if none does. */
+    @CheckForNull
+    private XcpngTemplate templateFor(@CheckForNull Label label) {
+        for (XcpngTemplate template : templates) {
+            if (labelMatches(label, template)) {
+                return template;
+            }
+        }
+        return null;
+    }
+
+    private static boolean labelMatches(@CheckForNull Label label, XcpngTemplate template) {
+        // A null label is a job with no label constraint; any template may serve it.
+        return label == null || label.matches(Label.parse(template.getLabelString()));
+    }
+
+    /** Instance-cap headroom: the configured maximum minus the agents this cloud already runs. */
+    private int availableCapacity() {
+        int active = 0;
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent) {
+                active++;
+            }
+        }
+        return Math.max(0, maxInstances - active);
+    }
+
+    /**
+     * How {@link #openClient()} obtains a client. Production leaves this null and builds an
+     * {@link XapiClient}; a test supplies an in-memory fake. Not {@code Serializable} on purpose: it is
+     * held only in the transient {@link #clientFactory} field and never reaches {@code config.xml}.
+     */
+    @FunctionalInterface
+    interface HypervisorClientFactory {
+        @NonNull
+        HypervisorClient open(@NonNull XcpngCloud cloud);
     }
 
     @Extension
