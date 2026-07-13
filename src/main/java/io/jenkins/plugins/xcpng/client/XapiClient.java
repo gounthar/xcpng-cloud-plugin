@@ -15,6 +15,7 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Logger;
@@ -42,7 +43,7 @@ public final class XapiClient implements HypervisorClient {
     private static final Pattern OPAQUE_REF = Pattern.compile("OpaqueRef:[0-9a-fA-F-]+");
 
     private final JsonRpcTransport transport;
-    private final ObjectMapper mapper = new ObjectMapper();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
     private final AtomicInteger id = new AtomicInteger();
     private final String user;
     private final String password;
@@ -65,31 +66,31 @@ public final class XapiClient implements HypervisorClient {
 
     /** For tests: inject a transport that replays recorded JSON fixtures. */
     XapiClient(@NonNull JsonRpcTransport transport, @NonNull String user, @NonNull String password) {
-        this.transport = transport;
-        this.user = user;
-        this.password = password;
+        this.transport = Objects.requireNonNull(transport, "transport");
+        this.user = Objects.requireNonNull(user, "user");
+        this.password = Objects.requireNonNull(password, "password");
     }
 
     // -- plumbing ---------------------------------------------------------
 
     private JsonNode raw(String method, List<Object> params) {
-        ObjectNode body = mapper.createObjectNode();
+        ObjectNode body = MAPPER.createObjectNode();
         body.put("jsonrpc", "2.0");
         body.put("id", id.incrementAndGet());
         body.put("method", method);
         ArrayNode arr = body.putArray("params");
         for (Object p : params) {
-            arr.add(mapper.<JsonNode>valueToTree(p));
+            arr.add(MAPPER.<JsonNode>valueToTree(p));
         }
         String responseBody;
         try {
-            responseBody = transport.post(mapper.writeValueAsString(body));
+            responseBody = transport.post(MAPPER.writeValueAsString(body));
         } catch (IOException e) {
             throw new HypervisorException(method + ": transport error: " + e.getMessage(), e);
         }
         JsonNode payload;
         try {
-            payload = mapper.readTree(responseBody);
+            payload = MAPPER.readTree(responseBody);
         } catch (IOException e) {
             throw new HypervisorException(method + ": malformed response: " + e.getMessage(), e);
         }
@@ -123,7 +124,9 @@ public final class XapiClient implements HypervisorClient {
     private JsonNode call(String method, Object... params) {
         List<Object> withSession = new ArrayList<>();
         withSession.add(session);
-        withSession.addAll(List.of(params));
+        for (Object p : params) {
+            withSession.add(p);
+        }
         try {
             return raw(method, withSession);
         } catch (HypervisorException e) {
@@ -196,15 +199,19 @@ public final class XapiClient implements HypervisorClient {
     @NonNull
     public VmRef resolveTemplate(@NonNull String name) {
         ensureSession();
+        int byName = 0;
         List<String> matches = new ArrayList<>();
         for (JsonNode ref : call("VM.get_by_name_label", name)) {
+            byName++;
             if (call("VM.get_is_a_template", ref.asText()).asBoolean()) {
                 matches.add(ref.asText());
             }
         }
         if (matches.isEmpty()) {
-            throw new HypervisorException("no template named '" + name
-                    + "' on this pool (a VM by that name is not a template)");
+            String detail = byName == 0
+                    ? "no VM or template by that name exists"
+                    : byName + " VM(s) carry that name but none is a template";
+            throw new HypervisorException("no template named '" + name + "' on this pool (" + detail + ")");
         }
         if (matches.size() > 1) {
             // First-match would be non-deterministic and could clone the wrong image.
@@ -261,7 +268,11 @@ public final class XapiClient implements HypervisorClient {
         if (state(vm) != VmState.RUNNING) {
             return Optional.empty();
         }
-        String gm = call("VM.get_guest_metrics", vm.value()).asText("");
+        JsonNode gmNode = call("VM.get_guest_metrics", vm.value());
+        if (gmNode.isNull()) {
+            return Optional.empty();
+        }
+        String gm = gmNode.asText("");
         if (gm.isEmpty() || gm.contains("NULL")) {
             return Optional.empty();
         }
@@ -322,7 +333,11 @@ public final class XapiClient implements HypervisorClient {
             if (!"Disk".equals(call("VBD.get_type", vbd.asText()).asText(""))) {
                 continue;
             }
-            String vdi = call("VBD.get_VDI", vbd.asText()).asText("");
+            JsonNode vdiNode = call("VBD.get_VDI", vbd.asText());
+            if (vdiNode.isNull()) {
+                continue;
+            }
+            String vdi = vdiNode.asText("");
             if (!vdi.isEmpty() && !vdi.contains("NULL")) {
                 vdis.add(vdi);
             }
@@ -359,19 +374,31 @@ public final class XapiClient implements HypervisorClient {
 
     private static final class HttpTransport implements JsonRpcTransport {
 
+        // One HttpClient per operation would allocate a fresh thread and connection pool each time.
+        // These are immutable and thread-safe, so share them across the JVM: one that verifies the
+        // pool cert, one that trusts a self-signed lab pool. The flag picks which.
+        private static final HttpClient SHARED = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
+        private static final HttpClient SHARED_TRUST_ALL = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .sslContext(trustAllContext())
+                .sslParameters(trustAllParameters())
+                .build();
+
         private final HttpClient http;
         private final URI endpoint;
 
         HttpTransport(String poolUrl, boolean trustSelfSigned) {
+            Objects.requireNonNull(poolUrl, "poolUrl");
             this.endpoint = URI.create(poolUrl.replaceAll("/+$", "") + "/jsonrpc");
-            HttpClient.Builder b = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30));
-            if (trustSelfSigned) {
-                b.sslContext(trustAllContext());
-                SSLParameters p = new SSLParameters();
-                p.setEndpointIdentificationAlgorithm(null); // also skip hostname verification
-                b.sslParameters(p);
-            }
-            this.http = b.build();
+            this.http = trustSelfSigned ? SHARED_TRUST_ALL : SHARED;
+        }
+
+        private static SSLParameters trustAllParameters() {
+            SSLParameters p = new SSLParameters();
+            p.setEndpointIdentificationAlgorithm(null); // also skip hostname verification
+            return p;
         }
 
         @Override
@@ -381,12 +408,22 @@ public final class XapiClient implements HypervisorClient {
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                     .build();
+            HttpResponse<String> resp;
             try {
-                return http.send(req, HttpResponse.BodyHandlers.ofString()).body();
+                resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted", e);
             }
+            int status = resp.statusCode();
+            if (status / 100 != 2) {
+                // A proxy error page or an auth failure is HTML or plain text, not a JSON-RPC envelope.
+                // Fail here with the status so the operator sees "HTTP 502" rather than "malformed response".
+                String body = resp.body() == null ? "" : resp.body();
+                throw new IOException("HTTP " + status + " from " + endpoint + ": "
+                        + body.substring(0, Math.min(body.length(), 200)));
+            }
+            return resp.body();
         }
 
         private static SSLContext trustAllContext() {
