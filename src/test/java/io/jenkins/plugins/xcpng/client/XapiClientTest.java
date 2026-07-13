@@ -61,6 +61,8 @@ class XapiClientTest {
         assertThrows(HypervisorException.class, () -> c.cloneFromTemplate(new VmRef("OpaqueRef:tmpl"),
                 new ProvisionSpec("agent", 2, 2048L, null, "host-3", null)));
         assertFalse(t.methods().contains("Async.VM.clone"), "must not clone when the spec is rejected");
+        assertFalse(t.methods().contains("session.login_with_password"),
+                "must reject the spec before opening a session");
     }
 
     @Test

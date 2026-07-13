@@ -231,13 +231,14 @@ public final class XapiClient implements HypervisorClient {
     @Override
     @NonNull
     public VmRef cloneFromTemplate(@NonNull VmRef template, @NonNull ProvisionSpec spec) {
-        ensureSession();
         if (spec.placementHint() != null) {
-            // Guard before the clone so a bad spec leaves no VM behind. Placement (start-on-host,
+            // Reject before opening a session, so a bad spec fails with this local message rather than
+            // as a connection or auth error, and leaves no VM behind. Placement (start-on-host,
             // affinity) is not wired in v0, which targets a single-host pool; reject rather than
             // silently ignore, so a caller cannot believe it placed a VM when it did not.
             throw new HypervisorException("placementHint is not honoured in v0 (single-host pool); leave it null");
         }
+        ensureSession();
         String task = call("Async.VM.clone", template.value(), spec.name()).asText();
         String vm = awaitTaskRef(task);
         // The clone exists now, so anything past this point that throws (a rejected disk layout, a
@@ -399,16 +400,22 @@ public final class XapiClient implements HypervisorClient {
     private static final class HttpTransport implements JsonRpcTransport {
 
         // One HttpClient per operation would allocate a fresh thread and connection pool each time.
-        // These are immutable and thread-safe, so share them across the JVM: one that verifies the
-        // pool cert, one that trusts a self-signed lab pool. The flag picks which.
+        // These are immutable and thread-safe, so share them across the JVM. The verified client is the
+        // default; the trust-all client is built lazily (see TrustAllHolder) so its weaker SSLContext is
+        // only ever constructed when a caller actually opts into trustSelfSigned, and a failure building
+        // it can never take down the verified path.
         private static final HttpClient SHARED = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
-        private static final HttpClient SHARED_TRUST_ALL = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
-                .sslContext(trustAllContext())
-                .sslParameters(trustAllParameters())
-                .build();
+
+        /** Holds the trust-all client so it is constructed on first use, not at class load. */
+        private static final class TrustAllHolder {
+            static final HttpClient CLIENT = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(30))
+                    .sslContext(trustAllContext())
+                    .sslParameters(trustAllParameters())
+                    .build();
+        }
 
         private final HttpClient http;
         private final URI endpoint;
@@ -416,7 +423,7 @@ public final class XapiClient implements HypervisorClient {
         HttpTransport(String poolUrl, boolean trustSelfSigned) {
             Objects.requireNonNull(poolUrl, "poolUrl");
             this.endpoint = URI.create(poolUrl.replaceAll("/+$", "") + "/jsonrpc");
-            this.http = trustSelfSigned ? SHARED_TRUST_ALL : SHARED;
+            this.http = trustSelfSigned ? TrustAllHolder.CLIENT : SHARED;
         }
 
         private static SSLParameters trustAllParameters() {
