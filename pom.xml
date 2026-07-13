@@ -87,10 +87,16 @@
       <groupId>org.jenkins-ci.plugins</groupId>
       <artifactId>jackson2-api</artifactId>
     </dependency>
-  </dependencies>
 
-  <!--
-    The credentials plugin arrives with the config model (the first code that resolves a secret),
-    not here. Declaring it earlier would make every installing controller pull it in for nothing.
-  -->
+    <!--
+      The config model stores a credential ID and resolves the username/password at point of use.
+      This is the first code that touches a secret, so the credentials plugin arrives here rather
+      than at scaffold time, where every installing controller would have pulled it in for nothing.
+      The BOM manages the version.
+    -->
+    <dependency>
+      <groupId>org.jenkins-ci.plugins</groupId>
+      <artifactId>credentials</artifactId>
+    </dependency>
+  </dependencies>
 </project>

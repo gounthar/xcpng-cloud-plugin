@@ -1,0 +1,12 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
+  <f:entry title="${%Template name}" field="templateName">
+    <f:textbox/>
+  </f:entry>
+  <f:entry title="${%Labels}" field="labelString">
+    <f:textbox/>
+  </f:entry>
+  <f:entry title="${%Executors}" field="numExecutors">
+    <f:number default="1" clazz="positive-number"/>
+  </f:entry>
+</j:jelly>

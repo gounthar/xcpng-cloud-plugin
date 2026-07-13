@@ -1,9 +1,23 @@
 <?jelly escape-by-default='true'?>
-<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form" xmlns:c="/lib/credentials">
   <f:entry title="${%Name}" field="name">
     <f:textbox default="xcpng"/>
   </f:entry>
   <f:entry title="${%Pool URL}" field="poolUrl">
     <f:textbox/>
   </f:entry>
+  <f:entry title="${%Credentials}" field="credentialsId">
+    <c:select/>
+  </f:entry>
+  <f:entry title="${%Trust self-signed certificate}" field="trustSelfSigned">
+    <f:checkbox/>
+  </f:entry>
+  <f:entry title="${%Max instances}" field="maxInstances">
+    <f:number default="2" clazz="positive-number"/>
+  </f:entry>
+  <f:entry title="${%Templates}">
+    <f:repeatableHeteroProperty field="templates" hasHeader="true" addCaption="${%Add template}"/>
+  </f:entry>
+  <f:validateButton title="${%Test connection}" progress="${%Testing...}"
+                    method="testConnection" with="poolUrl,credentialsId,trustSelfSigned"/>
 </j:jelly>

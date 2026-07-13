@@ -197,25 +197,51 @@ class XapiClientTest {
         }
     }
 
+    // The next three let login succeed and fail only on the target verb, so they exercise that verb's
+    // own response handling rather than login's. The verb name in the message is asserted to prove it:
+    // a transport that failed every call would trip inside login() and never reach the verb at all.
+
     @Test
     void anErrorEnvelopeBecomesAHypervisorException() {
-        XapiClient c = new XapiClient(body -> envelope(reqId(body), null,
-                Map.of("message", "HANDLE_INVALID", "data", List.of("VM", "x"))), "root", "pw");
+        JsonRpcTransport t = body -> {
+            JsonNode req = read(body);
+            if (req.get("method").asText().equals("session.login_with_password")) {
+                return envelope(req.get("id"), "OpaqueRef:session", null);
+            }
+            return envelope(req.get("id"), null, Map.of("message", "HANDLE_INVALID", "data", List.of("VM", "x")));
+        };
+        XapiClient c = new XapiClient(t, "root", "pw");
         HypervisorException e =
                 assertThrows(HypervisorException.class, () -> c.state(new VmRef("OpaqueRef:vm-1")));
-        assertTrue(e.getMessage().contains("HANDLE_INVALID"));
+        assertTrue(e.getMessage().contains("HANDLE_INVALID"), e.getMessage());
+        assertTrue(e.getMessage().contains("VM.get_power_state"), e.getMessage());
     }
 
     @Test
     void aBareScalarResponseIsMalformed() {
-        XapiClient c = new XapiClient(body -> "5", "root", "pw");
-        assertThrows(HypervisorException.class, c::ping);
+        JsonRpcTransport t = body -> {
+            JsonNode req = read(body);
+            return req.get("method").asText().equals("session.login_with_password")
+                    ? envelope(req.get("id"), "OpaqueRef:session", null)
+                    : "5";
+        };
+        XapiClient c = new XapiClient(t, "root", "pw");
+        HypervisorException e = assertThrows(HypervisorException.class, c::ping);
+        assertTrue(e.getMessage().contains("pool.get_all"), e.getMessage());
+        assertTrue(e.getMessage().contains("expected a JSON object"), e.getMessage());
     }
 
     @Test
     void aNullResponseBodyIsSurfacedNotAnNpe() {
-        XapiClient c = new XapiClient(body -> null, "root", "pw");
+        JsonRpcTransport t = body -> {
+            JsonNode req = read(body);
+            return req.get("method").asText().equals("session.login_with_password")
+                    ? envelope(req.get("id"), "OpaqueRef:session", null)
+                    : null;
+        };
+        XapiClient c = new XapiClient(t, "root", "pw");
         HypervisorException e = assertThrows(HypervisorException.class, c::ping);
+        assertTrue(e.getMessage().contains("pool.get_all"), e.getMessage());
         assertTrue(e.getMessage().contains("no response body"), e.getMessage());
     }
 
@@ -332,10 +358,6 @@ class XapiClientTest {
             }
         }
         throw new AssertionError(method + " was never called");
-    }
-
-    private static JsonNode reqId(String body) {
-        return read(body).get("id");
     }
 
     private static JsonNode read(String body) {
