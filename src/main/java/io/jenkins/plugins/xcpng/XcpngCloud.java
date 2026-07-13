@@ -48,8 +48,10 @@ public class XcpngCloud extends Cloud {
     private final String poolUrl;
     private final String credentialsId;
     private final boolean trustSelfSigned;
-    private final int maxInstances;
-    private final List<XcpngTemplate> templates;
+    // Not final: readResolve re-applies the constructor's guards when XStream loads an older config
+    // that predates these fields (the constructor does not run on deserialization).
+    private int maxInstances;
+    private List<XcpngTemplate> templates;
 
     @DataBoundConstructor
     public XcpngCloud(
@@ -67,6 +69,22 @@ public class XcpngCloud extends Cloud {
         this.trustSelfSigned = trustSelfSigned;
         this.maxInstances = maxInstances <= 0 ? 1 : maxInstances;
         this.templates = templates == null ? new ArrayList<>() : new ArrayList<>(templates);
+    }
+
+    /**
+     * XStream reloads global configuration without running the {@link DataBoundConstructor}, so an
+     * older or hand-edited {@code config.xml} can arrive with no {@code <templates>} element (leaving
+     * the list null, which would make {@link #getTemplates()} throw) or a zero {@code maxInstances}
+     * that skipped the constructor's guard. Re-apply those guards on the way in.
+     */
+    protected Object readResolve() {
+        if (templates == null) {
+            templates = new ArrayList<>();
+        }
+        if (maxInstances <= 0) {
+            maxInstances = 1;
+        }
+        return this;
     }
 
     public String getPoolUrl() {

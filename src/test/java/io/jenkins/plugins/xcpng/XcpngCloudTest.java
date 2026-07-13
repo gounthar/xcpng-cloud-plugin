@@ -117,6 +117,22 @@ class XcpngCloudTest {
         assertTrue(v.getMessage().contains("http"), v.getMessage());
     }
 
+    /**
+     * XStream loads global config without the constructor, so an older config.xml predating the
+     * templates/maxInstances fields must still reload without an NPE, with the guards re-applied.
+     */
+    @Test
+    void legacyConfigWithoutTemplatesSurvivesReload(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngCloud>\n"
+                + "  <name>xcpng</name>\n"
+                + "  <poolUrl>https://pool.example.test</poolUrl>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngCloud>\n";
+        XcpngCloud cloud = (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertNotNull(cloud.getTemplates(), "a missing <templates> must not leave the list null");
+        assertTrue(cloud.getTemplates().isEmpty());
+        assertEquals(1, cloud.getMaxInstances(), "a missing maxInstances must clamp to 1, not 0");
+    }
+
     @Test
     void provisioningIsInertUntilWired(JenkinsRule r) {
         XcpngCloud cloud = new XcpngCloud(
