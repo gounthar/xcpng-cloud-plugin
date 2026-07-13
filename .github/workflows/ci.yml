@@ -121,7 +121,9 @@ jobs:
           packer --version
 
       # Schema-checks every field against the real vatesfr/xenserver builder. It does not, and
-      # cannot, build: there is no pool. `packer build` remains unrun. See the template's header.
+      # cannot, build here: CI has no pool. `packer build` has been run by hand against the lab
+      # pool and works up to the WSL-NAT-blocked preseed fetch; see the template header and
+      # docs/golden-image.md. CI only validates.
       - name: Init and validate
         env:
           PKR_VAR_remote_host: pool.invalid
