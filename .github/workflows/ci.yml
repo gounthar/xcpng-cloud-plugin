@@ -126,6 +126,10 @@ jobs:
       # docs/golden-image.md. CI only validates.
       - name: Init and validate
         env:
+          # packer init resolves the vatesfr/xenserver plugin through the GitHub API. Unauthenticated,
+          # it shares the runner's IP rate limit (60/hour) and 403s under load; the built-in token
+          # raises that to 5000/hour. Packer reads this exact variable (its own error names it).
+          PACKER_GITHUB_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PKR_VAR_remote_host: pool.invalid
           PKR_VAR_remote_username: root
           PKR_VAR_remote_password: unused-by-validate
