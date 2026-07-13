@@ -1,0 +1,27 @@
+#
+# NoCloud network-config (cloud-init "Networking Config Version 2" / netplan v2).
+#
+# This is the third file of the NoCloud seed, beside user-data and meta-data, and it is the one a
+# from-scratch bootstrap cannot omit. A pristine cloud image relies on cloud-init to bring the
+# network up; a fresh `import_raw_vdi` disk has no persisted network state, so without this file the
+# VM boots to a login prompt with no DHCP, no address, and no agent that can reach the controller.
+# It looks like a boot stall through every indirect signal (empty serial console, low CPU, MAC
+# absent from the bridge) but the VM is up — it just has no network. Proven on the lab pool: adding
+# exactly this file to the seed turned a "staller" into a VM that DHCPs and reports traffic.
+#
+# A clone of the golden image already carries golden's persisted network config on disk, so it does
+# not strictly need this. Shipping it in every seed is still correct: a DHCP-on-first-ethernet
+# config is what both paths want, and it makes the seed a complete datasource for the from-scratch
+# import path as well as the clone path.
+#
+# `match: name: "e*"` covers both the classic `eth0` and predictable `en*` names without pinning one.
+# It is static — there is nothing per-agent here — so the plugin attaches it verbatim; only
+# user-data and meta-data carry rendered placeholders.
+#
+---
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "e*"
+    dhcp4: true

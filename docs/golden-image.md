@@ -91,7 +91,9 @@ ships no `openjdk-21`, not even in `bookworm-backports`.
 
 ## The per-clone seed
 
-`image/seed/` holds the templates the plugin renders per clone. They are **not** part of the image.
+`image/seed/` holds what the plugin attaches as a NoCloud seed per clone. Three files:
+`user-data.tmpl` and `meta-data.tmpl` are rendered per clone; `network-config` is static. None is
+part of the image.
 
 `meta-data.tmpl` carries `instance-id`, and it must be **unique per clone**. Use the VM's XAPI UUID.
 
@@ -100,6 +102,17 @@ the one cached on disk. Pin a constant id and the first clone works. Then boot t
 with that same seed attached, and from then on **every clone silently skips cloud-init**: no secret
 is written, no agent starts, and nothing appears in any log. The VM simply sits there. This is why
 `provision.sh` runs `cloud-init clean` before the image is templated.
+
+`network-config` is the third file, and it is the one a **from-scratch `import_raw_vdi` bootstrap
+cannot omit**. A pristine cloud image relies on cloud-init to bring the network up; a freshly
+imported disk has no persisted network state, so without a `network-config` in the seed the VM boots
+to a login prompt with no DHCP, no address, and no agent that can reach the controller. Through
+indirect signals (empty serial console, low CPU, MAC absent from the bridge) that looks like a boot
+stall — it is not; the VM is up with no network. Proven on the lab pool: a fresh import that
+"stalled" through all those proxies came up as `<hostname> login:` with a real DHCP lease the moment
+a `network-config` (`dhcp4: true`, `match: name "e*"`) was added to its seed. A **clone** of the
+golden image already carries a working network config on disk and does not strictly need it; the seed
+ships it anyway, because DHCP-on-the-first-ethernet is what both paths want.
 
 ## Automated bootstrap via `import_raw_vdi`
 
@@ -124,9 +137,12 @@ MAC absent from the bridge) that looks like a boot stall, but is not. golden's *
 they inherit golden's persisted, cloud-init-configured network from disk.
 
 **So a from-scratch bootstrap is ordinary, given one thing: a correct cloud-init network config in the
-seed.** The plugin's seed (`image/seed/`) must carry a DHCP network config, and cloud-init must actually
-apply it — which needs a fresh, unique `instance-id` per clone (the silent-skip trap documented above).
-With that, the imported VM gets an address and provisions normally.
+seed.** The plugin's seed (`image/seed/`) now carries a static `network-config` (`dhcp4: true`,
+`match: name "e*"`) alongside `user-data` and `meta-data`, and cloud-init applies it as long as the
+`instance-id` is fresh and unique per clone (the silent-skip trap documented above). With that, the
+imported VM gets an address and provisions normally. Confirmed on the lab pool: a fresh bare import
+plus a seed with this `network-config` booted to a login prompt with a real DHCP lease and learned
+MAC, where the same disk without it looked like a stall.
 
 **Options for producing the template:**
 
