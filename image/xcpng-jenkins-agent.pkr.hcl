@@ -6,10 +6,14 @@
 // the static fleet, and this plugin does the one thing neither can, which is watch a build queue
 // and scale to it.
 //
-// STATUS. `packer validate` passes. `packer build` has NOT been run against a pool. Everything
-// durable about the image lives in image/provision.sh, which CI executes on every push inside a
-// debian:13 container. What remains unverified here is boot_command and the preseed, i.e. whether
-// the Debian installer can be driven over XCP-ng's VNC console. docs/golden-image.md documents the
+// STATUS. `packer validate` passes and CI runs it on every push. `packer build` HAS now been run
+// against the lab pool: the builder uploaded the netinst ISO, created the VM, connected VNC, and
+// drove the Debian installer via boot_command (the installer kernel loaded). It then blocked at the
+// preseed HTTP fetch — an environment wall, not a template one: packer serves the preseed on the
+// host running it, unreachable from the pool when that host is behind WSL2 NAT. Run `packer build`
+// from a pool-reachable host (WSL2 mirrored networking, a netsh portproxy, or a golden-image clone
+// as the builder). Everything durable about the image lives in image/provision.sh, which CI executes
+// on every push inside a debian:13 container. docs/golden-image.md has the full write-up and the
 // manual path, which was performed by hand and does work.
 //
 //   export PKR_VAR_remote_host=192.168.1.87

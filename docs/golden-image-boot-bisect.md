@@ -1,4 +1,4 @@
-# Why the `import_raw_vdi` bootstrap does not boot: a bisect
+# Why the `import_raw_vdi` bootstrap *appeared* not to boot: a bisect
 
 > **SUPERSEDED (2026-07-12, evening) — the premise below is wrong. The VMs were booting the whole
 > time.** A VNC capture of a "stalling" VM shows a full Debian 12 login prompt (`localhost login:`).
@@ -7,7 +7,7 @@
 > consistent with a booted, idle VM that never brought up networking*. The real issue is
 > **cloud-init not configuring the network** on fresh/reassembled VMs, not firmware. See the
 > "Correction — we never had a boot problem" section at the end. Read that first; treat the OVMF /
-> seed-content / device-model theorising below as a record of a wrong turn, not as findings.*
+> seed-content / device-model theorising below as a record of a wrong turn, not as findings.
 
 *Recorded 2026-07-12 from the `vates-2` session, against the lab pool (XCP-ng 8.3.0, XAPI 26.1).
 Two controlled experiments on real hardware. Every test VM was destroyed by ref in a `finally`;
