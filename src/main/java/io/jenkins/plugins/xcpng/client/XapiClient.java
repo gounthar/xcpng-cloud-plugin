@@ -32,6 +32,9 @@ import javax.net.ssl.X509TrustManager;
  * <p>Session handling (re-login on {@code SESSION_INVALID}) stays inside this class and never reaches
  * the interface. The {@code ~500-line} kill criterion applies here; if this balloons, that is a signal
  * to move the backend to Xen Orchestra where clone and cloud-init are first-class.
+ *
+ * <p>Not thread-safe: an instance holds one mutable session. Provisioning must use one client per
+ * operation (the intended model) rather than sharing an instance across threads.
  */
 public final class XapiClient implements HypervisorClient {
 
@@ -99,6 +102,14 @@ public final class XapiClient implements HypervisorClient {
         JsonNode error = payload.get("error");
         if (error != null && !error.isNull()) {
             String message = error.path("message").asText("UNKNOWN");
+            if (message.contains("HOST_IS_SLAVE")) {
+                // The pool returns the master's address in the error data. v0 does not auto-redirect
+                // (the lab is a single host), so turn the opaque failure into an actionable one and
+                // point the operator at the master. Auto-redirect is a TODO for a multi-host backend.
+                throw new HypervisorException(method + ": this host is a pool member, not the master."
+                        + " Point the cloud's poolUrl at the pool master at "
+                        + error.path("data").path(0).asText("(address not reported)"));
+            }
             throw new HypervisorException(method + ": " + message + " " + error.path("data"));
         }
         JsonNode result = payload.get("result");
@@ -131,17 +142,18 @@ public final class XapiClient implements HypervisorClient {
 
     // -- async task helper ------------------------------------------------
 
+    /**
+     * Block until a task settles; return its raw result string. Void tasks (Async.VM.start,
+     * clean_shutdown) settle with an empty result, so this must not require one; only the callers
+     * that expect an object reference parse it (see {@link #awaitTaskRef}).
+     */
     private String awaitTask(String task) {
         long deadline = System.nanoTime() + Duration.ofMinutes(15).toNanos();
         try {
             while (true) {
                 String status = call("task.get_status", task).asText();
                 if ("success".equals(status)) {
-                    var m = OPAQUE_REF.matcher(call("task.get_result", task).asText(""));
-                    if (!m.find()) {
-                        throw new HypervisorException("task result unparseable: " + task);
-                    }
-                    return m.group();
+                    return call("task.get_result", task).asText("");
                 }
                 if ("failure".equals(status) || "cancelled".equals(status)) {
                     throw new HypervisorException("task " + status + ": " + call("task.get_error_info", task));
@@ -160,6 +172,15 @@ public final class XapiClient implements HypervisorClient {
         }
     }
 
+    /** Await a task that yields an object reference (e.g. VM.clone), extracting the OpaqueRef. */
+    private String awaitTaskRef(String task) {
+        var m = OPAQUE_REF.matcher(awaitTask(task));
+        if (!m.find()) {
+            throw new HypervisorException("task " + task + " produced no object reference");
+        }
+        return m.group();
+    }
+
     private static void sleep() {
         try {
             Thread.sleep(250);
@@ -175,21 +196,36 @@ public final class XapiClient implements HypervisorClient {
     @NonNull
     public VmRef resolveTemplate(@NonNull String name) {
         ensureSession();
+        List<String> matches = new ArrayList<>();
         for (JsonNode ref : call("VM.get_by_name_label", name)) {
             if (call("VM.get_is_a_template", ref.asText()).asBoolean()) {
-                return new VmRef(ref.asText());
+                matches.add(ref.asText());
             }
         }
-        throw new HypervisorException("no template named '" + name
-                + "' on this pool (a VM by that name is not a template)");
+        if (matches.isEmpty()) {
+            throw new HypervisorException("no template named '" + name
+                    + "' on this pool (a VM by that name is not a template)");
+        }
+        if (matches.size() > 1) {
+            // First-match would be non-deterministic and could clone the wrong image.
+            throw new HypervisorException(matches.size() + " templates are named '" + name
+                    + "'; rename them so the name is unique before provisioning against it");
+        }
+        return new VmRef(matches.get(0));
     }
 
     @Override
     @NonNull
     public VmRef cloneFromTemplate(@NonNull VmRef template, @NonNull ProvisionSpec spec) {
         ensureSession();
+        if (spec.placementHint() != null) {
+            // Guard before the clone so a bad spec leaves no VM behind. Placement (start-on-host,
+            // affinity) is not wired in v0, which targets a single-host pool; reject rather than
+            // silently ignore, so a caller cannot believe it placed a VM when it did not.
+            throw new HypervisorException("placementHint is not honoured in v0 (single-host pool); leave it null");
+        }
         String task = call("Async.VM.clone", template.value(), spec.name()).asText();
-        String vm = awaitTask(task);
+        String vm = awaitTaskRef(task);
         // VM.clone of a template yields a template; make it a runnable VM, then size it. VM.clone
         // copies the source's vCPU and memory, so each clone overrides them here.
         call("VM.set_is_a_template", vm, false);
@@ -197,6 +233,16 @@ public final class XapiClient implements HypervisorClient {
         call("VM.set_VCPUs_at_startup", vm, String.valueOf(spec.vcpus()));
         String mem = String.valueOf(spec.memoryBytes());
         call("VM.set_memory_limits", vm, mem, mem, mem, mem);
+        if (spec.diskBytes() != null) {
+            // Grow the single root disk; a genericcloud image auto-expands its root FS on first boot.
+            // Refuse ambiguity rather than resize an arbitrary disk.
+            List<String> disks = diskVdis(vm);
+            if (disks.size() != 1) {
+                throw new HypervisorException("cannot honour diskBytes: expected one disk on the clone, found "
+                        + disks.size());
+            }
+            call("VDI.resize", disks.get(0), String.valueOf(spec.diskBytes()));
+        }
         return new VmRef(vm);
     }
 
@@ -220,6 +266,8 @@ public final class XapiClient implements HypervisorClient {
             return Optional.empty();
         }
         JsonNode networks = call("VM_guest_metrics.get_networks", gm);
+        // "0/ip" is the first NIC's IPv4. A multi-NIC or IPv6-only guest may not populate it and would
+        // read as "no address"; acceptable for v0, whose inbound launcher never needs one.
         JsonNode ip = networks.get("0/ip");
         return ip == null || ip.asText().isBlank() ? Optional.empty() : Optional.of(ip.asText());
     }
@@ -251,13 +299,20 @@ public final class XapiClient implements HypervisorClient {
             call("VM.hard_shutdown", vm.value());
         }
         call("VM.destroy", vm.value());
+        List<String> orphaned = new ArrayList<>();
         for (String vdi : vdis) {
             try {
                 call("VDI.destroy", vdi);
             } catch (HypervisorException e) {
-                // Report and keep going: giving up halfway is how disks get orphaned.
+                // Try every disk even after one fails: giving up halfway orphans the rest.
                 LOGGER.warning("VDI " + vdi + " survived teardown: " + e.getMessage());
+                orphaned.add(vdi);
             }
+        }
+        if (!orphaned.isEmpty()) {
+            // The VM is gone but storage leaked. Surface it so an operator (or the retention path)
+            // knows the teardown was partial, rather than reporting a clean destroy.
+            throw new HypervisorException("teardown leaked " + orphaned.size() + " VDI(s): " + orphaned);
         }
     }
 
