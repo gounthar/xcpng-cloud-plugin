@@ -46,6 +46,9 @@ class HypervisorClientContractTest {
         int cloneAt = indexOfPrefix(calls, "cloneFromTemplate:");
         int startAt = calls.indexOf("start:" + vm.value());
         int destroyAt = calls.indexOf("destroyWithDisks:" + vm.value());
+        assertTrue(cloneAt >= 0, "clone recorded");
+        assertTrue(startAt >= 0, "start recorded");
+        assertTrue(destroyAt >= 0, "destroy recorded");
         assertTrue(cloneAt < startAt, "clone before start");
         assertTrue(startAt < destroyAt, "start before destroy");
     }
