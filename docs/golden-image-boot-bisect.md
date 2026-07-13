@@ -210,6 +210,10 @@ pin the single factor, bisect: `vm-install` + CD-only, then `vm-install` + seed-
 
 ### Actionable fix for the `import_raw_vdi` bootstrap
 
+> **SUPERSEDED — see "Correction — we never had a boot problem" at the end.** The CD-in-boot-order
+> and seed-ISO-build theories below were a misdiagnosis: there was no boot stall. The only fix a
+> from-scratch bootstrap needs is a cloud-init `network-config` in the seed. Kept for the record.
+
 1. Create the VM via `xe vm-install <template>` (not `VM.clone`).
 2. Attach the `guest-tools.iso` as a **CD at device 3**, keep boot order `cdn`.
 3. Attach the cloud-init seed as a **data disk at device 1**.
@@ -256,6 +260,11 @@ reproducible detail — a fresh seed built that way should boot. Until then, a h
 coin-flip-worse-than-coin-flip lever.
 
 ### Bottom line for the plugin
+
+> **SUPERSEDED — see "Correction — we never had a boot problem" at the end.** The "two fragile levers"
+> below do not exist: there was no boot stall to be fragile about. A from-scratch bootstrap needs only
+> a cloud-init `network-config` in the seed, which is now shipped in `image/seed/network-config` and
+> verified on the pool. Clone-golden remains the simplest path; XO remains the cleanest automated one.
 
 The recipe boots, but it now rests on two undocumented fragile levers (clean-first-boot ordering, and
 an exact-but-unknown seed-ISO build). That is disqualifying for a plugin that must be reliable.
@@ -359,3 +368,46 @@ network configuration, not firmware, not the import, not the OVMF/seed-content q
 Practical fix for the from-scratch bootstrap: ship a NoCloud seed that includes a `network-config`
 (netplan v2, `dhcp4: true`, matched broadly e.g. `match: {name: "e*"}`), not just user-data/meta-data.
 The XO backend already does this; a hand-rolled seed must too.
+
+Strictly, this compares "no seed at all" against "a full NoCloud seed that includes a network-config",
+so it proves *a seed with a network-config* brings up the network — not that `network-config` is the
+sole causal byte in isolation. The mechanism (cloud-init has no other way to configure the NIC on a
+pristine image, and the seedless case stays `localhost`/networkless) makes the attribution safe, and a
+strict one-variable test (identical seed ± the `network-config` file) is left as unneeded given the fix
+is now shipped and reproduced.
+
+### Independent reproduction with the shipped seed file (2026-07-13)
+
+Re-ran it from the plugin session using the committed `image/seed/network-config` verbatim (comment
+header + `---` document-start included), to confirm cloud-init accepts *that exact file*. `vm-install`
+from the `jenkins-golden-debian` template (proven UEFI shell) → stripped golden's cloned disk → attached
+a fresh `import_raw_vdi` of dom0's `/var/tmp/deb.raw` (dev0) + a `genisoimage` NoCloud seed (user-data +
+meta-data with a unique `instance-id` + the repo's `network-config`) as dev1 → `vm-start`. After ~80 s:
+guest MAC `02:c0:77:dc:be:ef` **learned in `xenbr0` fdb**, `vif5.0` **rx 31 / tx 164 pkts (2652 / 16811
+bytes)** — DHCP happening. VM + both VDIs torn down; pool left clean. So the file as committed works.
+
+### Independent corroboration — Atomic XOA (2026-07-13)
+
+A separate Vates project reached the same conclusion by a different route. Dale Morgan's
+**Atomic XOA** (`git.vates.tech/dale.morgan/atomic-xoa`, v0.1) is an AlmaLinux 10 bootc image of
+Xen Orchestra. Its first-boot design encodes exactly the finding above:
+
+- `bootc/cloud-init.cfg` pins `datasource_list: [ NoCloud, None ]` — an XO config drive supplies
+  "first-boot users, SSH keys, hostnames, **and network configuration**", while `None` lets a bare
+  import still boot cleanly.
+- `bootc/atomic-xoa-hostname.service` runs `Before=cloud-init-local.service network-pre.target` and
+  `ensure-hostname.sh` replaces an empty / `localhost` / `localhost.localdomain` hostname with a
+  fallback that NoCloud metadata then overrides. That is the same `localhost login:` vs
+  configured-hostname signal we used to tell a seedless boot from a provisioned one.
+- The README's import steps explicitly require attaching the VM to a **DHCP-enabled network** and
+  **enabling the config drive** before boot.
+
+Different distro (AlmaLinux vs our Debian genericcloud), same root cause: a fresh cloud image needs a
+NoCloud datasource carrying a `network-config` to bring its NIC up. Two independent implementations
+now say the boot was never the problem.
+
+Its Packer path (`packer/`, using the `vatesfr/xenserver` plugin v0.11.4+ to leave native XCP-ng UEFI
+templates, `ip_getter = "tools"`, `keep_vm = "on_success"`, convert-in-place) is a useful reference if
+the plugin ever moves toward a Packer-golden workflow instead of clone-golden. As of v0.1 that path is
+blocked upstream (osbuild image-builder cannot resolve AlmaLinux 10 x86-64-v2 RPMs for ISO generation,
+osbuild/image-builder#2305), so only the VHD-import path is validated today.

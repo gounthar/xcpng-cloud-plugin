@@ -91,9 +91,10 @@ ships no `openjdk-21`, not even in `bookworm-backports`.
 
 ## The per-clone seed
 
-`image/seed/` holds what the plugin attaches as a NoCloud seed per clone. Three files:
+`image/seed/` holds the files that make up the per-clone NoCloud seed. Three files:
 `user-data.tmpl` and `meta-data.tmpl` are rendered per clone; `network-config` is static. None is
-part of the image.
+part of the image. **These are groundwork, not a wired code path yet:** rendering them and attaching
+the seed is M3 — `provision()` is still inert and `user-data.tmpl` is marked `NOT YET WIRED UP`.
 
 `meta-data.tmpl` carries `instance-id`, and it must be **unique per clone**. Use the VM's XAPI UUID.
 
@@ -137,12 +138,19 @@ MAC absent from the bridge) that looks like a boot stall, but is not. golden's *
 they inherit golden's persisted, cloud-init-configured network from disk.
 
 **So a from-scratch bootstrap is ordinary, given one thing: a correct cloud-init network config in the
-seed.** The plugin's seed (`image/seed/`) now carries a static `network-config` (`dhcp4: true`,
-`match: name "e*"`) alongside `user-data` and `meta-data`, and cloud-init applies it as long as the
-`instance-id` is fresh and unique per clone (the silent-skip trap documented above). With that, the
-imported VM gets an address and provisions normally. Confirmed on the lab pool: a fresh bare import
-plus a seed with this `network-config` booted to a login prompt with a real DHCP lease and learned
-MAC, where the same disk without it looked like a stall.
+seed.** `image/seed/` now includes a static `network-config` (`dhcp4: true`, `match: name "e*"`)
+beside `user-data` and `meta-data`, and cloud-init applies it as long as the `instance-id` is fresh
+and unique per clone (the silent-skip trap above). These are seed *files*; assembling and attaching
+the NoCloud seed is still M3, so nothing in the plugin consumes them yet. Verified **by hand** on the
+lab pool: a fresh bare `import_raw_vdi` disk (golden's pristine source, no persisted network) plus a
+seed carrying this exact `network-config` booted and brought up DHCP — the guest MAC was learned on
+the `xenbr0` bridge and the vif showed real bidirectional traffic — where the same disk with a seed
+lacking `network-config` came up networkless. When M3 wires the seed, the from-scratch path works;
+until then the reliable path is to clone the golden template.
+
+This scopes to a **DHCP** network and a single primary interface (`match: name "e*"` covers `eth0`
+and predictable `en*` names). A static-IP or multi-NIC agent would need a different `network-config`;
+that is out of v0 scope.
 
 **Options for producing the template:**
 
