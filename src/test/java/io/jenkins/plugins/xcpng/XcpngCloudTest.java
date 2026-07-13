@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
+import hudson.util.FormValidation;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -75,6 +76,22 @@ class XcpngCloudTest {
         String xml = Files.readString(configXml);
         assertTrue(xml.contains("xcpng-root"), "the credential ID should be stored");
         assertFalse(xml.contains(secret), "the plaintext password must never reach the cloud config");
+    }
+
+    /**
+     * The pool URL check accepts an http/https address with a host and rejects everything else, so a
+     * schemeless string that {@code new URI(...)} would parse without complaint is still flagged.
+     */
+    @Test
+    void poolUrlValidation(JenkinsRule r) {
+        XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("https://192.168.1.87").kind);
+        assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("http://pool.example.test:443").kind);
+        assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("192.168.1.87").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("ftp://pool").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("https://").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("http://[bad").kind);
     }
 
     @Test

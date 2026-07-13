@@ -15,10 +15,14 @@ import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 import io.jenkins.plugins.xcpng.client.XapiClient;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -38,6 +42,8 @@ import org.kohsuke.stapler.verb.POST;
  * {@link #provision} to the build queue is the next slice, so provisioning stays inert here.
  */
 public class XcpngCloud extends Cloud {
+
+    private static final Logger LOGGER = Logger.getLogger(XcpngCloud.class.getName());
 
     private final String poolUrl;
     private final String credentialsId;
@@ -121,6 +127,32 @@ public class XcpngCloud extends Cloud {
                     CredentialsMatchers.withId(credentialsId));
         }
 
+        /**
+         * Validate the pool URL as the administrator types, before they reach "Test connection". A
+         * bare {@code new URI(value)} parse is too permissive here: a relative or schemeless string
+         * such as {@code 192.168.1.87} parses without error yet is not a pool address, so also assert
+         * an http/https scheme and a host.
+         */
+        public FormValidation doCheckPoolUrl(@QueryParameter String value) {
+            if (value == null || value.isBlank()) {
+                return FormValidation.ok();
+            }
+            URI uri;
+            try {
+                uri = new URI(value.trim());
+            } catch (URISyntaxException e) {
+                return FormValidation.error("Enter a valid URL, for example https://192.168.1.87.");
+            }
+            String scheme = uri.getScheme();
+            if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
+                return FormValidation.error("The pool URL must start with http:// or https://.");
+            }
+            if (uri.getHost() == null) {
+                return FormValidation.error("The pool URL must include a host, for example https://192.168.1.87.");
+            }
+            return FormValidation.ok();
+        }
+
         @POST
         public ListBoxModel doFillCredentialsIdItems(
                 @QueryParameter String poolUrl, @QueryParameter String credentialsId) {
@@ -160,6 +192,9 @@ public class XcpngCloud extends Cloud {
                 client.ping();
                 return FormValidation.ok("Connected to the pool.");
             } catch (RuntimeException e) {
+                // The button is admin-only and the message carries no secret, so it is returned to the
+                // operator as the diagnostic they asked for; the stack trace is kept server-side.
+                LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + poolUrl + " failed");
                 return FormValidation.error("Connection failed: " + e.getMessage());
             }
         }
