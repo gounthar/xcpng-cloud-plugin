@@ -94,6 +94,19 @@ class XcpngCloudTest {
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("http://[bad").kind);
     }
 
+    /**
+     * The connection test applies the same scheme/host check as the field validator, so a malformed
+     * URL is rejected with that message up front rather than failing deeper in the client. A schemeless
+     * value must not fall through to the credentials error.
+     */
+    @Test
+    void testConnectionRejectsMalformedUrlBeforeConnecting(JenkinsRule r) {
+        XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        FormValidation v = d.doTestConnection("192.168.1.87", "", false);
+        assertEquals(FormValidation.Kind.ERROR, v.kind);
+        assertTrue(v.getMessage().contains("http"), v.getMessage());
+    }
+
     @Test
     void provisioningIsInertUntilWired(JenkinsRule r) {
         XcpngCloud cloud = new XcpngCloud(

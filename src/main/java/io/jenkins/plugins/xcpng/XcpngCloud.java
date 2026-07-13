@@ -128,15 +128,24 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * Validate the pool URL as the administrator types, before they reach "Test connection". A
-         * bare {@code new URI(value)} parse is too permissive here: a relative or schemeless string
-         * such as {@code 192.168.1.87} parses without error yet is not a pool address, so also assert
-         * an http/https scheme and a host.
+         * Validate the pool URL as the administrator types, before they reach "Test connection". Blank
+         * is left to {@code ok()} so a fresh form does not nag; a non-blank value goes through the same
+         * scheme/host check the connection test applies.
          */
         public FormValidation doCheckPoolUrl(@QueryParameter String value) {
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
+            return validatePoolUrlFormat(value);
+        }
+
+        /**
+         * Scheme/host check shared by the field validator and {@code doTestConnection}, so a malformed
+         * URL is rejected the same way in both. A bare {@code new URI(value)} parse is too permissive:
+         * a relative or schemeless string such as {@code 192.168.1.87} parses without error yet is not
+         * a pool address, so also assert an http/https scheme and a host. Assumes a non-blank value.
+         */
+        static FormValidation validatePoolUrlFormat(String value) {
             URI uri;
             try {
                 uri = new URI(value.trim());
@@ -180,6 +189,12 @@ public class XcpngCloud extends Cloud {
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.error("The pool URL is required.");
             }
+            FormValidation urlCheck = validatePoolUrlFormat(poolUrl);
+            if (urlCheck.kind != FormValidation.Kind.OK) {
+                // Reject a malformed URL with the same message the field validator gives, rather than
+                // letting it fail deeper in XapiClient as a less actionable transport error.
+                return urlCheck;
+            }
             StandardUsernamePasswordCredentials credentials = lookupCredentials(poolUrl, credentialsId);
             if (credentials == null) {
                 return FormValidation.error("Select the XAPI credentials.");
@@ -193,9 +208,14 @@ public class XcpngCloud extends Cloud {
                 return FormValidation.ok("Connected to the pool.");
             } catch (RuntimeException e) {
                 // The button is admin-only and the message carries no secret, so it is returned to the
-                // operator as the diagnostic they asked for; the stack trace is kept server-side.
+                // operator as the diagnostic they asked for; the stack trace is kept server-side. A
+                // RuntimeException with no message (a bare NPE) would render as "Connection failed: null",
+                // so fall back to a generic line and let the logged trace carry the detail.
                 LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + poolUrl + " failed");
-                return FormValidation.error("Connection failed: " + e.getMessage());
+                String detail = e.getMessage();
+                return detail == null || detail.isBlank()
+                        ? FormValidation.error("Connection failed; see the system log for details.")
+                        : FormValidation.error("Connection failed: " + detail);
             }
         }
     }
