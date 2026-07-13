@@ -335,3 +335,27 @@ The recommendation to **clone golden** (or drive the bootstrap through the XO ba
 but for a plain reason now, not a scary one: clones carry a working, cloud-init-configured network;
 a from-scratch VM needs a correct cloud-init **network** config to get one. No OVMF fragility, no
 unknown-good seed magic. The from-scratch path is ordinary once it's given network config.
+
+### CONFIRMED — the confirming test passed (2026-07-12, evening)
+
+Ran the isolating test. Cloned golden's **UEFI shell only** (params + NVRAM), stripped its disk, and
+attached a **fresh bare `import_raw_vdi` of `deb.raw`** (dev0) plus a NoCloud seed carrying an explicit
+netplan v2 **DHCP** `network-config` and a distinctive hostname `nettest` (dev1). Same disk image and
+same UEFI shell as the proven staller; the only added variable is a cloud-init datasource with network
+config. Signals are guest-tools-independent (the bare `deb.raw` has no `xe-guest-utilities`, so
+guest-metrics can't report an IP either way — hence measuring at the bridge, not via XAPI):
+
+| signal | staller (bare, no seed) | nettest (fresh disk + DHCP network-config seed) |
+|---|---|---|
+| console hostname | `localhost login:` | **`nettest login:`** — cloud-init applied its config |
+| guest MAC in `ovs-appctl fdb/show xenbr0` | never | **learned (port 54)** |
+| `vifN.0` counters | idle | **RX 34 pkts / TX 391 pkts** — real bidirectional traffic |
+
+Both VMs booted to a getty (never in doubt after the screenshot). The difference is entirely
+networking: give cloud-init a datasource with a DHCP `network-config` and the fresh import comes up
+networked; withhold it and it sits at a login prompt with a dead NIC. **Root cause confirmed: cloud-init
+network configuration, not firmware, not the import, not the OVMF/seed-content quirk theorised earlier.**
+
+Practical fix for the from-scratch bootstrap: ship a NoCloud seed that includes a `network-config`
+(netplan v2, `dhcp4: true`, matched broadly e.g. `match: {name: "e*"}`), not just user-data/meta-data.
+The XO backend already does this; a hand-rolled seed must too.
