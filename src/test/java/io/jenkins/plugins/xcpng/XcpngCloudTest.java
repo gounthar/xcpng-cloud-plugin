@@ -92,6 +92,16 @@ class XcpngCloudTest {
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("ftp://pool").kind);
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("https://").kind);
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("http://[bad").kind);
+        // Credentials belong in the Credentials field, never embedded in the URL.
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("https://root:pw@192.168.1.87").kind);
+    }
+
+    /** Surrounding whitespace is trimmed on the way in so the persisted value matches what parses. */
+    @Test
+    void poolUrlIsTrimmedOnConstruction(JenkinsRule r) {
+        XcpngCloud cloud = new XcpngCloud(
+                "xcpng", "  https://pool.example.test  ", "id", false, 2, List.of());
+        assertEquals("https://pool.example.test", cloud.getPoolUrl());
     }
 
     /**

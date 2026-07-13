@@ -60,7 +60,9 @@ public class XcpngCloud extends Cloud {
             int maxInstances,
             List<XcpngTemplate> templates) {
         super(name);
-        this.poolUrl = poolUrl;
+        // Trim on the way in so the persisted value matches what the validator parses; a stray space
+        // would otherwise validate in the form yet break URI.create when the endpoint is built.
+        this.poolUrl = poolUrl == null ? null : poolUrl.trim();
         this.credentialsId = credentialsId;
         this.trustSelfSigned = trustSelfSigned;
         this.maxInstances = maxInstances <= 0 ? 1 : maxInstances;
@@ -159,6 +161,11 @@ public class XcpngCloud extends Cloud {
             if (uri.getHost() == null) {
                 return FormValidation.error("The pool URL must include a host, for example https://192.168.1.87.");
             }
+            if (uri.getUserInfo() != null) {
+                // Credentials embedded in the URL (https://user:pass@host) would be persisted in
+                // config.xml and could reach logs, against the store-the-ID-never-the-secret design.
+                return FormValidation.error("Do not put credentials in the pool URL; select them in the Credentials field.");
+            }
             return FormValidation.ok();
         }
 
@@ -189,18 +196,21 @@ public class XcpngCloud extends Cloud {
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.error("The pool URL is required.");
             }
-            FormValidation urlCheck = validatePoolUrlFormat(poolUrl);
+            // Normalise once so the check, the credential lookup, and the client all see the same value
+            // the constructor would persist. A fresh local keeps the captured parameter effectively final.
+            final String url = poolUrl.trim();
+            FormValidation urlCheck = validatePoolUrlFormat(url);
             if (urlCheck.kind != FormValidation.Kind.OK) {
                 // Reject a malformed URL with the same message the field validator gives, rather than
                 // letting it fail deeper in XapiClient as a less actionable transport error.
                 return urlCheck;
             }
-            StandardUsernamePasswordCredentials credentials = lookupCredentials(poolUrl, credentialsId);
+            StandardUsernamePasswordCredentials credentials = lookupCredentials(url, credentialsId);
             if (credentials == null) {
                 return FormValidation.error("Select the XAPI credentials.");
             }
             try (XapiClient client = new XapiClient(
-                    poolUrl,
+                    url,
                     credentials.getUsername(),
                     credentials.getPassword().getPlainText(),
                     trustSelfSigned)) {
@@ -211,7 +221,7 @@ public class XcpngCloud extends Cloud {
                 // operator as the diagnostic they asked for; the stack trace is kept server-side. A
                 // RuntimeException with no message (a bare NPE) would render as "Connection failed: null",
                 // so fall back to a generic line and let the logged trace carry the detail.
-                LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + poolUrl + " failed");
+                LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + url + " failed");
                 String detail = e.getMessage();
                 return detail == null || detail.isBlank()
                         ? FormValidation.error("Connection failed; see the system log for details.")
