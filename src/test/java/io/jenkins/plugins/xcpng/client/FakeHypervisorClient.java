@@ -24,6 +24,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private final Map<String, VmState> states = new HashMap<>();
     private int cloneCounter = 0;
     private boolean pingFails = false;
+    private boolean startFails = false;
     private String assignIpOnStart = null;
 
     public FakeHypervisorClient(String... templates) {
@@ -39,6 +40,12 @@ public final class FakeHypervisorClient implements HypervisorClient {
     /** Have a started VM report this IP, to stand in for guest tools writing an address. */
     public FakeHypervisorClient reportIpOnStart(String ip) {
         this.assignIpOnStart = ip;
+        return this;
+    }
+
+    /** Make {@link #start} throw after the clone exists, to test failed-provision cleanup. */
+    public FakeHypervisorClient failStart() {
+        this.startFails = true;
         return this;
     }
 
@@ -67,6 +74,9 @@ public final class FakeHypervisorClient implements HypervisorClient {
     @Override
     public void start(VmRef vm) {
         calls.add("start:" + vm.value());
+        if (startFails) {
+            throw new HypervisorException("start failed");
+        }
         states.put(vm.value(), VmState.RUNNING);
     }
 

@@ -9,4 +9,10 @@
   <f:entry title="${%Executors}" field="numExecutors">
     <f:number default="1" clazz="positive-number"/>
   </f:entry>
+  <f:entry title="${%vCPUs}" field="numCpus">
+    <f:number default="2" clazz="positive-number"/>
+  </f:entry>
+  <f:entry title="${%Memory (MiB)}" field="memoryMb">
+    <f:number default="2048" clazz="positive-number"/>
+  </f:entry>
 </j:jelly>
