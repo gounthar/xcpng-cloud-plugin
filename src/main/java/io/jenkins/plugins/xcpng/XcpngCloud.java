@@ -28,6 +28,9 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -86,6 +89,13 @@ public class XcpngCloud extends Cloud {
      * #readResolve} covers a deserialized one (XStream skips both the constructor and field initializers).
      */
     private transient AtomicInteger inFlight = new AtomicInteger();
+
+    /**
+     * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
+     * back to the shared remoting pool; a test injects a controllable one. Transient: behaviour, never
+     * persisted to {@code config.xml}.
+     */
+    private transient ExecutorService provisionExecutor;
 
     @DataBoundConstructor
     public XcpngCloud(
@@ -172,25 +182,79 @@ public class XcpngCloud extends Cloud {
             // Reserve capacity before the clone starts and release it when the provision settles, so a
             // concurrent round sees the reservation and the cap holds even while clones are still booting.
             inFlight.incrementAndGet();
+
+            // A CompletableFuture, not the raw submit() future, so cancellation is handled: the node
+            // provisioner may cancel a PlannedNode, and if the task never runs (cancelled before start)
+            // its own finally would never release the reservation. Releasing in whenComplete instead ties
+            // the decrement to the future settling by any path -- success, failure, or cancellation.
+            CompletableFuture<Node> future = new CompletableFuture<>();
+            future.whenComplete((node, throwable) -> inFlight.decrementAndGet());
+
             try {
-                Future<Node> future = Computer.threadPoolForRemoting.submit(() -> {
+                Future<?> task = provisionExecutor().submit(() -> {
+                    if (future.isCancelled()) {
+                        return;
+                    }
                     try {
-                        return provisionNode(template, displayName);
-                    } finally {
-                        inFlight.decrementAndGet();
+                        Node node = provisionNode(template, displayName);
+                        if (!future.complete(node) && node instanceof XcpngAgent agent) {
+                            // The planned node was cancelled while this VM was being built, so it will
+                            // never be added to Jenkins. Tear it down rather than leak it on the pool.
+                            LOGGER.log(
+                                    Level.WARNING,
+                                    () -> "Provision of " + displayName
+                                            + " completed after cancellation; terminating the orphaned agent");
+                            try {
+                                agent.terminate();
+                            } catch (Exception e) {
+                                LOGGER.log(
+                                        Level.WARNING,
+                                        e,
+                                        () -> "Failed to terminate orphaned agent " + displayName);
+                            }
+                        }
+                    } catch (Throwable t) {
+                        future.completeExceptionally(t);
+                    }
+                });
+                // Propagate a cancellation of the planned node to the running task so its thread is freed
+                // and provisionNode's own post-clone cleanup can destroy a half-built VM.
+                future.whenComplete((node, throwable) -> {
+                    if (throwable instanceof CancellationException) {
+                        task.cancel(true);
                     }
                 });
                 planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
                 remaining -= template.getNumExecutors();
             } catch (RejectedExecutionException e) {
-                // The pool refused the task, which it does only while shutting down. The task's finally
-                // will never run, so release the reservation here and stop planning further nodes.
-                inFlight.decrementAndGet();
+                // The pool refused the task, which it does only while shutting down. Settle the future so
+                // its whenComplete releases the reservation, then stop planning further nodes.
                 LOGGER.log(Level.WARNING, e, () -> "Could not schedule provision of " + displayName);
+                future.completeExceptionally(e);
                 break;
             }
         }
         return planned;
+    }
+
+    /**
+     * Executor that runs provisioning tasks. Production uses the shared remoting pool; a test injects
+     * one via {@link #setProvisionExecutor} to force a rejection or to hold tasks so the in-flight
+     * reservation is observable.
+     */
+    @NonNull
+    private ExecutorService provisionExecutor() {
+        return provisionExecutor != null ? provisionExecutor : Computer.threadPoolForRemoting;
+    }
+
+    /** Test seam: run provisioning submits on a controllable executor. */
+    void setProvisionExecutor(ExecutorService provisionExecutor) {
+        this.provisionExecutor = provisionExecutor;
+    }
+
+    /** Test seam: reservations taken but not yet settled, for asserting the cap accounting. */
+    int inFlightCount() {
+        return inFlight.get();
     }
 
     /**
