@@ -11,6 +11,7 @@ import hudson.model.Node;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
+import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.Collection;
 import java.util.List;
 import org.junit.jupiter.api.Test;
@@ -82,7 +83,13 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        assertThrows(Exception.class, () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1"));
+        // Narrowed to the client's own exception (not any Exception): the clone succeeds and only the
+        // start throws, so a broader assertion could pass on an unrelated failure and hide a regression.
+        HypervisorException thrown = assertThrows(
+                HypervisorException.class, () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1"));
+        assertTrue(
+                thrown.getMessage().contains("start failed"),
+                "the surfaced failure must be the start failure: " + thrown.getMessage());
         assertTrue(
                 fake.calls().contains("destroyWithDisks:vm/xcpng-agent-1/1"),
                 "a clone that fails to start must be destroyed, not leaked: " + fake.calls());

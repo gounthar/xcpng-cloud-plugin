@@ -27,6 +27,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
@@ -61,9 +62,6 @@ public class XcpngCloud extends Cloud {
      */
     private static final int RETENTION_IDLE_MINUTES = 10;
 
-    /** Names provisioned VMs and agents uniquely within a controller run. */
-    private static final AtomicInteger PROVISION_COUNTER = new AtomicInteger();
-
     private final String poolUrl;
     private final String credentialsId;
     private final boolean trustSelfSigned;
@@ -78,6 +76,15 @@ public class XcpngCloud extends Cloud {
      * Transient: it is behaviour, not configuration, and must never be persisted to {@code config.xml}.
      */
     private transient HypervisorClientFactory clientFactory;
+
+    /**
+     * Provisions submitted but not yet registered as {@link XcpngAgent} nodes. Counted against the
+     * instance cap so a burst of concurrent {@link #provision} rounds cannot overshoot {@code
+     * maxInstances} while earlier clones are still booting and have not yet appeared in the node list.
+     * Transient and never persisted; the field initializer covers a fresh instance and {@link
+     * #readResolve} covers a deserialized one (XStream skips both the constructor and field initializers).
+     */
+    private transient AtomicInteger inFlight = new AtomicInteger();
 
     @DataBoundConstructor
     public XcpngCloud(
@@ -109,6 +116,9 @@ public class XcpngCloud extends Cloud {
         }
         if (maxInstances <= 0) {
             maxInstances = 1;
+        }
+        if (inFlight == null) {
+            inFlight = new AtomicInteger();
         }
         return this;
     }
@@ -151,8 +161,21 @@ public class XcpngCloud extends Cloud {
         // One VM per planned node; each serves numExecutors of the excess workload. Stop when the
         // workload is met or the instance cap is reached, whichever comes first.
         while (remaining > 0 && planned.size() < capacity) {
-            final String displayName = "xcpng-" + template.getTemplateName() + "-" + PROVISION_COUNTER.incrementAndGet();
-            Future<Node> future = Computer.threadPoolForRemoting.submit(() -> provisionNode(template, displayName));
+            // A random suffix, not a counter: an in-process counter resets on controller restart, so a
+            // crash that leaves an old node behind could hand a new clone the same name and collide in
+            // the pool. A UUID segment stays unique across restarts.
+            final String displayName = "xcpng-" + template.getTemplateName() + "-"
+                    + UUID.randomUUID().toString().substring(0, 8);
+            // Reserve capacity before the clone starts and release it when the provision settles, so a
+            // concurrent round sees the reservation and the cap holds even while clones are still booting.
+            inFlight.incrementAndGet();
+            Future<Node> future = Computer.threadPoolForRemoting.submit(() -> {
+                try {
+                    return provisionNode(template, displayName);
+                } finally {
+                    inFlight.decrementAndGet();
+                }
+            });
             planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
             remaining -= template.getNumExecutors();
         }
@@ -251,7 +274,9 @@ public class XcpngCloud extends Cloud {
                 active++;
             }
         }
-        return Math.max(0, maxInstances - active);
+        // Subtract in-flight provisions too: they will become nodes but have not yet, so counting only
+        // registered agents would let a concurrent round provision past the cap.
+        return Math.max(0, maxInstances - active - inFlight.get());
     }
 
     /**

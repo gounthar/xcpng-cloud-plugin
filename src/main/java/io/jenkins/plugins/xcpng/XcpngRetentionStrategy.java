@@ -28,7 +28,10 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
 
     private final int idleMinutes;
 
-    /** Guards against a second reap while the first is already in flight. Reset on deserialization. */
+    /**
+     * Guards against a second reap while the first is already in flight. Cleared when the reap task
+     * finishes (so a failed teardown can be retried) and reset to false on deserialization.
+     */
     private transient boolean reaping;
 
     public XcpngRetentionStrategy(int idleMinutes) {
@@ -44,7 +47,11 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     @Override
     @SuppressWarnings("rawtypes") // Match CloudRetentionStrategy.check's raw parameter to override it.
     public long check(AbstractCloudComputer computer) {
-        if (idleMinutes > 0 && computer.isOnline() && computer.isIdle()) {
+        // Deliberately not gated on isOnline(): a clone that started but never connected (bad boot,
+        // network, or JNLP misconfiguration) is offline forever, and gating on online would leave its
+        // VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
+        // net is for, and matches the superclass CloudRetentionStrategy.
+        if (idleMinutes > 0 && computer.isIdle()) {
             long idleMillis = System.currentTimeMillis() - computer.getIdleStartMilliseconds();
             if (idleMillis > TimeUnit.MINUTES.toMillis(idleMinutes)) {
                 reap(computer);
@@ -93,6 +100,13 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
                 Thread.currentThread().interrupt();
             } catch (Exception e) {
                 LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + agent.getNodeName());
+            } finally {
+                // Clear the guard whatever happened. On success the node is already gone, so the next
+                // reap short-circuits on the getNode() check; on a transient failure this lets a later
+                // periodic check retry the teardown rather than leaving the VM to leak forever.
+                synchronized (this) {
+                    reaping = false;
+                }
             }
         });
     }
