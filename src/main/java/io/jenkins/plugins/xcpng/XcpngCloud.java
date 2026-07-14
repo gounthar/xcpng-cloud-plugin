@@ -223,7 +223,7 @@ public class XcpngCloud extends Cloud {
                     }
                 });
                 // Propagate a cancellation of the planned node to the task, but without interrupting it:
-                // a not-yet-started task is dropped from the queue, and a running one is left to finish so
+                // a not-yet-started task is prevented from running, and a running one is left to finish so
                 // its cleanup (provisionNode's post-clone destroy, or the orphan guard above) runs on a
                 // thread with no interrupt flag set. Interrupting mid-run could leave the flag set and make
                 // the blocking destroyWithDisks call fail, leaking the very VM the cleanup exists to remove.
