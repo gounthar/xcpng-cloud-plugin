@@ -8,8 +8,10 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -252,6 +254,7 @@ public final class XapiClient implements HypervisorClient {
                 }
                 call("VDI.resize", disks.get(0), String.valueOf(spec.diskBytes()));
             }
+            seedGuestData(vm, spec.guestData());
         } catch (RuntimeException e) {
             try {
                 destroyWithDisks(new VmRef(vm));
@@ -263,6 +266,33 @@ public final class XapiClient implements HypervisorClient {
             throw e;
         }
         return new VmRef(vm);
+    }
+
+    /** Xenstore path the guest agent reads its seed from. Only {@code vm-data/*} keys reach the guest. */
+    private static final String GUEST_DATA_PREFIX = "vm-data/jenkins/";
+
+    /**
+     * Write the per-clone seed (controller URL, node name, JNLP secret) into the VM's xenstore so the
+     * guest can start its inbound agent unattended. Proven on the pool: only {@code vm-data/*} keys are
+     * pushed into the guest, and the write must happen before the VM starts (setting xenstore-data on a
+     * running VM does not propagate). Called from {@link #cloneFromTemplate} before the clone is started.
+     *
+     * <p>The keys are merged onto whatever the clone inherited rather than replacing the whole map, so a
+     * template that carries its own xenstore-data keeps them.
+     */
+    private void seedGuestData(String vm, Map<String, String> guestData) {
+        if (guestData.isEmpty()) {
+            return;
+        }
+        Map<String, String> merged = new LinkedHashMap<>();
+        JsonNode existing = call("VM.get_xenstore_data", vm);
+        if (existing.isObject()) {
+            existing.fields().forEachRemaining(e -> merged.put(e.getKey(), e.getValue().asText()));
+        }
+        for (Map.Entry<String, String> e : guestData.entrySet()) {
+            merged.put(GUEST_DATA_PREFIX + e.getKey(), e.getValue());
+        }
+        call("VM.set_xenstore_data", vm, merged);
     }
 
     @Override

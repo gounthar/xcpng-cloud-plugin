@@ -133,6 +133,41 @@ class XapiClientTest {
     }
 
     @Test
+    void cloneSeedsGuestDataIntoXenstoreBeforeReturning() {
+        ScriptedTransport t = new ScriptedTransport();
+        // A key the template already carries; the seed must merge onto it, not replace the whole map.
+        t.xenstoreData = Map.of("mmio-hole-size", "4096");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.cloneFromTemplate(
+                new VmRef("OpaqueRef:tmpl"),
+                new ProvisionSpec(
+                        "agent", 2, 2048L, null, null, null,
+                        Map.of("url", "http://ci.example/", "name", "agent", "secret", "abc123")));
+
+        // The seed is written after sizing (so a rejected size tears the clone down before any write) and
+        // is a read-merge-write: get the inherited map, then set the union, keys under vm-data/jenkins/.
+        assertOrder(t, "VM.set_memory_limits", "VM.get_xenstore_data", "VM.set_xenstore_data");
+        JsonNode set = paramsOf(t, "VM.set_xenstore_data").get(2);
+        assertEquals("http://ci.example/", set.get("vm-data/jenkins/url").asText());
+        assertEquals("agent", set.get("vm-data/jenkins/name").asText());
+        assertEquals("abc123", set.get("vm-data/jenkins/secret").asText());
+        assertEquals("4096", set.get("mmio-hole-size").asText(), "an inherited xenstore key must survive the merge");
+    }
+
+    @Test
+    void cloneWithNoGuestDataWritesNoXenstore() {
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        // The 6-arg spec carries an empty guest seed, so the clone must not touch xenstore at all.
+        c.cloneFromTemplate(new VmRef("OpaqueRef:tmpl"), new ProvisionSpec("agent", 2, 2048L, null, null, null));
+
+        assertFalse(t.methods().contains("VM.get_xenstore_data"), "no seed means no xenstore read");
+        assertFalse(t.methods().contains("VM.set_xenstore_data"), "no seed means no xenstore write");
+    }
+
+    @Test
     void startSucceedsWhenTheAsyncTaskResultIsVoid() {
         // Async.VM.start settles with an empty result; the client must not demand an OpaqueRef.
         ScriptedTransport t = new ScriptedTransport();
@@ -280,6 +315,7 @@ class XapiClientTest {
         boolean hostIsSlave = false;
         boolean extraDisk = false;
         boolean sharedVdi = false;
+        Map<String, String> xenstoreData = Map.of();
 
         @Override
         public String post(String body) {
@@ -313,6 +349,7 @@ class XapiClientTest {
                         ? "<value>OpaqueRef:1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d</value>"
                         : "";
                 case "task.get_error_info" -> List.of("INTERNAL_ERROR", "boom");
+                case "VM.get_xenstore_data" -> xenstoreData;
                 case "VM.get_power_state" -> powerState;
                 case "VM.get_guest_metrics" -> "OpaqueRef:gm";
                 case "VM_guest_metrics.get_networks" -> Map.of("0/ip", "192.168.1.50");

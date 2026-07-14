@@ -26,7 +26,9 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -37,6 +39,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
@@ -275,7 +278,13 @@ public class XcpngCloud extends Cloud {
         try (HypervisorClient client = openClient()) {
             VmRef templateRef = client.resolveTemplate(template.getTemplateName());
             ProvisionSpec spec = new ProvisionSpec(
-                    displayName, template.getNumCpus(), template.getMemoryBytes(), null, null, null);
+                    displayName,
+                    template.getNumCpus(),
+                    template.getMemoryBytes(),
+                    null,
+                    null,
+                    null,
+                    seedFor(displayName));
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
@@ -301,6 +310,31 @@ public class XcpngCloud extends Cloud {
                 throw e;
             }
         }
+    }
+
+    /**
+     * The per-clone seed the guest reads (from xenstore, via {@link ProvisionSpec#guestData()}) to
+     * launch its inbound agent unattended: the controller URL it dials, the node name it registers as,
+     * and the JNLP secret it must present. The secret is an HMAC of the node name, so it is stable and
+     * computable here, before the {@link XcpngAgent} node is added and its computer exists. The URL is
+     * omitted when the controller has no root URL configured; the guest then has nothing to dial and the
+     * agent is reclaimed by the idle timeout, which is the right outcome for that misconfiguration.
+     */
+    @NonNull
+    private static Map<String, String> seedFor(@NonNull String nodeName) {
+        Map<String, String> seed = new LinkedHashMap<>();
+        String rootUrl = Jenkins.get().getRootUrl();
+        if (rootUrl == null || rootUrl.isBlank()) {
+            LOGGER.log(
+                    Level.WARNING,
+                    () -> "Jenkins root URL is not set; agent " + nodeName
+                            + " will have no controller URL to connect back to");
+        } else {
+            seed.put("url", rootUrl);
+        }
+        seed.put("name", nodeName);
+        seed.put("secret", JnlpAgentReceiver.SLAVE_SECRET.mac(nodeName));
+        return seed;
     }
 
     /**

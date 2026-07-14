@@ -14,6 +14,8 @@ import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import jenkins.slaves.JnlpAgentReceiver;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -58,6 +60,23 @@ class XcpngProvisionTest {
                         "start:vm/xcpng-agent-1/1",
                         "close"),
                 fake.calls());
+    }
+
+    @Test
+    void provisionSeedsGuestDataForTheInboundConnection(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1");
+
+        Map<String, String> seed = fake.lastSpec().guestData();
+        // The guest reads these three keys to dial back in as an inbound agent: the controller URL, the
+        // node name it registers as, and the JNLP secret, which is a stable HMAC of that name computable
+        // before the node exists. Assert the secret matches what a real inbound agent would present.
+        assertEquals("xcpng-agent-1", seed.get("name"));
+        assertEquals(JnlpAgentReceiver.SLAVE_SECRET.mac("xcpng-agent-1"), seed.get("secret"));
+        assertEquals(r.jenkins.getRootUrl(), seed.get("url"));
     }
 
     @Test
