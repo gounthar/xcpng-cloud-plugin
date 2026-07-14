@@ -6,6 +6,7 @@ import hudson.model.ExecutorListener;
 import hudson.model.Queue;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.CloudRetentionStrategy;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -93,21 +94,29 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         // Refuse further work immediately so nothing new is scheduled onto a node about to die.
         computer.setAcceptingTasks(false);
         LOGGER.log(Level.FINE, () -> "Reclaiming XCP-ng agent " + agent.getNodeName());
-        Computer.threadPoolForRemoting.submit(() -> {
-            try {
-                agent.terminate();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } catch (Exception e) {
-                LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + agent.getNodeName());
-            } finally {
-                // Clear the guard whatever happened. On success the node is already gone, so the next
-                // reap short-circuits on the getNode() check; on a transient failure this lets a later
-                // periodic check retry the teardown rather than leaving the VM to leak forever.
-                synchronized (this) {
-                    reaping = false;
+        try {
+            Computer.threadPoolForRemoting.submit(() -> {
+                try {
+                    agent.terminate();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + agent.getNodeName());
+                } finally {
+                    // Clear the guard whatever happened. On success the node is already gone, so the next
+                    // reap short-circuits on the getNode() check; on a transient failure this lets a later
+                    // periodic check retry the teardown rather than leaving the VM to leak forever.
+                    synchronized (this) {
+                        reaping = false;
+                    }
                 }
-            }
-        });
+            });
+        } catch (RejectedExecutionException e) {
+            // The remoting pool would not even accept the teardown task, which it does only while
+            // shutting down. Clear the guard here (the task's finally will never run) so a later check
+            // can retry rather than pinning the node non-accepting with its VM leaked.
+            LOGGER.log(Level.WARNING, e, () -> "Could not schedule reclamation of agent " + agent.getNodeName());
+            reaping = false;
+        }
     }
 }
