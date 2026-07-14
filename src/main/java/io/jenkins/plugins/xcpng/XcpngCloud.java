@@ -29,6 +29,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -149,8 +150,10 @@ public class XcpngCloud extends Cloud {
         return templateFor(state.getLabel()) != null && availableCapacity() > 0;
     }
 
+    // Synchronized so two concurrent provisioning rounds cannot both snapshot the same capacity before
+    // either reserves against it; without that lock each could plan up to the cap and overshoot.
     @Override
-    public Collection<NodeProvisioner.PlannedNode> provision(CloudState state, int excessWorkload) {
+    public synchronized Collection<NodeProvisioner.PlannedNode> provision(CloudState state, int excessWorkload) {
         XcpngTemplate template = templateFor(state.getLabel());
         if (template == null) {
             return List.of();
@@ -169,15 +172,23 @@ public class XcpngCloud extends Cloud {
             // Reserve capacity before the clone starts and release it when the provision settles, so a
             // concurrent round sees the reservation and the cap holds even while clones are still booting.
             inFlight.incrementAndGet();
-            Future<Node> future = Computer.threadPoolForRemoting.submit(() -> {
-                try {
-                    return provisionNode(template, displayName);
-                } finally {
-                    inFlight.decrementAndGet();
-                }
-            });
-            planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
-            remaining -= template.getNumExecutors();
+            try {
+                Future<Node> future = Computer.threadPoolForRemoting.submit(() -> {
+                    try {
+                        return provisionNode(template, displayName);
+                    } finally {
+                        inFlight.decrementAndGet();
+                    }
+                });
+                planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
+                remaining -= template.getNumExecutors();
+            } catch (RejectedExecutionException e) {
+                // The pool refused the task, which it does only while shutting down. The task's finally
+                // will never run, so release the reservation here and stop planning further nodes.
+                inFlight.decrementAndGet();
+                LOGGER.log(Level.WARNING, e, () -> "Could not schedule provision of " + displayName);
+                break;
+            }
         }
         return planned;
     }
