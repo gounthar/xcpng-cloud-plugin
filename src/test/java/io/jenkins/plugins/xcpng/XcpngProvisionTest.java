@@ -77,6 +77,23 @@ class XcpngProvisionTest {
         assertEquals("xcpng-agent-1", seed.get("name"));
         assertEquals(JnlpAgentReceiver.SLAVE_SECRET.mac("xcpng-agent-1"), seed.get("secret"));
         assertEquals(r.jenkins.getRootUrl(), seed.get("url"));
+        // The default template sets no SSH key, so an inbound-only clone stays key-free.
+        assertFalse(seed.containsKey("ssh_authorized_key"), "no SSH key configured means none in the seed");
+    }
+
+    @Test
+    void provisionSeedsTheOptionalSshKeyWhenTheTemplateHasOne(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngTemplate keyed = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        String pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTest operator@host";
+        keyed.setSshAuthorizedKey(pubkey);
+
+        cloud.provisionNode(keyed, "xcpng-agent-1");
+
+        assertEquals(pubkey, fake.lastSpec().guestData().get("ssh_authorized_key"));
     }
 
     @Test

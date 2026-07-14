@@ -284,7 +284,7 @@ public class XcpngCloud extends Cloud {
                     null,
                     null,
                     null,
-                    seedFor(displayName));
+                    seedFor(displayName, template));
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
@@ -321,7 +321,7 @@ public class XcpngCloud extends Cloud {
      * agent is reclaimed by the idle timeout, which is the right outcome for that misconfiguration.
      */
     @NonNull
-    private static Map<String, String> seedFor(@NonNull String nodeName) {
+    private static Map<String, String> seedFor(@NonNull String nodeName, @NonNull XcpngTemplate template) {
         Map<String, String> seed = new LinkedHashMap<>();
         String rootUrl = Jenkins.get().getRootUrl();
         if (rootUrl == null || rootUrl.isBlank()) {
@@ -334,6 +334,13 @@ public class XcpngCloud extends Cloud {
         }
         seed.put("name", nodeName);
         seed.put("secret", JnlpAgentReceiver.SLAVE_SECRET.mac(nodeName));
+        // Optional operator-supplied public key. Delivered on the same channel; the guest writes it to
+        // the debian user's authorized_keys. Absent unless the template sets it, keeping inbound-only
+        // clones key-free. The setter already trimmed and null-normalised it.
+        String sshKey = template.getSshAuthorizedKey();
+        if (sshKey != null) {
+            seed.put("ssh_authorized_key", sshKey);
+        }
         return seed;
     }
 
