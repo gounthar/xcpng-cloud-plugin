@@ -217,11 +217,14 @@ public class XcpngCloud extends Cloud {
                         future.completeExceptionally(t);
                     }
                 });
-                // Propagate a cancellation of the planned node to the running task so its thread is freed
-                // and provisionNode's own post-clone cleanup can destroy a half-built VM.
+                // Propagate a cancellation of the planned node to the task, but without interrupting it:
+                // a not-yet-started task is dropped from the queue, and a running one is left to finish so
+                // its cleanup (provisionNode's post-clone destroy, or the orphan guard above) runs on a
+                // thread with no interrupt flag set. Interrupting mid-run could leave the flag set and make
+                // the blocking destroyWithDisks call fail, leaking the very VM the cleanup exists to remove.
                 future.whenComplete((node, throwable) -> {
                     if (throwable instanceof CancellationException) {
-                        task.cancel(true);
+                        task.cancel(false);
                     }
                 });
                 planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
