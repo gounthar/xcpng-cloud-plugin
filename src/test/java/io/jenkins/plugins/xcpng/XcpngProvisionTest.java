@@ -14,6 +14,9 @@ import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.Collection;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -122,5 +125,76 @@ class XcpngProvisionTest {
 
         assertTrue(cloud.provision(new Cloud.CloudState(Label.get("windows"), 0), 3)
                 .isEmpty());
+    }
+
+    @Test
+    void aRejectedProvisionSubmitReleasesItsReservation(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        // A shut-down executor rejects every submit, standing in for the remoting pool during shutdown.
+        ExecutorService dead = Executors.newSingleThreadExecutor();
+        dead.shutdownNow();
+        cloud.setProvisionExecutor(dead);
+
+        Collection<NodeProvisioner.PlannedNode> planned =
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
+
+        assertTrue(planned.isEmpty(), "a rejected submit plans nothing");
+        assertEquals(0, cloud.inFlightCount(), "the reservation must be released when the submit is rejected");
+    }
+
+    @Test
+    void inFlightReservationsHoldTheCapAcrossRounds(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        // One worker thread, blocked on a gate, so the provisioning tasks queue and their reservations
+        // stay outstanding while we inspect the cap. A second round must see no free capacity.
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        exec.submit(() -> {
+            gate.await();
+            return null;
+        });
+        cloud.setProvisionExecutor(exec);
+        try {
+            Collection<NodeProvisioner.PlannedNode> first =
+                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
+            Collection<NodeProvisioner.PlannedNode> second =
+                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
+
+            assertEquals(2, first.size());
+            assertEquals(0, second.size(), "the cap must hold while earlier reservations are outstanding");
+            assertEquals(2, cloud.inFlightCount());
+        } finally {
+            gate.countDown();
+            exec.shutdownNow();
+        }
+    }
+
+    @Test
+    void cancellingAPlannedNodeReleasesItsReservation(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        exec.submit(() -> {
+            gate.await();
+            return null;
+        });
+        cloud.setProvisionExecutor(exec);
+        try {
+            Collection<NodeProvisioner.PlannedNode> planned =
+                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
+            assertEquals(1, planned.size());
+            assertEquals(1, cloud.inFlightCount());
+
+            // The node provisioner can cancel a planned node; that must not strand the reservation.
+            planned.iterator().next().future.cancel(true);
+
+            assertEquals(0, cloud.inFlightCount(), "cancelling a planned node must release its reservation");
+        } finally {
+            gate.countDown();
+            exec.shutdownNow();
+        }
     }
 }
