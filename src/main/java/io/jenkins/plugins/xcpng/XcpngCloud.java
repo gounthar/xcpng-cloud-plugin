@@ -214,6 +214,11 @@ public class XcpngCloud extends Cloud {
                             }
                         }
                     } catch (Throwable t) {
+                        // Preserve the interrupt so higher-level shutdown/cancellation logic still sees it,
+                        // rather than swallowing it into the future's exceptional completion.
+                        if (t instanceof InterruptedException) {
+                            Thread.currentThread().interrupt();
+                        }
                         future.completeExceptionally(t);
                     }
                 });
