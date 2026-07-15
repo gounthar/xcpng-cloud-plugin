@@ -21,7 +21,7 @@ preparation, as this does.
 | requirement | why |
 |---|---|
 | **Java 21** | Jenkins core is compiled at class-file **major 65**. An agent on Java 17 opens its WebSocket, logs `Connected`, then dies in a silent reconnect loop with `UnsupportedClassVersionError`. It never reports a useful reason; you have to read `agent.log` inside the VM. The controller and its agents must run the same Java major. |
-| **`xenstore-utils`** | The baked agent service reads its per-clone data (controller URL, agent name, JNLP secret) from xenstore, so the guest needs a `xenstore-read` binary. On Debian 13 it is in `xenstore-utils`; `xe-guest-utilities` does not ship one. `provision.sh` installs it. |
+| **`xenstore-read`** | The baked agent service reads its per-clone data (controller URL, agent name, JNLP secret) from xenstore, so the guest needs a `xenstore-read` binary. On Debian 13 `xe-guest-utilities` 7.30 already ships one; `provision.sh` installs `xenstore-utils` only as a fallback when it is missing. |
 | **`xe-guest-utilities`** | Without the guest agent the VM never writes its address to xenstore, and XAPI reports `networks={}` for its whole life. The inbound launcher does not need an address, but `tools/measure_clone.py` and any future SSH launcher do. |
 | **cloud-init** | Needed for the from-scratch `import_raw_vdi` bootstrap, which relies on a seed `network-config` to bring the network up (see below). The clone path no longer consumes it: per-clone data arrives over xenstore, not a NoCloud seed. |
 

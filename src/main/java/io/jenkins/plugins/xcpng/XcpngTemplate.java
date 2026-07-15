@@ -140,9 +140,13 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             return checkPositiveInt(value, "The memory (MiB)");
         }
 
-        /** Accepted OpenSSH public-key type prefixes; anything else is almost certainly not a pubkey. */
+        /**
+         * Accepted OpenSSH public-key type prefixes; anything else is almost certainly not a pubkey.
+         * ssh-dss (DSA) is deliberately absent: current OpenSSH disables it, so such a key would validate
+         * here yet never authenticate on the agent.
+         */
         private static final String[] PUBLIC_KEY_PREFIXES = {
-            "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-", "ssh-dss "
+            "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-"
         };
 
         /**
@@ -155,6 +159,13 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                 return FormValidation.ok();
             }
             String key = value.trim();
+            if (key.contains("\n") || key.contains("\r")) {
+                // Trimming strips only the ends, so an embedded newline would otherwise smuggle a whole
+                // block of keys past a first-line prefix check, and the seed writes the value verbatim
+                // into the agent's authorized_keys. One key, one line.
+                return FormValidation.error(
+                        "Enter a single public key on one line; line breaks and multiple keys are not accepted.");
+            }
             if (key.contains("PRIVATE KEY")) {
                 return FormValidation.error(
                         "That looks like a private key. Paste the public key (e.g. the contents of a .pub file);"

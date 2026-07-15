@@ -287,7 +287,13 @@ public final class XapiClient implements HypervisorClient {
         Map<String, String> merged = new LinkedHashMap<>();
         JsonNode existing = call("VM.get_xenstore_data", vm);
         if (existing.isObject()) {
-            existing.fields().forEachRemaining(e -> merged.put(e.getKey(), e.getValue().asText()));
+            // xenstore-data is a string-to-string map, so a JSON null should never appear; guard anyway
+            // so a stray null value is dropped rather than written back as the literal string "null".
+            existing.fields().forEachRemaining(e -> {
+                if (!e.getValue().isNull()) {
+                    merged.put(e.getKey(), e.getValue().asText());
+                }
+            });
         }
         for (Map.Entry<String, String> e : guestData.entrySet()) {
             merged.put(GUEST_DATA_PREFIX + e.getKey(), e.getValue());

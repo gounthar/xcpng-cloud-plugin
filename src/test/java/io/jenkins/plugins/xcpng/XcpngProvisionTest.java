@@ -10,15 +10,17 @@ import hudson.model.Label;
 import hudson.model.Node;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
+import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import jenkins.slaves.JnlpAgentReceiver;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import jenkins.model.JenkinsLocationConfiguration;
+import jenkins.slaves.JnlpAgentReceiver;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -70,6 +72,9 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
+        // Pin an explicit root URL so the url assertion compares a known value rather than relying on
+        // whatever the harness happens to set (and never degrading to null == null).
+        JenkinsLocationConfiguration.get().setUrl("https://controller.example.test/");
 
         cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1");
 
@@ -79,9 +84,29 @@ class XcpngProvisionTest {
         // before the node exists. Assert the secret matches what a real inbound agent would present.
         assertEquals("xcpng-agent-1", seed.get("name"));
         assertEquals(JnlpAgentReceiver.SLAVE_SECRET.mac("xcpng-agent-1"), seed.get("secret"));
-        assertEquals(r.jenkins.getRootUrl(), seed.get("url"));
+        assertEquals("https://controller.example.test/", seed.get("url"));
         // The default template sets no SSH key, so an inbound-only clone stays key-free.
         assertFalse(seed.containsKey("ssh_authorized_key"), "no SSH key configured means none in the seed");
+    }
+
+    @Test
+    void sshKeyValidatorAcceptsOneKeyAndRejectsBlocksPrivateKeysAndDsa(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        // Optional field: blank is fine.
+        assertEquals(FormValidation.Kind.OK, d.doCheckSshAuthorizedKey("  ").kind);
+        // A single public key on one line is accepted.
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckSshAuthorizedKey("ssh-ed25519 AAAAC3NzaExampleKey operator@host").kind);
+        // A block of keys (embedded newline) is rejected, so only one line ever reaches authorized_keys.
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                d.doCheckSshAuthorizedKey("ssh-ed25519 AAAAOne a@h\nssh-ed25519 AAAATwo b@h").kind);
+        // A pasted private key is rejected outright.
+        assertEquals(
+                FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("-----BEGIN OPENSSH PRIVATE KEY-----").kind);
+        // Legacy DSA is rejected: current OpenSSH will not authenticate it.
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("ssh-dss AAAADsaExample x@h").kind);
     }
 
     @Test
