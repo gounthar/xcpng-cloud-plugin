@@ -7,6 +7,7 @@ import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
 import hudson.util.FormValidation;
 import org.jenkinsci.Symbol;
+import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -177,19 +178,29 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
 
         /**
          * The warm-pool size accepts 0 (the "off" default), so it takes the non-negative check rather
-         * than the positive one the sizing fields use.
+         * than the positive one the sizing fields use. When the enclosing cloud is in the form path, also
+         * warn if the target exceeds the cloud's instance cap: warm agents count against {@code
+         * maxInstances}, so a larger target can never be filled.
          */
-        public FormValidation doCheckMinInstances(@QueryParameter String value) {
+        public FormValidation doCheckMinInstances(
+                @AncestorInPath XcpngCloud cloud, @QueryParameter String value) {
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
+            int count;
             try {
-                return Integer.parseInt(value.trim()) >= 0
-                        ? FormValidation.ok()
-                        : FormValidation.error("Min instances cannot be negative.");
+                count = Integer.parseInt(value.trim());
             } catch (NumberFormatException e) {
                 return FormValidation.error("Min instances must be a whole number.");
             }
+            if (count < 0) {
+                return FormValidation.error("Min instances cannot be negative.");
+            }
+            if (cloud != null && count > cloud.getMaxInstances()) {
+                return FormValidation.warning("Min instances (" + count + ") exceeds the cloud's Max instances ("
+                        + cloud.getMaxInstances() + "); the warm pool is capped by Max instances.");
+            }
+            return FormValidation.ok();
         }
 
         /**

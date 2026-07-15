@@ -16,7 +16,7 @@
     <f:number default="2048" clazz="positive-number"/>
   </f:entry>
   <f:entry title="${%Warm pool size}" field="minInstances">
-    <f:number default="0"/>
+    <f:number default="0" min="0"/>
   </f:entry>
   <f:entry title="${%SSH authorized key (optional)}" field="sshAuthorizedKey">
     <f:textarea/>

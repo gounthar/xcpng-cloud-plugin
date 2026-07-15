@@ -188,6 +188,30 @@ class XcpngCloudTest {
     }
 
     /**
+     * The warm-pool field validator: rejects negatives, and warns (does not block) when the target
+     * exceeds the enclosing cloud's instance cap, since warm agents count against that cap. A null
+     * cloud (field checked outside a cloud form) skips the cross-field warning.
+     */
+    @Test
+    void minInstancesValidationWarnsWhenAboveCap(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 2, List.of());
+
+        assertEquals(FormValidation.Kind.OK, d.doCheckMinInstances(cloud, "").kind);
+        assertEquals(FormValidation.Kind.OK, d.doCheckMinInstances(cloud, "2").kind, "at the cap is fine");
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckMinInstances(cloud, "-1").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckMinInstances(cloud, "x").kind);
+        assertEquals(
+                FormValidation.Kind.WARNING,
+                d.doCheckMinInstances(cloud, "5").kind,
+                "a target above the cap must warn, not block");
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckMinInstances(null, "5").kind,
+                "no enclosing cloud means no cross-field warning");
+    }
+
+    /**
      * {@code idleMinutes} is an optional setter, so a cloud built without it must carry the default
      * timeout rather than 0, which would switch the idle safety net off entirely.
      */
