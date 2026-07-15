@@ -67,6 +67,13 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         if (memoryMb <= 0) {
             memoryMb = DEFAULT_MEMORY_MB;
         }
+        // XStream populates fields directly, bypassing the DataBoundSetter's normalization, so a
+        // hand-edited config.xml with a blank or whitespace key would survive as non-null and get seeded
+        // as an empty authorized_keys line. Collapse it to null here, matching the setter.
+        if (sshAuthorizedKey != null) {
+            String trimmed = sshAuthorizedKey.trim();
+            sshAuthorizedKey = trimmed.isEmpty() ? null : trimmed;
+        }
         return this;
     }
 

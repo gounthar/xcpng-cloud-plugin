@@ -310,12 +310,15 @@ public class XcpngCloud extends Cloud {
      */
     private static void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
             throws InterruptedException {
-        Computer computer = node.toComputer();
-        if (computer == null) {
-            return; // nothing to wait on
-        }
         long deadlineNanos = System.nanoTime() + ONLINE_TIMEOUT_MINUTES * 60L * 1_000_000_000L;
-        while (!computer.isOnline()) {
+        // Re-fetch the computer each pass and treat a null one as "not online yet": returning early on a
+        // transiently-null Computer would complete the future without the agent connected, reintroducing
+        // the over-provisioning this wait exists to prevent.
+        while (true) {
+            Computer computer = node.toComputer();
+            if (computer != null && computer.isOnline()) {
+                return;
+            }
             if (future.isCancelled()) {
                 return;
             }

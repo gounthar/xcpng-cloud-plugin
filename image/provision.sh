@@ -155,7 +155,7 @@ chmod 0400 "$secret_file"
 # whole service (systemd would restart it anyway, but a short in-launcher retry connects sooner).
 if [ ! -s "$agent_dir/agent.jar" ]; then
     tries=0
-    until curl -sSfL -o "$agent_dir/agent.jar" "${url}jnlpJars/agent.jar"; do
+    until curl -sSfL --connect-timeout 10 --max-time 120 -o "$agent_dir/agent.jar" "${url}jnlpJars/agent.jar"; do
         tries=$((tries + 1))
         if [ "$tries" -ge 5 ]; then
             echo "jenkins-agent: could not fetch agent.jar from ${url}jnlpJars/agent.jar after $tries tries" >&2
