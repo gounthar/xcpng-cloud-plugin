@@ -1,0 +1,13 @@
+- xcpng:
+    credentialsId: "xcpng-root"
+    maxInstances: 3
+    name: "xcpng-lab"
+    poolUrl: "https://192.168.1.87"
+    templates:
+    - labelString: "xcpng-linux"
+      memoryMb: 8192
+      numCpus: 4
+      numExecutors: 2
+      sshAuthorizedKey: "ssh-ed25519 AAAAExampleKeyForRoundTripTest lab"
+      templateName: "jenkins-golden-debian"
+    trustSelfSigned: true
