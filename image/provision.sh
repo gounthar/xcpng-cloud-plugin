@@ -22,8 +22,9 @@ JAVA_MAJOR=21
 ADOPTIUM_KEYRING=/etc/apt/keyrings/adoptium.asc
 ADOPTIUM_LIST=/etc/apt/sources.list.d/adoptium.list
 GUEST_TOOLS_DEB='Linux/xe-guest-utilities_7.30.0-18_amd64.deb'
-# Provides xenstore-read, the client the agent service uses to read its per-clone seed. On Debian 13
-# the command-line xenstore tools are in xenstore-utils; xe-guest-utilities does not ship them.
+# Fallback source of xenstore-read, the client the agent service uses to read its per-clone seed. On
+# Debian 13 xe-guest-utilities 7.30 already ships /usr/bin/xenstore-read, so ensure_xenstore_client
+# usually finds it present and skips this. xenstore-utils covers an image that has no guest tools.
 XENSTORE_PKG='xenstore-utils'
 AGENT_LAUNCHER=/usr/local/bin/jenkins-agent-launch
 AGENT_UNIT=/etc/systemd/system/jenkins-agent.service
@@ -98,9 +99,11 @@ install_guest_tools() {
 }
 
 ensure_xenstore_client() {
-    # The agent service reads its seed from xenstore, so the guest needs a xenstore-read binary. It is
-    # part of the guest-integration concern, so it lives here rather than in install_agent_service, and
-    # is skipped alongside guest tools in the CI container (which has no xenbus to talk to anyway).
+    # The agent service reads its seed from xenstore, so the guest needs a xenstore-read binary. On a
+    # real image xe-guest-utilities already provides /usr/bin/xenstore-read (verified on the pool: the
+    # 7.30 package ships it on Debian 13), so this normally no-ops; the install is a fallback for an
+    # image built without guest tools. It sits with the guest-integration concern and is skipped
+    # alongside guest tools in the CI container (which has no xenbus to talk to anyway).
     if command -v xenstore-read >/dev/null 2>&1; then
         log "xenstore-read already present"
         return
@@ -233,6 +236,17 @@ WantedBy=multi-user.target
 SSHUNIT
 
     sh -n /usr/local/bin/jenkins-agent-ssh-seed
+
+    # Regenerate SSH host keys on boot when they are missing. cleanup_for_template removes them so each
+    # clone gets unique keys, but a plugin clone is seeded over xenstore and has no cloud-init datasource
+    # (DataSourceNone), so cloud-init's cc_ssh never runs to recreate them. Without this drop-in sshd
+    # refuses to start on such a clone and the per-clone authorized_keys the seed service wrote is
+    # unreachable. Verified on the pool: a clone with removed host keys and no cidata left sshd down.
+    mkdir -p /etc/systemd/system/ssh.service.d
+    cat > /etc/systemd/system/ssh.service.d/regen-host-keys.conf <<'REGEN'
+[Service]
+ExecStartPre=/bin/sh -c 'test -e /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A'
+REGEN
 
     if [ -d /run/systemd/system ]; then
         systemctl enable jenkins-agent-ssh-seed.service
