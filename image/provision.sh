@@ -282,9 +282,12 @@ install_growroot_service() {
 # Expand the root partition and ext filesystem to the whole disk. Idempotent: growpart and resize2fs
 # both no-op when the partition and filesystem already fill the device.
 set -eu
-src=$(findmnt -no SOURCE /)                 # e.g. /dev/xvda1
-dev=$(lsblk -no PKNAME "$src" 2>/dev/null)  # e.g. xvda
-num=$(printf '%s' "$src" | grep -o '[0-9]*$')
+# The || true on the lookups matters under set -e: lsblk can exit non-zero on an unusual root SOURCE
+# (device-mapper, LVM) and grep exits 1 when the source has no trailing digit. Without it the whole
+# oneshot would abort before the guard below instead of cleanly no-oping on a layout it can't grow.
+src=$(findmnt -no SOURCE / || true)                  # e.g. /dev/xvda1
+dev=$(lsblk -no PKNAME "$src" 2>/dev/null || true)   # e.g. xvda
+num=$(printf '%s' "$src" | grep -o '[0-9]*$' || true)
 [ -n "$dev" ] && [ -n "$num" ] || exit 0
 growpart "/dev/$dev" "$num" 2>/dev/null || true
 resize2fs "$src" 2>/dev/null || true
