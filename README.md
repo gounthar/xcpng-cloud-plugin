@@ -170,4 +170,4 @@ Jenkins is then available at `http://localhost:8080/jenkins`.
 
 ## License
 
-MIT. See the license declared in `pom.xml`.
+MIT. See [`LICENSE`](LICENSE); it is also declared in `pom.xml`.
