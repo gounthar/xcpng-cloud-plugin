@@ -68,6 +68,7 @@ class XcpngProvisionTest {
 
         XcpngAgent agent = assertInstanceOf(XcpngAgent.class, node);
         assertEquals("vm/xcpng-agent-1/1", agent.getVmRef());
+        assertFalse(agent.isWarm(), "an on-demand agent is used from birth, never a warm spare");
         assertEquals(
                 List.of(
                         "resolveTemplate:jenkins-golden-debian",

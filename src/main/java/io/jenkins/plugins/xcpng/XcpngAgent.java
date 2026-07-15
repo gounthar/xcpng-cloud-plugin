@@ -52,13 +52,23 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     private final ProvisioningActivity.Id activityId;
 
+    /**
+     * True while this is an unused warm-pool spare: pre-booted and idle, waiting for its first build.
+     * The retention strategy leaves such an agent alone instead of idle-reaping it (that is the point of
+     * a warm pool). Cleared the moment it accepts work, after which it behaves like any single-use agent.
+     * Volatile: the retention thread reads it while the executor thread clears it. Persisted (non-transient)
+     * so a spare stays exempt across a controller restart rather than being downgraded and churned.
+     */
+    private volatile boolean warm;
+
     public XcpngAgent(
             @NonNull String name,
             @NonNull String cloudName,
             @NonNull String vmRef,
             @NonNull XcpngTemplate template,
             int idleMinutes,
-            @NonNull ProvisioningActivity.Id activityId)
+            @NonNull ProvisioningActivity.Id activityId,
+            boolean warm)
             throws Descriptor.FormException, IOException {
         super(
                 name,
@@ -73,6 +83,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.cloudName = cloudName;
         this.vmRef = vmRef;
         this.activityId = activityId;
+        this.warm = warm;
     }
 
     /** The VM this agent runs on, as an opaque backend handle. */
@@ -99,6 +110,20 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     public ProvisioningActivity.Id getId() {
         return activityId;
+    }
+
+    /** True while this is an unused warm-pool spare the retention strategy should not idle-reap. */
+    public boolean isWarm() {
+        return warm;
+    }
+
+    /**
+     * Mark this spare as used, so it is no longer exempt from idle-reaping and reverts to single-use
+     * behaviour. Called when the agent accepts its first build. Idempotent; not persisted on its own, as
+     * a used spare is reaped after its one build and does not need to survive a restart as "used".
+     */
+    public void markUsed() {
+        warm = false;
     }
 
     @Override
