@@ -26,6 +26,7 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -378,25 +379,45 @@ public class XcpngCloud extends Cloud {
      * {@link XcpngWarmPoolMaintainer}; package-visible so a test can drive a reconcile directly.
      */
     synchronized void reconcileWarmPool() {
+        // One pass over the node list feeds every template's deficit: count this cloud's agents (for the
+        // cap) and its unused warm spares per template, rather than rescanning the list per template.
+        int active = 0;
+        Map<String, Integer> warmCounts = new HashMap<>();
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                active++;
+                if (agent.isWarm()) {
+                    ProvisioningActivity.Id id = agent.getId();
+                    if (id != null) {
+                        warmCounts.merge(id.getTemplateName(), 1, Integer::sum);
+                    }
+                }
+            }
+        }
+        // The same headroom formula as availableCapacity(), fed from the pass above and decremented
+        // locally as launches are submitted (launch() reserves inFlight too, but the local counter saves
+        // re-reading it and keeps the two in step within this tick). Keep the formulas aligned.
+        int capacity = Math.max(0, maxInstances - active - inFlight.get());
         for (XcpngTemplate template : templates) {
             int target = template.getMinInstances();
             if (target <= 0) {
                 continue;
             }
-            // Deficit against both the spares already present and those still booting, so repeated ticks do
-            // not stack duplicate provisions for the same template.
-            int deficit = target - warmAgentCount(template)
+            // Deficit against both the spares already registered and those still booting, so repeated
+            // ticks do not stack duplicate provisions for the same template.
+            int deficit = target - warmCounts.getOrDefault(template.getTemplateName(), 0)
                     - warmInFlight(template.getTemplateName()).get();
-            int toLaunch = Math.min(deficit, availableCapacity());
+            int toLaunch = Math.min(deficit, capacity);
             for (int i = 0; i < toLaunch; i++) {
                 final String displayName = "xcpng-" + template.getTemplateName() + "-"
                         + UUID.randomUUID().toString().substring(0, 8);
                 final ProvisioningActivity.Id activityId =
                         new ProvisioningActivity.Id(name, template.getTemplateName(), displayName);
                 if (launch(template, displayName, activityId, true) == null) {
-                    // Pool shutting down; give up filling this template this tick.
-                    break;
+                    // Pool shutting down; no point trying this or any later template this tick.
+                    return;
                 }
+                capacity--;
             }
         }
     }
@@ -615,24 +636,6 @@ public class XcpngCloud extends Cloud {
         // Subtract in-flight provisions too: they will become nodes but have not yet, so counting only
         // registered agents would let a concurrent round provision past the cap.
         return Math.max(0, maxInstances - active - inFlight.get());
-    }
-
-    /**
-     * Unused warm spares this cloud already runs for {@code template}: registered {@link XcpngAgent}s that
-     * are still warm and were provisioned under the template (matched via the cloud-stats activity id the
-     * provision stamped on them). Feeds the warm-pool deficit.
-     */
-    private int warmAgentCount(@NonNull XcpngTemplate template) {
-        int count = 0;
-        for (Node node : Jenkins.get().getNodes()) {
-            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName()) && agent.isWarm()) {
-                ProvisioningActivity.Id id = agent.getId();
-                if (id != null && template.getTemplateName().equals(id.getTemplateName())) {
-                    count++;
-                }
-            }
-        }
-        return count;
     }
 
     /** The warm in-flight counter for a template, created on first use. */
