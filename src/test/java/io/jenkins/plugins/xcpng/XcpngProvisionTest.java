@@ -3,6 +3,7 @@ package io.jenkins.plugins.xcpng;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -21,6 +22,7 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import jenkins.model.JenkinsLocationConfiguration;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
@@ -311,5 +313,93 @@ class XcpngProvisionTest {
             gate.countDown();
             exec.shutdownNow();
         }
+    }
+
+    // ---- Warm pool (slice C) ----
+
+    /** A cloud whose single template keeps {@code minInstances} warm spares, backed by the given fake. */
+    private static XcpngCloud warmCloudBackedBy(FakeHypervisorClient fake, int maxInstances, int minInstances) {
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        template.setMinInstances(minInstances);
+        XcpngCloud cloud = new XcpngCloud(
+                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(template));
+        cloud.setClientFactory(c -> fake);
+        cloud.setWaitForOnline(false);
+        return cloud;
+    }
+
+    /** Reconcile the warm pool on one worker, then wait for the launched tasks to finish and register. */
+    private static void reconcileAndDrain(XcpngCloud cloud) throws InterruptedException {
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(exec);
+        cloud.reconcileWarmPool();
+        exec.shutdown();
+        assertTrue(exec.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool launches should finish");
+    }
+
+    private static int warmNodeCount(JenkinsRule r) {
+        int count = 0;
+        for (Node node : r.jenkins.getNodes()) {
+            if (node instanceof XcpngAgent agent && agent.isWarm()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Test
+    void warmPoolFillsToMinInstances(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2);
+
+        reconcileAndDrain(cloud);
+
+        assertEquals(2, warmNodeCount(r), "the pool should fill to minInstances");
+        for (Node node : r.jenkins.getNodes()) {
+            XcpngAgent agent = assertInstanceOf(XcpngAgent.class, node);
+            assertTrue(agent.isWarm(), "a maintainer-launched agent is a warm spare");
+            assertNotNull(agent.getId(), "the spare carries a cloud-stats activity");
+            assertEquals("jenkins-golden-debian", agent.getId().getTemplateName());
+        }
+    }
+
+    @Test
+    void warmPoolIsClampedByTheCap(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 2, 5); // wants five, cap of two
+
+        reconcileAndDrain(cloud);
+
+        assertEquals(2, warmNodeCount(r), "the warm pool cannot exceed the instance cap");
+    }
+
+    @Test
+    void warmReconcileIsIdempotentAcrossTicks(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3, 2);
+        // One worker blocked on a gate, so the first tick's launches queue with their reservations
+        // outstanding and never register. A second tick must see the deficit already covered and add nothing.
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        exec.submit(() -> {
+            gate.await();
+            return null;
+        });
+        cloud.setProvisionExecutor(exec);
+        try {
+            cloud.reconcileWarmPool();
+            cloud.reconcileWarmPool();
+            assertEquals(2, cloud.inFlightCount(), "the second tick must not double-provision the pool");
+        } finally {
+            gate.countDown();
+            exec.shutdownNow();
+        }
+    }
+
+    @Test
+    void warmMaintainerExtensionIsRegistered(JenkinsRule r) {
+        assertEquals(
+                1,
+                r.jenkins.getExtensionList(XcpngWarmPoolMaintainer.class).size(),
+                "the warm-pool maintainer should be an active periodic task");
     }
 }
