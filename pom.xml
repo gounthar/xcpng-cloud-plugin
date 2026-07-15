@@ -98,5 +98,16 @@
       <groupId>org.jenkins-ci.plugins</groupId>
       <artifactId>credentials</artifactId>
     </dependency>
+
+    <!--
+      cloud-stats records the lifecycle of every provisioned agent (provisioning, launching, operating,
+      then completed) and surfaces it under Manage Jenkins. The plugin only has to return a
+      TrackedPlannedNode and make its node and computer report the same activity id; cloud-stats' own
+      listeners drive the phase transitions. The BOM manages the version.
+    -->
+    <dependency>
+      <groupId>org.jenkins-ci.plugins</groupId>
+      <artifactId>cloud-stats</artifactId>
+    </dependency>
   </dependencies>
 </project>

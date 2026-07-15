@@ -3,9 +3,11 @@ package io.jenkins.plugins.xcpng;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.model.Computer;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.slaves.Cloud;
@@ -21,6 +23,9 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import jenkins.model.JenkinsLocationConfiguration;
 import jenkins.slaves.JnlpAgentReceiver;
+import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
+import org.jenkinsci.plugins.cloudstats.TrackedItem;
+import org.jenkinsci.plugins.cloudstats.TrackedPlannedNode;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -48,13 +53,18 @@ class XcpngProvisionTest {
         return cloud;
     }
 
+    /** The cloud-stats activity id a real provision would build for {@code nodeName} under this cloud. */
+    private static ProvisioningActivity.Id activityId(String nodeName) {
+        return new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", nodeName);
+    }
+
     @Test
     void provisionClonesStartsAndWrapsTheVmInAnAgent(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        Node node = cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1");
+        Node node = cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
 
         XcpngAgent agent = assertInstanceOf(XcpngAgent.class, node);
         assertEquals("vm/xcpng-agent-1/1", agent.getVmRef());
@@ -76,7 +86,7 @@ class XcpngProvisionTest {
         // whatever the harness happens to set (and never degrading to null == null).
         JenkinsLocationConfiguration.get().setUrl("https://controller.example.test/");
 
-        cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1");
+        cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
 
         Map<String, String> seed = fake.lastSpec().guestData();
         // The guest reads these three keys to dial back in as an inbound agent: the controller URL, the
@@ -119,7 +129,7 @@ class XcpngProvisionTest {
         String pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTest operator@host";
         keyed.setSshAuthorizedKey(pubkey);
 
-        cloud.provisionNode(keyed, "xcpng-agent-1");
+        cloud.provisionNode(keyed, "xcpng-agent-1", activityId("xcpng-agent-1"));
 
         assertEquals(pubkey, fake.lastSpec().guestData().get("ssh_authorized_key"));
     }
@@ -130,7 +140,7 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1");
+        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
         r.jenkins.addNode(agent);
         agent.terminate();
 
@@ -153,7 +163,7 @@ class XcpngProvisionTest {
         // Narrowed to the client's own exception (not any Exception): the clone succeeds and only the
         // start throws, so a broader assertion could pass on an unrelated failure and hide a regression.
         HypervisorException thrown = assertThrows(
-                HypervisorException.class, () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1"));
+                HypervisorException.class, () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1")));
         assertTrue(
                 thrown.getMessage().contains("start failed"),
                 "the surfaced failure must be the start failure: " + thrown.getMessage());
@@ -180,6 +190,46 @@ class XcpngProvisionTest {
         Collection<NodeProvisioner.PlannedNode> planned =
                 cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
         assertEquals(2, planned.size());
+    }
+
+    @Test
+    void provisionPlansTrackedNodesCarryingTheActivityId(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+
+        // cloud-stats reads the phases off a TrackedPlannedNode; a plain PlannedNode would never be tracked.
+        Collection<NodeProvisioner.PlannedNode> planned =
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
+        assertEquals(1, planned.size());
+
+        TrackedPlannedNode tracked =
+                assertInstanceOf(TrackedPlannedNode.class, planned.iterator().next());
+        ProvisioningActivity.Id id = tracked.getId();
+        assertEquals("xcpng", id.getCloudName());
+        assertEquals("jenkins-golden-debian", id.getTemplateName());
+        // The node name is the generated display name the clone registers under, which cloud-stats shows.
+        assertTrue(
+                id.getNodeName().startsWith("xcpng-jenkins-golden-debian-"),
+                "the activity node name must be the clone's display name: " + id.getNodeName());
+    }
+
+    @Test
+    void theAgentAndItsComputerReportTheSameActivity(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        // The exact id the planned node would carry. cloud-stats' id equality is per-instance (a random
+        // fingerprint), so correlation works only if the agent holds this same object, not a rebuilt one.
+        ProvisioningActivity.Id id = activityId("xcpng-agent-1");
+        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", id);
+        assertSame(id, agent.getId(), "the agent must carry the very id instance it was provisioned with");
+
+        r.jenkins.addNode(agent);
+        Computer computer = agent.toComputer();
+        TrackedItem trackedComputer = assertInstanceOf(TrackedItem.class, computer);
+        // Equal (by fingerprint) so cloud-stats moves this one activity through its launching/operating phases.
+        assertEquals(id, trackedComputer.getId(), "the computer must report the agent's activity");
     }
 
     @Test
