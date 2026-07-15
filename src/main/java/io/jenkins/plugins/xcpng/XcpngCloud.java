@@ -33,6 +33,7 @@ import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -74,6 +75,19 @@ public class XcpngCloud extends Cloud {
 
     private static final long ONLINE_POLL_MILLIS = 1000L;
 
+    /**
+     * Dedicated pool for provisioning tasks. Each task blocks up to {@link #ONLINE_TIMEOUT_MINUTES}
+     * waiting for its agent to connect, so it runs here rather than on {@code Computer.threadPoolForRemoting}
+     * where long waits would compete with the controller's own remoting work. Cached and daemon-threaded:
+     * it grows to the number of in-flight provisions (bounded per cloud by {@code maxInstances}) and idles
+     * back to zero.
+     */
+    private static final ExecutorService PROVISION_POOL = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "xcpng-provisioner");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     private final String poolUrl;
     private final String credentialsId;
     private final boolean trustSelfSigned;
@@ -100,8 +114,8 @@ public class XcpngCloud extends Cloud {
 
     /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
-     * back to the shared remoting pool; a test injects a controllable one. Transient: behaviour, never
-     * persisted to {@code config.xml}.
+     * back to the dedicated {@link #PROVISION_POOL}; a test injects a controllable one. Transient:
+     * behaviour, never persisted to {@code config.xml}.
      */
     private transient ExecutorService provisionExecutor;
 
@@ -275,13 +289,13 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Executor that runs provisioning tasks. Production uses the shared remoting pool; a test injects
-     * one via {@link #setProvisionExecutor} to force a rejection or to hold tasks so the in-flight
-     * reservation is observable.
+     * Executor that runs provisioning tasks. Production uses the dedicated {@link #PROVISION_POOL} so the
+     * blocking online-wait never ties up remoting threads; a test injects one via {@link
+     * #setProvisionExecutor} to force a rejection or to hold tasks so the in-flight reservation is observable.
      */
     @NonNull
     private ExecutorService provisionExecutor() {
-        return provisionExecutor != null ? provisionExecutor : Computer.threadPoolForRemoting;
+        return provisionExecutor != null ? provisionExecutor : PROVISION_POOL;
     }
 
     /** Test seam: run provisioning submits on a controllable executor. */
