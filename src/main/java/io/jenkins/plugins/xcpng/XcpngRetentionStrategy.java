@@ -48,9 +48,16 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     @Override
     @SuppressWarnings("rawtypes") // Match CloudRetentionStrategy.check's raw parameter to override it.
     public long check(AbstractCloudComputer computer) {
-        // Deliberately not gated on isOnline(): a clone that started but never connected (bad boot,
-        // network, or JNLP misconfiguration) is offline forever, and gating on online would leave its
-        // VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
+        // A warm-pool spare that connected but has not yet run a build is kept hot for the queue rather
+        // than idle-reaped: that is the whole point of the warm pool. The exemption is deliberately
+        // narrow (see exemptFromIdleReap), so an offline spare that never connected, or one whose cloud
+        // was deleted, still falls through to the idle net below and can never leak its VM.
+        if (isExemptWarmSpare(computer)) {
+            return 1;
+        }
+        // Otherwise, deliberately not gated on isOnline(): a clone that started but never connected (bad
+        // boot, network, or JNLP misconfiguration) is offline forever, and gating on online would leave
+        // its VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
         // net is for, and matches the superclass CloudRetentionStrategy.
         if (idleMinutes > 0 && computer.isIdle()) {
             long idleMillis = System.currentTimeMillis() - computer.getIdleStartMilliseconds();
@@ -61,9 +68,31 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         return 1;
     }
 
+    /** Whether the computer backs an unused warm spare that should be kept hot rather than idle-reaped. */
+    private static boolean isExemptWarmSpare(AbstractCloudComputer<?> computer) {
+        return computer.getNode() instanceof XcpngAgent agent
+                && exemptFromIdleReap(agent.isWarm(), computer.isOnline(), agent.getCloud() != null);
+    }
+
+    /**
+     * Pure exemption rule, split out so its input combinations are unit-testable without a live computer.
+     * A warm spare is kept only while it is both online (an offline one that never connected must still be
+     * reaped so its VM does not leak) and still attached to a live cloud (a spare whose cloud was deleted
+     * must lose the exemption, or the idle net could never reclaim it).
+     */
+    static boolean exemptFromIdleReap(boolean warm, boolean online, boolean cloudPresent) {
+        return warm && online && cloudPresent;
+    }
+
     @Override
     public void taskAccepted(Executor executor, Queue.Task task) {
-        // Nothing to do on accept; reclamation happens once the one build finishes.
+        // The spare has work now: drop the warm exemption so it reverts to ordinary single-use behaviour
+        // (reclaimed by taskCompleted below, or by the idle net if the build never completes). A build is
+        // already running by the time this fires, so the computer is not idle and check() would not reap
+        // it anyway; this simply keeps the exemption predicate honest for any later idle moment.
+        if (executor.getOwner().getNode() instanceof XcpngAgent agent) {
+            agent.markUsed();
+        }
     }
 
     @Override

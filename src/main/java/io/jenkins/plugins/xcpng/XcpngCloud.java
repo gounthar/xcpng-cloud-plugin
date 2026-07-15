@@ -412,8 +412,10 @@ public class XcpngCloud extends Cloud {
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
-                XcpngAgent agent =
-                        new XcpngAgent(displayName, name, clone.value(), template, idleMinutes, activityId);
+                // On-demand agents are never warm: they are provisioned for a queued build, so they are
+                // used from birth. The warm-pool maintainer is the only caller that passes warm=true.
+                XcpngAgent agent = new XcpngAgent(
+                        displayName, name, clone.value(), template, idleMinutes, activityId, false);
                 LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
                 return agent;
             } catch (Exception e) {

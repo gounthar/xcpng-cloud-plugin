@@ -35,6 +35,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
 
     private static final Logger LOGGER = Logger.getLogger(XcpngAgent.class.getName());
 
+    private static final long serialVersionUID = 1L;
+
     /**
      * Working directory for the agent on the golden image. Must match the {@code -workDir} the golden
      * image's {@code jenkins-agent} systemd unit passes to the agent, which runs as the {@code debian}
@@ -52,13 +54,27 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     private final ProvisioningActivity.Id activityId;
 
+    /**
+     * True while this is an unused warm-pool spare: pre-booted and idle, waiting for its first build.
+     * The retention strategy leaves such an agent alone instead of idle-reaping it (that is the point of
+     * a warm pool). Cleared the moment it accepts work, after which it behaves like any single-use agent.
+     *
+     * <p>Transient: it lives only for this controller session. On a restart a reloaded agent comes back
+     * not-warm by default, which is deliberate. It guarantees a <em>used</em> agent can never be revived
+     * as a spare and run a second build on a no-longer-pristine VM, so single-use holds by construction;
+     * the only cost is that genuine unused spares are reaped and re-booted after a restart. Volatile
+     * because the retention thread reads it while the executor thread clears it.
+     */
+    private transient volatile boolean warm;
+
     public XcpngAgent(
             @NonNull String name,
             @NonNull String cloudName,
             @NonNull String vmRef,
             @NonNull XcpngTemplate template,
             int idleMinutes,
-            @NonNull ProvisioningActivity.Id activityId)
+            @NonNull ProvisioningActivity.Id activityId,
+            boolean warm)
             throws Descriptor.FormException, IOException {
         super(
                 name,
@@ -73,6 +89,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.cloudName = cloudName;
         this.vmRef = vmRef;
         this.activityId = activityId;
+        this.warm = warm;
     }
 
     /** The VM this agent runs on, as an opaque backend handle. */
@@ -99,6 +116,32 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     public ProvisioningActivity.Id getId() {
         return activityId;
+    }
+
+    /** True while this is an unused warm-pool spare the retention strategy should not idle-reap. */
+    public boolean isWarm() {
+        return warm;
+    }
+
+    /**
+     * Mark this spare as used, so it is no longer exempt from idle-reaping and reverts to single-use
+     * behaviour. Called when the agent accepts its first build. Idempotent, and a plain field write:
+     * {@link #warm} is transient, so there is nothing to persist and a restart resets every agent to
+     * not-warm regardless.
+     */
+    public void markUsed() {
+        warm = false;
+    }
+
+    /**
+     * On reload, force {@link #warm} back to not-warm. The field is transient runtime state, so a reloaded
+     * agent must never come back as a spare: that guarantees a used agent cannot be revived and run a
+     * second build on a dirty VM. Reassigning the transient field here (rather than relying on the default)
+     * also keeps serialization analysis satisfied that it is handled, matching {@link XcpngCloud#readResolve}.
+     */
+    protected Object readResolve() {
+        warm = false;
+        return super.readResolve();
     }
 
     @Override
