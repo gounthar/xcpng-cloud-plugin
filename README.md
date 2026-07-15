@@ -77,6 +77,7 @@ jenkins:
         credentialsId: "xcpng-root"
         trustSelfSigned: false
         maxInstances: 3
+        idleMinutes: 10
         templates:
           - templateName: "jenkins-agent-debian13"
             labelString: "xcpng-linux"
@@ -103,6 +104,7 @@ Cloud fields:
 | Credentials | `credentialsId` | ID of the username/password credential used for XAPI login. |
 | Trust self-signed certificate | `trustSelfSigned` | Skip TLS verification against the pool. Off by default. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
+| Idle minutes | `idleMinutes` | Minutes an agent may sit idle before it is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this is only the safety net for a clone that connects but never receives work. A non-positive value is clamped to the default. |
 | Templates | `templates` | One or more agent templates (see below). |
 
 Template fields:

@@ -27,13 +27,17 @@ class XcpngCloudTest {
     /** Saving the global config and reading it back must preserve every field. */
     @Test
     void configRoundTrip(JenkinsRule r) throws Exception {
-        r.jenkins.clouds.add(new XcpngCloud(
+        XcpngCloud cloud = new XcpngCloud(
                 "xcpng",
                 "https://pool.example.test",
                 "xcpng-root",
                 true,
                 3,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 4, 8192))));
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 4, 8192)));
+        // A non-default idle timeout so the assertion proves the optional setter survives the form, not
+        // merely that the field initializer happens to match.
+        cloud.setIdleMinutes(20);
+        r.jenkins.clouds.add(cloud);
         r.configRoundtrip();
 
         XcpngCloud reloaded = (XcpngCloud) r.jenkins.clouds.getByName("xcpng");
@@ -42,6 +46,7 @@ class XcpngCloudTest {
         assertEquals("xcpng-root", reloaded.getCredentialsId());
         assertTrue(reloaded.isTrustSelfSigned());
         assertEquals(3, reloaded.getMaxInstances());
+        assertEquals(20, reloaded.getIdleMinutes());
         assertEquals(1, reloaded.getTemplates().size());
 
         XcpngTemplate template = reloaded.getTemplates().get(0);
@@ -153,4 +158,42 @@ class XcpngCloudTest {
         assertEquals(2048, t.getMemoryMb(), "missing memory must clamp to the default, not 0");
     }
 
+    /**
+     * {@code idleMinutes} is an optional setter, so a cloud built without it must carry the default
+     * timeout rather than 0, which would switch the idle safety net off entirely.
+     */
+    @Test
+    void idleMinutesDefaultsWhenUnset(JenkinsRule r) {
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", false, 2, List.of());
+        assertEquals(10, cloud.getIdleMinutes(), "an unset idle timeout must default to 10, not 0");
+    }
+
+    /**
+     * A non-positive idle timeout must clamp to the default so the setter can never disable the reap.
+     */
+    @Test
+    void idleMinutesClampsNonPositiveToDefault(JenkinsRule r) {
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", false, 2, List.of());
+        cloud.setIdleMinutes(0);
+        assertEquals(10, cloud.getIdleMinutes(), "zero must clamp to the default, not disable the reap");
+        cloud.setIdleMinutes(-5);
+        assertEquals(10, cloud.getIdleMinutes(), "a negative value must clamp to the default");
+        cloud.setIdleMinutes(15);
+        assertEquals(15, cloud.getIdleMinutes(), "a positive value must be kept as-is");
+    }
+
+    /**
+     * A config persisted before {@code idleMinutes} existed reloads with the field at 0. {@code
+     * readResolve} must restore the default so the safety-net reap is never left switched off.
+     */
+    @Test
+    void legacyConfigWithoutIdleMinutesRestoresDefault(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngCloud>\n"
+                + "  <name>xcpng</name>\n"
+                + "  <poolUrl>https://pool.example.test</poolUrl>\n"
+                + "  <maxInstances>2</maxInstances>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngCloud>\n";
+        XcpngCloud cloud = (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertEquals(10, cloud.getIdleMinutes(), "a missing idleMinutes must restore the default, not stay 0");
+    }
 }

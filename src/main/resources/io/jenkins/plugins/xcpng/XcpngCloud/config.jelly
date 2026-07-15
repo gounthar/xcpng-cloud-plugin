@@ -15,6 +15,9 @@
   <f:entry title="${%Max instances}" field="maxInstances">
     <f:number default="2" clazz="positive-number"/>
   </f:entry>
+  <f:entry title="${%Idle minutes}" field="idleMinutes">
+    <f:number default="10" clazz="positive-number"/>
+  </f:entry>
   <f:entry title="${%Templates}">
     <f:repeatableHeteroProperty field="templates" hasHeader="true" addCaption="${%Add template}"/>
   </f:entry>

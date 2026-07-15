@@ -41,6 +41,7 @@ class XcpngCloudConfigurationAsCodeTest {
         assertEquals("xcpng-root", cloud.getCredentialsId());
         assertTrue(cloud.isTrustSelfSigned());
         assertEquals(3, cloud.getMaxInstances());
+        assertEquals(15, cloud.getIdleMinutes());
         assertEquals(1, cloud.getTemplates().size());
 
         XcpngTemplate template = cloud.getTemplates().get(0);

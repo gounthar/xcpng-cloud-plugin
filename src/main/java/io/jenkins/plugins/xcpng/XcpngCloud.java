@@ -45,6 +45,7 @@ import org.jenkinsci.Symbol;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.jenkinsci.plugins.cloudstats.TrackedPlannedNode;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.interceptor.RequirePOST;
 import org.kohsuke.stapler.verb.POST;
@@ -66,11 +67,12 @@ public class XcpngCloud extends Cloud {
     private static final Logger LOGGER = Logger.getLogger(XcpngCloud.class.getName());
 
     /**
-     * Idle timeout before an agent that connected but never received work is reclaimed. A constant in
-     * v0: the dominant path is single-use (destroyed after one build), and this is only the safety net.
-     * A per-cloud form field is a later refinement.
+     * Default idle timeout, in minutes, before an agent that connected but never received work is
+     * reclaimed. Applied when {@link #idleMinutes} is left unset in the form or JCasC, and as the
+     * floor a non-positive configured value is clamped to: the idle reap is the only safety net for a
+     * clone that boots but never connects, so disabling it entirely would leak that VM forever.
      */
-    private static final int RETENTION_IDLE_MINUTES = 10;
+    private static final int DEFAULT_IDLE_MINUTES = 10;
 
     /** How long to wait for a provisioned agent to connect before giving up and tearing its VM down. */
     private static final int ONLINE_TIMEOUT_MINUTES = 5;
@@ -97,6 +99,15 @@ public class XcpngCloud extends Cloud {
     // that predates these fields (the constructor does not run on deserialization).
     private int maxInstances;
     private List<XcpngTemplate> templates;
+
+    /**
+     * Idle timeout, in minutes, before an agent that connected but never received work is reclaimed.
+     * Optional: a {@link DataBoundSetter} rather than a constructor parameter, so an older config or a
+     * JCasC document that omits it keeps the {@link #DEFAULT_IDLE_MINUTES} field initializer. The
+     * dominant path is single-use (reaped after one build); this is only the safety net for a clone that
+     * boots but never connects. Not final: {@link #readResolve} re-applies the clamp on deserialization.
+     */
+    private int idleMinutes = DEFAULT_IDLE_MINUTES;
 
     /**
      * How a live client is opened. Null in production, where {@link #openClient()} builds an
@@ -160,6 +171,11 @@ public class XcpngCloud extends Cloud {
         if (maxInstances <= 0) {
             maxInstances = 1;
         }
+        // A config predating this field deserializes it to 0 (XStream skips the initializer); a
+        // non-positive value would disable the idle safety net, so restore the default.
+        if (idleMinutes <= 0) {
+            idleMinutes = DEFAULT_IDLE_MINUTES;
+        }
         if (inFlight == null) {
             inFlight = new AtomicInteger();
         }
@@ -183,6 +199,19 @@ public class XcpngCloud extends Cloud {
 
     public int getMaxInstances() {
         return maxInstances;
+    }
+
+    public int getIdleMinutes() {
+        return idleMinutes;
+    }
+
+    /**
+     * Optional idle timeout. Clamped to {@link #DEFAULT_IDLE_MINUTES} for any non-positive value so the
+     * safety-net reap is never switched off, mirroring how {@code maxInstances} floors at one.
+     */
+    @DataBoundSetter
+    public void setIdleMinutes(int idleMinutes) {
+        this.idleMinutes = idleMinutes <= 0 ? DEFAULT_IDLE_MINUTES : idleMinutes;
     }
 
     @NonNull
@@ -383,8 +412,8 @@ public class XcpngCloud extends Cloud {
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
-                XcpngAgent agent = new XcpngAgent(
-                        displayName, name, clone.value(), template, RETENTION_IDLE_MINUTES, activityId);
+                XcpngAgent agent =
+                        new XcpngAgent(displayName, name, clone.value(), template, idleMinutes, activityId);
                 LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
                 return agent;
             } catch (Exception e) {
