@@ -6,6 +6,7 @@ jenkins:
         credentialsId: "xcpng-root"
         trustSelfSigned: true
         maxInstances: 3
+        idleMinutes: 15
         templates:
           - templateName: "jenkins-golden-debian"
             labelString: "xcpng-linux"
