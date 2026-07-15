@@ -60,9 +60,14 @@ class XcpngCloudConfigurationAsCodeTest {
     @Test
     void exportMatchesExpectedYaml(JenkinsRule r) throws Exception {
         configureFromYaml();
-        String exported = exportedClouds();
-        String expected = readResource("configuration-as-code-expected.yaml").trim();
-        assertEquals(expected, exported.trim(), "the exported cloud config must match the expected YAML");
+        // Normalise line endings on both sides: SnakeYAML always emits LF, but a Windows or autocrlf
+        // checkout reads the expected fixture back with CRLF (readResource takes it verbatim as bytes),
+        // so a raw comparison would fail off Linux -- e.g. on a future ci.jenkins.io Windows leg.
+        String exported = exportedClouds().replace("\r\n", "\n").trim();
+        String expected = readResource("configuration-as-code-expected.yaml")
+                .replace("\r\n", "\n")
+                .trim();
+        assertEquals(expected, exported, "the exported cloud config must match the expected YAML");
     }
 
     /**
