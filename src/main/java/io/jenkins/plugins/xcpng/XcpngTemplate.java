@@ -1,5 +1,6 @@
 package io.jenkins.plugins.xcpng;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.model.AbstractDescribableImpl;
@@ -7,6 +8,7 @@ import hudson.model.Descriptor;
 import hudson.util.FormValidation;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
 
 /**
@@ -35,6 +37,11 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
     private int numExecutors;
     private int numCpus;
     private int memoryMb;
+    // Optional: an OpenSSH *public* key. When set, each clone trusts it for the debian user (delivered
+    // per-clone over the same xenstore channel as the JNLP secret; the private half never touches a
+    // guest). Null when unset, which is the norm: the inbound launcher needs no SSH at all.
+    @CheckForNull
+    private String sshAuthorizedKey;
 
     @DataBoundConstructor
     public XcpngTemplate(String templateName, String labelString, int numExecutors, int numCpus, int memoryMb) {
@@ -59,6 +66,13 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         }
         if (memoryMb <= 0) {
             memoryMb = DEFAULT_MEMORY_MB;
+        }
+        // XStream populates fields directly, bypassing the DataBoundSetter's normalization, so a
+        // hand-edited config.xml with a blank or whitespace key would survive as non-null and get seeded
+        // as an empty authorized_keys line. Collapse it to null here, matching the setter.
+        if (sshAuthorizedKey != null) {
+            String trimmed = sshAuthorizedKey.trim();
+            sshAuthorizedKey = trimmed.isEmpty() ? null : trimmed;
         }
         return this;
     }
@@ -92,6 +106,23 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         return memoryMb * 1024L * 1024L;
     }
 
+    /**
+     * The operator-supplied OpenSSH public key each clone trusts for the debian user, or null when
+     * none is set. Optional, and opt-in: an inbound-only agent never needs it. Stored trimmed.
+     */
+    @CheckForNull
+    public String getSshAuthorizedKey() {
+        return sshAuthorizedKey;
+    }
+
+    @DataBoundSetter
+    public void setSshAuthorizedKey(@CheckForNull String sshAuthorizedKey) {
+        // Normalise a blank textarea to null so getSshAuthorizedKey() is either a real key or nothing,
+        // and the seed logic can gate on non-null rather than re-checking for blank.
+        String trimmed = sshAuthorizedKey == null ? null : sshAuthorizedKey.trim();
+        this.sshAuthorizedKey = trimmed == null || trimmed.isEmpty() ? null : trimmed;
+    }
+
     @Extension
     @Symbol("xcpngTemplate")
     public static class DescriptorImpl extends Descriptor<XcpngTemplate> {
@@ -114,6 +145,46 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
 
         public FormValidation doCheckMemoryMb(@QueryParameter String value) {
             return checkPositiveInt(value, "The memory (MiB)");
+        }
+
+        /**
+         * Accepted OpenSSH public-key type prefixes; anything else is almost certainly not a pubkey.
+         * ssh-dss (DSA) is deliberately absent: current OpenSSH disables it, so such a key would validate
+         * here yet never authenticate on the agent.
+         */
+        private static final String[] PUBLIC_KEY_PREFIXES = {
+            "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-"
+        };
+
+        /**
+         * Optional field, so blank is fine. Otherwise require something that looks like an OpenSSH
+         * public key, and reject a pasted private key outright: the private half must never reach the
+         * plugin, let alone a guest.
+         */
+        public FormValidation doCheckSshAuthorizedKey(@QueryParameter String value) {
+            if (value == null || value.isBlank()) {
+                return FormValidation.ok();
+            }
+            String key = value.trim();
+            if (key.contains("\n") || key.contains("\r")) {
+                // Trimming strips only the ends, so an embedded newline would otherwise smuggle a whole
+                // block of keys past a first-line prefix check, and the seed writes the value verbatim
+                // into the agent's authorized_keys. One key, one line.
+                return FormValidation.error(
+                        "Enter a single public key on one line; line breaks and multiple keys are not accepted.");
+            }
+            if (key.contains("PRIVATE KEY")) {
+                return FormValidation.error(
+                        "That looks like a private key. Paste the public key (e.g. the contents of a .pub file);"
+                                + " the private key must stay with you and never reaches the agent.");
+            }
+            for (String prefix : PUBLIC_KEY_PREFIXES) {
+                if (key.startsWith(prefix)) {
+                    return FormValidation.ok();
+                }
+            }
+            return FormValidation.error(
+                    "Enter a single OpenSSH public key, starting with a type such as ssh-ed25519 or ssh-rsa.");
         }
 
         private static FormValidation checkPositiveInt(String value, String what) {

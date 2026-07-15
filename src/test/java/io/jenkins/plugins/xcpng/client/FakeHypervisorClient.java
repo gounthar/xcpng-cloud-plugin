@@ -26,6 +26,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private boolean pingFails = false;
     private boolean startFails = false;
     private String assignIpOnStart = null;
+    private ProvisionSpec lastSpec = null;
 
     public FakeHypervisorClient(String... templates) {
         this.knownTemplates = new LinkedHashSet<>(List.of(templates));
@@ -54,6 +55,11 @@ public final class FakeHypervisorClient implements HypervisorClient {
         return Collections.unmodifiableList(calls);
     }
 
+    /** The spec passed to the most recent {@link #cloneFromTemplate}, to assert the seed it carried. */
+    public ProvisionSpec lastSpec() {
+        return lastSpec;
+    }
+
     @Override
     public VmRef resolveTemplate(String name) {
         calls.add("resolveTemplate:" + name);
@@ -65,6 +71,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public VmRef cloneFromTemplate(VmRef template, ProvisionSpec spec) {
+        this.lastSpec = spec;
         VmRef clone = new VmRef("vm/" + spec.name() + "/" + (++cloneCounter));
         calls.add("cloneFromTemplate:" + template.value() + "->" + clone.value());
         states.put(clone.value(), VmState.HALTED);

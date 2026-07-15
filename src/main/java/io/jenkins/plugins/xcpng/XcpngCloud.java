@@ -26,17 +26,21 @@ import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
@@ -66,6 +70,24 @@ public class XcpngCloud extends Cloud {
      */
     private static final int RETENTION_IDLE_MINUTES = 10;
 
+    /** How long to wait for a provisioned agent to connect before giving up and tearing its VM down. */
+    private static final int ONLINE_TIMEOUT_MINUTES = 5;
+
+    private static final long ONLINE_POLL_MILLIS = 1000L;
+
+    /**
+     * Dedicated pool for provisioning tasks. Each task blocks up to {@link #ONLINE_TIMEOUT_MINUTES}
+     * waiting for its agent to connect, so it runs here rather than on {@code Computer.threadPoolForRemoting}
+     * where long waits would compete with the controller's own remoting work. Cached and daemon-threaded:
+     * it grows to the number of in-flight provisions (bounded per cloud by {@code maxInstances}) and idles
+     * back to zero.
+     */
+    private static final ExecutorService PROVISION_POOL = Executors.newCachedThreadPool(runnable -> {
+        Thread thread = new Thread(runnable, "xcpng-provisioner");
+        thread.setDaemon(true);
+        return thread;
+    });
+
     private final String poolUrl;
     private final String credentialsId;
     private final boolean trustSelfSigned;
@@ -92,10 +114,18 @@ public class XcpngCloud extends Cloud {
 
     /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
-     * back to the shared remoting pool; a test injects a controllable one. Transient: behaviour, never
-     * persisted to {@code config.xml}.
+     * back to the dedicated {@link #PROVISION_POOL}; a test injects a controllable one. Transient:
+     * behaviour, never persisted to {@code config.xml}.
      */
     private transient ExecutorService provisionExecutor;
+
+    /**
+     * Whether a provisioning task registers the node and waits for it to come online before completing
+     * the planned-node future (the production behaviour, which stops the NodeProvisioner over-provisioning).
+     * A test flips this off so the fake, never-connecting agents complete immediately. Transient; the
+     * field initializer covers a fresh instance and {@link #readResolve} a deserialized one.
+     */
+    private transient boolean waitForOnline = true;
 
     @DataBoundConstructor
     public XcpngCloud(
@@ -131,6 +161,9 @@ public class XcpngCloud extends Cloud {
         if (inFlight == null) {
             inFlight = new AtomicInteger();
         }
+        // Transient boolean: XStream skips the field initializer, so a reloaded cloud would default to
+        // false (fast-complete) and over-provision. Restore the production behaviour.
+        waitForOnline = true;
         return this;
     }
 
@@ -195,29 +228,39 @@ public class XcpngCloud extends Cloud {
                     if (future.isCancelled()) {
                         return;
                     }
+                    Node node = null;
                     try {
-                        Node node = provisionNode(template, displayName);
+                        node = provisionNode(template, displayName);
+                        // Keep the planned node "pending" until the agent actually connects, not merely
+                        // until the VM clones (~2s). The NodeProvisioner counts a completed PlannedNode as
+                        // delivered capacity, so completing early -- while the node is registered but still
+                        // offline -- made it provision a second VM for a single build. Register the node now
+                        // so the inbound agent can dial in, then wait for it to come online. On completion
+                        // the NodeProvisioner re-adds the same instance, which is a no-op (node == existing).
+                        if (waitForOnline) {
+                            Jenkins.get().addNode(node);
+                            awaitOnline(node, displayName, future);
+                        }
                         if (!future.complete(node) && node instanceof XcpngAgent agent) {
                             // The planned node was cancelled while this VM was being built, so it will
-                            // never be added to Jenkins. Tear it down rather than leak it on the pool.
+                            // never be used. Tear it down rather than leak it on the pool.
                             LOGGER.log(
                                     Level.WARNING,
                                     () -> "Provision of " + displayName
                                             + " completed after cancellation; terminating the orphaned agent");
-                            try {
-                                agent.terminate();
-                            } catch (Exception e) {
-                                LOGGER.log(
-                                        Level.WARNING,
-                                        e,
-                                        () -> "Failed to terminate orphaned agent " + displayName);
-                            }
+                            terminateQuietly(agent, displayName);
                         }
                     } catch (Throwable t) {
                         // Preserve the interrupt so higher-level shutdown/cancellation logic still sees it,
                         // rather than swallowing it into the future's exceptional completion.
                         if (t instanceof InterruptedException) {
                             Thread.currentThread().interrupt();
+                        }
+                        // If the VM was built and registered but never came online (timeout, or a failure
+                        // after clone), tear it down so a failed provision leaks neither a VM nor a
+                        // half-added offline node.
+                        if (node instanceof XcpngAgent agent) {
+                            terminateQuietly(agent, displayName);
                         }
                         future.completeExceptionally(t);
                     }
@@ -246,13 +289,13 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Executor that runs provisioning tasks. Production uses the shared remoting pool; a test injects
-     * one via {@link #setProvisionExecutor} to force a rejection or to hold tasks so the in-flight
-     * reservation is observable.
+     * Executor that runs provisioning tasks. Production uses the dedicated {@link #PROVISION_POOL} so the
+     * blocking online-wait never ties up remoting threads; a test injects one via {@link
+     * #setProvisionExecutor} to force a rejection or to hold tasks so the in-flight reservation is observable.
      */
     @NonNull
     private ExecutorService provisionExecutor() {
-        return provisionExecutor != null ? provisionExecutor : Computer.threadPoolForRemoting;
+        return provisionExecutor != null ? provisionExecutor : PROVISION_POOL;
     }
 
     /** Test seam: run provisioning submits on a controllable executor. */
@@ -266,6 +309,50 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
+     * Test seam: with a fake client the provisioned agents never connect, so the online wait would block
+     * for the whole timeout. Turning it off makes the planned-node future complete as soon as the VM is
+     * "cloned", which is what the capacity/planning tests assert against.
+     */
+    void setWaitForOnline(boolean waitForOnline) {
+        this.waitForOnline = waitForOnline;
+    }
+
+    /**
+     * Block until the provisioned node's computer connects, or fail after {@link #ONLINE_TIMEOUT_MINUTES}.
+     * Returns early without error if the planned node is cancelled while waiting: the caller's cancellation
+     * path then tears the VM down.
+     */
+    private static void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
+            throws InterruptedException {
+        long deadlineNanos = System.nanoTime() + ONLINE_TIMEOUT_MINUTES * 60L * 1_000_000_000L;
+        // Re-fetch the computer each pass and treat a null one as "not online yet": returning early on a
+        // transiently-null Computer would complete the future without the agent connected, reintroducing
+        // the over-provisioning this wait exists to prevent.
+        while (true) {
+            Computer computer = node.toComputer();
+            if (computer != null && computer.isOnline()) {
+                return;
+            }
+            if (future.isCancelled()) {
+                return;
+            }
+            if (System.nanoTime() > deadlineNanos) {
+                throw new IllegalStateException(
+                        "agent " + displayName + " did not come online within " + ONLINE_TIMEOUT_MINUTES + " minutes");
+            }
+            Thread.sleep(ONLINE_POLL_MILLIS);
+        }
+    }
+
+    private static void terminateQuietly(@NonNull XcpngAgent agent, @NonNull String displayName) {
+        try {
+            agent.terminate();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + displayName);
+        }
+    }
+
+    /**
      * Clone the template, start it, and wrap the running VM in a single-use inbound agent. Called on a
      * background thread by {@link #provision}; the returned {@link Node} is added to Jenkins by the
      * node provisioner once this future completes. Package-visible so a test can drive it against a
@@ -275,7 +362,13 @@ public class XcpngCloud extends Cloud {
         try (HypervisorClient client = openClient()) {
             VmRef templateRef = client.resolveTemplate(template.getTemplateName());
             ProvisionSpec spec = new ProvisionSpec(
-                    displayName, template.getNumCpus(), template.getMemoryBytes(), null, null, null);
+                    displayName,
+                    template.getNumCpus(),
+                    template.getMemoryBytes(),
+                    null,
+                    null,
+                    null,
+                    seedFor(displayName, template));
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
@@ -301,6 +394,38 @@ public class XcpngCloud extends Cloud {
                 throw e;
             }
         }
+    }
+
+    /**
+     * The per-clone seed the guest reads (from xenstore, via {@link ProvisionSpec#guestData()}) to
+     * launch its inbound agent unattended: the controller URL it dials, the node name it registers as,
+     * and the JNLP secret it must present. The secret is an HMAC of the node name, so it is stable and
+     * computable here, before the {@link XcpngAgent} node is added and its computer exists. The URL is
+     * omitted when the controller has no root URL configured; the guest then has nothing to dial and the
+     * agent is reclaimed by the idle timeout, which is the right outcome for that misconfiguration.
+     */
+    @NonNull
+    private static Map<String, String> seedFor(@NonNull String nodeName, @NonNull XcpngTemplate template) {
+        Map<String, String> seed = new LinkedHashMap<>();
+        String rootUrl = Jenkins.get().getRootUrl();
+        if (rootUrl == null || rootUrl.isBlank()) {
+            LOGGER.log(
+                    Level.WARNING,
+                    () -> "Jenkins root URL is not set; agent " + nodeName
+                            + " will have no controller URL to connect back to");
+        } else {
+            seed.put("url", rootUrl);
+        }
+        seed.put("name", nodeName);
+        seed.put("secret", JnlpAgentReceiver.SLAVE_SECRET.mac(nodeName));
+        // Optional operator-supplied public key. Delivered on the same channel; the guest writes it to
+        // the debian user's authorized_keys. Absent unless the template sets it, keeping inbound-only
+        // clones key-free. The setter already trimmed and null-normalised it.
+        String sshKey = template.getSshAuthorizedKey();
+        if (sshKey != null) {
+            seed.put("ssh_authorized_key", sshKey);
+        }
+        return seed;
     }
 
     /**

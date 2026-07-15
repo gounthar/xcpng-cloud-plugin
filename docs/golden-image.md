@@ -21,14 +21,17 @@ preparation, as this does.
 | requirement | why |
 |---|---|
 | **Java 21** | Jenkins core is compiled at class-file **major 65**. An agent on Java 17 opens its WebSocket, logs `Connected`, then dies in a silent reconnect loop with `UnsupportedClassVersionError`. It never reports a useful reason; you have to read `agent.log` inside the VM. The controller and its agents must run the same Java major. |
-| **cloud-init** | The plugin passes the controller URL, agent name and JNLP secret to each clone through a NoCloud seed. Without cloud-init nothing consumes it. |
+| **`xenstore-read`** | The baked agent service reads its per-clone data (controller URL, agent name, JNLP secret) from xenstore, so the guest needs a `xenstore-read` binary. On Debian 13 `xe-guest-utilities` 7.30 already ships one; `provision.sh` installs `xenstore-utils` only as a fallback when it is missing. |
 | **`xe-guest-utilities`** | Without the guest agent the VM never writes its address to xenstore, and XAPI reports `networks={}` for its whole life. The inbound launcher does not need an address, but `tools/measure_clone.py` and any future SSH launcher do. |
-| **a CD-ROM drive** | Where the NoCloud seed is attached. The shipped Debian templates already have one. |
+| **cloud-init** | Needed for the from-scratch `import_raw_vdi` bootstrap, which relies on a seed `network-config` to bring the network up (see below). The clone path no longer consumes it: per-clone data arrives over xenstore, not a NoCloud seed. |
 
-`sshd` and an authorized key are needed **only** if you intend to use an SSH launcher later. The
-inbound launcher never opens an SSH connection, so an inbound-only image can drop both.
+`sshd` is in the image already. An authorized key is **opt-in**: set the agent template's SSH public
+key field and each clone trusts it for the `debian` user (delivered per-clone over xenstore, see
+below). An inbound-only agent needs no key at all, so leaving the field blank writes no
+`authorized_keys` and refuses SSH. The field is there for one-off verification and a future SSH
+launcher; the **private key never leaves you**.
 
-One image serves both launchers. What differs is what you attach at clone time, not the disk.
+One image serves both launchers. What differs is the per-clone xenstore data, not the disk.
 
 ## Building it with Packer (recommended)
 
@@ -73,8 +76,10 @@ template field.
 2. Install `sudo curl ca-certificates cloud-init`.
 3. Attach `guest-tools.iso` to the VM's CD drive.
 4. Run `image/provision.sh` as root inside the VM. It installs Temurin 21 from Adoptium, installs
-   `xe-guest-utilities` from the CD, resets cloud-init and the machine identity, and drops a
-   `/var/lib/golden-image-ready` marker.
+   `xe-guest-utilities` from the CD and `xenstore-utils` for the guest xenstore client, bakes the
+   `jenkins-agent` and `jenkins-agent-ssh-seed` systemd units that read the per-clone data from
+   xenstore, resets cloud-init and the machine identity, and drops a `/var/lib/golden-image-ready`
+   marker.
 5. Shut the VM down.
 6. Make it a **template**: `xe vm-param-set uuid=<uuid> is-a-template=true`.
 
@@ -89,12 +94,38 @@ there. It is chosen to pin the JVM vendor and version independently of the distr
 match what the Jenkins project itself installs. On Debian 12 there was no choice at all: bookworm
 ships no `openjdk-21`, not even in `bookworm-backports`.
 
-## The per-clone seed
+## Per-clone data over xenstore
 
-`image/seed/` holds the files that make up the per-clone NoCloud seed. Three files:
-`user-data.tmpl` and `meta-data.tmpl` are rendered per clone; `network-config` is static. None is
-part of the image. **These are groundwork, not a wired code path yet:** rendering them and attaching
-the seed is M3 work. `provision()` is still inert and `user-data.tmpl` is marked `NOT YET WIRED UP`.
+The clone path delivers each agent's data through **xenstore**, not a cloud-init seed. Before it
+starts a clone, the plugin writes these keys under `vm-data/jenkins/` (only `vm-data/*` keys are
+pushed into the guest):
+
+| key | what |
+|---|---|
+| `url` | the controller root URL the agent dials back to |
+| `name` | the Jenkins node name the agent registers as |
+| `secret` | the node's JNLP secret, an HMAC of the name computable before the node exists |
+| `ssh_authorized_key` | **optional**; the operator's OpenSSH public key, present only when the template's SSH key field is set |
+
+`provision.sh` bakes two systemd units that read these at boot. `jenkins-agent.service` runs the
+launcher as **root** (a xenstore read is root-only: the `debian` user is denied on
+`/proc/xen/xenbus`), writes the secret to a `debian`-owned file kept off the java command line, and
+execs the `-webSocket` agent as `debian`. `jenkins-agent-ssh-seed.service` is an independent oneshot
+that writes the `debian` user's `authorized_keys` from `ssh_authorized_key` when set, so SSH comes up
+even if the agent is flapping.
+
+The SSH key is **per-clone and opt-in**. The operator supplies a **public** key on the agent
+template; the private half never touches the plugin or any guest. It is delivered on the same
+xenstore channel as the JNLP secret, so `XapiClient` needs no special handling. To revoke, clear the
+template field: the next clones read no key and trust nothing (the managed `authorized_keys` is
+rewritten each boot). An inbound-only fleet sets no key and stays SSH-closed.
+
+## The from-scratch seed (cloud-init)
+
+`image/seed/` holds the files that make up a NoCloud seed for the from-scratch `import_raw_vdi`
+bootstrap: `user-data.tmpl`, `meta-data.tmpl`, and a static `network-config`. The clone path no
+longer uses these (it seeds over xenstore, above); they remain for the from-scratch path, whose
+freshly imported disk has no persisted network and so needs cloud-init to bring one up.
 
 `meta-data.tmpl` carries `instance-id`, and it must be **unique per clone**. Use the VM's XAPI UUID.
 

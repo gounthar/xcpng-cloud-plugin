@@ -15,4 +15,7 @@
   <f:entry title="${%Memory (MiB)}" field="memoryMb">
     <f:number default="2048" clazz="positive-number"/>
   </f:entry>
+  <f:entry title="${%SSH authorized key (optional)}" field="sshAuthorizedKey">
+    <f:textarea/>
+  </f:entry>
 </j:jelly>
