@@ -1,6 +1,6 @@
 <?jelly escape-by-default='true'?>
 <div>
   Provisions ephemeral Jenkins build agents on an XCP-ng pool, cloning each agent from a golden
-  image and destroying it (and its disks) once it goes idle.
-  Early scaffold: the cloud registers and can be configured, but does not provision agents yet.
+  image and destroying it (and its disks) once it goes idle. Each clone is seeded over xenstore and
+  connects back to the controller over an inbound WebSocket, runs a single build, and is reaped.
 </div>
