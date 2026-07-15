@@ -30,8 +30,13 @@ public class XcpngAgent extends AbstractCloudSlave {
 
     private static final Logger LOGGER = Logger.getLogger(XcpngAgent.class.getName());
 
-    /** Working directory for the agent on the golden image. */
-    private static final String REMOTE_FS = "/home/jenkins/agent";
+    /**
+     * Working directory for the agent on the golden image. Must match the {@code -workDir} the golden
+     * image's {@code jenkins-agent} systemd unit passes to the agent, which runs as the {@code debian}
+     * user: Jenkins runs builds under {@code REMOTE_FS/workspace}, so a mismatch here would send builds
+     * to a path the agent user cannot write.
+     */
+    private static final String REMOTE_FS = "/home/debian/agent";
 
     private final String cloudName;
     private final String vmRef;
