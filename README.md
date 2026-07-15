@@ -113,7 +113,7 @@ Template fields:
 | Label | `labelString` | Label expression a build must request to be matched to this template. |
 | Executors | `numExecutors` | Executors per agent. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
-| Memory (MB) | `memoryMb` | Memory for the cloned VM in megabytes. Defaults to 2048. |
+| Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |
 | SSH authorized key | `sshAuthorizedKey` | A public key seeded into the clone over xenstore. Paste a public key only; a pasted private key is rejected. |
 
 ## Preparing a golden image
