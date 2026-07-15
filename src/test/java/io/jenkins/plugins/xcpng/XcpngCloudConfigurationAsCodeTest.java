@@ -7,6 +7,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.cloudbees.plugins.credentials.CredentialsScope;
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
+import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
 import io.jenkins.plugins.casc.ConfigurationAsCode;
 import io.jenkins.plugins.casc.ConfigurationContext;
 import io.jenkins.plugins.casc.ConfiguratorRegistry;
@@ -62,13 +65,25 @@ class XcpngCloudConfigurationAsCodeTest {
         assertEquals(expected, exported.trim(), "the exported cloud config must match the expected YAML");
     }
 
-    /** The credential is exported by ID only; the secret it points at must never appear in the YAML. */
+    /**
+     * The credential is exported by ID only; the secret it points at must never appear in the YAML.
+     * Seed a real credential under the ID the fixture references with a unique sentinel password, so the
+     * assertion proves an actual secret is excluded rather than merely that the literal word "password"
+     * is absent.
+     */
     @Test
     void exportKeepsCredentialAsIdOnly(JenkinsRule r) throws Exception {
+        String secret = "s3ntinel-secret-must-not-export";
+        SystemCredentialsProvider.getInstance()
+                .getCredentials()
+                .add(new UsernamePasswordCredentialsImpl(
+                        CredentialsScope.GLOBAL, "xcpng-root", "XCP-ng lab", "root", secret));
+        SystemCredentialsProvider.getInstance().save();
+
         configureFromYaml();
         String exported = exportedClouds();
         assertTrue(exported.contains("xcpng-root"), "the credential ID should be exported");
-        assertFalse(exported.contains("password"), "no secret material should be exported");
+        assertFalse(exported.contains(secret), "the credential's secret must never appear in the export");
     }
 
     private void configureFromYaml() throws Exception {
