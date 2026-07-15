@@ -7,6 +7,7 @@
     templates:
     - labelString: "xcpng-linux"
       memoryMb: 8192
+      minInstances: 1
       numCpus: 4
       numExecutors: 2
       sshAuthorizedKey: "ssh-ed25519 AAAAExampleKeyForRoundTripTest lab"

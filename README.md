@@ -116,6 +116,7 @@ Template fields:
 | Executors | `numExecutors` | Executors per agent. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
 | Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |
+| Min instances (warm pool) | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. |
 | SSH authorized key | `sshAuthorizedKey` | A public key seeded into the clone over xenstore. Paste a public key only; a pasted private key is rejected. |
 
 ## Preparing a golden image
@@ -148,9 +149,8 @@ image from scratch. Adapt these to your own distribution and controller URL.
 ## Not in this version
 
 Deliberately out of scope for the spike: multiple templates matched by a single build, Windows
-agents, warm pools of pre-booted agents, pinning agents to specific hosts, per-label instance
-accounting, and controller-initiated SSH launching. The idle timeout is currently a fixed constant
-rather than a configurable field. These are cuts, not dead ends.
+agents, pinning agents to specific hosts, per-label instance accounting, and controller-initiated
+SSH launching. These are cuts, not dead ends.
 
 ## Building and testing
 

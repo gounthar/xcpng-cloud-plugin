@@ -50,6 +50,7 @@ class XcpngCloudConfigurationAsCodeTest {
         assertEquals(2, template.getNumExecutors());
         assertEquals(4, template.getNumCpus());
         assertEquals(8192, template.getMemoryMb());
+        assertEquals(1, template.getMinInstances());
         assertEquals("ssh-ed25519 AAAAExampleKeyForRoundTripTest lab", template.getSshAuthorizedKey());
     }
 

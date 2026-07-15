@@ -159,6 +159,59 @@ class XcpngCloudTest {
     }
 
     /**
+     * {@code minInstances} is an optional warm-pool setter. A template persisted before it existed
+     * reloads with the field at 0, which is exactly the "warm pool off" default, so no warm agents are
+     * ever booted for a legacy config.
+     */
+    @Test
+    void legacyTemplateWithoutMinInstancesDefaultsToZero(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                + "  <templateName>jenkins-golden-debian</templateName>\n"
+                + "  <labelString>xcpng-linux</labelString>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+        XcpngTemplate t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertEquals(0, t.getMinInstances(), "a missing minInstances must default to 0 (warm pool off)");
+    }
+
+    /**
+     * The warm-pool size floors at 0 (its valid "off" value), not at a positive default: a negative
+     * value cannot mean "negative agents", and 0 must survive as-is.
+     */
+    @Test
+    void minInstancesClampsNegativeToZero(JenkinsRule r) {
+        XcpngTemplate t = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        assertEquals(0, t.getMinInstances(), "an unset warm-pool size must be 0");
+        t.setMinInstances(-3);
+        assertEquals(0, t.getMinInstances(), "a negative warm-pool size must clamp to 0");
+        t.setMinInstances(2);
+        assertEquals(2, t.getMinInstances(), "a positive warm-pool size must be kept as-is");
+    }
+
+    /**
+     * The warm-pool field validator: rejects negatives, and warns (does not block) when the target
+     * exceeds the enclosing cloud's instance cap, since warm agents count against that cap. A null
+     * cloud (field checked outside a cloud form) skips the cross-field warning.
+     */
+    @Test
+    void minInstancesValidationWarnsWhenAboveCap(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 2, List.of());
+
+        assertEquals(FormValidation.Kind.OK, d.doCheckMinInstances(cloud, "").kind);
+        assertEquals(FormValidation.Kind.OK, d.doCheckMinInstances(cloud, "2").kind, "at the cap is fine");
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckMinInstances(cloud, "-1").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckMinInstances(cloud, "x").kind);
+        assertEquals(
+                FormValidation.Kind.WARNING,
+                d.doCheckMinInstances(cloud, "5").kind,
+                "a target above the cap must warn, not block");
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckMinInstances(null, "5").kind,
+                "no enclosing cloud means no cross-field warning");
+    }
+
+    /**
      * {@code idleMinutes} is an optional setter, so a cloud built without it must carry the default
      * timeout rather than 0, which would switch the idle safety net off entirely.
      */

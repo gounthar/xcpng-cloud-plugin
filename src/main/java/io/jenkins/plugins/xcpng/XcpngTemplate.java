@@ -7,6 +7,7 @@ import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
 import hudson.util.FormValidation;
 import org.jenkinsci.Symbol;
+import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
@@ -43,6 +44,15 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
     @CheckForNull
     private String sshAuthorizedKey;
 
+    /**
+     * Warm-pool target: how many pre-booted, idle agents of this template to keep hot so a queued
+     * build lands on a ready executor instead of waiting for a cold clone. Optional; 0 (the default)
+     * turns the warm pool off, which is why it clamps to 0 rather than a positive floor like the
+     * cloud's {@code idleMinutes}. Each warm agent is still single-use: it runs one build and is
+     * destroyed, and the pool maintainer boots a replacement.
+     */
+    private int minInstances;
+
     @DataBoundConstructor
     public XcpngTemplate(String templateName, String labelString, int numExecutors, int numCpus, int memoryMb) {
         this.templateName = templateName;
@@ -73,6 +83,11 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         if (sshAuthorizedKey != null) {
             String trimmed = sshAuthorizedKey.trim();
             sshAuthorizedKey = trimmed.isEmpty() ? null : trimmed;
+        }
+        // A config predating this field deserializes it to 0, which is already the "off" default; this
+        // only floors a hand-edited negative, mirroring the setter's clamp.
+        if (minInstances < 0) {
+            minInstances = 0;
         }
         return this;
     }
@@ -123,6 +138,20 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         this.sshAuthorizedKey = trimmed == null || trimmed.isEmpty() ? null : trimmed;
     }
 
+    /** Warm-pool target: pre-booted idle agents of this template to keep hot. 0 disables the warm pool. */
+    public int getMinInstances() {
+        return minInstances;
+    }
+
+    /**
+     * Optional warm-pool size. Clamped so a negative value cannot mean "negative agents": 0 is the
+     * valid "off" value, so this floors at 0 rather than at a positive default.
+     */
+    @DataBoundSetter
+    public void setMinInstances(int minInstances) {
+        this.minInstances = Math.max(0, minInstances);
+    }
+
     @Extension
     @Symbol("xcpngTemplate")
     public static class DescriptorImpl extends Descriptor<XcpngTemplate> {
@@ -145,6 +174,33 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
 
         public FormValidation doCheckMemoryMb(@QueryParameter String value) {
             return checkPositiveInt(value, "The memory (MiB)");
+        }
+
+        /**
+         * The warm-pool size accepts 0 (the "off" default), so it takes the non-negative check rather
+         * than the positive one the sizing fields use. When the enclosing cloud is in the form path, also
+         * warn if the target exceeds the cloud's instance cap: warm agents count against {@code
+         * maxInstances}, so a larger target can never be filled.
+         */
+        public FormValidation doCheckMinInstances(
+                @AncestorInPath XcpngCloud cloud, @QueryParameter String value) {
+            if (value == null || value.isBlank()) {
+                return FormValidation.ok();
+            }
+            int count;
+            try {
+                count = Integer.parseInt(value.trim());
+            } catch (NumberFormatException e) {
+                return FormValidation.error("Min instances must be a whole number.");
+            }
+            if (count < 0) {
+                return FormValidation.error("Min instances cannot be negative.");
+            }
+            if (cloud != null && count > cloud.getMaxInstances()) {
+                return FormValidation.warning("Min instances (" + count + ") exceeds the cloud's Max instances ("
+                        + cloud.getMaxInstances() + "); the warm pool is capped by Max instances.");
+            }
+            return FormValidation.ok();
         }
 
         /**

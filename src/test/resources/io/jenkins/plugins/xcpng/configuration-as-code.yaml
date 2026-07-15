@@ -13,4 +13,5 @@ jenkins:
             numExecutors: 2
             numCpus: 4
             memoryMb: 8192
+            minInstances: 1
             sshAuthorizedKey: "ssh-ed25519 AAAAExampleKeyForRoundTripTest lab"
