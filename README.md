@@ -75,7 +75,7 @@ jenkins:
         name: "xcpng-lab"
         poolUrl: "https://192.168.1.87"
         credentialsId: "xcpng-root"
-        trustSelfSigned: true
+        trustSelfSigned: false
         maxInstances: 3
         templates:
           - templateName: "jenkins-agent-debian13"
@@ -85,6 +85,9 @@ jenkins:
             memoryMb: 8192
             sshAuthorizedKey: "ssh-ed25519 AAAA...replace-with-your-public-key you@example"
 ```
+
+Set `trustSelfSigned: true` only for a lab pool whose self-signed certificate you cannot replace;
+see [Security notes](#security-notes).
 
 The exported configuration never contains the XAPI password; it holds only the credential ID, which
 the controller resolves at the point of use.
