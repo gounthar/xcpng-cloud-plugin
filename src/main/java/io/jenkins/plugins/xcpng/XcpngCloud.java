@@ -42,6 +42,8 @@ import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.Symbol;
+import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
+import org.jenkinsci.plugins.cloudstats.TrackedPlannedNode;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.interceptor.RequirePOST;
@@ -212,6 +214,12 @@ public class XcpngCloud extends Cloud {
             // the pool. A UUID segment stays unique across restarts.
             final String displayName = "xcpng-" + template.getTemplateName() + "-"
                     + UUID.randomUUID().toString().substring(0, 8);
+            // The cloud-stats activity id for this provisioning. One instance is created here and shared:
+            // the TrackedPlannedNode below and the XcpngAgent built by provisionNode both carry this exact
+            // object. cloud-stats' Id equality is per-instance (a random fingerprint, not the names), so a
+            // rebuilt id would never correlate; the phases stay on one activity only by sharing this handle.
+            final ProvisioningActivity.Id activityId =
+                    new ProvisioningActivity.Id(name, template.getTemplateName(), displayName);
             // Reserve capacity before the clone starts and release it when the provision settles, so a
             // concurrent round sees the reservation and the cap holds even while clones are still booting.
             inFlight.incrementAndGet();
@@ -230,7 +238,7 @@ public class XcpngCloud extends Cloud {
                     }
                     Node node = null;
                     try {
-                        node = provisionNode(template, displayName);
+                        node = provisionNode(template, displayName, activityId);
                         // Keep the planned node "pending" until the agent actually connects, not merely
                         // until the VM clones (~2s). The NodeProvisioner counts a completed PlannedNode as
                         // delivered capacity, so completing early -- while the node is registered but still
@@ -275,7 +283,7 @@ public class XcpngCloud extends Cloud {
                         task.cancel(false);
                     }
                 });
-                planned.add(new NodeProvisioner.PlannedNode(displayName, future, template.getNumExecutors()));
+                planned.add(new TrackedPlannedNode(activityId, template.getNumExecutors(), future));
                 remaining -= template.getNumExecutors();
             } catch (RejectedExecutionException e) {
                 // The pool refused the task, which it does only while shutting down. Settle the future so
@@ -356,9 +364,12 @@ public class XcpngCloud extends Cloud {
      * Clone the template, start it, and wrap the running VM in a single-use inbound agent. Called on a
      * background thread by {@link #provision}; the returned {@link Node} is added to Jenkins by the
      * node provisioner once this future completes. Package-visible so a test can drive it against a
-     * fake client and assert the clone/start call sequence.
+     * fake client and assert the clone/start call sequence. The {@code activityId} is the same instance
+     * carried by the planned node, stamped onto the agent so cloud-stats keeps both on one activity.
      */
-    Node provisionNode(@NonNull XcpngTemplate template, @NonNull String displayName) throws Exception {
+    Node provisionNode(
+            @NonNull XcpngTemplate template, @NonNull String displayName, @NonNull ProvisioningActivity.Id activityId)
+            throws Exception {
         try (HypervisorClient client = openClient()) {
             VmRef templateRef = client.resolveTemplate(template.getTemplateName());
             ProvisionSpec spec = new ProvisionSpec(
@@ -372,7 +383,8 @@ public class XcpngCloud extends Cloud {
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
-                XcpngAgent agent = new XcpngAgent(displayName, name, clone.value(), template, RETENTION_IDLE_MINUTES);
+                XcpngAgent agent = new XcpngAgent(
+                        displayName, name, clone.value(), template, RETENTION_IDLE_MINUTES, activityId);
                 LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
                 return agent;
             } catch (Exception e) {

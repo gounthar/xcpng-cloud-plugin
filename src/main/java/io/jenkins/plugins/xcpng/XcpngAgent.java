@@ -17,6 +17,8 @@ import java.util.Collections;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
+import org.jenkinsci.plugins.cloudstats.TrackedItem;
 
 /**
  * An ephemeral inbound agent backed by one cloned XCP-ng VM.
@@ -25,8 +27,11 @@ import jenkins.model.Jenkins;
  * discovery and no controller-to-agent reachability. The clone's {@link VmRef} value is held here so
  * that terminating the node destroys the VM and its disks; the reference back to the owning cloud is
  * by name, since the {@link XcpngCloud} instance is not serialised with the node.
+ *
+ * <p>Implements {@link TrackedItem} so cloud-stats can tie this node, and its {@link XcpngComputer}, back
+ * to the provisioning activity the {@link XcpngCloud} started for it.
  */
-public class XcpngAgent extends AbstractCloudSlave {
+public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
 
     private static final Logger LOGGER = Logger.getLogger(XcpngAgent.class.getName());
 
@@ -41,12 +46,19 @@ public class XcpngAgent extends AbstractCloudSlave {
     private final String cloudName;
     private final String vmRef;
 
+    /**
+     * The cloud-stats provisioning activity this agent belongs to. Serialisable and persisted with the
+     * node so a controller restart keeps the correlation; {@link #getId()} hands it to cloud-stats.
+     */
+    private final ProvisioningActivity.Id activityId;
+
     public XcpngAgent(
             @NonNull String name,
             @NonNull String cloudName,
             @NonNull String vmRef,
             @NonNull XcpngTemplate template,
-            int idleMinutes)
+            int idleMinutes,
+            @NonNull ProvisioningActivity.Id activityId)
             throws Descriptor.FormException, IOException {
         super(
                 name,
@@ -60,6 +72,7 @@ public class XcpngAgent extends AbstractCloudSlave {
                 Collections.emptyList());
         this.cloudName = cloudName;
         this.vmRef = vmRef;
+        this.activityId = activityId;
     }
 
     /** The VM this agent runs on, as an opaque backend handle. */
@@ -79,6 +92,13 @@ public class XcpngAgent extends AbstractCloudSlave {
     public XcpngCloud getCloud() {
         Cloud cloud = Jenkins.get().clouds.getByName(cloudName);
         return cloud instanceof XcpngCloud xcpng ? xcpng : null;
+    }
+
+    /** The cloud-stats activity this agent was provisioned under; never null in practice. */
+    @Override
+    @CheckForNull
+    public ProvisioningActivity.Id getId() {
+        return activityId;
     }
 
     @Override
