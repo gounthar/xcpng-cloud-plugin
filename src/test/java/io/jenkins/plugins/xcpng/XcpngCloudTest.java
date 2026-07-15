@@ -159,6 +159,35 @@ class XcpngCloudTest {
     }
 
     /**
+     * {@code minInstances} is an optional warm-pool setter. A template persisted before it existed
+     * reloads with the field at 0, which is exactly the "warm pool off" default, so no warm agents are
+     * ever booted for a legacy config.
+     */
+    @Test
+    void legacyTemplateWithoutMinInstancesDefaultsToZero(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                + "  <templateName>jenkins-golden-debian</templateName>\n"
+                + "  <labelString>xcpng-linux</labelString>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+        XcpngTemplate t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertEquals(0, t.getMinInstances(), "a missing minInstances must default to 0 (warm pool off)");
+    }
+
+    /**
+     * The warm-pool size floors at 0 (its valid "off" value), not at a positive default: a negative
+     * value cannot mean "negative agents", and 0 must survive as-is.
+     */
+    @Test
+    void minInstancesClampsNegativeToZero(JenkinsRule r) {
+        XcpngTemplate t = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        assertEquals(0, t.getMinInstances(), "an unset warm-pool size must be 0");
+        t.setMinInstances(-3);
+        assertEquals(0, t.getMinInstances(), "a negative warm-pool size must clamp to 0");
+        t.setMinInstances(2);
+        assertEquals(2, t.getMinInstances(), "a positive warm-pool size must be kept as-is");
+    }
+
+    /**
      * {@code idleMinutes} is an optional setter, so a cloud built without it must carry the default
      * timeout rather than 0, which would switch the idle safety net off entirely.
      */
