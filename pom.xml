@@ -109,5 +109,24 @@
       <groupId>org.jenkins-ci.plugins</groupId>
       <artifactId>cloud-stats</artifactId>
     </dependency>
+
+    <!--
+      JCasC needs no runtime dependency here: the plugin is configurable purely through its
+      @DataBoundConstructor/@DataBoundSetter and @Symbol annotations, which configuration-as-code
+      discovers reflectively. These two are test-only, exercising the YAML import/export round-trip so a
+      controller can be stood up from configuration-as-code.yaml with no click-ops. Keeping them out of
+      the runtime scope leaves the plugin's install footprint unchanged for controllers that do not use
+      JCasC. The BOM manages both versions.
+    -->
+    <dependency>
+      <groupId>io.jenkins</groupId>
+      <artifactId>configuration-as-code</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>io.jenkins.configuration-as-code</groupId>
+      <artifactId>test-harness</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 </project>

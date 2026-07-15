@@ -1,0 +1,15 @@
+jenkins:
+  clouds:
+    - xcpng:
+        name: "xcpng-lab"
+        poolUrl: "https://192.168.1.87"
+        credentialsId: "xcpng-root"
+        trustSelfSigned: true
+        maxInstances: 3
+        templates:
+          - templateName: "jenkins-golden-debian"
+            labelString: "xcpng-linux"
+            numExecutors: 2
+            numCpus: 4
+            memoryMb: 8192
+            sshAuthorizedKey: "ssh-ed25519 AAAAExampleKeyForRoundTripTest lab"
