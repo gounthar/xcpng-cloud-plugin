@@ -69,6 +69,11 @@ public class XcpngCloud extends Cloud {
      */
     private static final int RETENTION_IDLE_MINUTES = 10;
 
+    /** How long to wait for a provisioned agent to connect before giving up and tearing its VM down. */
+    private static final int ONLINE_TIMEOUT_MINUTES = 5;
+
+    private static final long ONLINE_POLL_MILLIS = 1000L;
+
     private final String poolUrl;
     private final String credentialsId;
     private final boolean trustSelfSigned;
@@ -99,6 +104,14 @@ public class XcpngCloud extends Cloud {
      * persisted to {@code config.xml}.
      */
     private transient ExecutorService provisionExecutor;
+
+    /**
+     * Whether a provisioning task registers the node and waits for it to come online before completing
+     * the planned-node future (the production behaviour, which stops the NodeProvisioner over-provisioning).
+     * A test flips this off so the fake, never-connecting agents complete immediately. Transient; the
+     * field initializer covers a fresh instance and {@link #readResolve} a deserialized one.
+     */
+    private transient boolean waitForOnline = true;
 
     @DataBoundConstructor
     public XcpngCloud(
@@ -134,6 +147,9 @@ public class XcpngCloud extends Cloud {
         if (inFlight == null) {
             inFlight = new AtomicInteger();
         }
+        // Transient boolean: XStream skips the field initializer, so a reloaded cloud would default to
+        // false (fast-complete) and over-provision. Restore the production behaviour.
+        waitForOnline = true;
         return this;
     }
 
@@ -198,29 +214,39 @@ public class XcpngCloud extends Cloud {
                     if (future.isCancelled()) {
                         return;
                     }
+                    Node node = null;
                     try {
-                        Node node = provisionNode(template, displayName);
+                        node = provisionNode(template, displayName);
+                        // Keep the planned node "pending" until the agent actually connects, not merely
+                        // until the VM clones (~2s). The NodeProvisioner counts a completed PlannedNode as
+                        // delivered capacity, so completing early -- while the node is registered but still
+                        // offline -- made it provision a second VM for a single build. Register the node now
+                        // so the inbound agent can dial in, then wait for it to come online. On completion
+                        // the NodeProvisioner re-adds the same instance, which is a no-op (node == existing).
+                        if (waitForOnline) {
+                            Jenkins.get().addNode(node);
+                            awaitOnline(node, displayName, future);
+                        }
                         if (!future.complete(node) && node instanceof XcpngAgent agent) {
                             // The planned node was cancelled while this VM was being built, so it will
-                            // never be added to Jenkins. Tear it down rather than leak it on the pool.
+                            // never be used. Tear it down rather than leak it on the pool.
                             LOGGER.log(
                                     Level.WARNING,
                                     () -> "Provision of " + displayName
                                             + " completed after cancellation; terminating the orphaned agent");
-                            try {
-                                agent.terminate();
-                            } catch (Exception e) {
-                                LOGGER.log(
-                                        Level.WARNING,
-                                        e,
-                                        () -> "Failed to terminate orphaned agent " + displayName);
-                            }
+                            terminateQuietly(agent, displayName);
                         }
                     } catch (Throwable t) {
                         // Preserve the interrupt so higher-level shutdown/cancellation logic still sees it,
                         // rather than swallowing it into the future's exceptional completion.
                         if (t instanceof InterruptedException) {
                             Thread.currentThread().interrupt();
+                        }
+                        // If the VM was built and registered but never came online (timeout, or a failure
+                        // after clone), tear it down so a failed provision leaks neither a VM nor a
+                        // half-added offline node.
+                        if (node instanceof XcpngAgent agent) {
+                            terminateQuietly(agent, displayName);
                         }
                         future.completeExceptionally(t);
                     }
@@ -266,6 +292,47 @@ public class XcpngCloud extends Cloud {
     /** Test seam: reservations taken but not yet settled, for asserting the cap accounting. */
     int inFlightCount() {
         return inFlight.get();
+    }
+
+    /**
+     * Test seam: with a fake client the provisioned agents never connect, so the online wait would block
+     * for the whole timeout. Turning it off makes the planned-node future complete as soon as the VM is
+     * "cloned", which is what the capacity/planning tests assert against.
+     */
+    void setWaitForOnline(boolean waitForOnline) {
+        this.waitForOnline = waitForOnline;
+    }
+
+    /**
+     * Block until the provisioned node's computer connects, or fail after {@link #ONLINE_TIMEOUT_MINUTES}.
+     * Returns early without error if the planned node is cancelled while waiting: the caller's cancellation
+     * path then tears the VM down.
+     */
+    private static void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
+            throws InterruptedException {
+        Computer computer = node.toComputer();
+        if (computer == null) {
+            return; // nothing to wait on
+        }
+        long deadlineNanos = System.nanoTime() + ONLINE_TIMEOUT_MINUTES * 60L * 1_000_000_000L;
+        while (!computer.isOnline()) {
+            if (future.isCancelled()) {
+                return;
+            }
+            if (System.nanoTime() > deadlineNanos) {
+                throw new IllegalStateException(
+                        "agent " + displayName + " did not come online within " + ONLINE_TIMEOUT_MINUTES + " minutes");
+            }
+            Thread.sleep(ONLINE_POLL_MILLIS);
+        }
+    }
+
+    private static void terminateQuietly(@NonNull XcpngAgent agent, @NonNull String displayName) {
+        try {
+            agent.terminate();
+        } catch (Exception e) {
+            LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + displayName);
+        }
     }
 
     /**

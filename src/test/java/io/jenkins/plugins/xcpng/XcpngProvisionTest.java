@@ -40,6 +40,9 @@ class XcpngProvisionTest {
         XcpngCloud cloud = new XcpngCloud(
                 "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
+        // The fake agents never connect, so skip the online wait; these tests assert planning/capacity,
+        // which the production online-wait does not change.
+        cloud.setWaitForOnline(false);
         return cloud;
     }
 
