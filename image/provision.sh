@@ -150,8 +150,19 @@ chmod 0400 "$secret_file"
 
 # The controller root URL carries its trailing slash (Jenkins.getRootUrl()), so jnlpJars sits directly
 # after it. Only fetch when missing or empty; Restart=on-failure would otherwise re-download in a loop.
+# Fetching the controller's own agent.jar keeps remoting version-matched, so it is preferred over baking
+# a copy into the image. Retry a few times so a controller that is still coming up does not fail the
+# whole service (systemd would restart it anyway, but a short in-launcher retry connects sooner).
 if [ ! -s "$agent_dir/agent.jar" ]; then
-    curl -sSfL -o "$agent_dir/agent.jar" "${url}jnlpJars/agent.jar"
+    tries=0
+    until curl -sSfL -o "$agent_dir/agent.jar" "${url}jnlpJars/agent.jar"; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 5 ]; then
+            echo "jenkins-agent: could not fetch agent.jar from ${url}jnlpJars/agent.jar after $tries tries" >&2
+            exit 1
+        fi
+        sleep 3
+    done
     chown debian:debian "$agent_dir/agent.jar"
 fi
 
@@ -255,6 +266,56 @@ REGEN
     fi
 }
 
+install_growroot_service() {
+    # Grow the root partition and filesystem to fill the virtual disk on boot. genericcloud does this
+    # through cloud-init's growpart module, but a plugin clone is seeded over xenstore and has no
+    # cloud-init datasource (DataSourceNone), so without this the root FS stays at the base image size
+    # and a real build fills it (the DiskSpaceMonitor took an agent offline in the first live run).
+    # growpart comes from cloud-guest-utils; resize2fs from e2fsprogs. Both no-op once the FS is full.
+    log "installing the root-filesystem grow service"
+    if ! command -v growpart >/dev/null 2>&1; then
+        apt-get install -y -q cloud-guest-utils
+    fi
+
+    cat > /usr/local/bin/jenkins-agent-growroot <<'GROW'
+#!/bin/sh
+# Expand the root partition and ext filesystem to the whole disk. Idempotent: growpart and resize2fs
+# both no-op when the partition and filesystem already fill the device.
+set -eu
+src=$(findmnt -no SOURCE /)                 # e.g. /dev/xvda1
+dev=$(lsblk -no PKNAME "$src" 2>/dev/null)  # e.g. xvda
+num=$(printf '%s' "$src" | grep -o '[0-9]*$')
+[ -n "$dev" ] && [ -n "$num" ] || exit 0
+growpart "/dev/$dev" "$num" 2>/dev/null || true
+resize2fs "$src" 2>/dev/null || true
+GROW
+    chmod 0755 /usr/local/bin/jenkins-agent-growroot
+
+    cat > /etc/systemd/system/jenkins-agent-growroot.service <<'GROWUNIT'
+[Unit]
+Description=Grow the root filesystem to fill the disk
+DefaultDependencies=no
+After=local-fs.target
+Before=jenkins-agent.service multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/jenkins-agent-growroot
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+GROWUNIT
+
+    sh -n /usr/local/bin/jenkins-agent-growroot
+
+    if [ -d /run/systemd/system ]; then
+        systemctl enable jenkins-agent-growroot.service
+    else
+        log "no systemd here; wrote and validated the growroot unit but skipped enable"
+    fi
+}
+
 harden_credentials() {
     # The build path leaves a login every clone would inherit: preseed sets user `debian` with
     # password `debian` and drops passwordless sudo in /etc/sudoers.d/debian, for Packer's SSH
@@ -301,6 +362,7 @@ main() {
     # container too (systemctl enable is skipped where there is no systemd), which is what exercises them.
     install_agent_service
     install_ssh_seed_service
+    install_growroot_service
 
     if [ "${SKIP_CLEANUP:-0}" = "1" ]; then
         log "skipping template cleanup (SKIP_CLEANUP=1)"
