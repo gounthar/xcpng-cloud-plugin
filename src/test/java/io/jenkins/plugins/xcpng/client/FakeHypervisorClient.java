@@ -55,6 +55,18 @@ public final class FakeHypervisorClient implements HypervisorClient {
         return Collections.unmodifiableList(calls);
     }
 
+    /**
+     * Every verb below is a blocking HTTP call in the real client, and {@code HttpClient.send} throws
+     * immediately when the calling thread's interrupt flag is already set. The fake models that, so a
+     * cleanup path that runs its destroy on an interrupted thread fails here exactly as it would against a
+     * pool, and records no call -- rather than passing a test vacuously.
+     */
+    private static void checkNotInterrupted(String verb) {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new HypervisorException(verb + " called on an interrupted thread");
+        }
+    }
+
     /** The spec passed to the most recent {@link #cloneFromTemplate}, to assert the seed it carried. */
     public ProvisionSpec lastSpec() {
         return lastSpec;
@@ -62,6 +74,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public VmRef resolveTemplate(String name) {
+        checkNotInterrupted("resolveTemplate");
         calls.add("resolveTemplate:" + name);
         if (!knownTemplates.contains(name)) {
             throw new HypervisorException("no template named '" + name + "'");
@@ -71,6 +84,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public VmRef cloneFromTemplate(VmRef template, ProvisionSpec spec) {
+        checkNotInterrupted("cloneFromTemplate");
         this.lastSpec = spec;
         VmRef clone = new VmRef("vm/" + spec.name() + "/" + (++cloneCounter));
         calls.add("cloneFromTemplate:" + template.value() + "->" + clone.value());
@@ -80,6 +94,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public void start(VmRef vm) {
+        checkNotInterrupted("start");
         calls.add("start:" + vm.value());
         if (startFails) {
             throw new HypervisorException("start failed");
@@ -102,18 +117,21 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public void stop(VmRef vm) {
+        checkNotInterrupted("stop");
         calls.add("stop:" + vm.value());
         states.put(vm.value(), VmState.HALTED);
     }
 
     @Override
     public void destroyWithDisks(VmRef vm) {
+        checkNotInterrupted("destroyWithDisks");
         calls.add("destroyWithDisks:" + vm.value());
         states.remove(vm.value());
     }
 
     @Override
     public void ping() {
+        checkNotInterrupted("ping");
         calls.add("ping");
         if (pingFails) {
             throw new HypervisorException("cannot reach pool");

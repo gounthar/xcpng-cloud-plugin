@@ -256,12 +256,21 @@ public final class XapiClient implements HypervisorClient {
             }
             seedGuestData(vm, spec.guestData());
         } catch (RuntimeException e) {
+            // Clear the interrupt flag for the duration of the cleanup, and restore it afterwards. sleep()
+            // re-interrupts the thread before throwing, and destroyWithDisks blocks on HTTP, which fails
+            // immediately on an already-interrupted thread -- so an interrupt while polling the clone task
+            // would otherwise leak the very clone and copy-on-write disks this cleanup exists to reclaim.
+            boolean interrupted = Thread.interrupted();
             try {
                 destroyWithDisks(new VmRef(vm));
             } catch (RuntimeException cleanup) {
                 // Best effort. The original failure is what the caller needs, so keep it and just note
                 // that the half-configured clone could not be reclaimed.
                 LOGGER.warning("could not clean up partly configured clone " + vm + ": " + cleanup.getMessage());
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
             throw e;
         }

@@ -22,7 +22,11 @@ import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import jenkins.model.JenkinsLocationConfiguration;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
@@ -311,6 +315,64 @@ class XcpngProvisionTest {
             assertEquals(0, cloud.inFlightCount(), "cancelling a planned node must release its reservation");
         } finally {
             gate.countDown();
+            exec.shutdownNow();
+        }
+    }
+
+    @Test
+    void interruptingAProvisionStillDestroysTheVmAndKeepsTheInterrupt(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = new XcpngCloud(
+                "xcpng", "https://pool.example.test", "cred", false, 2, List.of(LINUX_TEMPLATE));
+        cloud.setClientFactory(c -> fake);
+        // Unlike the other tests, keep the production online wait, so the task is still running when the
+        // interrupt lands. Once the node is registered the interrupt may land anywhere -- in addNode's tail
+        // or in awaitOnline's sleep -- and every one of those must still destroy the VM, so the assertions
+        // below hold regardless of where it hits rather than depending on one landing spot.
+        r.jenkins.clouds.add(cloud);
+
+        // afterExecute runs on the worker right after the task body, so it observes the interrupt flag the
+        // task left behind -- the only vantage point from which "restored on the way out" is assertable.
+        AtomicReference<Thread> worker = new AtomicReference<>();
+        AtomicBoolean interruptSurvived = new AtomicBoolean();
+        CountDownLatch taskDone = new CountDownLatch(1);
+        ThreadPoolExecutor exec = new ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), runnable -> {
+                    Thread t = new Thread(runnable, "provision-under-test");
+                    worker.set(t);
+                    return t;
+                }) {
+            @Override
+            protected void afterExecute(Runnable runnable, Throwable thrown) {
+                interruptSurvived.set(Thread.currentThread().isInterrupted());
+                taskDone.countDown();
+            }
+        };
+        cloud.setProvisionExecutor(exec);
+        try {
+            NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                    .iterator()
+                    .next();
+
+            // Interrupt only once the node is registered, which puts the task past the clone/start calls:
+            // interrupting earlier would fail the clone instead, leaving no VM to clean up and testing a
+            // different path. Spin rather than sleep between checks, so the interrupt lands as close to
+            // addNode as possible -- that window, not awaitOnline's sleep, is where the flag can still be
+            // set when the exception surfaces, and it is the case a coarser poll would rarely sample.
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (r.jenkins.getNodes().isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.onSpinWait();
+            }
+            assertFalse(r.jenkins.getNodes().isEmpty(), "the provision should have registered its node");
+            worker.get().interrupt();
+
+            assertTrue(taskDone.await(30, TimeUnit.SECONDS), "the interrupted provision should finish");
+            assertThrows(Exception.class, () -> planned.future.get(30, TimeUnit.SECONDS));
+            assertTrue(
+                    fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
+                    "an interrupted provision must still destroy its VM rather than leak it: " + fake.calls());
+            assertTrue(interruptSurvived.get(), "the interrupt must be restored once the cleanup has run");
+        } finally {
             exec.shutdownNow();
         }
     }

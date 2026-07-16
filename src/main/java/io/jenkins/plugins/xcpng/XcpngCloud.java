@@ -339,11 +339,17 @@ public class XcpngCloud extends Cloud {
                         terminateQuietly(agent, displayName);
                     }
                 } catch (Throwable t) {
-                    // Preserve the interrupt so higher-level shutdown/cancellation logic still sees it,
-                    // rather than swallowing it into the future's exceptional completion.
-                    if (t instanceof InterruptedException) {
-                        Thread.currentThread().interrupt();
-                    }
+                    // Capture the interrupt and clear the flag for the duration of the cleanup below.
+                    // terminateQuietly ends in a blocking HTTP call, which throws immediately on a thread
+                    // whose interrupt flag is already set -- so restoring the flag first would guarantee the
+                    // destroy fails in exactly the case the cleanup exists for (an awaitOnline sleep
+                    // interrupted during executor shutdown), leaking the VM and its disks. The flag is
+                    // restored below, once the destroy has had its chance to run.
+                    // Thread.interrupted() first, and never behind the instanceof: it is the call that
+                    // clears the flag, so short-circuiting past it would leave a thread interrupted after
+                    // the InterruptedException was thrown (a racing shutdownNow) still interrupted here,
+                    // which is the very failure this guards against.
+                    boolean interrupted = Thread.interrupted() || t instanceof InterruptedException;
                     // If the VM was built and registered but never came online (timeout, or a failure after
                     // clone), tear it down so a failed provision leaks neither a VM nor a half-added offline
                     // node.
@@ -351,6 +357,11 @@ public class XcpngCloud extends Cloud {
                         terminateQuietly(agent, displayName);
                     }
                     future.completeExceptionally(t);
+                    // Restore the interrupt so higher-level shutdown/cancellation logic still sees it,
+                    // rather than swallowing it into the future's exceptional completion.
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
                 }
             });
             // Propagate a cancellation of the planned node to the task, but without interrupting it: a
