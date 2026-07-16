@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -76,6 +77,32 @@ class XapiClientTest {
         assertTrue(e.getMessage().contains("expected one disk"), e.getMessage());
         // The clone already existed when the spec was rejected, so it must be torn down, not leaked.
         assertTrue(t.methods().contains("VM.destroy"), "the rejected clone must be destroyed");
+    }
+
+    @Test
+    void cloneInterruptedAfterTheCloneExistsStillDestroysItAndKeepsTheInterrupt() {
+        ScriptedTransport t = new ScriptedTransport();
+        // The clone exists, then the thread is interrupted while it is still being configured, so every
+        // later call fails on the interrupt exactly as it would against a pool. The cleanup must still
+        // reclaim the clone: this is the case that leaks a VM and its copy-on-write disks.
+        t.interruptOn = "VM.set_is_a_template";
+        XapiClient c = new XapiClient(t, "root", "pw");
+        try {
+            assertThrows(
+                    HypervisorException.class,
+                    () -> c.cloneFromTemplate(
+                            new VmRef("OpaqueRef:tmpl"), new ProvisionSpec("agent", 2, 2048L, null, null, null)));
+
+            assertTrue(
+                    t.methods().contains("VM.destroy"),
+                    "an interrupted clone must still be destroyed, not leaked: " + t.methods());
+            assertTrue(
+                    Thread.currentThread().isInterrupted(),
+                    "the interrupt must be restored once the cleanup has run");
+        } finally {
+            // Never leave the flag set on a shared JUnit thread, or the next test inherits it.
+            Thread.interrupted();
+        }
     }
 
     @Test
@@ -316,12 +343,24 @@ class XapiClientTest {
         boolean extraDisk = false;
         boolean sharedVdi = false;
         Map<String, String> xenstoreData = Map.of();
+        /** Interrupt the calling thread when this method is posted, standing in for an interrupt landing mid-clone. */
+        String interruptOn = null;
 
         @Override
-        public String post(String body) {
+        public String post(String body) throws IOException {
+            // What HttpTransport does on an already-interrupted thread: HttpClient.send throws
+            // InterruptedException, which it re-interrupts and rethrows as IOException. Modelling it here is
+            // what makes the cleanup tests below real -- a transport that answered regardless would let a
+            // destroy-on-an-interrupted-thread "succeed" and prove nothing.
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IOException("interrupted");
+            }
             JsonNode req = read(body);
             requests.add(req);
             String method = req.get("method").asText();
+            if (method.equals(interruptOn)) {
+                Thread.currentThread().interrupt();
+            }
             JsonNode id = req.get("id");
             if (hostIsSlave && method.equals("VM.get_power_state")) {
                 return envelope(id, null, Map.of("message", "HOST_IS_SLAVE", "data", List.of("192.168.1.99")));
