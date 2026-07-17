@@ -13,6 +13,7 @@ import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.security.ACL;
+import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
@@ -492,38 +493,36 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Reap one surplus warm spare, off the reconcile thread. Returns whether the teardown was submitted, so
+     * Reap one surplus warm spare, off the reconcile thread. Returns whether the teardown was handed over, so
      * the caller only counts a spare against the surplus once it is actually going away.
      *
      * <p>The spare must still be idle: one that has just accepted a build is no longer a spare at all (it is
-     * a used, single-use agent mid-build), and yanking it would kill that build. Between the check and the
-     * teardown there is a residual window, closed by refusing tasks first, so nothing can be scheduled onto a
-     * node already condemned. A node whose computer does not exist yet is left to the next tick.
+     * a used, single-use agent mid-build), and yanking it would kill that build. A node whose computer does
+     * not exist yet is left to the next tick.
      *
-     * <p>{@code destroyWithDisks} is a blocking network call and this runs while holding the cloud's monitor,
-     * so the teardown is submitted rather than run inline: a slow or hanging pool must not stall the
-     * maintainer tick, nor block a concurrent {@link #provision} round waiting on the same lock.
+     * <p>The teardown itself is delegated to the agent's own {@link XcpngRetentionStrategy}, rather than
+     * reimplemented here, so both routes to reclaiming a spare share one monitor and one in-flight guard. A
+     * warm spare that never came online keeps no idle exemption, so the retention thread can be reaping the
+     * very spare this tick just picked as surplus; going through the strategy makes one of the two back off
+     * instead of both firing {@code destroyWithDisks} at the same VM. The strategy also owns refusing further
+     * tasks, which closes the window between the idle check above and the destroy.
+     *
+     * <p>The executor is passed down because {@code destroyWithDisks} is a blocking network call and this runs
+     * while holding the cloud's monitor: a slow or hanging pool must not stall the maintainer tick, nor block
+     * a concurrent {@link #provision} round waiting on the same lock.
      */
     private boolean drainSpare(@NonNull XcpngAgent spare) {
-        // getComputer(), not toComputer(): setAcceptingTasks is a SlaveComputer method.
+        // getComputer(), not toComputer(): the reap seam is typed to the agent's cloud computer.
         SlaveComputer computer = spare.getComputer();
-        if (computer == null || !computer.isIdle()) {
+        if (!(computer instanceof AbstractCloudComputer<?> cloudComputer) || !computer.isIdle()) {
             return false;
         }
-        computer.setAcceptingTasks(false);
-        final String displayName = spare.getNodeName();
-        LOGGER.log(Level.FINE, () -> "Draining surplus XCP-ng warm spare " + displayName);
-        try {
-            reapExecutor().submit(() -> terminateQuietly(spare, displayName));
-            return true;
-        } catch (RejectedExecutionException e) {
-            // The pool would not accept the teardown, which it does only while shutting down. Let the spare
-            // go on serving builds rather than strand it non-accepting with its VM still running; a later
-            // tick can retry the drain.
-            computer.setAcceptingTasks(true);
-            LOGGER.log(Level.WARNING, e, () -> "Could not schedule drain of warm spare " + displayName);
+        if (!(computer.getRetentionStrategy() instanceof XcpngRetentionStrategy strategy)) {
             return false;
         }
+        LOGGER.log(Level.FINE, () -> "Draining surplus XCP-ng warm spare " + spare.getNodeName());
+        strategy.reap(cloudComputer, reapExecutor());
+        return true;
     }
 
     /**

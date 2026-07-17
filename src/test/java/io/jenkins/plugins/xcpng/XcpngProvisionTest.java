@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import hudson.model.Computer;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
@@ -560,6 +561,46 @@ class XcpngProvisionTest {
         assertEquals(2, warmNodeCount(r), "a pool at its target must be left alone");
         assertEquals(2, r.jenkins.getNodes().size());
         assertEquals(0, destroyCount(fake), "nothing should be torn down at the target: " + fake.calls());
+    }
+
+    @Test
+    void theDrainAndTheIdleNetNeverBothDestroyTheSameSpare(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate template = warmTemplate("jenkins-golden-debian", 1);
+        XcpngCloud cloud = warmCloudOver(fake, 3, template);
+        r.jenkins.clouds.add(cloud);
+        reconcileAndSettle(cloud);
+
+        XcpngAgent spare = assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+        AbstractCloudComputer<?> computer =
+                assertInstanceOf(AbstractCloudComputer.class, spare.getComputer());
+        XcpngRetentionStrategy strategy =
+                assertInstanceOf(XcpngRetentionStrategy.class, computer.getRetentionStrategy());
+
+        // This spare never came online, so it keeps no idle exemption and the retention net may reclaim it
+        // at any moment -- the same spare a shrinking target makes surplus. That overlap is the real race,
+        // not a contrived one. Let the idle net win, and hold its teardown mid-flight behind a gate.
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        reaps.submit(() -> {
+            gate.await();
+            return null;
+        });
+        strategy.reap(computer, reaps);
+
+        // Now lower the target, so the drain picks that very spare while the first teardown is still queued.
+        template.setMinInstances(0);
+        cloud.setReapExecutor(reaps);
+        cloud.reconcileWarmPool();
+
+        gate.countDown();
+        reaps.shutdown();
+        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the teardown should finish");
+
+        // One VM, one destroy. Two would mean the drain fired destroyWithDisks at a VM the idle net was
+        // already destroying, which is what routing both through the strategy's guard exists to prevent.
+        assertEquals(
+                1, destroyCount(fake), "a spare must be destroyed once, not once per reclaim route: " + fake.calls());
     }
 
     @Test
