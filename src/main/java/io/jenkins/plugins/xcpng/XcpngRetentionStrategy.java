@@ -6,6 +6,7 @@ import hudson.model.ExecutorListener;
 import hudson.model.Queue;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.CloudRetentionStrategy;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
@@ -112,7 +113,23 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         }
     }
 
-    private synchronized void reap(AbstractCloudComputer<?> computer) {
+    /** Reap on the remoting pool, the production path for the idle net and a build's completion. */
+    private void reap(AbstractCloudComputer<?> computer) {
+        reap(computer, Computer.threadPoolForRemoting);
+    }
+
+    /**
+     * Reclaim this agent asynchronously, at most once at a time. Package-visible, and with the executor a
+     * parameter, so {@link XcpngCloud#reconcileWarmPool} can drain a surplus warm spare through this very
+     * method rather than reimplementing it.
+     *
+     * <p>Sharing the path is what makes the {@link #reaping} guard meaningful. A warm spare that never came
+     * online is not exempt (see {@link #exemptFromIdleReap}), so the idle net below and a warm-pool drain can
+     * both decide to reclaim the same spare at the same moment; routing both through this monitor means the
+     * loser returns instead of firing a second {@code destroyWithDisks} at a VM the winner is already
+     * destroying. The guard is per-agent, since each {@link XcpngAgent} holds its own strategy instance.
+     */
+    synchronized void reap(AbstractCloudComputer<?> computer, ExecutorService executor) {
         if (reaping) {
             return;
         }
@@ -124,7 +141,7 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         computer.setAcceptingTasks(false);
         LOGGER.log(Level.FINE, () -> "Reclaiming XCP-ng agent " + agent.getNodeName());
         try {
-            Computer.threadPoolForRemoting.submit(() -> {
+            executor.submit(() -> {
                 try {
                     agent.terminate();
                 } catch (InterruptedException e) {
