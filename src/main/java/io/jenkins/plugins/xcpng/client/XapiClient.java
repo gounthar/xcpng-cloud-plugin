@@ -377,6 +377,16 @@ public final class XapiClient implements HypervisorClient {
     }
 
     @Override
+    public void clearGuestSecret(@NonNull VmRef vm) {
+        ensureSession();
+        // Remove just the secret key from xenstore-data; url/name stay. VM.remove_from_xenstore_data is a
+        // per-key delete and a no-op when the key is absent, so this needs no read-merge-write. Setting
+        // xenstore-data on a running VM does not propagate to the guest, but that is fine: this only scrubs
+        // the VM record, which the guest already read at boot.
+        call("VM.remove_from_xenstore_data", vm.value(), GUEST_DATA_PREFIX + "secret");
+    }
+
+    @Override
     @NonNull
     public Optional<String> primaryIpAddress(@NonNull VmRef vm) {
         ensureSession();
