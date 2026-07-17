@@ -15,6 +15,7 @@ import hudson.model.Node;
 import hudson.security.ACL;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
+import hudson.slaves.SlaveComputer;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
@@ -27,9 +28,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -142,6 +145,14 @@ public class XcpngCloud extends Cloud {
      * behaviour, never persisted to {@code config.xml}.
      */
     private transient ExecutorService provisionExecutor;
+
+    /**
+     * Executor for warm-pool drains. Null in production, where {@link #reapExecutor()} falls back to
+     * {@code Computer.threadPoolForRemoting} (the same pool {@link XcpngRetentionStrategy} reaps on: a
+     * teardown is a short blocking call, unlike a provision's minutes-long online wait, so it does not
+     * warrant a pool of its own). A test injects a controllable one. Transient: behaviour, never persisted.
+     */
+    private transient ExecutorService reapExecutor;
 
     /**
      * Whether a provisioning task registers the node and waits for it to come online before completing
@@ -383,31 +394,53 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Bring each template's warm pool up to its {@code minInstances} target: for every template that wants
-     * spares, launch enough pre-booted agents to cover the gap, bounded by the cloud's instance cap.
-     * Synchronized on the same monitor as {@link #provision} so warm and on-demand reservations cannot both
-     * snapshot the same headroom and overshoot {@code maxInstances}. Called on a schedule by
-     * {@link XcpngWarmPoolMaintainer}; package-visible so a test can drive a reconcile directly.
+     * Bring each template's warm pool to its {@code minInstances} target, in both directions: launch
+     * pre-booted spares to cover a deficit (bounded by the cloud's instance cap), then drain surplus spares
+     * once a target is lowered or a template is removed. Synchronized on the same monitor as
+     * {@link #provision} so warm and on-demand reservations cannot both snapshot the same headroom and
+     * overshoot {@code maxInstances}. Called on a schedule by {@link XcpngWarmPoolMaintainer};
+     * package-visible so a test can drive a reconcile directly.
+     *
+     * <p>The drain is what makes the target authoritative rather than a floor. Spares are exempt from the
+     * idle reap by design (see {@link XcpngRetentionStrategy}), so without it a lowered target would leave
+     * its surplus running until each spare happened to pick up a build.
      */
     synchronized void reconcileWarmPool() {
-        // One pass over the node list feeds every template's deficit: count this cloud's agents (for the
-        // cap) and its unused warm spares per template, rather than rescanning the list per template.
+        // One pass over the node list feeds both halves: count this cloud's agents (for the cap) and bucket
+        // its unused warm spares by template, rather than rescanning the list per template. The spares
+        // themselves are collected, not just counted, because the drain below needs the agents to reap.
+        Set<String> configuredTemplates = new HashSet<>();
+        for (XcpngTemplate template : templates) {
+            configuredTemplates.add(template.getTemplateName());
+        }
         int active = 0;
-        Map<String, Integer> warmCounts = new HashMap<>();
+        Map<String, List<XcpngAgent>> warmByTemplate = new HashMap<>();
+        List<XcpngAgent> orphanedSpares = new ArrayList<>();
         for (Node node : Jenkins.get().getNodes()) {
             if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
                 active++;
                 if (agent.isWarm()) {
                     ProvisioningActivity.Id id = agent.getId();
                     if (id != null) {
-                        warmCounts.merge(id.getTemplateName(), 1, Integer::sum);
+                        // A spare whose template no longer resolves belongs to a template the administrator
+                        // removed: nothing will ever want it, so it is drained outright rather than counted
+                        // against a target that no longer exists.
+                        if (configuredTemplates.contains(id.getTemplateName())) {
+                            warmByTemplate
+                                    .computeIfAbsent(id.getTemplateName(), k -> new ArrayList<>())
+                                    .add(agent);
+                        } else {
+                            orphanedSpares.add(agent);
+                        }
                     }
                 }
             }
         }
         // The same headroom formula as availableCapacity(), fed from the pass above and decremented
         // locally as launches are submitted (launch() reserves inFlight too, but the local counter saves
-        // re-reading it and keeps the two in step within this tick). Keep the formulas aligned.
+        // re-reading it and keeps the two in step within this tick). Keep the formulas aligned. Spares
+        // drained later in this tick still count as active here: their teardown is asynchronous, so they
+        // are not headroom yet, and letting the next tick see the freed capacity is the honest reading.
         int capacity = Math.max(0, maxInstances - active - inFlight.get());
         for (XcpngTemplate template : templates) {
             int target = template.getMinInstances();
@@ -416,7 +449,7 @@ public class XcpngCloud extends Cloud {
             }
             // Deficit against both the spares already registered and those still booting, so repeated
             // ticks do not stack duplicate provisions for the same template.
-            int deficit = target - warmCounts.getOrDefault(template.getTemplateName(), 0)
+            int deficit = target - warmCount(warmByTemplate, template.getTemplateName())
                     - warmInFlight(template.getTemplateName()).get();
             int toLaunch = Math.min(deficit, capacity);
             for (int i = 0; i < toLaunch; i++) {
@@ -430,6 +463,66 @@ public class XcpngCloud extends Cloud {
                 }
                 capacity--;
             }
+        }
+        // Drain after the fill, in the same tick and under the same monitor. A template sitting at its
+        // target has no deficit and no surplus, so it is untouched by both halves.
+        for (XcpngTemplate template : templates) {
+            List<XcpngAgent> spares = warmByTemplate.get(template.getTemplateName());
+            if (spares == null) {
+                continue;
+            }
+            int surplus = spares.size() - Math.max(0, template.getMinInstances());
+            for (XcpngAgent spare : spares) {
+                if (surplus <= 0) {
+                    break;
+                }
+                if (drainSpare(spare)) {
+                    surplus--;
+                }
+            }
+        }
+        for (XcpngAgent spare : orphanedSpares) {
+            drainSpare(spare);
+        }
+    }
+
+    private static int warmCount(@NonNull Map<String, List<XcpngAgent>> warmByTemplate, @NonNull String templateName) {
+        List<XcpngAgent> spares = warmByTemplate.get(templateName);
+        return spares == null ? 0 : spares.size();
+    }
+
+    /**
+     * Reap one surplus warm spare, off the reconcile thread. Returns whether the teardown was submitted, so
+     * the caller only counts a spare against the surplus once it is actually going away.
+     *
+     * <p>The spare must still be idle: one that has just accepted a build is no longer a spare at all (it is
+     * a used, single-use agent mid-build), and yanking it would kill that build. Between the check and the
+     * teardown there is a residual window, closed by refusing tasks first, so nothing can be scheduled onto a
+     * node already condemned. A node whose computer does not exist yet is left to the next tick.
+     *
+     * <p>{@code destroyWithDisks} is a blocking network call and this runs while holding the cloud's monitor,
+     * so the teardown is submitted rather than run inline: a slow or hanging pool must not stall the
+     * maintainer tick, nor block a concurrent {@link #provision} round waiting on the same lock.
+     */
+    private boolean drainSpare(@NonNull XcpngAgent spare) {
+        // getComputer(), not toComputer(): setAcceptingTasks is a SlaveComputer method.
+        SlaveComputer computer = spare.getComputer();
+        if (computer == null || !computer.isIdle()) {
+            return false;
+        }
+        computer.setAcceptingTasks(false);
+        final String displayName = spare.getNodeName();
+        LOGGER.log(Level.FINE, () -> "Draining surplus XCP-ng warm spare " + displayName);
+        try {
+            reapExecutor().submit(() -> terminateQuietly(spare, displayName));
+            return true;
+        } catch (RejectedExecutionException e) {
+            // The pool would not accept the teardown, which it does only while shutting down. Let the spare
+            // go on serving builds rather than strand it non-accepting with its VM still running; a later
+            // tick can retry the drain.
+            computer.setAcceptingTasks(true);
+            LOGGER.log(Level.WARNING, e, () -> "Could not schedule drain of warm spare " + displayName);
+            return false;
         }
     }
 
@@ -446,6 +539,20 @@ public class XcpngCloud extends Cloud {
     /** Test seam: run provisioning submits on a controllable executor. */
     void setProvisionExecutor(ExecutorService provisionExecutor) {
         this.provisionExecutor = provisionExecutor;
+    }
+
+    /**
+     * Executor that runs warm-pool drains. Production reaps on {@code Computer.threadPoolForRemoting}; a
+     * test injects one via {@link #setReapExecutor} so a drain is observable by the time it asserts.
+     */
+    @NonNull
+    private ExecutorService reapExecutor() {
+        return reapExecutor != null ? reapExecutor : Computer.threadPoolForRemoting;
+    }
+
+    /** Test seam: run warm-pool drains on a controllable executor. */
+    void setReapExecutor(ExecutorService reapExecutor) {
+        this.reapExecutor = reapExecutor;
     }
 
     /** Test seam: reservations taken but not yet settled, for asserting the cap accounting. */

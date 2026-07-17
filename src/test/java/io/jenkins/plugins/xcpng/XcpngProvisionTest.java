@@ -379,24 +379,46 @@ class XcpngProvisionTest {
 
     // ---- Warm pool (slice C) ----
 
-    /** A cloud whose single template keeps {@code minInstances} warm spares, backed by the given fake. */
-    private static XcpngCloud warmCloudBackedBy(FakeHypervisorClient fake, int maxInstances, int minInstances) {
-        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+    /** A warm-pool template for {@code templateName}, wanting {@code minInstances} spares. */
+    private static XcpngTemplate warmTemplate(String templateName, int minInstances) {
+        XcpngTemplate template = new XcpngTemplate(templateName, "xcpng-linux", 1, 2, 2048);
         template.setMinInstances(minInstances);
+        return template;
+    }
+
+    /** A cloud over the given warm-pool templates, backed by the given fake. */
+    private static XcpngCloud warmCloudOver(FakeHypervisorClient fake, int maxInstances, XcpngTemplate... templates) {
         XcpngCloud cloud = new XcpngCloud(
-                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(template));
+                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(templates));
         cloud.setClientFactory(c -> fake);
         cloud.setWaitForOnline(false);
         return cloud;
     }
 
-    /** Reconcile the warm pool on one worker, then wait for the launched tasks to finish and register. */
-    private static void reconcileAndDrain(XcpngCloud cloud) throws InterruptedException {
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        cloud.setProvisionExecutor(exec);
+    /** A cloud whose single template keeps {@code minInstances} warm spares, backed by the given fake. */
+    private static XcpngCloud warmCloudBackedBy(FakeHypervisorClient fake, int maxInstances, int minInstances) {
+        return warmCloudOver(fake, maxInstances, warmTemplate("jenkins-golden-debian", minInstances));
+    }
+
+    /**
+     * Reconcile the warm pool with both halves on controllable workers, then wait for the launches to
+     * register and the drains to tear down, so the node list and the fake's call log are settled by the
+     * time the caller asserts on them.
+     */
+    private static void reconcileAndSettle(XcpngCloud cloud) throws InterruptedException {
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(launches);
+        cloud.setReapExecutor(reaps);
         cloud.reconcileWarmPool();
-        exec.shutdown();
-        assertTrue(exec.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool launches should finish");
+        launches.shutdown();
+        assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool launches should finish");
+        reaps.shutdown();
+        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool drains should finish");
+    }
+
+    private static long destroyCount(FakeHypervisorClient fake) {
+        return fake.calls().stream().filter(c -> c.startsWith("destroyWithDisks:")).count();
     }
 
     private static int warmNodeCount(JenkinsRule r) {
@@ -414,7 +436,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2);
 
-        reconcileAndDrain(cloud);
+        reconcileAndSettle(cloud);
 
         assertEquals(2, warmNodeCount(r), "the pool should fill to minInstances");
         for (Node node : r.jenkins.getNodes()) {
@@ -430,7 +452,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = warmCloudBackedBy(fake, 2, 5); // wants five, cap of two
 
-        reconcileAndDrain(cloud);
+        reconcileAndSettle(cloud);
 
         assertEquals(2, warmNodeCount(r), "the warm pool cannot exceed the instance cap");
     }
@@ -455,6 +477,89 @@ class XcpngProvisionTest {
             gate.countDown();
             exec.shutdownNow();
         }
+    }
+
+    // ---- Warm pool (slice D): draining a surplus ----
+
+    @Test
+    void loweringTheTargetDrainsTheSurplusSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate template = warmTemplate("jenkins-golden-debian", 3);
+        XcpngCloud cloud = warmCloudOver(fake, 3, template);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+        assertEquals(3, warmNodeCount(r), "the pool should fill to the original target");
+
+        // The administrator lowers the target. Spares are exempt from the idle reap, so without the drain
+        // the surplus two would run until they each happened to pick up a build.
+        template.setMinInstances(1);
+        reconcileAndSettle(cloud);
+
+        assertEquals(1, warmNodeCount(r), "the surplus spares should be drained down to the new target");
+        assertEquals(1, r.jenkins.getNodes().size(), "the drained spares should be removed as nodes");
+        assertEquals(2, destroyCount(fake), "each drained spare must destroy its VM: " + fake.calls());
+    }
+
+    @Test
+    void aSpareWhoseTemplateWasRemovedIsDrained(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud before = warmCloudOver(fake, 3, warmTemplate("jenkins-golden-debian", 1));
+        r.jenkins.clouds.add(before);
+
+        reconcileAndSettle(before);
+        assertEquals(1, warmNodeCount(r), "the pool should fill its one spare");
+
+        // The administrator drops that template and configures a different one. Editing the cloud replaces
+        // the instance under the same name, which is what the running spare still points at by cloudName.
+        XcpngCloud after = warmCloudOver(fake, 3, warmTemplate("jenkins-golden-other", 0));
+        r.jenkins.clouds.remove(before);
+        r.jenkins.clouds.add(after);
+
+        reconcileAndSettle(after);
+
+        assertEquals(0, warmNodeCount(r), "a spare for a removed template belongs to nothing and must be drained");
+        assertEquals(1, destroyCount(fake), "the orphaned spare must destroy its VM: " + fake.calls());
+    }
+
+    @Test
+    void theDrainLeavesAUsedAgentAlone(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate template = warmTemplate("jenkins-golden-debian", 1);
+        XcpngCloud cloud = warmCloudOver(fake, 3, template);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+        assertEquals(1, warmNodeCount(r));
+
+        // The spare accepts a build, so it is no longer a spare: it is an ordinary single-use agent, which
+        // the retention strategy reaps once that build finishes. The drain must not reach it even with the
+        // target dropped to zero underneath it -- yanking it would kill the build it is running.
+        XcpngAgent agent = assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+        agent.markUsed();
+        template.setMinInstances(0);
+        reconcileAndSettle(cloud);
+
+        assertEquals(1, r.jenkins.getNodes().size(), "a used agent is not the warm pool's to drain");
+        assertEquals(0, destroyCount(fake), "a used agent must not be torn down by the drain: " + fake.calls());
+    }
+
+    @Test
+    void aTemplateAtItsTargetIsNeitherFilledNorDrained(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+        assertEquals(2, warmNodeCount(r), "the pool should fill to minInstances");
+
+        // Steady state: the two halves must not fight, launching a spare the drain then reaps (or the
+        // reverse) and churning VMs on the pool every tick.
+        reconcileAndSettle(cloud);
+
+        assertEquals(2, warmNodeCount(r), "a pool at its target must be left alone");
+        assertEquals(2, r.jenkins.getNodes().size());
+        assertEquals(0, destroyCount(fake), "nothing should be torn down at the target: " + fake.calls());
     }
 
     @Test
