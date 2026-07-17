@@ -47,6 +47,10 @@
     <!-- LTS baseline. 2.555.x matches what vsphere-cloud targets. -->
     <jenkins.baseline>2.555</jenkins.baseline>
     <jenkins.version>${jenkins.baseline}.3</jenkins.version>
+
+    <!-- The parent POM configures spotless but skips the check by default. Enforce it here so
+         `mvn verify` (what CI runs) fails on formatting drift; run `mvn spotless:apply` to fix. -->
+    <spotless.check.skip>false</spotless.check.skip>
   </properties>
 
   <dependencyManagement>
