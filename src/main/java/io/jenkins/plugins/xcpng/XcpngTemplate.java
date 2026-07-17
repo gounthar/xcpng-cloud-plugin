@@ -182,8 +182,7 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * warn if the target exceeds the cloud's instance cap: warm agents count against {@code
          * maxInstances}, so a larger target can never be filled.
          */
-        public FormValidation doCheckMinInstances(
-                @AncestorInPath XcpngCloud cloud, @QueryParameter String value) {
+        public FormValidation doCheckMinInstances(@AncestorInPath XcpngCloud cloud, @QueryParameter String value) {
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }

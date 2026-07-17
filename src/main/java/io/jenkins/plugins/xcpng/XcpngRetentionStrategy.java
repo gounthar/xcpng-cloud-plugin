@@ -102,8 +102,7 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     }
 
     @Override
-    public void taskCompletedWithProblems(
-            Executor executor, Queue.Task task, long durationMS, Throwable problems) {
+    public void taskCompletedWithProblems(Executor executor, Queue.Task task, long durationMS, Throwable problems) {
         reapOwner(executor);
     }
 

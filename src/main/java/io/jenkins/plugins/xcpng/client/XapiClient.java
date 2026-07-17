@@ -51,7 +51,8 @@ public final class XapiClient implements HypervisorClient {
      * @param trustSelfSigned accept a self-signed pool certificate. Off by default; a lab pool needs
      *     it, nothing else should. Turning it on disables both chain and hostname verification.
      */
-    public XapiClient(@NonNull String poolUrl, @NonNull String user, @NonNull String password, boolean trustSelfSigned) {
+    public XapiClient(
+            @NonNull String poolUrl, @NonNull String user, @NonNull String password, boolean trustSelfSigned) {
         this(new HttpTransport(poolUrl, trustSelfSigned), user, password);
         if (trustSelfSigned) {
             LOGGER.warning("TLS verification disabled for " + poolUrl
@@ -97,8 +98,8 @@ public final class XapiClient implements HypervisorClient {
         // A bare JSON scalar (5, null, true) is not an object; treat anything non-object as malformed
         // up front rather than tripping over it below, the same guard tools/xapi.py learned to add.
         if (payload == null || !payload.isObject()) {
-            throw new HypervisorException(method + ": expected a JSON object, got "
-                    + (payload == null ? "null" : payload.getNodeType()));
+            throw new HypervisorException(
+                    method + ": expected a JSON object, got " + (payload == null ? "null" : payload.getNodeType()));
         }
         JsonNode error = payload.get("error");
         if (error != null && !error.isNull()) {
@@ -140,7 +141,8 @@ public final class XapiClient implements HypervisorClient {
     }
 
     private void login() {
-        session = raw("session.login_with_password", List.of(user, password, "", "xcpng-cloud")).asText();
+        session = raw("session.login_with_password", List.of(user, password, "", "xcpng-cloud"))
+                .asText();
     }
 
     // -- async task helper ------------------------------------------------
@@ -273,8 +275,8 @@ public final class XapiClient implements HypervisorClient {
                 // Refuse ambiguity rather than resize an arbitrary disk.
                 List<String> disks = diskVdis(vm);
                 if (disks.size() != 1) {
-                    throw new HypervisorException("cannot honour diskBytes: expected one disk on the clone, found "
-                            + disks.size());
+                    throw new HypervisorException(
+                            "cannot honour diskBytes: expected one disk on the clone, found " + disks.size());
                 }
                 call("VDI.resize", disks.get(0), String.valueOf(spec.diskBytes()));
             }
@@ -487,5 +489,4 @@ public final class XapiClient implements HypervisorClient {
             login();
         }
     }
-
 }

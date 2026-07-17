@@ -27,9 +27,8 @@ final class HttpTransport implements JsonRpcTransport {
     // default; the trust-all client is built lazily (see TrustAllHolder) so its weaker SSLContext is
     // only ever constructed when a caller actually opts into trustSelfSigned, and a failure building
     // it can never take down the verified path.
-    private static final HttpClient SHARED = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(30))
-            .build();
+    private static final HttpClient SHARED =
+            HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
 
     /** Holds the trust-all client so it is constructed on first use, not at class load. */
     private static final class TrustAllHolder {
@@ -74,8 +73,8 @@ final class HttpTransport implements JsonRpcTransport {
             // A proxy error page or an auth failure is HTML or plain text, not a JSON-RPC envelope.
             // Fail here with the status so the operator sees "HTTP 502" rather than "malformed response".
             String body = resp.body() == null ? "" : resp.body();
-            throw new IOException("HTTP " + status + " from " + endpoint + ": "
-                    + body.substring(0, Math.min(body.length(), 200)));
+            throw new IOException(
+                    "HTTP " + status + " from " + endpoint + ": " + body.substring(0, Math.min(body.length(), 200)));
         }
         String responseBody = resp.body();
         if (responseBody == null) {
@@ -89,18 +88,23 @@ final class HttpTransport implements JsonRpcTransport {
     private static SSLContext trustAllContext() {
         try {
             SSLContext ctx = SSLContext.getInstance("TLS");
-            ctx.init(null, new TrustManager[] {new X509TrustManager() {
-                @Override
-                public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+            ctx.init(
+                    null,
+                    new TrustManager[] {
+                        new X509TrustManager() {
+                            @Override
+                            public void checkClientTrusted(X509Certificate[] chain, String authType) {}
 
-                @Override
-                public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+                            @Override
+                            public void checkServerTrusted(X509Certificate[] chain, String authType) {}
 
-                @Override
-                public X509Certificate[] getAcceptedIssuers() {
-                    return new X509Certificate[0];
-                }
-            }}, new SecureRandom());
+                            @Override
+                            public X509Certificate[] getAcceptedIssuers() {
+                                return new X509Certificate[0];
+                            }
+                        }
+                    },
+                    new SecureRandom());
             return ctx;
         } catch (java.security.GeneralSecurityException e) {
             throw new HypervisorException("cannot build a trust-all SSL context: " + e.getMessage(), e);

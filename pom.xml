@@ -1,14 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
     <groupId>org.jenkins-ci.plugins</groupId>
     <artifactId>plugin</artifactId>
     <version>6.2211.v27f680c93c53</version>
-    <relativePath/>
+    <relativePath />
   </parent>
 
   <groupId>io.jenkins.plugins</groupId>
@@ -37,8 +35,8 @@
   <scm>
     <connection>scm:git:https://github.com/${gitHubRepo}.git</connection>
     <developerConnection>scm:git:git@github.com:${gitHubRepo}.git</developerConnection>
-    <url>https://github.com/${gitHubRepo}</url>
     <tag>${scmTag}</tag>
+    <url>https://github.com/${gitHubRepo}</url>
   </scm>
 
   <properties>
@@ -49,21 +47,11 @@
     <!-- LTS baseline. 2.555.x matches what vsphere-cloud targets. -->
     <jenkins.baseline>2.555</jenkins.baseline>
     <jenkins.version>${jenkins.baseline}.3</jenkins.version>
+
+    <!-- The parent POM configures spotless but skips the check by default. Enforce it here so
+         `mvn verify` (what CI runs) fails on formatting drift; run `mvn spotless:apply` to fix. -->
+    <spotless.check.skip>false</spotless.check.skip>
   </properties>
-
-  <repositories>
-    <repository>
-      <id>repo.jenkins-ci.org</id>
-      <url>https://repo.jenkins-ci.org/public/</url>
-    </repository>
-  </repositories>
-
-  <pluginRepositories>
-    <pluginRepository>
-      <id>repo.jenkins-ci.org</id>
-      <url>https://repo.jenkins-ci.org/public/</url>
-    </pluginRepository>
-  </pluginRepositories>
 
   <dependencyManagement>
     <dependencies>
@@ -78,14 +66,16 @@
   </dependencyManagement>
 
   <dependencies>
+
     <!--
-      Jackson drives the XAPI client's JSON-RPC. Jenkins core bundles jackson-databind at runtime,
-      but a plugin must depend on the jackson2-api plugin to compile against it and to be pinned to
-      core's version. The BOM manages the version.
+      cloud-stats records the lifecycle of every provisioned agent (provisioning, launching, operating,
+      then completed) and surfaces it under Manage Jenkins. The plugin only has to return a
+      TrackedPlannedNode and make its node and computer report the same activity id; cloud-stats' own
+      listeners drive the phase transitions. The BOM manages the version.
     -->
     <dependency>
       <groupId>org.jenkins-ci.plugins</groupId>
-      <artifactId>jackson2-api</artifactId>
+      <artifactId>cloud-stats</artifactId>
     </dependency>
 
     <!--
@@ -98,16 +88,14 @@
       <groupId>org.jenkins-ci.plugins</groupId>
       <artifactId>credentials</artifactId>
     </dependency>
-
     <!--
-      cloud-stats records the lifecycle of every provisioned agent (provisioning, launching, operating,
-      then completed) and surfaces it under Manage Jenkins. The plugin only has to return a
-      TrackedPlannedNode and make its node and computer report the same activity id; cloud-stats' own
-      listeners drive the phase transitions. The BOM manages the version.
+      Jackson drives the XAPI client's JSON-RPC. Jenkins core bundles jackson-databind at runtime,
+      but a plugin must depend on the jackson2-api plugin to compile against it and to be pinned to
+      core's version. The BOM manages the version.
     -->
     <dependency>
       <groupId>org.jenkins-ci.plugins</groupId>
-      <artifactId>cloud-stats</artifactId>
+      <artifactId>jackson2-api</artifactId>
     </dependency>
 
     <!--
@@ -129,4 +117,18 @@
       <scope>test</scope>
     </dependency>
   </dependencies>
+
+  <repositories>
+    <repository>
+      <id>repo.jenkins-ci.org</id>
+      <url>https://repo.jenkins-ci.org/public/</url>
+    </repository>
+  </repositories>
+
+  <pluginRepositories>
+    <pluginRepository>
+      <id>repo.jenkins-ci.org</id>
+      <url>https://repo.jenkins-ci.org/public/</url>
+    </pluginRepository>
+  </pluginRepositories>
 </project>

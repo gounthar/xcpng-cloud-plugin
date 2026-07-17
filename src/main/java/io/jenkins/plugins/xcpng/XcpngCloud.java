@@ -452,7 +452,8 @@ public class XcpngCloud extends Cloud {
             }
             // Deficit against both the spares already registered and those still booting, so repeated
             // ticks do not stack duplicate provisions for the same template.
-            int deficit = target - warmCount(warmByTemplate, template.getTemplateName())
+            int deficit = target
+                    - warmCount(warmByTemplate, template.getTemplateName())
                     - warmInFlight(template.getTemplateName()).get();
             int toLaunch = Math.min(deficit, capacity);
             for (int i = 0; i < toLaunch; i++) {
@@ -645,8 +646,8 @@ public class XcpngCloud extends Cloud {
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
-                XcpngAgent agent = new XcpngAgent(
-                        displayName, name, clone.value(), template, idleMinutes, activityId, warm);
+                XcpngAgent agent =
+                        new XcpngAgent(displayName, name, clone.value(), template, idleMinutes, activityId, warm);
                 LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
                 return agent;
             } catch (Exception e) {
@@ -712,16 +713,12 @@ public class XcpngCloud extends Cloud {
         if (clientFactory != null) {
             return clientFactory.open(this);
         }
-        StandardUsernamePasswordCredentials credentials =
-                DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
+        StandardUsernamePasswordCredentials credentials = DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
         if (credentials == null) {
             throw new IllegalStateException("No XAPI credentials configured for cloud '" + name + "'.");
         }
         return new XapiClient(
-                poolUrl,
-                credentials.getUsername(),
-                credentials.getPassword().getPlainText(),
-                trustSelfSigned);
+                poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned);
     }
 
     /** Test seam: replace how a client is opened with an in-memory fake. */
@@ -842,7 +839,8 @@ public class XcpngCloud extends Cloud {
             if (uri.getUserInfo() != null) {
                 // Credentials embedded in the URL (https://user:pass@host) would be persisted in
                 // config.xml and could reach logs, against the store-the-ID-never-the-secret design.
-                return FormValidation.error("Do not put credentials in the pool URL; select them in the Credentials field.");
+                return FormValidation.error(
+                        "Do not put credentials in the pool URL; select them in the Credentials field.");
             }
             return FormValidation.ok();
         }
@@ -888,10 +886,7 @@ public class XcpngCloud extends Cloud {
                 return FormValidation.error("Select the XAPI credentials.");
             }
             try (XapiClient client = new XapiClient(
-                    url,
-                    credentials.getUsername(),
-                    credentials.getPassword().getPlainText(),
-                    trustSelfSigned)) {
+                    url, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned)) {
                 client.ping();
                 return FormValidation.ok("Connected to the pool.");
             } catch (RuntimeException e) {
