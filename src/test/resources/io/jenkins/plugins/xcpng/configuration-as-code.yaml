@@ -10,7 +10,6 @@ jenkins:
         templates:
           - templateName: "jenkins-golden-debian"
             labelString: "xcpng-linux"
-            numExecutors: 2
             numCpus: 4
             memoryMb: 8192
             minInstances: 1

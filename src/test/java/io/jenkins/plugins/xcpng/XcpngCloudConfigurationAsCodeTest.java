@@ -47,7 +47,6 @@ class XcpngCloudConfigurationAsCodeTest {
         XcpngTemplate template = cloud.getTemplates().get(0);
         assertEquals("jenkins-golden-debian", template.getTemplateName());
         assertEquals("xcpng-linux", template.getLabelString());
-        assertEquals(2, template.getNumExecutors());
         assertEquals(4, template.getNumCpus());
         assertEquals(8192, template.getMemoryMb());
         assertEquals(1, template.getMinInstances());

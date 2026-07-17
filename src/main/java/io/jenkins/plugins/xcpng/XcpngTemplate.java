@@ -14,7 +14,11 @@ import org.kohsuke.stapler.QueryParameter;
 
 /**
  * One kind of agent this cloud can provision: which golden-image template to clone, the labels the
- * resulting agent serves, how many executors it runs, and the size of the clone.
+ * resulting agent serves, and the size of the clone.
+ *
+ * <p>Executors are not among them. Every agent runs exactly one (see {@link XcpngAgent#EXECUTORS_PER_AGENT}),
+ * because single-use and a second executor cannot both hold: the reap fires on the first build's completion
+ * and would destroy the VM under any build still running beside it. Scale with more clones instead.
  *
  * <p>v0 supports a single template per cloud (the plan cuts multi-template). {@link XcpngCloud} holds
  * a list only because that is the standard shape of a cloud configuration form; provisioning uses the
@@ -35,7 +39,6 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
 
     private final String templateName;
     private final String labelString;
-    private int numExecutors;
     private int numCpus;
     private int memoryMb;
     // Optional: an OpenSSH *public* key. When set, each clone trusts it for the debian user (delivered
@@ -54,10 +57,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
     private int minInstances;
 
     @DataBoundConstructor
-    public XcpngTemplate(String templateName, String labelString, int numExecutors, int numCpus, int memoryMb) {
+    public XcpngTemplate(String templateName, String labelString, int numCpus, int memoryMb) {
         this.templateName = templateName;
         this.labelString = labelString;
-        this.numExecutors = numExecutors <= 0 ? 1 : numExecutors;
         this.numCpus = numCpus <= 0 ? DEFAULT_NUM_CPUS : numCpus;
         this.memoryMb = memoryMb <= 0 ? DEFAULT_MEMORY_MB : memoryMb;
     }
@@ -66,11 +68,13 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
      * XStream loads a persisted template without the constructor, so a config.xml predating the sizing
      * fields (or carrying a zero left by a hand-edit) reloads with {@code numCpus}/{@code memoryMb} at
      * 0. Re-apply the same clamps the constructor does, so provisioning never builds an invalid spec.
+     *
+     * <p>A config.xml written before executors were pinned still carries a {@code <numExecutors>} element.
+     * Nothing reads it: Jenkins' robust reflection converter drops an element with no matching field, and
+     * the agent takes {@link XcpngAgent#EXECUTORS_PER_AGENT} regardless. A persisted 2 therefore stops
+     * meaning "two builds share this VM" on reload, which is the point of the change, not a casualty of it.
      */
     protected Object readResolve() {
-        if (numExecutors <= 0) {
-            numExecutors = 1;
-        }
         if (numCpus <= 0) {
             numCpus = DEFAULT_NUM_CPUS;
         }
@@ -100,10 +104,6 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
     /** Space-separated labels the provisioned agent serves. */
     public String getLabelString() {
         return labelString;
-    }
-
-    public int getNumExecutors() {
-        return numExecutors;
     }
 
     /** Virtual CPUs the clone is sized to, overriding whatever the golden image carried. */

@@ -6,9 +6,6 @@
   <f:entry title="${%Labels}" field="labelString">
     <f:textbox/>
   </f:entry>
-  <f:entry title="${%Executors}" field="numExecutors">
-    <f:number default="1" clazz="positive-number"/>
-  </f:entry>
   <f:entry title="${%vCPUs}" field="numCpus">
     <f:number default="2" clazz="positive-number"/>
   </f:entry>

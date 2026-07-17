@@ -9,7 +9,6 @@
       memoryMb: 8192
       minInstances: 1
       numCpus: 4
-      numExecutors: 2
       sshAuthorizedKey: "ssh-ed25519 AAAAExampleKeyForRoundTripTest lab"
       templateName: "jenkins-golden-debian"
     trustSelfSigned: true

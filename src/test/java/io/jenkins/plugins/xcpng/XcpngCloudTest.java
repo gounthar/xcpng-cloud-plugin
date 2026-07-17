@@ -12,6 +12,7 @@ import hudson.util.FormValidation;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
+import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -33,7 +34,7 @@ class XcpngCloudTest {
                 "xcpng-root",
                 true,
                 3,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 4, 8192)));
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 4, 8192)));
         // A non-default idle timeout so the assertion proves the optional setter survives the form, not
         // merely that the field initializer happens to match.
         cloud.setIdleMinutes(20);
@@ -52,7 +53,6 @@ class XcpngCloudTest {
         XcpngTemplate template = reloaded.getTemplates().get(0);
         assertEquals("jenkins-golden-debian", template.getTemplateName());
         assertEquals("xcpng-linux", template.getLabelString());
-        assertEquals(2, template.getNumExecutors());
         assertEquals(4, template.getNumCpus());
         assertEquals(8192, template.getMemoryMb());
         assertEquals(8192L * 1024 * 1024, template.getMemoryBytes());
@@ -77,7 +77,7 @@ class XcpngCloudTest {
                 "xcpng-root",
                 true,
                 2,
-                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048))));
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048))));
         r.jenkins.save();
 
         Path configXml = r.jenkins.getRootDir().toPath().resolve("config.xml");
@@ -153,9 +153,44 @@ class XcpngCloudTest {
                 + "  <labelString>xcpng-linux</labelString>\n"
                 + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
         XcpngTemplate t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
-        assertEquals(1, t.getNumExecutors(), "missing executors must clamp to 1");
         assertEquals(2, t.getNumCpus(), "missing vCPUs must clamp to the default, not 0");
         assertEquals(2048, t.getMemoryMb(), "missing memory must clamp to the default, not 0");
+    }
+
+    /**
+     * A template persisted while executors were still configurable carries a {@code <numExecutors>} element
+     * no field matches any more. That config must still load rather than break the controller's startup, and
+     * the value must be inert: a persisted 2 used to mean two builds shared one VM, which is the arrangement
+     * that let the first to finish destroy the VM under the second.
+     */
+    @Test
+    void aLegacyExecutorCountIsIgnoredRatherThanHonoured(JenkinsRule r) throws Exception {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                + "  <templateName>jenkins-golden-debian</templateName>\n"
+                + "  <labelString>xcpng-linux</labelString>\n"
+                + "  <numExecutors>2</numExecutors>\n"
+                + "  <numCpus>4</numCpus>\n"
+                + "  <memoryMb>8192</memoryMb>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+
+        XcpngTemplate t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+
+        // The unknown element is dropped, and the fields beside it still load: proof the legacy config is
+        // absorbed rather than rejected.
+        assertEquals("jenkins-golden-debian", t.getTemplateName());
+        assertEquals(4, t.getNumCpus(), "the fields around the dropped element must still load");
+        assertEquals(8192, t.getMemoryMb());
+
+        // What the operator actually gets: one executor, whatever the old config asked for.
+        XcpngAgent agent = new XcpngAgent(
+                "xcpng-legacy-1",
+                "xcpng",
+                "vm/legacy/1",
+                t,
+                10,
+                new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-legacy-1"),
+                false);
+        assertEquals(1, agent.getNumExecutors(), "a legacy numExecutors=2 must not resurrect a shared VM");
     }
 
     /**
@@ -179,7 +214,7 @@ class XcpngCloudTest {
      */
     @Test
     void minInstancesClampsNegativeToZero(JenkinsRule r) {
-        XcpngTemplate t = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        XcpngTemplate t = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
         assertEquals(0, t.getMinInstances(), "an unset warm-pool size must be 0");
         t.setMinInstances(-3);
         assertEquals(0, t.getMinInstances(), "a negative warm-pool size must clamp to 0");

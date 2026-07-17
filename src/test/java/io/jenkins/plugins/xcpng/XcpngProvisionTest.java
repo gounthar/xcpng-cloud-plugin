@@ -47,7 +47,7 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 class XcpngProvisionTest {
 
     private static final XcpngTemplate LINUX_TEMPLATE =
-            new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+            new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
 
     /** A cloud whose clients are the given fake, so a test can inspect the recorded call sequence. */
     private static XcpngCloud cloudBackedBy(FakeHypervisorClient fake, int maxInstances) {
@@ -133,7 +133,7 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        XcpngTemplate keyed = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        XcpngTemplate keyed = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
         String pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTest operator@host";
         keyed.setSshAuthorizedKey(pubkey);
 
@@ -382,7 +382,7 @@ class XcpngProvisionTest {
 
     /** A warm-pool template for {@code templateName}, wanting {@code minInstances} spares. */
     private static XcpngTemplate warmTemplate(String templateName, int minInstances) {
-        XcpngTemplate template = new XcpngTemplate(templateName, "xcpng-linux", 1, 2, 2048);
+        XcpngTemplate template = new XcpngTemplate(templateName, "xcpng-linux", 2, 2048);
         template.setMinInstances(minInstances);
         return template;
     }

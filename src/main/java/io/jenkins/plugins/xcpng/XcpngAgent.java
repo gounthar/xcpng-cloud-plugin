@@ -45,6 +45,17 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     private static final String REMOTE_FS = "/home/debian/agent";
 
+    /**
+     * Executors per agent, fixed at one and deliberately not configurable.
+     *
+     * <p>Single-use is the whole design: one build, one pristine VM, then the VM and its disks are
+     * destroyed. That is incompatible with a second executor. The reap fires when a build completes
+     * (see {@link XcpngRetentionStrategy#taskCompleted}), so on a two-executor agent the first build to
+     * finish would hard-destroy the VM out from under the second, which dies with a channel loss and no
+     * way for the operator to tell why. Throughput comes from more clones, not more executors per clone.
+     */
+    static final int EXECUTORS_PER_AGENT = 1;
+
     private final String cloudName;
     private final String vmRef;
 
@@ -80,7 +91,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 name,
                 "XCP-ng ephemeral agent",
                 REMOTE_FS,
-                template.getNumExecutors(),
+                EXECUTORS_PER_AGENT,
                 Node.Mode.NORMAL,
                 template.getLabelString(),
                 new JNLPLauncher(),

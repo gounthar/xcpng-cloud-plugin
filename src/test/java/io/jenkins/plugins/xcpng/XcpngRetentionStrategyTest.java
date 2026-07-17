@@ -33,7 +33,7 @@ class XcpngRetentionStrategyTest {
     /** A warm spare reports warm until it accepts work, then markUsed() flips it to single-use for good. */
     @Test
     void markUsedClearsTheWarmFlag(JenkinsRule r) throws Exception {
-        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 1, 2, 2048);
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
         ProvisioningActivity.Id id = new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-warm-1");
         XcpngAgent spare = new XcpngAgent("xcpng-warm-1", "xcpng", "vm/xcpng-warm-1/1", template, 10, id, true);
 
