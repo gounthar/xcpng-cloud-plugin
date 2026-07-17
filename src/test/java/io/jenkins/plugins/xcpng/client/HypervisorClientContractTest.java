@@ -69,7 +69,9 @@ class HypervisorClientContractTest {
 
     @Test
     void pingSurfacesFailure() {
-        assertThrows(HypervisorException.class, () -> new FakeHypervisorClient().failPing().ping());
+        assertThrows(
+                HypervisorException.class,
+                () -> new FakeHypervisorClient().failPing().ping());
         new FakeHypervisorClient().ping(); // does not throw on success
     }
 

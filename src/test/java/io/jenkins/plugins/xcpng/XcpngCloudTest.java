@@ -107,8 +107,7 @@ class XcpngCloudTest {
     /** Surrounding whitespace is trimmed on the way in so the persisted value matches what parses. */
     @Test
     void poolUrlIsTrimmedOnConstruction(JenkinsRule r) {
-        XcpngCloud cloud = new XcpngCloud(
-                "xcpng", "  https://pool.example.test  ", "id", false, 2, List.of());
+        XcpngCloud cloud = new XcpngCloud("xcpng", "  https://pool.example.test  ", "id", false, 2, List.of());
         assertEquals("https://pool.example.test", cloud.getPoolUrl());
     }
 

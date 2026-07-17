@@ -135,8 +135,7 @@ class XcpngProvisionTest {
                 FormValidation.Kind.ERROR,
                 d.doCheckSshAuthorizedKey("ssh-ed25519 AAAAOne a@h\nssh-ed25519 AAAATwo b@h").kind);
         // A pasted private key is rejected outright.
-        assertEquals(
-                FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("-----BEGIN OPENSSH PRIVATE KEY-----").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("-----BEGIN OPENSSH PRIVATE KEY-----").kind);
         // Legacy DSA is rejected: current OpenSSH will not authenticate it.
         assertEquals(FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("ssh-dss AAAADsaExample x@h").kind);
     }
@@ -162,7 +161,8 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        XcpngAgent agent =
+                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
         r.jenkins.addNode(agent);
         agent.terminate();
 
@@ -185,7 +185,8 @@ class XcpngProvisionTest {
         // Narrowed to the client's own exception (not any Exception): the clone succeeds and only the
         // start throws, so a broader assertion could pass on an unrelated failure and hide a regression.
         HypervisorException thrown = assertThrows(
-                HypervisorException.class, () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1")));
+                HypervisorException.class,
+                () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1")));
         assertTrue(
                 thrown.getMessage().contains("start failed"),
                 "the surfaced failure must be the start failure: " + thrown.getMessage());
@@ -337,8 +338,8 @@ class XcpngProvisionTest {
     @Test
     void interruptingAProvisionStillDestroysTheVmAndKeepsTheInterrupt(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
-        XcpngCloud cloud = new XcpngCloud(
-                "xcpng", "https://pool.example.test", "cred", false, 2, List.of(LINUX_TEMPLATE));
+        XcpngCloud cloud =
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 2, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
         // Unlike the other tests, keep the production online wait, so the task is still running when the
         // interrupt lands. Once the node is registered the interrupt may land anywhere -- in addNode's tail
@@ -351,18 +352,18 @@ class XcpngProvisionTest {
         AtomicReference<Thread> worker = new AtomicReference<>();
         AtomicBoolean interruptSurvived = new AtomicBoolean();
         CountDownLatch taskDone = new CountDownLatch(1);
-        ThreadPoolExecutor exec = new ThreadPoolExecutor(
-                1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), runnable -> {
+        ThreadPoolExecutor exec =
+                new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), runnable -> {
                     Thread t = new Thread(runnable, "provision-under-test");
                     worker.set(t);
                     return t;
                 }) {
-            @Override
-            protected void afterExecute(Runnable runnable, Throwable thrown) {
-                interruptSurvived.set(Thread.currentThread().isInterrupted());
-                taskDone.countDown();
-            }
-        };
+                    @Override
+                    protected void afterExecute(Runnable runnable, Throwable thrown) {
+                        interruptSurvived.set(Thread.currentThread().isInterrupted());
+                        taskDone.countDown();
+                    }
+                };
         cloud.setProvisionExecutor(exec);
         try {
             NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
@@ -403,8 +404,8 @@ class XcpngProvisionTest {
 
     /** A cloud over the given warm-pool templates, backed by the given fake. */
     private static XcpngCloud warmCloudOver(FakeHypervisorClient fake, int maxInstances, XcpngTemplate... templates) {
-        XcpngCloud cloud = new XcpngCloud(
-                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(templates));
+        XcpngCloud cloud =
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(templates));
         cloud.setClientFactory(c -> fake);
         cloud.setWaitForOnline(false);
         return cloud;
@@ -433,7 +434,9 @@ class XcpngProvisionTest {
     }
 
     private static long destroyCount(FakeHypervisorClient fake) {
-        return fake.calls().stream().filter(c -> c.startsWith("destroyWithDisks:")).count();
+        return fake.calls().stream()
+                .filter(c -> c.startsWith("destroyWithDisks:"))
+                .count();
     }
 
     private static int warmNodeCount(JenkinsRule r) {
@@ -550,7 +553,8 @@ class XcpngProvisionTest {
         // The spare accepts a build, so it is no longer a spare: it is an ordinary single-use agent, which
         // the retention strategy reaps once that build finishes. The drain must not reach it even with the
         // target dropped to zero underneath it -- yanking it would kill the build it is running.
-        XcpngAgent agent = assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+        XcpngAgent agent =
+                assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
         agent.markUsed();
         template.setMinInstances(0);
         reconcileAndSettle(cloud);
@@ -585,9 +589,9 @@ class XcpngProvisionTest {
         r.jenkins.clouds.add(cloud);
         reconcileAndSettle(cloud);
 
-        XcpngAgent spare = assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
-        AbstractCloudComputer<?> computer =
-                assertInstanceOf(AbstractCloudComputer.class, spare.getComputer());
+        XcpngAgent spare =
+                assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, spare.getComputer());
         XcpngRetentionStrategy strategy =
                 assertInstanceOf(XcpngRetentionStrategy.class, computer.getRetentionStrategy());
 
