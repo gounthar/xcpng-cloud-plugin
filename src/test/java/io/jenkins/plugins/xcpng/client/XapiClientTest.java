@@ -160,6 +160,36 @@ class XapiClientTest {
     }
 
     @Test
+    void cloneCanShrinkVcpusBelowTheTemplatesCount() {
+        ScriptedTransport t = new ScriptedTransport(); // template has 2 vCPUs, as the golden image does
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        // Setting max first would try 0 < 2 <= 1 while at_startup still holds the inherited 2, which the
+        // pool rejects with INVALID_VALUE. at_startup has to come down under the new ceiling first.
+        c.cloneFromTemplate(new VmRef("OpaqueRef:tmpl"), new ProvisionSpec("agent", 1, 2048L, null, null, null));
+
+        assertOrder(t, "VM.set_VCPUs_at_startup", "VM.set_VCPUs_max");
+        assertEquals("1", paramsOf(t, "VM.set_VCPUs_at_startup").get(2).asText());
+        assertEquals("1", paramsOf(t, "VM.set_VCPUs_max").get(2).asText());
+        assertEquals(1, t.vcpusMax);
+        assertEquals(1, t.vcpusAtStartup);
+        assertFalse(t.methods().contains("VM.destroy"), "a clone that sized cleanly must not be torn down");
+    }
+
+    @Test
+    void cloneGrowingVcpusRaisesTheCeilingFirst() {
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        // The mirror image: at_startup first would try 0 < 4 <= 2 against the inherited ceiling.
+        c.cloneFromTemplate(new VmRef("OpaqueRef:tmpl"), new ProvisionSpec("agent", 4, 2048L, null, null, null));
+
+        assertOrder(t, "VM.set_VCPUs_max", "VM.set_VCPUs_at_startup");
+        assertEquals(4, t.vcpusMax);
+        assertEquals(4, t.vcpusAtStartup);
+    }
+
+    @Test
     void cloneSeedsGuestDataIntoXenstoreBeforeReturning() {
         ScriptedTransport t = new ScriptedTransport();
         // A key the template already carries; the seed must merge onto it, not replace the whole map.
@@ -345,6 +375,9 @@ class XapiClientTest {
         Map<String, String> xenstoreData = Map.of();
         /** Interrupt the calling thread when this method is posted, standing in for an interrupt landing mid-clone. */
         String interruptOn = null;
+        /** The template's vCPU counts, which a clone inherits. The golden image on the lab pool has 2. */
+        int vcpusMax = 2;
+        int vcpusAtStartup = 2;
 
         @Override
         public String post(String body) throws IOException {
@@ -368,6 +401,26 @@ class XapiClientTest {
             if (vdiDestroyFails && method.equals("VDI.destroy")) {
                 return envelope(id, null, Map.of("message", "VDI_IN_USE"));
             }
+            // XAPI checks 0 < VCPUs_at_startup <= VCPUs_max on *every* write, against the value being set
+            // and whatever the other one currently holds. Modelling it is what makes the sizing tests real:
+            // accepting any value, as this transport used to, lets a clone "resize" in an order the pool
+            // rejects outright.
+            if (method.equals("VM.set_VCPUs_max") || method.equals("VM.set_VCPUs_at_startup")) {
+                int value = Integer.parseInt(req.get("params").get(2).asText());
+                boolean max = method.endsWith("_max");
+                int wouldBeMax = max ? value : vcpusMax;
+                int wouldBeAtStartup = max ? vcpusAtStartup : value;
+                if (wouldBeAtStartup <= 0 || wouldBeAtStartup > wouldBeMax) {
+                    return envelope(id, null, Map.of(
+                            "message", "INVALID_VALUE",
+                            "data",
+                            List.of(
+                                    "VCPU values must satisfy: 0 < VCPUs_at_startup ≤ VCPUs_max",
+                                    String.valueOf(value))));
+                }
+                vcpusMax = wouldBeMax;
+                vcpusAtStartup = wouldBeAtStartup;
+            }
             Object result = switch (method) {
                 case "session.login_with_password" -> "OpaqueRef:session";
                 case "VM.get_by_name_label" -> {
@@ -388,6 +441,7 @@ class XapiClientTest {
                         ? "<value>OpaqueRef:1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d</value>"
                         : "";
                 case "task.get_error_info" -> List.of("INTERNAL_ERROR", "boom");
+                case "VM.get_VCPUs_max" -> vcpusMax;
                 case "VM.get_xenstore_data" -> xenstoreData;
                 case "VM.get_power_state" -> powerState;
                 case "VM.get_guest_metrics" -> "OpaqueRef:gm";

@@ -192,6 +192,29 @@ public final class XapiClient implements HypervisorClient {
         }
     }
 
+    /**
+     * Size a clone's vCPUs, writing the two values in whichever order keeps XAPI's invariant true.
+     *
+     * <p>XAPI enforces {@code 0 < VCPUs_at_startup <= VCPUs_max} on *every* write, and a clone inherits
+     * the template's counts. So neither fixed order works for both directions: setting max first breaks
+     * when shrinking (the inherited at_startup still exceeds the new max), and setting at_startup first
+     * breaks when growing (it would exceed the inherited max). Read the clone's current max and move the
+     * value that keeps the pair legal at each step.
+     */
+    private void setVcpus(String vm, int vcpus) {
+        int currentMax = call("VM.get_VCPUs_max", vm).asInt();
+        String target = String.valueOf(vcpus);
+        if (vcpus <= currentMax) {
+            // Shrinking: bring at_startup down under the new ceiling before lowering the ceiling onto it.
+            call("VM.set_VCPUs_at_startup", vm, target);
+            call("VM.set_VCPUs_max", vm, target);
+        } else {
+            // Growing: raise the ceiling first, so at_startup has room to follow.
+            call("VM.set_VCPUs_max", vm, target);
+            call("VM.set_VCPUs_at_startup", vm, target);
+        }
+    }
+
     // -- the verbs --------------------------------------------------------
 
     @Override
@@ -240,8 +263,7 @@ public final class XapiClient implements HypervisorClient {
             // VM.clone of a template yields a template; make it a runnable VM, then size it. VM.clone
             // copies the source's vCPU and memory, so each clone overrides them here.
             call("VM.set_is_a_template", vm, false);
-            call("VM.set_VCPUs_max", vm, String.valueOf(spec.vcpus()));
-            call("VM.set_VCPUs_at_startup", vm, String.valueOf(spec.vcpus()));
+            setVcpus(vm, spec.vcpus());
             String mem = String.valueOf(spec.memoryBytes());
             call("VM.set_memory_limits", vm, mem, mem, mem, mem);
             if (spec.diskBytes() != null) {
