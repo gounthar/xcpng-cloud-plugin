@@ -23,6 +23,14 @@ import java.util.Map;
  * to deliver them. The XAPI backend writes them into the clone's xenstore (under {@code vm-data/jenkins/})
  * before the VM starts; a Xen Orchestra backend could deliver the same map via cloud-init instead. Empty
  * when no seed is needed. Distinct from {@code userData}, which is an opaque cloud-init blob v0 ignores.
+ *
+ * <p>{@code owner} names the cloud this clone belongs to, and asks the backend to record it <em>on the VM
+ * itself</em> so the VM can be identified later without the plugin. Null means "do not mark", which is what
+ * a caller that only sizes a clone wants. It exists for recovery: the plugin's own teardown covers the
+ * normal path, but a controller that crashes mid-provision, or a {@code destroyWithDisks} that throws,
+ * leaves a VM only an out-of-band sweep will ever find. Matching such VMs by name is what left
+ * {@code tools/reaper.py} unable to see a single one of them, so the mark is a property of the record
+ * rather than a naming convention. Each backend picks the field: the XAPI backend uses {@code other_config}.
  */
 public record ProvisionSpec(
         @NonNull String name,
@@ -31,7 +39,8 @@ public record ProvisionSpec(
         @CheckForNull Long diskBytes,
         @CheckForNull String placementHint,
         @CheckForNull String userData,
-        @NonNull Map<String, String> guestData) {
+        @NonNull Map<String, String> guestData,
+        @CheckForNull String owner) {
 
     public ProvisionSpec {
         if (name == null || name.isBlank()) {
@@ -59,6 +68,18 @@ public record ProvisionSpec(
             @CheckForNull Long diskBytes,
             @CheckForNull String placementHint,
             @CheckForNull String userData) {
-        this(name, vcpus, memoryBytes, diskBytes, placementHint, userData, Map.of());
+        this(name, vcpus, memoryBytes, diskBytes, placementHint, userData, Map.of(), null);
+    }
+
+    /** A seeded spec for an unowned clone, i.e. one no out-of-band sweep is expected to have to find. */
+    public ProvisionSpec(
+            @NonNull String name,
+            int vcpus,
+            long memoryBytes,
+            @CheckForNull Long diskBytes,
+            @CheckForNull String placementHint,
+            @CheckForNull String userData,
+            @NonNull Map<String, String> guestData) {
+        this(name, vcpus, memoryBytes, diskBytes, placementHint, userData, guestData, null);
     }
 }

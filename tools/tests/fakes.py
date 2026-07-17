@@ -24,8 +24,18 @@ class FakeResponse:
         return self._body
 
 
-def vm_record(name, snapshot=False, template=False, control_domain=False, power="Halted"):
-    """The subset of a XAPI VM record that reaper.py filters on."""
+def vm_record(name, snapshot=False, template=False, control_domain=False, power="Halted",
+              owner=None, other_config=None):
+    """The subset of a XAPI VM record that reaper.py filters on.
+
+    `owner` stamps the `xcpng-cloud` marker the plugin writes into other_config, i.e. this is
+    a VM the plugin provisioned and is answerable for. Leave it None for everything the plugin
+    did not create: an operator's VM, the golden image, a pre-plugin probe. Defaulting to None
+    matters, because a fake that marked every VM would make the marker filter untestable.
+    """
+    config = dict(other_config or {})
+    if owner is not None:
+        config["xcpng-cloud"] = owner
     return {
         "name_label": name,
         "uuid": f"uuid-{name}",
@@ -33,6 +43,7 @@ def vm_record(name, snapshot=False, template=False, control_domain=False, power=
         "is_a_snapshot": snapshot,
         "is_a_template": template,
         "is_control_domain": control_domain,
+        "other_config": config,
     }
 
 

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.time.Duration;
@@ -263,6 +264,7 @@ public final class XapiClient implements HypervisorClient {
             // VM.clone of a template yields a template; make it a runnable VM, then size it. VM.clone
             // copies the source's vCPU and memory, so each clone overrides them here.
             call("VM.set_is_a_template", vm, false);
+            markOwner(vm, spec.owner());
             setVcpus(vm, spec.vcpus());
             String mem = String.valueOf(spec.memoryBytes());
             call("VM.set_memory_limits", vm, mem, mem, mem, mem);
@@ -297,6 +299,40 @@ public final class XapiClient implements HypervisorClient {
             throw e;
         }
         return new VmRef(vm);
+    }
+
+    /**
+     * {@code other_config} key stamped on every clone this plugin provisions, holding the owning cloud's
+     * name. The recovery contract with {@code tools/reaper.py}, which selects on this key rather than on a
+     * name prefix: names drift (they already did, silently, and the reaper matched nothing for it), whereas
+     * a VM that carries this key was provisioned by this plugin and by nothing else. A golden image, an
+     * operator's VM, and a snapshot cannot acquire it by being named unluckily.
+     *
+     * <p>Change this string and the reaper stops finding VMs the plugin leaks. Both sides must move together.
+     */
+    public static final String OWNER_KEY = "xcpng-cloud";
+
+    /**
+     * Record the owning cloud on the VM record so an out-of-band sweep can find this clone later. Merged
+     * onto whatever the clone inherited from the template, rather than replacing {@code other_config}
+     * wholesale: XCP-ng itself keeps keys there (and a golden image may carry its own), and a clone that
+     * dropped them would be a worse citizen than one the reaper cannot see.
+     */
+    private void markOwner(String vm, @CheckForNull String owner) {
+        if (owner == null || owner.isBlank()) {
+            return;
+        }
+        Map<String, String> merged = new LinkedHashMap<>();
+        JsonNode existing = call("VM.get_other_config", vm);
+        if (existing.isObject()) {
+            existing.fields().forEachRemaining(e -> {
+                if (!e.getValue().isNull()) {
+                    merged.put(e.getKey(), e.getValue().asText());
+                }
+            });
+        }
+        merged.put(OWNER_KEY, owner);
+        call("VM.set_other_config", vm, merged);
     }
 
     /** Xenstore path the guest agent reads its seed from. Only {@code vm-data/*} keys reach the guest. */

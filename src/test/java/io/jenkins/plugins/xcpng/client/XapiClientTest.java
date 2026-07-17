@@ -225,6 +225,40 @@ class XapiClientTest {
     }
 
     @Test
+    void cloneMarksTheOwningCloudInOtherConfig() {
+        ScriptedTransport t = new ScriptedTransport();
+        // Keys XCP-ng itself keeps on the record; the marker merges onto them rather than replacing them.
+        t.otherConfig = Map.of("mac_seed", "9f4d-abcd", "base_template_name", "Debian Bookworm 12");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.cloneFromTemplate(
+                new VmRef("OpaqueRef:tmpl"),
+                new ProvisionSpec("agent", 2, 2048L, null, null, null, Map.of(), "xcpng-lab"));
+
+        // Stamped on the record itself, which is the whole point: tools/reaper.py selects on this key, and
+        // a name-based selector is what left it unable to see a single plugin-provisioned VM.
+        JsonNode set = paramsOf(t, "VM.set_other_config").get(2);
+        assertEquals("xcpng-lab", set.get(XapiClient.OWNER_KEY).asText());
+        assertEquals("9f4d-abcd", set.get("mac_seed").asText(), "an inherited other_config key must survive");
+        assertEquals("Debian Bookworm 12", set.get("base_template_name").asText());
+        // Before the VM can ever run: a clone that starts, then crashes before it is marked, is exactly the
+        // leak the marker exists to make findable.
+        assertOrder(t, "VM.set_other_config", "VM.set_memory_limits");
+    }
+
+    @Test
+    void cloneWithNoOwnerTouchesNoOtherConfig() {
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        // The 6-arg spec carries no owner: a caller only sizing a clone marks nothing.
+        c.cloneFromTemplate(new VmRef("OpaqueRef:tmpl"), new ProvisionSpec("agent", 2, 2048L, null, null, null));
+
+        assertFalse(t.methods().contains("VM.get_other_config"), "no owner means no other_config read");
+        assertFalse(t.methods().contains("VM.set_other_config"), "no owner means no other_config write");
+    }
+
+    @Test
     void startSucceedsWhenTheAsyncTaskResultIsVoid() {
         // Async.VM.start settles with an empty result; the client must not demand an OpaqueRef.
         ScriptedTransport t = new ScriptedTransport();
@@ -373,6 +407,13 @@ class XapiClientTest {
         boolean extraDisk = false;
         boolean sharedVdi = false;
         Map<String, String> xenstoreData = Map.of();
+
+        /**
+         * What the clone inherits in other_config from the template. XCP-ng keeps its own keys there, so a
+         * marker write that replaced the map wholesale would silently drop them; leaving this empty by
+         * default would let that regression pass.
+         */
+        Map<String, String> otherConfig = Map.of();
         /** Interrupt the calling thread when this method is posted, standing in for an interrupt landing mid-clone. */
         String interruptOn = null;
         /** The template's vCPU counts, which a clone inherits. The golden image on the lab pool has 2. */
@@ -443,6 +484,7 @@ class XapiClientTest {
                 case "task.get_error_info" -> List.of("INTERNAL_ERROR", "boom");
                 case "VM.get_VCPUs_max" -> vcpusMax;
                 case "VM.get_xenstore_data" -> xenstoreData;
+                case "VM.get_other_config" -> otherConfig;
                 case "VM.get_power_state" -> powerState;
                 case "VM.get_guest_metrics" -> "OpaqueRef:gm";
                 case "VM_guest_metrics.get_networks" -> Map.of("0/ip", "192.168.1.50");
