@@ -9,6 +9,7 @@ import hudson.slaves.CloudRetentionStrategy;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -36,6 +37,20 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
      */
     private transient boolean reaping;
 
+    /**
+     * Executor the idle net and a build's completion reap on. Null in production, where {@link #reapExecutor()}
+     * falls back to {@code Computer.threadPoolForRemoting}; a test injects a controllable one so the async
+     * teardown is observable by the time it asserts. Transient: behaviour, never persisted.
+     */
+    private transient ExecutorService reapExecutor;
+
+    /**
+     * Clock for the idle-timeout math. Null in production, where {@link #now()} reads the system clock; a
+     * test injects a fixed instant so {@link #check} can be driven just before or past the timeout without a
+     * minutes-long wait, while the real {@code MINUTES.toMillis} conversion stays under test. Transient.
+     */
+    private transient LongSupplier clock;
+
     public XcpngRetentionStrategy(int idleMinutes) {
         super(idleMinutes);
         this.idleMinutes = idleMinutes;
@@ -61,12 +76,17 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         // its VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
         // net is for, and matches the superclass CloudRetentionStrategy.
         if (idleMinutes > 0 && computer.isIdle()) {
-            long idleMillis = System.currentTimeMillis() - computer.getIdleStartMilliseconds();
+            long idleMillis = now() - computer.getIdleStartMilliseconds();
             if (idleMillis > TimeUnit.MINUTES.toMillis(idleMinutes)) {
                 reap(computer);
             }
         }
         return 1;
+    }
+
+    /** The current instant in millis, from the injected clock in tests or the system clock in production. */
+    private long now() {
+        return clock != null ? clock.getAsLong() : System.currentTimeMillis();
     }
 
     /** Whether the computer backs an unused warm spare that should be kept hot rather than idle-reaped. */
@@ -114,7 +134,22 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
 
     /** Reap on the remoting pool, the production path for the idle net and a build's completion. */
     private void reap(AbstractCloudComputer<?> computer) {
-        reap(computer, Computer.threadPoolForRemoting);
+        reap(computer, reapExecutor());
+    }
+
+    /** The executor the idle net and task-completion reap on: an injected one in tests, the remoting pool otherwise. */
+    private ExecutorService reapExecutor() {
+        return reapExecutor != null ? reapExecutor : Computer.threadPoolForRemoting;
+    }
+
+    /** Test seam: run the idle-net and task-completion reaps on a controllable executor. */
+    void setReapExecutor(ExecutorService reapExecutor) {
+        this.reapExecutor = reapExecutor;
+    }
+
+    /** Test seam: drive the idle-timeout math off a fixed clock instead of the wall clock. */
+    void setClock(LongSupplier clock) {
+        this.clock = clock;
     }
 
     /**

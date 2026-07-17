@@ -25,6 +25,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private int cloneCounter = 0;
     private boolean pingFails = false;
     private boolean startFails = false;
+    private boolean destroyFails = false;
     private String assignIpOnStart = null;
     private ProvisionSpec lastSpec = null;
 
@@ -47,6 +48,15 @@ public final class FakeHypervisorClient implements HypervisorClient {
     /** Make {@link #start} throw after the clone exists, to test failed-provision cleanup. */
     public FakeHypervisorClient failStart() {
         this.startFails = true;
+        return this;
+    }
+
+    /**
+     * Make {@link #destroyWithDisks} throw <em>after</em> recording the attempt, to test a teardown whose
+     * destroy fails: the caller must still complete (remove the node, log) rather than leave it half-removed.
+     */
+    public FakeHypervisorClient failDestroy() {
+        this.destroyFails = true;
         return this;
     }
 
@@ -132,6 +142,9 @@ public final class FakeHypervisorClient implements HypervisorClient {
     public void destroyWithDisks(VmRef vm) {
         checkNotInterrupted("destroyWithDisks");
         calls.add("destroyWithDisks:" + vm.value());
+        if (destroyFails) {
+            throw new HypervisorException("destroy failed");
+        }
         states.remove(vm.value());
     }
 
