@@ -202,6 +202,38 @@ def test_a_non_interactive_prefix_apply_destroys_nothing_without_force(pool, cap
     assert "without --force" in capsys.readouterr().err
 
 
+def test_a_detached_stdin_prefix_apply_destroys_nothing(pool, capsys, monkeypatch):
+    """sys.stdin is None, not merely closed, when the interpreter runs with stdin detached.
+
+    That is still nobody to confirm to, so it must take the same refusal as a non-TTY rather than
+    raise AttributeError out of the confirmation prompt. Both outcomes destroy nothing, but one of
+    them prints the reason.
+    """
+    fake = pool(
+        {"vm-probe": vm_record("jenkins-ci-probe-1")},
+        argv=("reaper.py", "--apply", "--prefix", "jenkins-ci-"),
+    )
+    monkeypatch.setattr(reaper.sys, "stdin", None)
+
+    assert reaper.main() == 2
+    assert fake.destroyed == []
+    assert "without --force" in capsys.readouterr().err
+
+
+def test_a_record_with_a_null_other_config_is_not_a_crash(pool):
+    """Defensive: a record whose other_config is None must read as unmarked, not raise.
+
+    I could not get real XAPI to emit this (it types other_config as a map and returns {} when
+    empty), so this pins the guard rather than a reproduced failure.
+    """
+    records = {"vm-odd": vm_record("xcpng-weird-1"), "vm-ok": vm_record(PLUGIN_VM, owner=CLOUD)}
+    records["vm-odd"]["other_config"] = None
+    fake = pool(records)
+
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-ok"], "a null other_config must read as unmarked, not match or explode"
+
+
 def test_prefix_and_cloud_together_are_refused(monkeypatch):
     """--cloud filters the marker, so combining it with a name prefix asks for two things at once."""
     monkeypatch.setattr(

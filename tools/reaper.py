@@ -42,11 +42,11 @@ def _selector(args):
     if args.prefix is None:
         if args.cloud:
             return (
-                lambda rec: rec.get("other_config", {}).get(OWNER_KEY) == args.cloud,
+                lambda rec: (rec.get("other_config") or {}).get(OWNER_KEY) == args.cloud,
                 f"provisioned by cloud {args.cloud!r}",
             )
         return (
-            lambda rec: OWNER_KEY in rec.get("other_config", {}),
+            lambda rec: OWNER_KEY in (rec.get("other_config") or {}),
             f"carrying the {OWNER_KEY!r} marker",
         )
     return (
@@ -62,7 +62,9 @@ def _confirm(doomed, what):
     image (docs/golden-image.md), which is not recoverable without a rebuild. Skipped when
     stdin is not a TTY, where there is nobody to ask; use --force in automation.
     """
-    if not sys.stdin.isatty():
+    # sys.stdin is None when the interpreter runs with stdin detached, not merely closed. Both mean
+    # the same thing here: nobody to confirm to, so fail closed rather than sweep by name unattended.
+    if sys.stdin is None or not sys.stdin.isatty():
         print("refusing a non-interactive prefix --apply without --force.", file=sys.stderr)
         return False
     print(f"\nAbout to permanently destroy {len(doomed)} VM(s) {what}, with their disks.")
