@@ -43,6 +43,16 @@ public interface HypervisorClient extends AutoCloseable {
     void start(@NonNull VmRef vm);
 
     /**
+     * Remove the per-clone JNLP secret from the VM's guest-data record, once the agent has connected and
+     * no longer needs to read it. The seed has to live in the VM record to reach the guest at boot, where
+     * it is readable by any pool session that can read VM objects; clearing it after connect shrinks that
+     * exposure from the whole build to the boot-until-connect window. The guest reads the seed once at
+     * boot, so this is functionally free. Only the secret is removed; the other seed keys are untouched.
+     * Idempotent: removing an already-absent key is a no-op.
+     */
+    void clearGuestSecret(@NonNull VmRef vm);
+
+    /**
      * The VM's primary IP, if one is known yet. Empty until an in-guest agent reports an address to
      * the backend; a VM without guest tools returns empty for its whole life. The inbound launcher
      * does not need this, but an SSH launcher and the latency probe do.

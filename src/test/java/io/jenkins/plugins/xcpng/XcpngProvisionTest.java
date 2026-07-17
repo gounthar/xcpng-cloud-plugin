@@ -256,6 +256,39 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void onlineScrubsTheSeedSecretFromTheVmRecord(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent =
+                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        r.jenkins.addNode(agent);
+        Computer computer = agent.toComputer();
+
+        // The fake agent never really connects, so drive the connect hook directly: onOnline is what fires
+        // once an inbound agent has read the seed and no longer needs the secret in the VM record.
+        new XcpngComputerListener().onOnline(computer, hudson.model.TaskListener.NULL);
+
+        assertTrue(
+                fake.calls().contains("clearGuestSecret:" + agent.getVmRef()),
+                "coming online must scrub the seed secret for the agent's VM, calls were " + fake.calls());
+    }
+
+    @Test
+    void onlineIgnoresANonXcpngComputer(JenkinsRule r) throws Exception {
+        // A listener firing for some other cloud's computer must not open a client or touch a VM. Guard it
+        // with the built-in master computer, which is never an XcpngComputer.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        new XcpngComputerListener().onOnline(r.jenkins.toComputer(), hudson.model.TaskListener.NULL);
+
+        assertTrue(
+                fake.calls().isEmpty(), "a non-XCP-ng computer must not reach the client, calls were " + fake.calls());
+    }
+
+    @Test
     void provisionSkipsAnUnmatchedLabel(JenkinsRule r) {
         XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
         r.jenkins.clouds.add(cloud);

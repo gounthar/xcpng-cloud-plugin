@@ -103,6 +103,12 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
+    public void clearGuestSecret(VmRef vm) {
+        checkNotInterrupted("clearGuestSecret");
+        calls.add("clearGuestSecret:" + vm.value());
+    }
+
+    @Override
     public Optional<String> primaryIpAddress(VmRef vm) {
         if (assignIpOnStart != null && states.get(vm.value()) == VmState.RUNNING) {
             return Optional.of(assignIpOnStart);

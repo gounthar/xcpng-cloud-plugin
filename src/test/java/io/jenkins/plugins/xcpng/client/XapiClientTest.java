@@ -226,6 +226,22 @@ class XapiClientTest {
     }
 
     @Test
+    void clearGuestSecretRemovesOnlyTheSecretKey() {
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.clearGuestSecret(new VmRef("OpaqueRef:vm"));
+
+        // A per-key delete, not a read-merge-write: the secret key is named directly and url/name are
+        // never mentioned, so they cannot be dropped. Removing an absent key is a no-op on the pool, so no
+        // read is needed to guard it.
+        assertFalse(t.methods().contains("VM.get_xenstore_data"), "a per-key delete needs no read");
+        JsonNode params = paramsOf(t, "VM.remove_from_xenstore_data");
+        assertEquals("OpaqueRef:vm", params.get(1).asText());
+        assertEquals("vm-data/jenkins/secret", params.get(2).asText());
+    }
+
+    @Test
     void cloneWithNoGuestDataWritesNoXenstore() {
         ScriptedTransport t = new ScriptedTransport();
         XapiClient c = new XapiClient(t, "root", "pw");
