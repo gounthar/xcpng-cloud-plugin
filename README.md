@@ -43,6 +43,11 @@ for the deliberate scope cuts.
 
 Single-use is intentional: every build gets a clean machine, and nothing survives between builds.
 
+Each agent therefore runs exactly one executor, and this is not configurable. A second executor would
+put two builds on one VM, and the reap fires when a build completes, so the first to finish would
+destroy the VM under the other. Scale throughput with `maxInstances` (more clones), not with executors
+per clone.
+
 ## Requirements
 
 - An XCP-ng pool reachable over XAPI (developed against XCP-ng 8.3, XAPI 26.1).
@@ -81,7 +86,6 @@ jenkins:
         templates:
           - templateName: "jenkins-agent-debian13"
             labelString: "xcpng-linux"
-            numExecutors: 2
             numCpus: 4
             memoryMb: 8192
             sshAuthorizedKey: "ssh-ed25519 AAAA...replace-with-your-public-key you@example"
@@ -113,7 +117,6 @@ Template fields:
 | --- | --- | --- |
 | Template name | `templateName` | Name of the golden-image VM or template on the pool to clone. |
 | Label | `labelString` | Label expression a build must request to be matched to this template. |
-| Executors | `numExecutors` | Executors per agent. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
 | Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |
 | Min instances (warm pool) | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. |

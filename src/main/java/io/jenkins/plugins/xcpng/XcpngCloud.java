@@ -261,8 +261,10 @@ public class XcpngCloud extends Cloud {
         List<NodeProvisioner.PlannedNode> planned = new ArrayList<>();
         int capacity = availableCapacity();
         int remaining = excessWorkload;
-        // One VM per planned node; each serves numExecutors of the excess workload. Stop when the
-        // workload is met or the instance cap is reached, whichever comes first.
+        // One VM per planned node, and one executor per VM, so each planned node serves exactly one unit of
+        // the excess workload. Stop when the workload is met or the instance cap is reached, whichever comes
+        // first. Throughput scales by cloning more agents, never by stacking executors onto one: see
+        // XcpngAgent.EXECUTORS_PER_AGENT for why the two cannot coexist.
         while (remaining > 0 && planned.size() < capacity) {
             // A random suffix, not a counter: an in-process counter resets on controller restart, so a
             // crash that leaves an old node behind could hand a new clone the same name and collide in
@@ -284,8 +286,8 @@ public class XcpngCloud extends Cloud {
                 // already settled inside launch; stop planning further nodes this round.
                 break;
             }
-            planned.add(new TrackedPlannedNode(activityId, template.getNumExecutors(), future));
-            remaining -= template.getNumExecutors();
+            planned.add(new TrackedPlannedNode(activityId, XcpngAgent.EXECUTORS_PER_AGENT, future));
+            remaining -= XcpngAgent.EXECUTORS_PER_AGENT;
         }
         return planned;
     }
