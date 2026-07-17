@@ -83,9 +83,15 @@ template field.
 5. Shut the VM down.
 6. Make it a **template**: `xe vm-param-set uuid=<uuid> is-a-template=true`.
 
-Step 6 is not cosmetic. `tools/reaper.py` refuses to destroy templates, and it destroys by name
-prefix. A golden image named `jenkins-golden-debian` is one typo away from
-`reaper.py --apply --prefix jenkins-` if it is an ordinary VM.
+Step 6 is not cosmetic. `tools/reaper.py` refuses to destroy templates, which is the guard that does
+not depend on what the image is called.
+
+The reaper now selects on the `xcpng-cloud` marker the plugin stamps into each clone's `other_config`,
+so a golden image cannot be caught by a default run however it is named: it carries no marker. The
+name-prefix mode still exists for the pre-plugin probe VMs, and there a golden image named
+`jenkins-golden-debian` is still one typo away from `reaper.py --apply --prefix jenkins-` if it is an
+ordinary VM. That path now refuses a prefix shorter than `jenkins-ci-` without `--force`, and confirms
+interactively before destroying, but making the image a template is what makes the question moot.
 
 ### Debian 13 and Temurin
 

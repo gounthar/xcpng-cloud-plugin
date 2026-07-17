@@ -637,7 +637,11 @@ public class XcpngCloud extends Cloud {
                     null,
                     null,
                     null,
-                    seedFor(displayName, template));
+                    seedFor(displayName, template),
+                    // Stamp the owning cloud onto the VM record. The plugin's own teardown is the normal
+                    // path; this is what lets tools/reaper.py find a clone the plugin lost track of, after
+                    // a crash mid-provision or a destroy that threw.
+                    name);
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);

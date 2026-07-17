@@ -108,6 +108,20 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void provisionMarksTheCloneWithTheOwningCloud(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+
+        // The recovery contract: every clone carries the owning cloud's name on its VM record, so a VM the
+        // plugin lost track of (a controller that died mid-provision, a destroy that threw) is still findable
+        // by tools/reaper.py. The reaper matched on names before, and the plugin's names never matched.
+        assertEquals("xcpng", fake.lastSpec().owner(), "a provisioned clone must be marked with its cloud");
+    }
+
+    @Test
     void sshKeyValidatorAcceptsOneKeyAndRejectsBlocksPrivateKeysAndDsa(JenkinsRule r) {
         XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
         // Optional field: blank is fine.
