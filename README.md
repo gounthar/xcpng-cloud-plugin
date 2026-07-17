@@ -32,9 +32,12 @@ for the deliberate scope cuts.
 1. A build enters the queue with a label that matches a configured template.
 2. `XcpngCloud.provision()` clones the named golden image on the pool. On a file-backed storage
    repository the clone is copy-on-write and returns in under a second; no disk is copied up front.
-3. The clone starts. The plugin writes the agent name and the JNLP connection secret into the
-   guest's xenstore, so the secret never appears on a command line, in a disk image, or in the VM
-   configuration.
+3. The clone starts. The plugin writes the agent name and the JNLP connection secret into the VM
+   record's `xenstore-data`, where the guest reads them at first boot. This keeps the secret off any
+   command line and out of the golden image, but `xenstore-data` is part of the VM record: until the
+   agent connects, the secret is readable by anyone with XAPI read access to the pool. The plugin
+   removes it as soon as the agent comes online. See [Security notes](#security-notes) for the
+   scoping of that window.
 4. A systemd unit baked into the golden image reads the secret from xenstore and launches the
    Jenkins agent, which dials out to the controller over an inbound WebSocket. No inbound
    reachability to the agent, and no SSH credential, is required.
@@ -140,6 +143,15 @@ image from scratch. Adapt these to your own distribution and controller URL.
 
 - **Credentials are never stored in the plugin configuration.** Only the credential ID is persisted;
   the XAPI password is resolved from the Jenkins credentials store when a connection is opened.
+- **The JNLP secret is delivered through the VM record's `xenstore-data`.** It is not hidden from the
+  pool: until the agent connects, anyone with XAPI read access (an RBAC read-only role, Xen Orchestra,
+  a metadata export or a backup) can read it through `xe vm-param-get param-name=xenstore-data` or the
+  XO advanced tab. The plugin scrubs the secret from the VM record the moment the agent comes online,
+  so the exposure is the boot-until-connect window (seconds on the lab pool), not the life of the
+  build. The secret is an HMAC bound to a single node name on a short-lived, single-use VM, so reading
+  it in that window lets an attacker impersonate that one agent, not the controller. The optional SSH
+  key is seeded the same way and is not scrubbed; because it is a public key, its presence in the VM
+  record is not a secret disclosure.
 - **`trustSelfSigned` disables TLS verification** against the pool and exposes the XAPI session to a
   man-in-the-middle. Use it only on a trusted network against a pool whose certificate you cannot
   replace, and prefer installing the pool's certificate into the controller's trust store instead.
