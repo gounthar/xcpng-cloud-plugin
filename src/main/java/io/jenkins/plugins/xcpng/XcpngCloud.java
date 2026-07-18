@@ -42,6 +42,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -163,6 +164,17 @@ public class XcpngCloud extends Cloud {
      */
     private transient boolean waitForOnline = true;
 
+    /**
+     * How long a provisioning task waits for its agent to come online, and how often it polls, before
+     * giving up and tearing the VM down. Default to the production {@link #ONLINE_TIMEOUT_MINUTES} and
+     * {@link #ONLINE_POLL_MILLIS}; a test shrinks them via {@link #setOnlineWait} so the timeout path
+     * runs in milliseconds rather than five minutes. Transient: behaviour, never persisted; {@link
+     * #readResolve} restores the defaults on deserialization, where XStream skips the field initializers.
+     */
+    private transient long onlineTimeoutMillis = TimeUnit.MINUTES.toMillis(ONLINE_TIMEOUT_MINUTES);
+
+    private transient long onlinePollMillis = ONLINE_POLL_MILLIS;
+
     @DataBoundConstructor
     public XcpngCloud(
             @NonNull String name,
@@ -208,6 +220,10 @@ public class XcpngCloud extends Cloud {
         // Transient boolean: XStream skips the field initializer, so a reloaded cloud would default to
         // false (fast-complete) and over-provision. Restore the production behaviour.
         waitForOnline = true;
+        // Same reason: a reloaded cloud would deserialize these transient longs to 0, which would make
+        // awaitOnline poll without sleeping and time out instantly. Restore the production wait.
+        onlineTimeoutMillis = TimeUnit.MINUTES.toMillis(ONLINE_TIMEOUT_MINUTES);
+        onlinePollMillis = ONLINE_POLL_MILLIS;
         return this;
     }
 
@@ -572,13 +588,23 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Block until the provisioned node's computer connects, or fail after {@link #ONLINE_TIMEOUT_MINUTES}.
-     * Returns early without error if the planned node is cancelled while waiting: the caller's cancellation
-     * path then tears the VM down.
+     * Test seam: shrink the online wait and poll interval so a never-connecting fake agent is given up
+     * on in milliseconds, exercising the timeout-and-teardown path without the production five-minute wait.
      */
-    private static void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
+    void setOnlineWait(long timeoutMillis, long pollMillis) {
+        this.onlineTimeoutMillis = timeoutMillis;
+        this.onlinePollMillis = pollMillis;
+    }
+
+    /**
+     * Block until the provisioned node's computer connects, or fail after {@link #onlineTimeoutMillis}
+     * (the production {@link #ONLINE_TIMEOUT_MINUTES} unless a test shrank it). Returns early without error
+     * if the planned node is cancelled while waiting: the caller's cancellation path then tears the VM down.
+     * An instance method, not static, because the timeout and poll interval are injectable seams.
+     */
+    private void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
             throws InterruptedException {
-        long deadlineNanos = System.nanoTime() + ONLINE_TIMEOUT_MINUTES * 60L * 1_000_000_000L;
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(onlineTimeoutMillis);
         // Re-fetch the computer each pass and treat a null one as "not online yet": returning early on a
         // transiently-null Computer would complete the future without the agent connected, reintroducing
         // the over-provisioning this wait exists to prevent.
@@ -592,9 +618,9 @@ public class XcpngCloud extends Cloud {
             }
             if (System.nanoTime() > deadlineNanos) {
                 throw new IllegalStateException(
-                        "agent " + displayName + " did not come online within " + ONLINE_TIMEOUT_MINUTES + " minutes");
+                        "agent " + displayName + " did not come online within " + onlineTimeoutMillis + " ms");
             }
-            Thread.sleep(ONLINE_POLL_MILLIS);
+            Thread.sleep(onlinePollMillis);
         }
     }
 

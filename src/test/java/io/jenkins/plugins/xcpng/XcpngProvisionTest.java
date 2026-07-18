@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -423,6 +424,128 @@ class XcpngProvisionTest {
                     fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
                     "an interrupted provision must still destroy its VM rather than leak it: " + fake.calls());
             assertTrue(interruptSurvived.get(), "the interrupt must be restored once the cleanup has run");
+        } finally {
+            exec.shutdownNow();
+        }
+    }
+
+    // ---- The async launch() path: timeout, cancellation mid-boot, failure through launch ----
+
+    /** A cloud backed by the given fake that keeps the production online wait (unlike {@link #cloudBackedBy}). */
+    private static XcpngCloud onlineWaitingCloudBackedBy(FakeHypervisorClient fake, int maxInstances) {
+        XcpngCloud cloud = new XcpngCloud(
+                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(LINUX_TEMPLATE));
+        cloud.setClientFactory(c -> fake);
+        return cloud;
+    }
+
+    @Test
+    void aProvisionThatNeverComesOnlineTimesOutAndDestroysTheVm(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
+        // The fake agent never connects, so keep the production online wait but shrink it: the task gives
+        // up in ~100ms instead of five minutes and takes the timeout-and-teardown path the production
+        // constants would make untestable.
+        cloud.setOnlineWait(100L, 10L);
+        r.jenkins.clouds.add(cloud);
+
+        NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                .iterator()
+                .next();
+
+        // A clone that boots but never connects must not keep its VM: the timeout has to tear it down, or
+        // the VM (and its disks) leak on the pool for the controller's whole lifetime.
+        ExecutionException thrown =
+                assertThrows(ExecutionException.class, () -> planned.future.get(30, TimeUnit.SECONDS));
+        assertInstanceOf(
+                IllegalStateException.class,
+                thrown.getCause(),
+                "the online timeout should surface as an IllegalStateException: " + thrown.getCause());
+        assertTrue(
+                fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
+                "an agent that never comes online must have its VM destroyed on timeout: " + fake.calls());
+    }
+
+    @Test
+    void aPlannedNodeCancelledAfterRegistrationTearsDownTheOrphan(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
+        // Keep the online wait so the task is still looping in awaitOnline when the cancel lands; a generous
+        // timeout so the test never races the deadline, a small poll so the cancel is noticed promptly. This
+        // reaches the "completed after cancellation" branch that the existing cancel-before-start test cannot.
+        cloud.setOnlineWait(TimeUnit.MINUTES.toMillis(5), 10L);
+        // A controllable executor so the orphan teardown can be awaited: fake.calls() is a live view, not a
+        // snapshot, so the call log must not be read while the worker thread is still appending to it.
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(exec);
+        r.jenkins.clouds.add(cloud);
+        try {
+            NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                    .iterator()
+                    .next();
+
+            // Cancel only once the task has registered the node, so the cancel lands after registration rather
+            // than before the task starts (which the existing test covers and which never reaches this branch).
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (r.jenkins.getNodes().isEmpty() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+            assertFalse(r.jenkins.getNodes().isEmpty(), "the provision should have registered its node");
+            XcpngAgent orphan =
+                    assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+            String vmRef = orphan.getVmRef();
+
+            planned.future.cancel(false);
+
+            // awaitOnline returns on the cancel, complete(node) then returns false, and the task tears the
+            // orphan down before it finishes; await that completion so the call log is settled before reading.
+            exec.shutdown();
+            assertTrue(exec.awaitTermination(30, TimeUnit.SECONDS), "the cancelled provision's task should finish");
+
+            // A cancelled-mid-boot VM must not be left running on the pool.
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + vmRef),
+                    "a node cancelled after registration must have its orphaned VM destroyed: " + fake.calls());
+        } finally {
+            exec.shutdownNow();
+        }
+    }
+
+    @Test
+    void aProvisionThatFailsThroughLaunchReleasesItsReservation(JenkinsRule r) throws Exception {
+        // failStart() makes the clone succeed and the start throw, so the failure surfaces through the async
+        // launch() task rather than the direct provisionNode() call the existing failure test uses.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
+        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
+        // The start throws before any online wait, so the wait setting is irrelevant here; a real single-thread
+        // executor runs the task so provision() returns before it completes and the future is awaited below.
+        ExecutorService exec = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(exec);
+        r.jenkins.clouds.add(cloud);
+        try {
+            NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                    .iterator()
+                    .next();
+
+            ExecutionException thrown =
+                    assertThrows(ExecutionException.class, () -> planned.future.get(30, TimeUnit.SECONDS));
+            assertInstanceOf(
+                    HypervisorException.class,
+                    thrown.getCause(),
+                    "the start failure should surface as the client's own exception: " + thrown.getCause());
+            assertTrue(
+                    fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
+                    "a clone that fails after start must be destroyed, not leaked: " + fake.calls());
+
+            // The whenComplete decrement runs off the completing thread, so spin briefly for it. If it broke on
+            // the exceptional path, every failed provision would permanently shrink availableCapacity() and
+            // eventually wedge the cloud at zero capacity with no VMs running.
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (cloud.inFlightCount() != 0 && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+            assertEquals(
+                    0, cloud.inFlightCount(), "a failed provision must release its reservation, not wedge the cap");
         } finally {
             exec.shutdownNow();
         }
