@@ -55,6 +55,7 @@ class FakeXapi:
     """
 
     def __init__(self, records=None, stuck=(), vdis_after=None):
+        self.host = "dom0.invalid"
         self.records = records or {}
         self.stuck = set(stuck)
         self.destroyed = []
