@@ -55,8 +55,11 @@ def live_domains_on_dom0(host, password):
     Returns the set of Xen domain names (the first column of `xl list`). On XCP-ng that name is
     the VM uuid; callers match on both uuid and name_label so the check does not depend on it.
     Raises XapiError if dom0 cannot be reached, so an --apply that asked for the check fails
-    closed rather than sweeping blind. Assumes dom0 root shares XCPNG_PASS (true on a single-host
-    lab); uses sshpass with password auth as tools/lab-cookbook.md does. Nothing is written to disk.
+    closed rather than sweeping blind. Reads `xl list` on the connected host only, which is the
+    whole pool on a single-host lab; on a multi-host pool x.host is just the master, so a domain
+    resident on another host would not be seen (out of scope here). Assumes dom0 root shares
+    XCPNG_PASS (true on a single-host lab); uses sshpass with password auth as tools/lab-cookbook.md
+    does. Nothing is written to disk.
     """
     if shutil.which("sshpass") is None:
         raise XapiError("DOM0_CHECK_UNAVAILABLE",
@@ -67,6 +70,7 @@ def live_domains_on_dom0(host, password):
              "-o", "PubkeyAuthentication=no",
              "-o", "PreferredAuthentications=password",
              "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null",
              "-o", "ConnectTimeout=10",
              f"root@{host}", "xl list"],
             env={**os.environ, "SSHPASS": password},
