@@ -11,6 +11,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import hudson.model.Computer;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
@@ -20,6 +21,7 @@ import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -660,5 +662,112 @@ class XcpngProvisionTest {
                 1,
                 r.jenkins.getExtensionList(XcpngWarmPoolMaintainer.class).size(),
                 "the warm-pool maintainer should be an active periodic task");
+    }
+
+    // ---- Warm pool (slice C): steady state ----
+
+    @Test
+    void aConsumedSpareIsRefilledOnTheNextTick(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2); // cap 3, target 2
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+        assertEquals(2, warmNodeCount(r), "the pool should fill to minInstances");
+
+        // One spare accepts a build, so it stops counting as warm: the deficit reopens and the next tick must
+        // boot a replacement. This is the refill contract. Counting all agents of the template rather than only
+        // the warm ones would see three, find no deficit, and never replenish while used agents finish builds.
+        XcpngAgent consumed = null;
+        for (Node node : r.jenkins.getNodes()) {
+            if (node instanceof XcpngAgent agent && agent.isWarm()) {
+                consumed = agent;
+                break;
+            }
+        }
+        assertNotNull(consumed, "there should be a warm spare to consume");
+        consumed.markUsed();
+
+        reconcileAndSettle(cloud);
+
+        assertEquals(2, warmNodeCount(r), "the consumed spare must be replaced so the warm count returns to target");
+        assertEquals(3, r.jenkins.getNodes().size(), "the used agent stays; two fresh spares sit beside it");
+    }
+
+    /** An executor whose every submit throws, standing in for any RuntimeException escaping a reconcile. */
+    private static ExecutorService throwingExecutor() {
+        return new AbstractExecutorService() {
+            @Override
+            public void execute(Runnable command) {
+                throw new IllegalStateException("reconcile boom");
+            }
+
+            @Override
+            public void shutdown() {}
+
+            @Override
+            public List<Runnable> shutdownNow() {
+                return List.of();
+            }
+
+            @Override
+            public boolean isShutdown() {
+                return false;
+            }
+
+            @Override
+            public boolean isTerminated() {
+                return false;
+            }
+
+            @Override
+            public boolean awaitTermination(long timeout, TimeUnit unit) {
+                return true;
+            }
+        };
+    }
+
+    @Test
+    void theMaintainerIsolatesOneCloudsFailureFromTheRest(JenkinsRule r) throws Exception {
+        // The first cloud throws synchronously from its reconcile (its provision submit blows up); the second
+        // is healthy. The maintainer's per-cloud try/catch must let the healthy cloud's spares launch anyway.
+        // Narrow or remove that catch and the first cloud's RuntimeException aborts the whole tick, starving
+        // every other cloud's warm pool -- and nothing else in the suite would notice.
+        FakeHypervisorClient brokenFake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud broken = new XcpngCloud(
+                "xcpng-a",
+                "https://pool.example.test",
+                "cred",
+                false,
+                3,
+                List.of(warmTemplate("jenkins-golden-debian", 1)));
+        broken.setClientFactory(c -> brokenFake);
+        broken.setWaitForOnline(false);
+        broken.setProvisionExecutor(throwingExecutor());
+        r.jenkins.clouds.add(broken);
+
+        FakeHypervisorClient healthyFake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud healthy = new XcpngCloud(
+                "xcpng-b",
+                "https://pool.example.test",
+                "cred",
+                false,
+                3,
+                List.of(warmTemplate("jenkins-golden-debian", 1)));
+        healthy.setClientFactory(c -> healthyFake);
+        healthy.setWaitForOnline(false);
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        healthy.setProvisionExecutor(launches);
+        r.jenkins.clouds.add(healthy);
+        try {
+            new XcpngWarmPoolMaintainer().execute(TaskListener.NULL);
+
+            launches.shutdown();
+            assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the healthy cloud's launch should finish");
+            assertEquals(
+                    1, warmNodeCount(r), "the healthy cloud's spare must launch despite the broken cloud throwing");
+        } finally {
+            launches.shutdownNow();
+        }
     }
 }
