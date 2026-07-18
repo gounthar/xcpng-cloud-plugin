@@ -161,6 +161,21 @@ image from scratch. Adapt these to your own distribution and controller URL.
 - **`Test connection` requires the overall administer permission**, so a lower-privileged user
   cannot use it to probe arbitrary hosts.
 
+## Known limitations
+
+- **Teardown trusts XAPI's `power_state`, which can occasionally lie.** The plugin destroys a VM by
+  reading its power state, shutting the domain down only if it is not already `Halted`, then
+  destroying the VM and its disks. A VM has been observed on the lab pool reading `Halted` (with
+  `domid -1`) from XAPI while the domain was still running on dom0. Trusting that record skips the
+  shutdown and destroys a live domain's disk, leaving an orphan that holds memory. The plugin speaks
+  only XAPI (JSON-RPC) and, by the inbound/JNLP design, holds no SSH credential, so it has no
+  independent second opinion; asking XAPI to re-check the same record inherits the same lie. This is
+  a rare, accepted risk for this version rather than a fixable bug in the plugin. The root cause,
+  frequency, and a reliable reproduction are unknown (observed once). The operator-side safety net is
+  `tools/reaper.py --dom0-check`, which reads `xl list` directly from dom0 and refuses to reap any VM
+  that XAPI reports `Halted` while Xen still has a live domain for it; run it before and after a batch
+  of provisioning on a shared pool.
+
 ## Not in this version
 
 Deliberately out of scope for the spike: multiple templates matched by a single build, Windows

@@ -10,10 +10,13 @@ exited 0 while the VMs it exists to catch held pool memory and SR space. Selecti
 by the marker the plugin stamps on each clone, and the first test below is that regression.
 """
 
+import types
+
 import pytest
 
 import reaper
 from fakes import FakeXapi, vm_record
+from xapi import XapiError
 
 # What the plugin actually names its clones, and the cloud that owns them.
 PLUGIN_VM = "xcpng-jenkins-golden-debian-518ab396"
@@ -241,3 +244,142 @@ def test_prefix_and_cloud_together_are_refused(monkeypatch):
     with pytest.raises(SystemExit) as caught:
         reaper.main()
     assert caught.value.code == 2
+
+
+# ---- dom0 cross-check: XAPI's power_state can lie (#48) ----
+#
+# The reap gates VM.hard_shutdown on power_state; a VM that falsely reads Halted skips the
+# shutdown and has its disk destroyed under a live domain. --dom0-check reads `xl list` straight
+# from dom0 and refuses that exact pair. The integration tests stub live_domains_on_dom0 so no ssh
+# is attempted; the unit tests at the bottom cover the ssh helper itself.
+
+
+def _stub_dom0(monkeypatch, live=(), raises=None):
+    """Replace the dom0 ssh call with a canned answer (or failure). No network."""
+
+    def fake(host, password):
+        if raises is not None:
+            raise raises
+        return set(live)
+
+    monkeypatch.setattr(reaper, "live_domains_on_dom0", fake)
+
+
+@pytest.mark.parametrize("identifier", ["uuid", "name_label"])
+def test_dom0_check_refuses_a_halted_vm_live_on_dom0(pool, monkeypatch, capsys, identifier):
+    """The lie: XAPI reads Halted, dom0 has a live domain. Refuse it, do not destroy its disk.
+
+    dom0 names its domains by uuid on XCP-ng, but the match falls back to name_label so the check
+    does not depend on that; both identifiers must condemn the VM.
+    """
+    rec = vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")
+    fake = pool({"vm-lie": rec}, argv=("reaper.py", "--apply", "--dom0-check"))
+    _stub_dom0(monkeypatch, live=[rec[identifier]])
+
+    assert reaper.main() == 1, "a refused VM must be a non-zero exit"
+    assert fake.destroyed == [], "destroyed a VM dom0 still had a live domain for"
+    err = capsys.readouterr().err
+    assert "REFUSING" in err and "dom0 has a live domain" in err
+
+
+def test_dom0_check_allows_a_halted_vm_absent_from_dom0(pool, monkeypatch):
+    """A genuinely halted VM is absent from `xl list`, so the check clears it and it reaps."""
+    fake = pool({"vm-dead": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
+                argv=("reaper.py", "--apply", "--dom0-check"))
+    _stub_dom0(monkeypatch, live=["Domain-0"])  # dom0 has no domain for this VM
+
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-dead"]
+
+
+def test_dom0_check_still_reaps_a_running_leaked_agent(pool, monkeypatch):
+    """A leaked *running* agent (XAPI Running, dom0 live) is consistent, not the lie.
+
+    The reaper must still tear it down: destroy_with_disks hard_shuts it down correctly because the
+    record it acts on is true. Refusing here would break the tool's own job.
+    """
+    rec = vm_record(PLUGIN_VM, owner=CLOUD, power="Running")
+    fake = pool({"vm-run": rec}, argv=("reaper.py", "--apply", "--dom0-check"))
+    _stub_dom0(monkeypatch, live=[rec["uuid"]])
+
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-run"], "a running leaked agent must still be reapable"
+
+
+def test_dom0_check_fails_closed_when_dom0_is_unreachable(pool, monkeypatch):
+    """If the second opinion cannot be had, destroy nothing. A raise beats sweeping blind.
+
+    The CLI wrapper turns this XapiError into exit 2; here it propagates, and crucially the raise
+    happens before the destroy loop, so nothing is torn down.
+    """
+    fake = pool({"vm-x": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
+                argv=("reaper.py", "--apply", "--dom0-check"))
+    _stub_dom0(monkeypatch, raises=XapiError("DOM0_UNREACHABLE", "no route"))
+
+    with pytest.raises(XapiError):
+        reaper.main()
+    assert fake.destroyed == [], "a VM was destroyed despite an unverifiable dom0"
+
+
+def test_dom0_check_flags_the_lie_in_a_dry_run(pool, monkeypatch, capsys):
+    """A dry run destroys nothing anyway, but the flag still surfaces the desync and exits 1."""
+    rec = vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")
+    fake = pool({"vm-lie": rec}, argv=("reaper.py", "--dom0-check"))
+    _stub_dom0(monkeypatch, live=[rec["uuid"]])
+
+    assert reaper.main() == 1
+    assert fake.destroyed == []
+    assert "REFUSING" in capsys.readouterr().err
+
+
+def test_without_the_flag_dom0_is_never_contacted(pool, monkeypatch):
+    """The check is opt-in. A default run must not try to ssh anywhere."""
+
+    def explode(*args, **kwargs):
+        raise AssertionError("contacted dom0 without --dom0-check")
+
+    monkeypatch.setattr(reaper, "live_domains_on_dom0", explode)
+    fake = pool({"vm-1": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")})
+
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-1"]
+
+
+# ---- the ssh helper itself ----
+
+
+def test_live_domains_parses_xl_list(monkeypatch):
+    """Every `xl list` row past the header contributes its first column as a live domain name."""
+    monkeypatch.setattr(reaper.shutil, "which", lambda _: "/usr/bin/sshpass")
+    xl = (
+        "Name                                    ID   Mem VCPUs\tState\tTime(s)\n"
+        "Domain-0                                 0  2048     6     r-----   1234.5\n"
+        "244561b4-1fdf-6739-6fec-006defa76152    18  2048     2     -b----     12.3\n"
+    )
+    monkeypatch.setattr(reaper.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout=xl))
+
+    assert reaper.live_domains_on_dom0("dom0.invalid", "pw") == {
+        "Domain-0",
+        "244561b4-1fdf-6739-6fec-006defa76152",
+    }
+
+
+def test_live_domains_raises_without_sshpass(monkeypatch):
+    """No sshpass means the check cannot run; say so rather than pretend dom0 is clean."""
+    monkeypatch.setattr(reaper.shutil, "which", lambda _: None)
+    with pytest.raises(XapiError) as caught:
+        reaper.live_domains_on_dom0("dom0.invalid", "pw")
+    assert caught.value.message == "DOM0_CHECK_UNAVAILABLE"
+
+
+def test_live_domains_raises_when_ssh_fails(monkeypatch):
+    """A failed ssh must raise (fail closed), not return an empty, reassuring set."""
+    monkeypatch.setattr(reaper.shutil, "which", lambda _: "/usr/bin/sshpass")
+
+    def boom(*args, **kwargs):
+        raise reaper.subprocess.CalledProcessError(255, "ssh", stderr="Permission denied")
+
+    monkeypatch.setattr(reaper.subprocess, "run", boom)
+    with pytest.raises(XapiError) as caught:
+        reaper.live_domains_on_dom0("dom0.invalid", "pw")
+    assert caught.value.message == "DOM0_UNREACHABLE"

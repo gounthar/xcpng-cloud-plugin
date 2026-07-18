@@ -433,6 +433,13 @@ public final class XapiClient implements HypervisorClient {
     public void destroyWithDisks(@NonNull VmRef vm) {
         ensureSession();
         List<String> vdis = diskVdis(vm.value()); // capture before destroy, or the VDIs orphan
+        // Known, accepted hazard: XAPI's power_state can lie. A VM has been observed reading Halted
+        // (domid -1) from XAPI while the domain was still running on dom0, so this guard skips the
+        // hard_shutdown and VM.destroy then takes a live domain's disk. There is no fix from here:
+        // this client speaks only JSON-RPC and the inbound/JNLP design holds no SSH credential, so
+        // it has no second opinion, and asking XAPI to check XAPI inherits the same stale record.
+        // The operator-side safety net is tools/reaper.py --dom0-check, which reads `xl list` off
+        // dom0 before a sweep. See README "Known limitations".
         if (!"Halted".equals(call("VM.get_power_state", vm.value()).asText(""))) {
             call("VM.hard_shutdown", vm.value());
         }
