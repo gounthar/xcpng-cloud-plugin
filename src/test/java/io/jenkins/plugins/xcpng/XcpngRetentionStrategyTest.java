@@ -125,12 +125,16 @@ class XcpngRetentionStrategyTest {
         strategy.setClock(() -> idleStart + 30_000L);
         ExecutorService reaps = Executors.newSingleThreadExecutor();
         strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(computer);
 
-        strategy.check(computer);
-
-        reaps.shutdown();
-        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "any (wrongly) scheduled reap should finish");
-        assertEquals(0, destroyCount(fake), "a freshly-idle agent is well within its timeout and must not be reaped");
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "any (wrongly) scheduled reap should finish");
+            assertEquals(
+                    0, destroyCount(fake), "a freshly-idle agent is well within its timeout and must not be reaped");
+        } finally {
+            reaps.shutdownNow();
+        }
     }
 
     /**
@@ -151,14 +155,17 @@ class XcpngRetentionStrategyTest {
         strategy.setClock(() -> idleStart + TimeUnit.MINUTES.toMillis(IDLE_MINUTES) + 5000L);
         ExecutorService reaps = Executors.newSingleThreadExecutor();
         strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(computer);
 
-        strategy.check(computer);
-
-        reaps.shutdown();
-        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the idle reap should finish");
-        assertTrue(
-                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
-                "an idle agent past its timeout must have its VM destroyed: " + fake.calls());
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the idle reap should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                    "an idle agent past its timeout must have its VM destroyed: " + fake.calls());
+        } finally {
+            reaps.shutdownNow();
+        }
     }
 
     /**
@@ -179,12 +186,16 @@ class XcpngRetentionStrategyTest {
         strategy.setClock(() -> idleStart + TimeUnit.MINUTES.toMillis(IDLE_MINUTES) + 5000L);
         ExecutorService reaps = Executors.newSingleThreadExecutor();
         strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(online);
 
-        strategy.check(online);
-
-        reaps.shutdown();
-        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "no reap should have been scheduled");
-        assertEquals(0, destroyCount(fake), "a warm, online spare must be exempt from the idle net: " + fake.calls());
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "no reap should have been scheduled");
+            assertEquals(
+                    0, destroyCount(fake), "a warm, online spare must be exempt from the idle net: " + fake.calls());
+        } finally {
+            reaps.shutdownNow();
+        }
     }
 
     /**
@@ -205,14 +216,17 @@ class XcpngRetentionStrategyTest {
         strategy.setClock(() -> idleStart + TimeUnit.MINUTES.toMillis(IDLE_MINUTES) + 5000L);
         ExecutorService reaps = Executors.newSingleThreadExecutor();
         strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(online);
 
-        strategy.check(online);
-
-        reaps.shutdown();
-        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the idle reap should finish");
-        assertTrue(
-                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
-                "a used, online agent past its timeout must still be reaped: " + fake.calls());
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the idle reap should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                    "a used, online agent past its timeout must still be reaped: " + fake.calls());
+        } finally {
+            reaps.shutdownNow();
+        }
     }
 
     // ---- taskAccepted / taskCompleted wiring ----
@@ -250,14 +264,17 @@ class XcpngRetentionStrategyTest {
         XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
         ExecutorService reaps = Executors.newSingleThreadExecutor();
         strategy.setReapExecutor(reaps);
+        try {
+            strategy.taskCompleted(executor, null, 0L);
 
-        strategy.taskCompleted(executor, null, 0L);
-
-        reaps.shutdown();
-        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the completion reap should finish");
-        assertTrue(
-                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
-                "a completed build must reap its single-use agent: " + fake.calls());
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the completion reap should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                    "a completed build must reap its single-use agent: " + fake.calls());
+        } finally {
+            reaps.shutdownNow();
+        }
     }
 
     // ---- The async teardown: guard, rejection, and error paths ----
@@ -284,15 +301,21 @@ class XcpngRetentionStrategyTest {
             return null;
         });
         XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
+        try {
+            strategy.reap(computer, reaps);
+            strategy.reap(computer, reaps);
 
-        strategy.reap(computer, reaps);
-        strategy.reap(computer, reaps);
-
-        gate.countDown();
-        reaps.shutdown();
-        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the teardown should finish");
-        assertEquals(
-                1, destroyCount(fake), "the reaping guard must collapse two reaps into one destroy: " + fake.calls());
+            gate.countDown();
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the teardown should finish");
+            assertEquals(
+                    1,
+                    destroyCount(fake),
+                    "the reaping guard must collapse two reaps into one destroy: " + fake.calls());
+        } finally {
+            gate.countDown();
+            reaps.shutdownNow();
+        }
     }
 
     /**
@@ -316,12 +339,16 @@ class XcpngRetentionStrategyTest {
         assertFalse(r.jenkins.getNodes().isEmpty(), "a rejected reap must leave the node in place, not orphan it");
 
         ExecutorService live = Executors.newSingleThreadExecutor();
-        strategy.reap(computer, live);
-        live.shutdown();
-        assertTrue(live.awaitTermination(30, TimeUnit.SECONDS), "the retry teardown should finish");
-        assertTrue(
-                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
-                "the guard must have been cleared so a later reap can retry: " + fake.calls());
+        try {
+            strategy.reap(computer, live);
+            live.shutdown();
+            assertTrue(live.awaitTermination(30, TimeUnit.SECONDS), "the retry teardown should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                    "the guard must have been cleared so a later reap can retry: " + fake.calls());
+        } finally {
+            live.shutdownNow();
+        }
     }
 
     /**

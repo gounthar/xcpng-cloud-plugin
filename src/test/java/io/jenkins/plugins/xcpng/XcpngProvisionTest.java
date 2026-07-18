@@ -759,11 +759,15 @@ class XcpngProvisionTest {
         ExecutorService launches = Executors.newSingleThreadExecutor();
         healthy.setProvisionExecutor(launches);
         r.jenkins.clouds.add(healthy);
+        try {
+            new XcpngWarmPoolMaintainer().execute(TaskListener.NULL);
 
-        new XcpngWarmPoolMaintainer().execute(TaskListener.NULL);
-
-        launches.shutdown();
-        assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the healthy cloud's launch should finish");
-        assertEquals(1, warmNodeCount(r), "the healthy cloud's spare must launch despite the broken cloud throwing");
+            launches.shutdown();
+            assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the healthy cloud's launch should finish");
+            assertEquals(
+                    1, warmNodeCount(r), "the healthy cloud's spare must launch despite the broken cloud throwing");
+        } finally {
+            launches.shutdownNow();
+        }
     }
 }
