@@ -42,6 +42,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -170,7 +171,7 @@ public class XcpngCloud extends Cloud {
      * runs in milliseconds rather than five minutes. Transient: behaviour, never persisted; {@link
      * #readResolve} restores the defaults on deserialization, where XStream skips the field initializers.
      */
-    private transient long onlineTimeoutMillis = ONLINE_TIMEOUT_MINUTES * 60_000L;
+    private transient long onlineTimeoutMillis = TimeUnit.MINUTES.toMillis(ONLINE_TIMEOUT_MINUTES);
 
     private transient long onlinePollMillis = ONLINE_POLL_MILLIS;
 
@@ -221,7 +222,7 @@ public class XcpngCloud extends Cloud {
         waitForOnline = true;
         // Same reason: a reloaded cloud would deserialize these transient longs to 0, which would make
         // awaitOnline poll without sleeping and time out instantly. Restore the production wait.
-        onlineTimeoutMillis = ONLINE_TIMEOUT_MINUTES * 60_000L;
+        onlineTimeoutMillis = TimeUnit.MINUTES.toMillis(ONLINE_TIMEOUT_MINUTES);
         onlinePollMillis = ONLINE_POLL_MILLIS;
         return this;
     }
@@ -603,7 +604,7 @@ public class XcpngCloud extends Cloud {
      */
     private void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
             throws InterruptedException {
-        long deadlineNanos = System.nanoTime() + onlineTimeoutMillis * 1_000_000L;
+        long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(onlineTimeoutMillis);
         // Re-fetch the computer each pass and treat a null one as "not online yet": returning early on a
         // transiently-null Computer would complete the future without the agent connected, reintroducing
         // the over-provisioning this wait exists to prevent.

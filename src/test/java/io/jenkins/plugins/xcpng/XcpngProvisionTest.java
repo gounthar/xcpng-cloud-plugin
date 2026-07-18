@@ -488,7 +488,7 @@ class XcpngProvisionTest {
             // than before the task starts (which the existing test covers and which never reaches this branch).
             long deadline = System.currentTimeMillis() + 30_000;
             while (r.jenkins.getNodes().isEmpty() && System.currentTimeMillis() < deadline) {
-                Thread.onSpinWait();
+                Thread.sleep(10);
             }
             assertFalse(r.jenkins.getNodes().isEmpty(), "the provision should have registered its node");
             XcpngAgent orphan =
@@ -512,7 +512,7 @@ class XcpngProvisionTest {
     }
 
     @Test
-    void aProvisionThatFailsThroughLaunchReleasesItsReservation(JenkinsRule r) {
+    void aProvisionThatFailsThroughLaunchReleasesItsReservation(JenkinsRule r) throws Exception {
         // failStart() makes the clone succeed and the start throw, so the failure surfaces through the async
         // launch() task rather than the direct provisionNode() call the existing failure test uses.
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
@@ -542,7 +542,7 @@ class XcpngProvisionTest {
             // eventually wedge the cloud at zero capacity with no VMs running.
             long deadline = System.currentTimeMillis() + 30_000;
             while (cloud.inFlightCount() != 0 && System.currentTimeMillis() < deadline) {
-                Thread.onSpinWait();
+                Thread.sleep(10);
             }
             assertEquals(
                     0, cloud.inFlightCount(), "a failed provision must release its reservation, not wedge the cap");
