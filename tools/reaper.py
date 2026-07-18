@@ -52,8 +52,9 @@ def live_domains_on_dom0(host, password):
     VM.hard_shutdown on that same power_state, so it skips the shutdown and takes the live
     domain's disk. Asking XAPI to check XAPI inherits the lie; dom0 is the only honest source.
 
-    Returns the set of Xen domain names (the first column of `xl list`). On XCP-ng that name is
-    the VM uuid; callers match on both uuid and name_label so the check does not depend on it.
+    Returns the set of Xen domain names (the first column of `xl list`). On XCP-ng 8.3 that name
+    is the VM name_label (measured 2026-07-18: every live guest matched by name_label, none by
+    uuid); callers still match on both uuid and name_label so the check does not depend on it.
     Raises XapiError if dom0 cannot be reached, so an --apply that asked for the check fails
     closed rather than sweeping blind. Reads `xl list` on the connected host only, which is the
     whole pool on a single-host lab; on a multi-host pool x.host is just the master, so a domain
