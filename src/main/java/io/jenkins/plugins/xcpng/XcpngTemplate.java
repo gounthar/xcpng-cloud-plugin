@@ -6,6 +6,8 @@ import hudson.Extension;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
 import hudson.util.FormValidation;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -32,10 +34,47 @@ import org.kohsuke.stapler.QueryParameter;
  */
 public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
 
+    private static final Logger LOGGER = Logger.getLogger(XcpngTemplate.class.getName());
+
     /** Fallbacks for a clone whose size was not set, matching the lab golden image (2 vCPU / 2 GiB). */
     private static final int DEFAULT_NUM_CPUS = 2;
 
     private static final int DEFAULT_MEMORY_MB = 2048;
+
+    /**
+     * Accepted OpenSSH public-key type prefixes; anything else is almost certainly not a pubkey.
+     * ssh-dss (DSA) is deliberately absent: current OpenSSH disables it, so such a key would validate
+     * here yet never authenticate on the agent.
+     */
+    private static final String[] PUBLIC_KEY_PREFIXES = {
+        "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-"
+    };
+
+    /**
+     * The single-key invariant, enforced everywhere the value enters the plugin rather than only in the
+     * advisory form validator. The seed writes the value verbatim into the clone's {@code
+     * authorized_keys}, so it must be one public key on one line: no line breaks (which would smuggle
+     * extra keys or {@code authorized_keys} option prefixes such as {@code command=...} past a first-line
+     * check), no private-key material, and a recognised OpenSSH type prefix. Returns a human-readable
+     * reason the value is unacceptable, or {@code null} when it is a well-formed single public key.
+     * Assumes the value is already trimmed and non-empty.
+     */
+    @CheckForNull
+    static String sshAuthorizedKeyProblem(@NonNull String trimmed) {
+        if (trimmed.contains("\n") || trimmed.contains("\r")) {
+            return "Enter a single public key on one line; line breaks and multiple keys are not accepted.";
+        }
+        if (trimmed.contains("PRIVATE KEY")) {
+            return "That looks like a private key. Paste the public key (e.g. the contents of a .pub file);"
+                    + " the private key must stay with you and never reaches the agent.";
+        }
+        for (String prefix : PUBLIC_KEY_PREFIXES) {
+            if (trimmed.startsWith(prefix)) {
+                return null;
+            }
+        }
+        return "Enter a single OpenSSH public key, starting with a type such as ssh-ed25519 or ssh-rsa.";
+    }
 
     private final String templateName;
     private final String labelString;
@@ -86,7 +125,22 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         // as an empty authorized_keys line. Collapse it to null here, matching the setter.
         if (sshAuthorizedKey != null) {
             String trimmed = sshAuthorizedKey.trim();
-            sshAuthorizedKey = trimmed.isEmpty() ? null : trimmed;
+            if (trimmed.isEmpty()) {
+                sshAuthorizedKey = null;
+            } else {
+                // Apply the same single-key invariant as the setter. Here the safe move is to drop the
+                // bad value and log rather than throw: one hand-edited template must not stop the whole
+                // controller loading, and a dropped key just leaves that agent inbound-only.
+                String problem = sshAuthorizedKeyProblem(trimmed);
+                if (problem != null) {
+                    LOGGER.log(
+                            Level.WARNING,
+                            () -> "Dropping the SSH authorized key on template " + templateName + ": " + problem);
+                    sshAuthorizedKey = null;
+                } else {
+                    sshAuthorizedKey = trimmed;
+                }
+            }
         }
         // A config predating this field deserializes it to 0, which is already the "off" default; this
         // only floors a hand-edited negative, mirroring the setter's clamp.
@@ -135,7 +189,19 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         // Normalise a blank textarea to null so getSshAuthorizedKey() is either a real key or nothing,
         // and the seed logic can gate on non-null rather than re-checking for blank.
         String trimmed = sshAuthorizedKey == null ? null : sshAuthorizedKey.trim();
-        this.sshAuthorizedKey = trimmed == null || trimmed.isEmpty() ? null : trimmed;
+        if (trimmed == null || trimmed.isEmpty()) {
+            this.sshAuthorizedKey = null;
+            return;
+        }
+        // doCheckSshAuthorizedKey is advisory: the form, a JCasC document, or a direct config submit
+        // save regardless of a red validation message. Enforce the single-key invariant here too, so a
+        // multi-line value smuggling extra keys or authorized_keys option prefixes fails loudly at load
+        // instead of being seeded verbatim to every clone.
+        String problem = sshAuthorizedKeyProblem(trimmed);
+        if (problem != null) {
+            throw new IllegalArgumentException(problem);
+        }
+        this.sshAuthorizedKey = trimmed;
     }
 
     /** Warm-pool target: pre-booted idle agents of this template to keep hot. 0 disables the warm pool. */
@@ -203,43 +269,16 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         }
 
         /**
-         * Accepted OpenSSH public-key type prefixes; anything else is almost certainly not a pubkey.
-         * ssh-dss (DSA) is deliberately absent: current OpenSSH disables it, so such a key would validate
-         * here yet never authenticate on the agent.
-         */
-        private static final String[] PUBLIC_KEY_PREFIXES = {
-            "ssh-ed25519 ", "ssh-rsa ", "ecdsa-sha2-", "sk-ssh-", "sk-ecdsa-"
-        };
-
-        /**
-         * Optional field, so blank is fine. Otherwise require something that looks like an OpenSSH
-         * public key, and reject a pasted private key outright: the private half must never reach the
-         * plugin, let alone a guest.
+         * The friendly form-time layer over the same rule the setter and {@code readResolve} enforce
+         * ({@link XcpngTemplate#sshAuthorizedKeyProblem}), so the UI message and the load-time invariant
+         * cannot drift apart. Optional field, so blank is fine.
          */
         public FormValidation doCheckSshAuthorizedKey(@QueryParameter String value) {
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
-            String key = value.trim();
-            if (key.contains("\n") || key.contains("\r")) {
-                // Trimming strips only the ends, so an embedded newline would otherwise smuggle a whole
-                // block of keys past a first-line prefix check, and the seed writes the value verbatim
-                // into the agent's authorized_keys. One key, one line.
-                return FormValidation.error(
-                        "Enter a single public key on one line; line breaks and multiple keys are not accepted.");
-            }
-            if (key.contains("PRIVATE KEY")) {
-                return FormValidation.error(
-                        "That looks like a private key. Paste the public key (e.g. the contents of a .pub file);"
-                                + " the private key must stay with you and never reaches the agent.");
-            }
-            for (String prefix : PUBLIC_KEY_PREFIXES) {
-                if (key.startsWith(prefix)) {
-                    return FormValidation.ok();
-                }
-            }
-            return FormValidation.error(
-                    "Enter a single OpenSSH public key, starting with a type such as ssh-ed25519 or ssh-rsa.");
+            String problem = sshAuthorizedKeyProblem(value.trim());
+            return problem == null ? FormValidation.ok() : FormValidation.error(problem);
         }
 
         private static FormValidation checkPositiveInt(String value, String what) {
