@@ -403,9 +403,20 @@ public class XcpngCloud extends Cloud {
                     // The activity was opened with onStarted above. A failure here means no computer was ever
                     // launched, so cloud-stats' own onLaunchFailure/onDeleted listeners never fire and the
                     // activity would hang in PROVISIONING forever. Close it as failed by hand; the on-demand
-                    // path lets the NodeProvisioner record the failure through its PlannedNode instead.
+                    // path lets the NodeProvisioner record the failure through its PlannedNode instead. Guard
+                    // it: this monitoring call sits before completeExceptionally, so letting it throw would skip
+                    // the future completion and leak the inFlight/warmInFlight reservation whenComplete releases,
+                    // wedging capacity over a stats hiccup.
                     if (warm) {
-                        CloudStatistics.ProvisioningListener.get().onFailure(activityId, t);
+                        try {
+                            CloudStatistics.ProvisioningListener.get().onFailure(activityId, t);
+                        } catch (RuntimeException statsFailure) {
+                            LOGGER.log(
+                                    Level.WARNING,
+                                    statsFailure,
+                                    () -> "Could not record the failed provision of " + displayName
+                                            + " in cloud-stats");
+                        }
                     }
                     future.completeExceptionally(t);
                     // Restore the interrupt so higher-level shutdown/cancellation logic still sees it,

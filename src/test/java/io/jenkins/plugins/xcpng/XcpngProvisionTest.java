@@ -979,5 +979,9 @@ class XcpngProvisionTest {
                 ProvisioningActivity.Status.FAIL,
                 activity.getStatus(),
                 "a warm launch that threw must be recorded as a failed activity");
+        // The failure path must still release its reservation: recording the failure in cloud-stats runs
+        // before the future completes, so a stats call that escaped would strand this counter and wedge the
+        // cap. (The onFailure call is guarded against exactly that; this locks the invariant it protects.)
+        assertEquals(0, cloud.inFlightCount(), "a failed warm launch must release its reservation, not wedge the cap");
     }
 }
