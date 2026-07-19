@@ -889,7 +889,14 @@ public class XcpngCloud extends Cloud {
             }
             String scheme = uri.getScheme();
             if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
-                return FormValidation.error("The pool URL must start with http:// or https://.");
+                return FormValidation.error("The pool URL must start with https://.");
+            }
+            if (scheme.equalsIgnoreCase("http")) {
+                // Plain http sends the XAPI credential (typically the pool's root password) and every
+                // session token in cleartext. XAPI speaks TLS out of the box, and a self-signed pool
+                // certificate is already handled by trustSelfSigned, so no ordinary setup needs http.
+                return FormValidation.error(
+                        "The pool URL must use https://; http would send the XAPI credential in cleartext.");
             }
             if (uri.getHost() == null) {
                 return FormValidation.error("The pool URL must include a host, for example https://192.168.1.87.");

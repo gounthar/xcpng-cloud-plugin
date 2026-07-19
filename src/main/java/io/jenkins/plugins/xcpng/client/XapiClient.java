@@ -58,6 +58,13 @@ public final class XapiClient implements HypervisorClient {
             LOGGER.warning("TLS verification disabled for " + poolUrl
                     + " (trustSelfSigned). Traffic is exposed to interception.");
         }
+        // The form validator rejects http, but it is advisory: a JCasC document or a hand-edited
+        // config.xml can still persist an http pool URL. Warn here so the cleartext exposure is not
+        // silent, matching the trustSelfSigned warning above.
+        if (poolUrl.regionMatches(true, 0, "http://", 0, "http://".length())) {
+            LOGGER.warning("Pool URL " + poolUrl + " uses plain http; the XAPI credential and every"
+                    + " session token are sent in cleartext. Use https://.");
+        }
     }
 
     /** For tests: inject a transport that replays recorded JSON fixtures. */
