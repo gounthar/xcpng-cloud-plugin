@@ -1,0 +1,14 @@
+<div>
+  Number of pre-booted idle agents of this template to keep hot (a warm pool), so a queued build connects
+  to a ready executor instead of waiting for a cold clone. Defaults to 0, which turns the warm pool off.
+  <p>
+    Warm spares count against the cloud's <b>Max instances</b>, so the pool is capped by that limit and a
+    target larger than it can never be filled. Warm agents are still single-use: each runs one build and
+    is then destroyed, and the maintainer clones a replacement to keep the pool at size.
+  </p>
+  <p>
+    The pool is reconciled about once a minute by a background task, so a spare appears up to a minute
+    after you save the configuration, and a consumed spare's replacement takes up to a minute to appear.
+    A spare that boots but never connects is still reclaimed by the idle timeout.
+  </p>
+</div>

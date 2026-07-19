@@ -51,12 +51,27 @@ put two builds on one VM, and the reap fires when a build completes, so the firs
 destroy the VM under the other. Scale throughput with `maxInstances` (more clones), not with executors
 per clone.
 
+### Warm pool
+
+A template with a **Warm pool size** above 0 keeps that many pre-booted, idle agents ready, so a queued
+build lands on a live executor instead of waiting for a cold clone. A background task reconciles the pool
+roughly once a minute, so a spare appears up to a minute after you save the configuration, and after a
+spare is consumed by a build its replacement is cloned within about a minute. Warm agents are still
+single-use and count against `maxInstances`. A spare that boots but never connects is still reclaimed by
+the idle timeout. The "warm" marker is intentionally not persisted, so after a controller restart every
+existing spare loses its exemption, is reaped by the idle net, and is re-cloned by the maintainer; this
+churn is deliberate, since it guarantees a VM that has already run a build can never be revived as a
+spare.
+
 ## Requirements
 
 - An XCP-ng pool reachable over XAPI (developed against XCP-ng 8.3, XAPI 26.1).
 - A golden-image VM on that pool, prepared as described below.
 - A Jenkins controller on the 2.555.x line or newer. The controller and the agent must run the same
   Java major version; the baseline here is Java 21 (Temurin on the agent side).
+- The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
+  the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
+  unreachable, a clone never connects and is destroyed after the connect timeout.
 - XAPI credentials stored in Jenkins as a username/password credential.
 
 ## Configuration
@@ -111,7 +126,7 @@ Cloud fields:
 | Credentials | `credentialsId` | ID of the username/password credential used for XAPI login. |
 | Trust self-signed certificate | `trustSelfSigned` | Skip TLS verification against the pool. Off by default. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
-| Idle minutes | `idleMinutes` | Minutes an agent may sit idle before it is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this is only the safety net for a clone that connects but never receives work. A non-positive value is clamped to the default. |
+| Idle minutes | `idleMinutes` | Minutes an agent may sit idle before it is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this is only the safety net for a clone that connects but never receives work. A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
 | Templates | `templates` | One or more agent templates (see below). |
 
 Template fields:
@@ -119,10 +134,10 @@ Template fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Template name | `templateName` | Name of the golden-image VM or template on the pool to clone. |
-| Label | `labelString` | Label expression a build must request to be matched to this template. |
+| Labels | `labelString` | Label expression a build must request to be matched to this template. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
 | Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |
-| Min instances (warm pool) | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. |
+| Warm pool size | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. See [Warm pool](#warm-pool). |
 | SSH authorized key | `sshAuthorizedKey` | A public key seeded into the clone over xenstore. Paste a public key only; a pasted private key is rejected. |
 
 ## Preparing a golden image
@@ -137,7 +152,14 @@ agent on first boot with no manual steps. It needs, at minimum:
 
 The `image/` directory holds the recipe used for the lab image: `image/provision.sh` installs and
 enables the units, and `image/xcpng-jenkins-agent.pkr.hcl` is a Packer template for building the
-image from scratch. Adapt these to your own distribution and controller URL.
+image from scratch. Adapt these to your own distribution. The image is controller-agnostic by design,
+which is a feature: the launcher reads the controller URL, agent name, and secret per clone from
+xenstore at boot, so one golden image serves any controller and there is nothing controller-specific to
+bake in.
+
+[`docs/golden-image.md`](docs/golden-image.md) is the authoritative guide, with the full requirements
+table, the Packer workflow and its honest status, and the produced template name
+(`jenkins-agent-debian13`, matching the Configuration as Code example above).
 
 ## Security notes
 
@@ -160,6 +182,24 @@ image from scratch. Adapt these to your own distribution and controller URL.
   an agent.
 - **`Test connection` requires the overall administer permission**, so a lower-privileged user
   cannot use it to probe arbitrary hosts.
+
+## Troubleshooting
+
+**An agent is provisioned but never connects.** This is the most common first-run failure, and the VM
+is destroyed after the connect timeout (five minutes), so the evidence is gone unless you look while it
+is up.
+
+- Confirm the Jenkins root URL is set (**Manage Jenkins** then **System**) and is reachable over
+  HTTP(S) from the network the clone booted on. The launcher fetches `agent.jar` from that URL and
+  opens the WebSocket back to it; if it is unset or wrong, the clone boots, finds no controller, and is
+  reaped.
+- On the clone, check the launcher: `journalctl -u jenkins-agent`. The unit reads the agent name and
+  secret from xenstore and starts the agent; its log shows whether it got them and what the connection
+  attempt did.
+- If the agent logs `Connected` and then drops into a silent reconnect loop, suspect a Java major
+  mismatch: the agent JRE must match the controller's Java major version (Java 21 here). A mismatch
+  throws `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
+  offline cause in the UI.
 
 ## Known limitations
 

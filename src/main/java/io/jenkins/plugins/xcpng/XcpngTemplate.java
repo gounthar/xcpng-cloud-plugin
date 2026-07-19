@@ -256,13 +256,13 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             try {
                 count = Integer.parseInt(value.trim());
             } catch (NumberFormatException e) {
-                return FormValidation.error("Min instances must be a whole number.");
+                return FormValidation.error("Warm pool size must be a whole number.");
             }
             if (count < 0) {
-                return FormValidation.error("Min instances cannot be negative.");
+                return FormValidation.error("Warm pool size cannot be negative.");
             }
             if (cloud != null && count > cloud.getMaxInstances()) {
-                return FormValidation.warning("Min instances (" + count + ") exceeds the cloud's Max instances ("
+                return FormValidation.warning("Warm pool size (" + count + ") exceeds the cloud's Max instances ("
                         + cloud.getMaxInstances() + "); the warm pool is capped by Max instances.");
             }
             return FormValidation.ok();

@@ -1,0 +1,12 @@
+<div>
+  Minutes an agent may sit idle before it is reclaimed and its VM destroyed. Defaults to 10; a
+  non-positive value is clamped back to 10.
+  <p>
+    Because every agent is single-use, a build normally reaps its own agent on completion. This timeout
+    is only the safety net for a clone that connects but never receives work.
+  </p>
+  <p>
+    It does not apply to online warm-pool spares that have not yet run a build: a spare is deliberately
+    held past this idle window so it is ready when a matching build arrives.
+  </p>
+</div>

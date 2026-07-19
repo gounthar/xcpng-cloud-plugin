@@ -1,0 +1,6 @@
+<div>
+  Upper bound on the number of agents this cloud will run at once. The plugin never clones past this
+  limit, so it caps how much of the pool a busy queue can consume. Warm-pool spares (a template's
+  <b>Warm pool size</b>) count towards this total. Raise it to scale throughput; each agent runs a single
+  build, so more concurrent builds means more instances, not more executors per instance.
+</div>

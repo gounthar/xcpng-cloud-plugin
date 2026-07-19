@@ -128,6 +128,21 @@ class XcpngCloudTest {
     }
 
     /**
+     * A successful connection made with TLS verification off is reported as a warning, not a clean OK, so
+     * the operator is told on the form that the link carrying the pool credential was unverified. A
+     * verified connection stays a plain OK. This is the message layer only; it needs no live pool.
+     */
+    @Test
+    void testConnectionSuccessWarnsWhenTlsVerificationDisabled(JenkinsRule r) {
+        FormValidation verified = XcpngCloud.DescriptorImpl.connectedResult(false);
+        assertEquals(FormValidation.Kind.OK, verified.kind);
+
+        FormValidation unverified = XcpngCloud.DescriptorImpl.connectedResult(true);
+        assertEquals(FormValidation.Kind.WARNING, unverified.kind);
+        assertTrue(unverified.getMessage().contains("verification"), unverified.getMessage());
+    }
+
+    /**
      * XStream loads global config without the constructor, so an older config.xml predating the
      * templates/maxInstances fields must still reload without an NPE, with the guards re-applied.
      */

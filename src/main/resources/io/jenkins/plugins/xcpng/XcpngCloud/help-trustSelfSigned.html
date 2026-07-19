@@ -1,0 +1,15 @@
+<div>
+  Skip TLS verification of the pool's certificate when opening the XAPI connection. Off by default, and
+  it should stay off.
+  <p>
+    Enabling this disables both certificate-chain validation and hostname verification on a connection
+    that carries the XAPI pool credential. It leaves the session open to a man-in-the-middle: anyone able
+    to intercept the link can present their own certificate, capture the credential, and talk to the pool
+    as you.
+  </p>
+  <p>
+    Turn it on only on a trusted network against a pool whose self-signed certificate you cannot replace,
+    typically a lab. The safer alternative is to install the pool's certificate into the controller's
+    Java trust store and leave this unticked.
+  </p>
+</div>
