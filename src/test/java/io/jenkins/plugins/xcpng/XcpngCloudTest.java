@@ -94,8 +94,11 @@ class XcpngCloudTest {
     void poolUrlValidation(JenkinsRule r) {
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
         assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("https://192.168.1.87").kind);
-        assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("http://pool.example.test:443").kind);
+        assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("https://pool.example.test:8443").kind);
         assertEquals(FormValidation.Kind.OK, d.doCheckPoolUrl("").kind);
+        // Plain http would send the XAPI credential in cleartext, so it is rejected outright.
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("http://192.168.1.87").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("http://pool.example.test:443").kind);
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("192.168.1.87").kind);
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("ftp://pool").kind);
         assertEquals(FormValidation.Kind.ERROR, d.doCheckPoolUrl("https://").kind);
