@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -19,6 +20,7 @@ import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -32,6 +34,10 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import jenkins.model.JenkinsLocationConfiguration;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.plugins.cloudstats.CloudStatistics;
@@ -143,6 +149,64 @@ class XcpngProvisionTest {
         assertEquals(FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("-----BEGIN OPENSSH PRIVATE KEY-----").kind);
         // Legacy DSA is rejected: current OpenSSH will not authenticate it.
         assertEquals(FormValidation.Kind.ERROR, d.doCheckSshAuthorizedKey("ssh-dss AAAADsaExample x@h").kind);
+    }
+
+    @Test
+    void sshKeySetterEnforcesTheSingleKeyInvariantThatTheValidatorOnlyAdvises(JenkinsRule r) {
+        XcpngTemplate t = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
+        // A single valid public key is accepted and stored trimmed.
+        t.setSshAuthorizedKey("  ssh-ed25519 AAAAValidKey operator@host  ");
+        assertEquals("ssh-ed25519 AAAAValidKey operator@host", t.getSshAuthorizedKey());
+        // Blank collapses to null, the inbound-only default.
+        t.setSshAuthorizedKey("   ");
+        assertNull(t.getSshAuthorizedKey());
+        // doCheckSshAuthorizedKey is advisory, so the form saves past a red message; the setter is where
+        // the rule bites. A multi-line value (smuggling extra keys or option prefixes), a pasted private
+        // key, and a non-pubkey prefix each throw rather than being seeded verbatim to every clone.
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> t.setSshAuthorizedKey("ssh-ed25519 AAAAOne a@h\nssh-ed25519 AAAATwo b@h"));
+        assertThrows(
+                IllegalArgumentException.class, () -> t.setSshAuthorizedKey("-----BEGIN OPENSSH PRIVATE KEY-----"));
+        assertThrows(IllegalArgumentException.class, () -> t.setSshAuthorizedKey("ssh-dss AAAADsaExample x@h"));
+    }
+
+    @Test
+    void readResolveDropsAndLogsAMultilineSshKeyFromAHandEditedConfig(JenkinsRule r) {
+        Logger logger = Logger.getLogger(XcpngTemplate.class.getName());
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.addHandler(handler);
+        XcpngTemplate t;
+        try {
+            // &#10; is an XML newline in the element text, so the deserialized field carries an embedded
+            // line break exactly as a hand-edited config.xml smuggling a second key would.
+            String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                    + "  <templateName>jenkins-golden-debian</templateName>\n"
+                    + "  <labelString>xcpng-linux</labelString>\n"
+                    + "  <sshAuthorizedKey>ssh-ed25519 AAAAOne a@h&#10;ssh-ed25519 AAAATwo b@h</sshAuthorizedKey>\n"
+                    + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+            t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        } finally {
+            logger.removeHandler(handler);
+        }
+        assertNull(t.getSshAuthorizedKey(), "a multi-line key from a hand-edited config must be dropped, not seeded");
+        assertTrue(
+                records.stream()
+                        .anyMatch(rec -> rec.getLevel() == Level.WARNING
+                                && String.valueOf(rec.getMessage()).contains("Dropping the SSH authorized key")),
+                "dropping the bad key must be logged at WARNING");
     }
 
     @Test

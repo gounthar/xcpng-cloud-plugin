@@ -5,6 +5,7 @@ import static io.jenkins.plugins.casc.misc.Util.toYamlString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cloudbees.plugins.credentials.CredentialsScope;
@@ -12,6 +13,7 @@ import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
 import io.jenkins.plugins.casc.ConfigurationAsCode;
 import io.jenkins.plugins.casc.ConfigurationContext;
+import io.jenkins.plugins.casc.ConfiguratorException;
 import io.jenkins.plugins.casc.ConfiguratorRegistry;
 import io.jenkins.plugins.casc.model.CNode;
 import org.junit.jupiter.api.Test;
@@ -90,6 +92,22 @@ class XcpngCloudConfigurationAsCodeTest {
         String exported = exportedClouds();
         assertTrue(exported.contains("xcpng-root"), "the credential ID should be exported");
         assertFalse(exported.contains(secret), "the credential's secret must never appear in the export");
+    }
+
+    /**
+     * The single-key invariant is enforced on the way in, not merely flagged in the advisory form
+     * validator, so a JCasC document carrying a multi-line {@code sshAuthorizedKey} (which would smuggle
+     * extra keys or {@code authorized_keys} option prefixes to every clone) fails to load rather than
+     * being applied verbatim.
+     */
+    @Test
+    void multilineSshKeyInYamlFailsToLoad(JenkinsRule r) {
+        assertThrows(
+                ConfiguratorException.class,
+                () -> ConfigurationAsCode.get()
+                        .configure(getClass()
+                                .getResource("configuration-as-code-multiline-sshkey.yaml")
+                                .toExternalForm()));
     }
 
     private void configureFromYaml() throws Exception {
