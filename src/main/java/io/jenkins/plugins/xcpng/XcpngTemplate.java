@@ -225,21 +225,21 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         @NonNull
         @Override
         public String getDisplayName() {
-            return "XCP-ng agent template";
+            return Messages.XcpngTemplate_DisplayName();
         }
 
         public FormValidation doCheckTemplateName(@QueryParameter String value) {
             return value == null || value.isBlank()
-                    ? FormValidation.error("The golden-image template name is required.")
+                    ? FormValidation.error(Messages.XcpngTemplate_templateName_required())
                     : FormValidation.ok();
         }
 
         public FormValidation doCheckNumCpus(@QueryParameter String value) {
-            return checkPositiveInt(value, "The number of vCPUs");
+            return checkPositiveInt(value, Messages.XcpngTemplate_numCpus_label());
         }
 
         public FormValidation doCheckMemoryMb(@QueryParameter String value) {
-            return checkPositiveInt(value, "The memory (MiB)");
+            return checkPositiveInt(value, Messages.XcpngTemplate_memoryMb_label());
         }
 
         /**
@@ -256,14 +256,14 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             try {
                 count = Integer.parseInt(value.trim());
             } catch (NumberFormatException e) {
-                return FormValidation.error("Warm pool size must be a whole number.");
+                return FormValidation.error(Messages.XcpngTemplate_minInstances_notWhole());
             }
             if (count < 0) {
-                return FormValidation.error("Warm pool size cannot be negative.");
+                return FormValidation.error(Messages.XcpngTemplate_minInstances_negative());
             }
             if (cloud != null && count > cloud.getMaxInstances()) {
-                return FormValidation.warning("Warm pool size (" + count + ") exceeds the cloud's Max instances ("
-                        + cloud.getMaxInstances() + "); the warm pool is capped by Max instances.");
+                return FormValidation.warning(Messages.XcpngTemplate_minInstances_exceedsMax(
+                        String.valueOf(count), String.valueOf(cloud.getMaxInstances())));
             }
             return FormValidation.ok();
         }
@@ -288,9 +288,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             try {
                 return Integer.parseInt(value.trim()) > 0
                         ? FormValidation.ok()
-                        : FormValidation.error(what + " must be a positive whole number.");
+                        : FormValidation.error(Messages.XcpngTemplate_field_notPositive(what));
             } catch (NumberFormatException e) {
-                return FormValidation.error(what + " must be a whole number.");
+                return FormValidation.error(Messages.XcpngTemplate_field_notWhole(what));
             }
         }
     }

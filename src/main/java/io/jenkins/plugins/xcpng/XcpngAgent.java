@@ -204,7 +204,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         @NonNull
         @Override
         public String getDisplayName() {
-            return "XCP-ng agent";
+            return Messages.XcpngAgent_DisplayName();
         }
 
         /** Provisioned only by {@link XcpngCloud}, never created by hand from the New Node form. */
