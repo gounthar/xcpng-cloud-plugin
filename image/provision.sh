@@ -319,6 +319,29 @@ GROWUNIT
     fi
 }
 
+move_tmp_off_tmpfs() {
+    # Debian 13 mounts /tmp as a tmpfs sized to about half of RAM through systemd's tmp.mount. On the
+    # golden's 2 GiB that is ~983 MiB, just under Jenkins' default TemporarySpaceMonitor threshold of
+    # 1 GiB, so a freshly connected agent is marked temporarily offline ("Disk space is below threshold
+    # of 1.00 GiB ... on /tmp") and refuses queued builds. A warm spare that Jenkins benches on connect
+    # is worse than none: the build waits in the queue instead of landing on the hot agent, so the whole
+    # point of keeping one hot is lost. Mask tmp.mount so /tmp is a plain directory on the root disk,
+    # which jenkins-agent-growroot expands to fill the 10 GiB virtual disk; that clears the threshold
+    # with no controller-side monitor tuning. systemd-tmpfiles restores /tmp's 1777 mode on boot.
+    log "moving /tmp off tmpfs so it clears the disk-space monitor"
+
+    # This symlink is exactly what `systemctl mask tmp.mount` writes, done by hand so the mask also
+    # lands in the CI container, where systemd is not running; the daemon-reload is gated like the
+    # enable calls above.
+    ln -sf /dev/null /etc/systemd/system/tmp.mount
+
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+    else
+        log "no systemd here; wrote the tmp.mount mask but skipped daemon-reload"
+    fi
+}
+
 harden_credentials() {
     # The build path leaves a login every clone would inherit: preseed sets user `debian` with
     # password `debian` and drops passwordless sudo in /etc/sudoers.d/debian, for Packer's SSH
@@ -366,6 +389,7 @@ main() {
     install_agent_service
     install_ssh_seed_service
     install_growroot_service
+    move_tmp_off_tmpfs
 
     if [ "${SKIP_CLEANUP:-0}" = "1" ]; then
         log "skipping template cleanup (SKIP_CLEANUP=1)"
