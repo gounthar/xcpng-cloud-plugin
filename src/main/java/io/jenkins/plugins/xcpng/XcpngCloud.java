@@ -934,7 +934,7 @@ public class XcpngCloud extends Cloud {
         @NonNull
         @Override
         public String getDisplayName() {
-            return "XCP-ng";
+            return Messages.XcpngCloud_DisplayName();
         }
 
         /**
@@ -979,27 +979,25 @@ public class XcpngCloud extends Cloud {
             try {
                 uri = new URI(value.trim());
             } catch (URISyntaxException e) {
-                return FormValidation.error("Enter a valid URL, for example https://192.168.1.87.");
+                return FormValidation.error(Messages.XcpngCloud_poolUrl_malformed());
             }
             String scheme = uri.getScheme();
             if (scheme == null || !(scheme.equalsIgnoreCase("http") || scheme.equalsIgnoreCase("https"))) {
-                return FormValidation.error("The pool URL must start with https://.");
+                return FormValidation.error(Messages.XcpngCloud_poolUrl_schemeMissing());
             }
             if (scheme.equalsIgnoreCase("http")) {
                 // Plain http sends the XAPI credential (typically the pool's root password) and every
                 // session token in cleartext. XAPI speaks TLS out of the box, and a self-signed pool
                 // certificate is already handled by trustSelfSigned, so no ordinary setup needs http.
-                return FormValidation.error(
-                        "The pool URL must use https://; http would send the XAPI credential in cleartext.");
+                return FormValidation.error(Messages.XcpngCloud_poolUrl_http());
             }
             if (uri.getHost() == null) {
-                return FormValidation.error("The pool URL must include a host, for example https://192.168.1.87.");
+                return FormValidation.error(Messages.XcpngCloud_poolUrl_noHost());
             }
             if (uri.getUserInfo() != null) {
                 // Credentials embedded in the URL (https://user:pass@host) would be persisted in
                 // config.xml and could reach logs, against the store-the-ID-never-the-secret design.
-                return FormValidation.error(
-                        "Do not put credentials in the pool URL; select them in the Credentials field.");
+                return FormValidation.error(Messages.XcpngCloud_poolUrl_userInfo());
             }
             return FormValidation.ok();
         }
@@ -1029,7 +1027,7 @@ public class XcpngCloud extends Cloud {
                 @QueryParameter boolean trustSelfSigned) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (poolUrl == null || poolUrl.isBlank()) {
-                return FormValidation.error("The pool URL is required.");
+                return FormValidation.error(Messages.XcpngCloud_poolUrl_required());
             }
             // Normalise once so the check, the credential lookup, and the client all see the same value
             // the constructor would persist. A fresh local keeps the captured parameter effectively final.
@@ -1042,7 +1040,7 @@ public class XcpngCloud extends Cloud {
             }
             StandardUsernamePasswordCredentials credentials = lookupCredentials(url, credentialsId);
             if (credentials == null) {
-                return FormValidation.error("Select the XAPI credentials.");
+                return FormValidation.error(Messages.XcpngCloud_credentials_required());
             }
             try (XapiClient client = new XapiClient(
                     url, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned)) {
@@ -1056,8 +1054,8 @@ public class XcpngCloud extends Cloud {
                 LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + url + " failed");
                 String detail = e.getMessage();
                 return detail == null || detail.isBlank()
-                        ? FormValidation.error("Connection failed; see the system log for details.")
-                        : FormValidation.error("Connection failed: " + detail);
+                        ? FormValidation.error(Messages.XcpngCloud_testConnection_failedNoDetail())
+                        : FormValidation.error(Messages.XcpngCloud_testConnection_failed(detail));
             }
         }
 
@@ -1069,9 +1067,8 @@ public class XcpngCloud extends Cloud {
          */
         static FormValidation connectedResult(boolean trustSelfSigned) {
             return trustSelfSigned
-                    ? FormValidation.warning("Connected to the pool, but TLS verification was disabled because"
-                            + " \"Trust self-signed certificate\" is on.")
-                    : FormValidation.ok("Connected to the pool.");
+                    ? FormValidation.warning(Messages.XcpngCloud_testConnection_okInsecure())
+                    : FormValidation.ok(Messages.XcpngCloud_testConnection_ok());
         }
     }
 }
