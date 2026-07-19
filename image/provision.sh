@@ -330,16 +330,11 @@ move_tmp_off_tmpfs() {
     # with no controller-side monitor tuning. systemd-tmpfiles restores /tmp's 1777 mode on boot.
     log "moving /tmp off tmpfs so it clears the disk-space monitor"
 
-    # This symlink is exactly what `systemctl mask tmp.mount` writes, done by hand so the mask also
-    # lands in the CI container, where systemd is not running; the daemon-reload is gated like the
-    # enable calls above.
+    # This symlink is exactly what `systemctl mask tmp.mount` writes, done by hand so the mask also lands
+    # in the CI container where systemd is not running. No daemon-reload is needed: the image is templated
+    # (shut down) right after, and the clone's systemd reads the mask naturally on its next boot; on this
+    # build VM a reload would not unmount the live tmpfs anyway, so it buys nothing.
     ln -sf /dev/null /etc/systemd/system/tmp.mount
-
-    if [ -d /run/systemd/system ]; then
-        systemctl daemon-reload
-    else
-        log "no systemd here; wrote the tmp.mount mask but skipped daemon-reload"
-    fi
 }
 
 harden_credentials() {
