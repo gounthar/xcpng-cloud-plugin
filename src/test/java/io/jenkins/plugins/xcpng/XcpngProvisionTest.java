@@ -1048,4 +1048,107 @@ class XcpngProvisionTest {
         // cap. (The onFailure call is guarded against exactly that; this locks the invariant it protects.)
         assertEquals(0, cloud.inFlightCount(), "a failed warm launch must release its reservation, not wedge the cap");
     }
+
+    // ---- Leaked-VM recording and sweep (#27) ----
+
+    @Test
+    void sweepReclaimsARecordedLeakedVm(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:vm/leaked/1"),
+                "the sweep must reissue the destroy for a recorded leak: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(), "a reclaimed VM must be dropped from the set: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void sweepKeepsARefItStillCannotDestroy(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:vm/leaked/1"),
+                "the sweep must attempt the destroy: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().contains("vm/leaked/1"),
+                "a ref that still cannot be destroyed must stay recorded for the next tick: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void sweepWithNothingRecordedOpensNoClient(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                fake.calls().isEmpty(), "a sweep with nothing recorded must not even open a client: " + fake.calls());
+    }
+
+    @Test
+    void aFailedTeardownIsRecordedThenReclaimedOnTheNextSweep(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent =
+                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        r.jenkins.addNode(agent);
+
+        // The teardown's destroy fails: the node is still removed, but the VM ref is recorded rather than lost.
+        agent.terminate();
+        assertFalse(r.jenkins.getNodes().contains(agent), "the node is removed even though its destroy failed");
+        assertTrue(
+                cloud.leakedVmRefs().contains(agent.getVmRef()),
+                "the failed teardown must record the VM as leaked: " + cloud.leakedVmRefs());
+
+        // The pool recovers; the next sweep reissues the destroy and the ref clears.
+        fake.recoverDestroy();
+        cloud.sweepLeakedVms();
+
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "the recovered sweep must reclaim the VM: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void theMaintainerSweepsLeakedVms(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        // The maintainer tick must run the sweep, not only reconcile the warm pool: that is what turns a
+        // recorded leak into an actual destroy without an operator or the external reaper stepping in.
+        new XcpngWarmPoolMaintainer().execute(TaskListener.NULL);
+
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:vm/leaked/1"),
+                "the maintainer tick must sweep recorded leaks: " + fake.calls());
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "the swept VM must be dropped: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void recordedLeakedVmsSurviveAConfigRoundTrip(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        // Recording rather than retrying inline earns its keep only by surviving a controller restart, which is
+        // an XStream round-trip of config.xml. A transient set would come back empty and the VM would leak
+        // undetected past the very restart the durable set exists to bridge.
+        XcpngCloud reloaded =
+                (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(jenkins.model.Jenkins.XSTREAM2.toXML(cloud));
+        assertTrue(
+                reloaded.leakedVmRefs().contains("vm/leaked/1"),
+                "a recorded leaked VM must survive a config reload: " + reloaded.leakedVmRefs());
+    }
 }

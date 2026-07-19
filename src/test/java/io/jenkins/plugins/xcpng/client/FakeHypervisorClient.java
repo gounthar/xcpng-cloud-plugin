@@ -60,6 +60,15 @@ public final class FakeHypervisorClient implements HypervisorClient {
         return this;
     }
 
+    /**
+     * Stop {@link #destroyWithDisks} throwing, so a later call succeeds. Models a pool that was briefly
+     * unreachable during a teardown recovering by the time the leaked-VM sweep retries the destroy.
+     */
+    public FakeHypervisorClient recoverDestroy() {
+        this.destroyFails = false;
+        return this;
+    }
+
     /** The verbs invoked so far, in order. */
     public List<String> calls() {
         return Collections.unmodifiableList(calls);

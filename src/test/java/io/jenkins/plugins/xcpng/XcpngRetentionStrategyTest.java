@@ -371,6 +371,26 @@ class XcpngRetentionStrategyTest {
     }
 
     /**
+     * A destroy that throws must record the VM as leaked on its cloud, so the warm-pool maintainer's sweep can
+     * reclaim it later. Without this the node is still removed (above) but the VM ref is lost for good, since
+     * nothing in Jenkins references it once the node is gone, and the VM leaks on the pool forever -- the #27
+     * bug. Dropping the recordLeakedVm call leaves this red while the removal test above still passes.
+     */
+    @Test
+    void terminateRecordsTheLeakedVmWhenDestroyThrows(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+
+        agent.terminate();
+
+        assertTrue(
+                cloud.leakedVmRefs().contains(agent.getVmRef()),
+                "a failed destroy must record the VM as leaked for later reclamation: " + cloud.leakedVmRefs());
+    }
+
+    /**
      * An agent whose cloud has been deleted from the configuration must terminate cleanly: no client is
      * opened, no VM destroyed, the node still removed. Otherwise teardown would dereference a missing cloud.
      */

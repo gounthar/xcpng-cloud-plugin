@@ -182,8 +182,19 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         try (HypervisorClient client = cloud.openClient()) {
             client.destroyWithDisks(new VmRef(vmRef));
         } catch (RuntimeException e) {
-            LOGGER.log(Level.WARNING, e, () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName());
-            listener.getLogger().println("Failed to destroy VM " + vmRef + ": " + e.getMessage());
+            // The base class removes this node in a finally regardless of what happens here, so once we
+            // return nothing in Jenkins references vmRef any more: a swallowed failure would leak the VM
+            // and its disks for the controller's whole life. Hand the ref to the cloud's durable orphan set
+            // instead, so XcpngWarmPoolMaintainer can reissue the destroy on a later tick, across a restart.
+            // Logged at SEVERE, not WARNING: a leaked VM holds real pool storage until reclaimed.
+            LOGGER.log(
+                    Level.SEVERE,
+                    e,
+                    () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName()
+                            + "; recorded it as a leaked VM for the warm-pool maintainer to reclaim");
+            listener.getLogger()
+                    .println("Failed to destroy VM " + vmRef + "; recorded for later cleanup: " + e.getMessage());
+            cloud.recordLeakedVm(vmRef);
         }
     }
 
