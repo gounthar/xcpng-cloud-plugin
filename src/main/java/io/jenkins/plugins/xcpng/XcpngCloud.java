@@ -49,6 +49,7 @@ import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.Symbol;
+import org.jenkinsci.plugins.cloudstats.CloudStatistics;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.jenkinsci.plugins.cloudstats.TrackedPlannedNode;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -319,7 +320,11 @@ public class XcpngCloud extends Cloud {
      *
      * <p>A warm spare differs from an on-demand agent only here: it is still registered so its inbound
      * agent can connect, but the maintainer never blocks a tick waiting for it to come online, and the
-     * per-template warm counter is reserved so a later tick does not double-provision it.
+     * per-template warm counter is reserved so a later tick does not double-provision it. Because it
+     * bypasses the NodeProvisioner, it also opens its own cloud-stats activity with {@code onStarted} against
+     * {@code activityId} (the on-demand path leaves that to the {@link TrackedPlannedNode}); once the activity
+     * exists, cloud-stats' own computer and node listeners drive it through launch, operation, and teardown, so
+     * the only phase this method must close by hand is a failure before any computer exists, via {@code onFailure}.
      */
     @CheckForNull
     private CompletableFuture<Node> launch(
@@ -349,6 +354,15 @@ public class XcpngCloud extends Cloud {
                 }
                 Node node = null;
                 try {
+                    // A warm spare is added straight to the pool and never passes through the
+                    // NodeProvisioner, which is what files an on-demand TrackedPlannedNode's cloud-stats
+                    // activity. Register it here against the agent's own activityId, before the clone starts,
+                    // so an activity exists by the time the spare connects or is drained -- otherwise
+                    // cloud-stats' online and deletion listeners call getActivityFor on an untracked node and
+                    // throw IllegalStateException. The on-demand path leaves this to the NodeProvisioner.
+                    if (warm) {
+                        CloudStatistics.ProvisioningListener.get().onStarted(activityId);
+                    }
                     node = provisionNode(template, displayName, activityId, warm);
                     // Register the node so its inbound agent can dial in -- both warm spares and on-demand
                     // agents need this. Only an on-demand agent in production then blocks until it is online,
@@ -385,6 +399,13 @@ public class XcpngCloud extends Cloud {
                     // node.
                     if (node instanceof XcpngAgent agent) {
                         terminateQuietly(agent, displayName);
+                    }
+                    // The activity was opened with onStarted above. A failure here means no computer was ever
+                    // launched, so cloud-stats' own onLaunchFailure/onDeleted listeners never fire and the
+                    // activity would hang in PROVISIONING forever. Close it as failed by hand; the on-demand
+                    // path lets the NodeProvisioner record the failure through its PlannedNode instead.
+                    if (warm) {
+                        CloudStatistics.ProvisioningListener.get().onFailure(activityId, t);
                     }
                     future.completeExceptionally(t);
                     // Restore the interrupt so higher-level shutdown/cancellation logic still sees it,

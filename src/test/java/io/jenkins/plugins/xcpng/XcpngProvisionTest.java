@@ -1,5 +1,6 @@
 package io.jenkins.plugins.xcpng;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -33,6 +34,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import jenkins.model.JenkinsLocationConfiguration;
 import jenkins.slaves.JnlpAgentReceiver;
+import org.jenkinsci.plugins.cloudstats.CloudStatistics;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.jenkinsci.plugins.cloudstats.TrackedItem;
 import org.jenkinsci.plugins.cloudstats.TrackedPlannedNode;
@@ -892,5 +894,90 @@ class XcpngProvisionTest {
         } finally {
             launches.shutdownNow();
         }
+    }
+
+    // ---- Warm pool: cloud-stats visibility (#56) ----
+
+    /** The one warm spare on the pool, failing the assertion if the reconcile produced anything else. */
+    private static XcpngAgent theOnlySpare(JenkinsRule r) {
+        assertEquals(1, r.jenkins.getNodes().size(), "expected exactly one spare on the pool");
+        return assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+    }
+
+    @Test
+    void warmSpareIsRegisteredWithCloudStats(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 1);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+        XcpngAgent spare = theOnlySpare(r);
+
+        // The bug: a warm spare bypasses the NodeProvisioner, so no ProvisioningActivity is ever filed, and
+        // getActivityFor throws IllegalStateException on this TrackedItem. onStarted in launch() fixes it.
+        ProvisioningActivity activity = CloudStatistics.get().getActivityFor(spare);
+        assertNotNull(activity, "the warm spare must have a cloud-stats activity");
+        assertSame(spare.getId(), activity.getId(), "the activity must key off the agent's own id, not a rebuilt one");
+
+        // Once the activity is filed, cloud-stats' own OperationListener advances it to LAUNCHING as the
+        // spare's computer starts up. That listener can only find the activity because onStarted filed it, so
+        // reaching LAUNCHING also proves the spare is genuinely tracked, not filed once and then orphaned.
+        assertEquals(
+                ProvisioningActivity.Phase.LAUNCHING,
+                activity.getCurrentPhase(),
+                "a tracked spare should progress into the LAUNCHING phase under cloud-stats");
+    }
+
+    @Test
+    void deletingAWarmSpareDoesNotThrowFromCloudStats(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 1);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+        XcpngAgent spare = theOnlySpare(r);
+        ProvisioningActivity activity = CloudStatistics.get().getActivityFor(spare);
+
+        // The other half of #56: cloud-stats' node-deletion listener also calls getActivityFor, so removing an
+        // untracked spare threw IllegalStateException out of removeNode. With the activity filed, the delete
+        // closes it cleanly instead.
+        assertDoesNotThrow(
+                () -> r.jenkins.removeNode(spare), "removing a tracked spare must not throw from cloud-stats");
+        assertEquals(
+                ProvisioningActivity.Status.OK,
+                activity.getStatus(),
+                "a spare removed before use is a clean completion, not a failure");
+        assertEquals(
+                ProvisioningActivity.Phase.COMPLETED,
+                activity.getCurrentPhase(),
+                "deleting the spare should close its activity");
+    }
+
+    @Test
+    void aFailedWarmLaunchIsRecordedAsFailedInCloudStats(JenkinsRule r) throws Exception {
+        // failStart() clones the spare and then throws from start, so the launch fails after the activity is
+        // opened but before any computer exists. No computer means cloud-stats' own launch/deletion listeners
+        // never fire, so without the explicit onFailure the activity would hang in PROVISIONING forever.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 1);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+
+        assertEquals(0, warmNodeCount(r), "a spare whose start throws must not be registered");
+        assertTrue(
+                fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
+                "the clone that failed to start must be destroyed, not leaked: " + fake.calls());
+
+        // Exactly one activity, for this template, closed as a failure. Drop the onFailure and cloud-stats
+        // never learns the launch threw: the abandoned activity is left looking successful (OK), never FAIL.
+        List<ProvisioningActivity> activities = CloudStatistics.get().getActivities();
+        assertEquals(1, activities.size(), "the failed launch should still leave one tracked activity");
+        ProvisioningActivity activity = activities.get(0);
+        assertEquals("jenkins-golden-debian", activity.getId().getTemplateName());
+        assertEquals(
+                ProvisioningActivity.Status.FAIL,
+                activity.getStatus(),
+                "a warm launch that threw must be recorded as a failed activity");
     }
 }
