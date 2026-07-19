@@ -248,21 +248,38 @@ SSHUNIT
 
     sh -n /usr/local/bin/jenkins-agent-ssh-seed
 
-    # Regenerate SSH host keys on boot when they are missing. cleanup_for_template removes them so each
-    # clone gets unique keys, but a plugin clone is seeded over xenstore and has no cloud-init datasource
-    # (DataSourceNone), so cloud-init's cc_ssh never runs to recreate them. Without this drop-in sshd
-    # refuses to start on such a clone and the per-clone authorized_keys the seed service wrote is
-    # unreachable. Verified on the pool: a clone with removed host keys and no cidata left sshd down.
-    mkdir -p /etc/systemd/system/ssh.service.d
-    cat > /etc/systemd/system/ssh.service.d/regen-host-keys.conf <<'REGEN'
+    # Regenerate SSH host keys before sshd when a clone has none. cleanup_for_template removes them so
+    # each clone gets unique keys, but a plugin clone is seeded over xenstore with no cloud-init
+    # datasource (DataSourceNone), so cloud-init's cc_ssh never recreates them. Debian's own
+    # sshd-keygen.service would, but it is gated on ConditionFirstBoot, which an image sealed with an
+    # empty /etc/machine-id does not reliably trigger. Without host keys, ssh.service's built-in
+    # ExecStartPre=/usr/sbin/sshd -t fails ("no hostkeys available -- exiting") and sshd never listens,
+    # so the per-clone authorized_keys the seed service wrote is unreachable. A dedicated oneshot,
+    # ordered Before=ssh.service and guarded only on the keys being absent, regenerates them in time on
+    # every clone. This supersedes the earlier ssh.service.d drop-in, whose ExecStartPre was appended
+    # after ssh.service's own sshd -t and so never fired on a keyless clone; remove that stale file.
+    rm -f /etc/systemd/system/ssh.service.d/regen-host-keys.conf
+    rmdir /etc/systemd/system/ssh.service.d 2>/dev/null || true
+
+    cat > /etc/systemd/system/jenkins-agent-sshd-keygen.service <<'KEYGEN'
+[Unit]
+Description=Generate SSH host keys before sshd when a clone has none
+ConditionPathExists=!/etc/ssh/ssh_host_ed25519_key
+Before=ssh.service ssh.socket sshd.service
+
 [Service]
-ExecStartPre=/bin/sh -c 'test -e /etc/ssh/ssh_host_ed25519_key || ssh-keygen -A'
-REGEN
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/ssh-keygen -A
+
+[Install]
+WantedBy=multi-user.target
+KEYGEN
 
     if [ -d /run/systemd/system ]; then
-        systemctl enable jenkins-agent-ssh-seed.service
+        systemctl enable ssh.service jenkins-agent-ssh-seed.service jenkins-agent-sshd-keygen.service
     else
-        log "no systemd here; wrote and validated the ssh-seed unit but skipped enable"
+        log "no systemd here; wrote and validated the ssh units but skipped enable"
     fi
 }
 
