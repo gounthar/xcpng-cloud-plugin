@@ -273,7 +273,7 @@ RemainAfterExit=yes
 ExecStart=/usr/bin/ssh-keygen -A
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target ssh.service ssh.socket sshd.service
 KEYGEN
 
     if [ -d /run/systemd/system ]; then
