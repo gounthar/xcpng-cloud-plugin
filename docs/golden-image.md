@@ -24,6 +24,7 @@ preparation, as this does.
 | **`xenstore-read`** | The baked agent service reads its per-clone data (controller URL, agent name, JNLP secret) from xenstore, so the guest needs a `xenstore-read` binary. On Debian 13 `xe-guest-utilities` 7.30 already ships one; `provision.sh` installs `xenstore-utils` only as a fallback when it is missing. |
 | **`xe-guest-utilities`** | Without the guest agent the VM never writes its address to xenstore, and XAPI reports `networks={}` for its whole life. The inbound launcher does not need an address, but `tools/measure_clone.py` and any future SSH launcher do. |
 | **cloud-init** | Needed for the from-scratch `import_raw_vdi` bootstrap, which relies on a seed `network-config` to bring the network up (see below). The clone path no longer consumes it: per-clone data arrives over xenstore, not a NoCloud seed. |
+| **`/tmp` on disk, not tmpfs** | Debian 13 mounts `/tmp` as a tmpfs sized to about half of RAM. On a 2 GiB agent that is ~983 MiB, under Jenkins' default `TemporarySpaceMonitor` threshold of 1 GiB, so a freshly connected agent is benched (`Disk space is below threshold of 1.00 GiB ... on /tmp`) and refuses queued builds. `provision.sh` masks `tmp.mount` so `/tmp` lives on the root disk that `jenkins-agent-growroot` expands to 10 GiB, clearing the threshold with no controller-side monitor tuning. |
 
 `sshd` is in the image already. An authorized key is **opt-in**: set the agent template's SSH public
 key field and each clone trusts it for the `debian` user (delivered per-clone over xenstore, see
