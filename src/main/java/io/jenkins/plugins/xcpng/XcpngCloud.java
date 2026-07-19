@@ -40,6 +40,7 @@ import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -126,10 +127,13 @@ public class XcpngCloud extends Cloud {
      * {@link XcpngWarmPoolMaintainer} calls it on a schedule. Persisted (not transient, unlike the in-flight
      * counters below) because the VM outlives the controller process: a leak recorded before a restart must
      * still be reclaimed after one. Not final: {@link #readResolve} re-creates it for a config predating the
-     * field. Accessed under its own monitor rather than the cloud's, so the blocking sweep never holds the lock
-     * that {@link #provision} and {@link #reconcileWarmPool} contend on.
+     * field. A {@link CopyOnWriteArraySet} rather than a locked {@link LinkedHashSet}: a runtime mutation
+     * (a record or a sweep) must not throw {@code ConcurrentModificationException} against XStream iterating
+     * the set during an unrelated {@code Jenkins.save()} on another thread, which no lock of ours could prevent
+     * since XStream never takes it. Its copy-on-write iteration is snapshot-based, so mutations are safe and no
+     * explicit synchronization is needed.
      */
-    private Set<String> leakedVmRefs = new LinkedHashSet<>();
+    private Set<String> leakedVmRefs = new CopyOnWriteArraySet<>();
 
     /**
      * How a live client is opened. Null in production, where {@link #openClient()} builds an
@@ -235,7 +239,7 @@ public class XcpngCloud extends Cloud {
         // A config predating the leaked-VM set deserializes it to null (XStream skips the initializer). Any
         // refs an older controller persisted are gone, but a live sweep must still have a set to work with.
         if (leakedVmRefs == null) {
-            leakedVmRefs = new LinkedHashSet<>();
+            leakedVmRefs = new CopyOnWriteArraySet<>();
         }
         // Transient boolean: XStream skips the field initializer, so a reloaded cloud would default to
         // false (fast-complete) and over-provision. Restore the production behaviour.
@@ -602,12 +606,11 @@ public class XcpngCloud extends Cloud {
      * the ref survives a restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
      */
     void recordLeakedVm(@NonNull String vmRef) {
-        synchronized (leakedVmRefs) {
-            if (!leakedVmRefs.add(vmRef)) {
-                return;
-            }
+        // add() is atomic on the CopyOnWriteArraySet and returns whether the ref was new, so only a genuine
+        // first record triggers a save, and XStream may iterate the set mid-save without a CME.
+        if (leakedVmRefs.add(vmRef)) {
+            saveQuietly();
         }
-        saveQuietly();
     }
 
     /**
@@ -619,13 +622,11 @@ public class XcpngCloud extends Cloud {
      * carries its own lock.
      */
     void sweepLeakedVms() {
-        List<String> pending;
-        synchronized (leakedVmRefs) {
-            if (leakedVmRefs.isEmpty()) {
-                return;
-            }
-            pending = new ArrayList<>(leakedVmRefs);
+        if (leakedVmRefs.isEmpty()) {
+            return;
         }
+        // A CopyOnWriteArraySet snapshot: iterating it to copy cannot throw even if a record lands mid-sweep.
+        List<String> pending = new ArrayList<>(leakedVmRefs);
         List<String> reclaimed = new ArrayList<>();
         try (HypervisorClient client = openClient()) {
             for (String vmRef : pending) {
@@ -645,11 +646,9 @@ public class XcpngCloud extends Cloud {
             LOGGER.log(Level.FINE, e, () -> "Could not open a client to sweep leaked XCP-ng VMs for cloud " + name);
         } finally {
             // In a finally, not after the try, so a client whose close() throws cannot resurrect a ref whose
-            // destroy already succeeded.
+            // destroy already succeeded. removeAll is atomic on the CopyOnWriteArraySet.
             if (!reclaimed.isEmpty()) {
-                synchronized (leakedVmRefs) {
-                    leakedVmRefs.removeAll(reclaimed);
-                }
+                leakedVmRefs.removeAll(reclaimed);
                 saveQuietly();
             }
         }
@@ -658,9 +657,8 @@ public class XcpngCloud extends Cloud {
     /** A snapshot of the VM refs a past teardown could not destroy, for asserting the durable orphan set in tests. */
     @NonNull
     Set<String> leakedVmRefs() {
-        synchronized (leakedVmRefs) {
-            return new LinkedHashSet<>(leakedVmRefs);
-        }
+        // A defensive copy off the copy-on-write set; the snapshot iteration cannot throw a CME.
+        return new LinkedHashSet<>(leakedVmRefs);
     }
 
     /** Persist the cloud after mutating the leaked-VM set, logging rather than throwing if the save fails. */
