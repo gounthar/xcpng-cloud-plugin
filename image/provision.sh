@@ -314,13 +314,21 @@ num=$(printf '%s' "$src" | grep -o '[0-9]*$' || true)
 [ -n "$dev" ] && [ -n "$num" ] || exit 0
 # growpart exits 1 for NOCHANGE (the partition already fills the disk) and 2 for a real error: a
 # missing sfdisk, an unexpected layout, or a filesystem needing fsck first. Treat only NOCHANGE as
-# success and let stderr reach the journal, so a root FS left at base-image size -- whose first
-# symptom is DiskSpaceMonitor benching the agent mid-build -- leaves evidence instead of a green
-# oneshot with an empty journal. resize2fs no-ops cleanly (exit 0) once the FS already fills.
+# success; on a real error let stderr reach the journal and exit non-zero so the unit goes failed in
+# systemctl status, rather than leaving a root FS silently at base-image size (first symptom:
+# DiskSpaceMonitor benching the agent mid-build) behind a green oneshot. Exiting non-zero is safe:
+# the unit is only Before= ordered, with nothing Requires-ing it, so a failure shows red without
+# blocking jenkins-agent.service. resize2fs no-ops cleanly (exit 0) once the FS already fills.
 rc=0
 growpart "/dev/$dev" "$num" || rc=$?
-[ "$rc" -le 1 ] || echo "jenkins-agent-growroot: growpart exit $rc, root partition not grown" >&2
-resize2fs "$src" || echo "jenkins-agent-growroot: resize2fs failed, root filesystem not grown" >&2
+if [ "$rc" -gt 1 ]; then
+    echo "jenkins-agent-growroot: growpart exit $rc, root partition not grown" >&2
+    exit 1
+fi
+resize2fs "$src" || {
+    echo "jenkins-agent-growroot: resize2fs failed, root filesystem not grown" >&2
+    exit 1
+}
 GROW
     chmod 0755 /usr/local/bin/jenkins-agent-growroot
 
