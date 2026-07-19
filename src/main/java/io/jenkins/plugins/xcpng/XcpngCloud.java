@@ -23,6 +23,7 @@ import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import io.jenkins.plugins.xcpng.client.XapiClient;
+import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.ArrayList;
@@ -31,6 +32,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,6 +40,7 @@ import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -116,6 +119,21 @@ public class XcpngCloud extends Cloud {
      * boots but never connects. Not final: {@link #readResolve} re-applies the clamp on deserialization.
      */
     private int idleMinutes = DEFAULT_IDLE_MINUTES;
+
+    /**
+     * VM refs the plugin failed to destroy during agent teardown, awaiting another attempt. When
+     * {@link XcpngAgent#_terminate}'s {@code destroyWithDisks} throws, the base class still removes the node,
+     * so this set becomes the last thing referencing that VM; {@link #sweepLeakedVms} reissues the destroy and
+     * {@link XcpngWarmPoolMaintainer} calls it on a schedule. Persisted (not transient, unlike the in-flight
+     * counters below) because the VM outlives the controller process: a leak recorded before a restart must
+     * still be reclaimed after one. Not final: {@link #readResolve} re-creates it for a config predating the
+     * field. A {@link CopyOnWriteArraySet} rather than a locked {@link LinkedHashSet}: a runtime mutation
+     * (a record or a sweep) must not throw {@code ConcurrentModificationException} against XStream iterating
+     * the set during an unrelated {@code Jenkins.save()} on another thread, which no lock of ours could prevent
+     * since XStream never takes it. Its copy-on-write iteration is snapshot-based, so mutations are safe and no
+     * explicit synchronization is needed.
+     */
+    private Set<String> leakedVmRefs = new CopyOnWriteArraySet<>();
 
     /**
      * How a live client is opened. Null in production, where {@link #openClient()} builds an
@@ -217,6 +235,11 @@ public class XcpngCloud extends Cloud {
         }
         if (warmInFlightByTemplate == null) {
             warmInFlightByTemplate = new ConcurrentHashMap<>();
+        }
+        // A config predating the leaked-VM set deserializes it to null (XStream skips the initializer). Any
+        // refs an older controller persisted are gone, but a live sweep must still have a set to work with.
+        if (leakedVmRefs == null) {
+            leakedVmRefs = new CopyOnWriteArraySet<>();
         }
         // Transient boolean: XStream skips the field initializer, so a reloaded cloud would default to
         // false (fast-complete) and over-provision. Restore the production behaviour.
@@ -574,6 +597,77 @@ public class XcpngCloud extends Cloud {
         LOGGER.log(Level.FINE, () -> "Draining surplus XCP-ng warm spare " + spare.getNodeName());
         strategy.reap(cloudComputer, reapExecutor());
         return true;
+    }
+
+    /**
+     * Record a VM the plugin failed to destroy during teardown, so it is reclaimed later rather than leaked.
+     * Called from {@link XcpngAgent#_terminate} on a {@code destroyWithDisks} failure, at which point the base
+     * class is about to remove the node and this set becomes the last reference to the VM. Persisted at once so
+     * the ref survives a restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
+     */
+    void recordLeakedVm(@NonNull String vmRef) {
+        // add() is atomic on the CopyOnWriteArraySet and returns whether the ref was new, so only a genuine
+        // first record triggers a save, and XStream may iterate the set mid-save without a CME.
+        if (leakedVmRefs.add(vmRef)) {
+            saveQuietly();
+        }
+    }
+
+    /**
+     * Reissue the destroy for every VM a past teardown failed to remove, dropping each ref that now destroys
+     * cleanly and leaving the rest for the next tick. Called on a schedule by {@link XcpngWarmPoolMaintainer};
+     * package-visible so a test can drive it directly. Opens at most one client per sweep, and none at all when
+     * nothing is recorded, so a healthy cloud pays nothing for it. Runs off the cloud monitor: the blocking
+     * destroy must not stall a concurrent {@link #provision} or {@link #reconcileWarmPool}, and the leaked set
+     * carries its own lock.
+     */
+    void sweepLeakedVms() {
+        if (leakedVmRefs.isEmpty()) {
+            return;
+        }
+        // A CopyOnWriteArraySet snapshot: iterating it to copy cannot throw even if a record lands mid-sweep.
+        List<String> pending = new ArrayList<>(leakedVmRefs);
+        List<String> reclaimed = new ArrayList<>();
+        try (HypervisorClient client = openClient()) {
+            for (String vmRef : pending) {
+                try {
+                    client.destroyWithDisks(new VmRef(vmRef));
+                    reclaimed.add(vmRef);
+                    LOGGER.log(Level.INFO, () -> "Reclaimed leaked XCP-ng VM " + vmRef + " for cloud " + name);
+                } catch (RuntimeException e) {
+                    // Still unreachable. Keep it recorded and retry next tick; logged at FINE so a
+                    // persistently-stuck ref does not spam the log every minute (the leak itself was SEVERE).
+                    LOGGER.log(Level.FINE, e, () -> "Leaked XCP-ng VM " + vmRef + " still could not be destroyed");
+                }
+            }
+        } catch (RuntimeException e) {
+            // Could not even open a session (bad credentials, pool down). Whatever was reclaimed before the
+            // failure is still dropped in the finally; the rest stay recorded for the next tick.
+            LOGGER.log(Level.FINE, e, () -> "Could not open a client to sweep leaked XCP-ng VMs for cloud " + name);
+        } finally {
+            // In a finally, not after the try, so a client whose close() throws cannot resurrect a ref whose
+            // destroy already succeeded. removeAll is atomic on the CopyOnWriteArraySet.
+            if (!reclaimed.isEmpty()) {
+                leakedVmRefs.removeAll(reclaimed);
+                saveQuietly();
+            }
+        }
+    }
+
+    /** A snapshot of the VM refs a past teardown could not destroy, for asserting the durable orphan set in tests. */
+    @NonNull
+    Set<String> leakedVmRefs() {
+        // A defensive copy off the copy-on-write set; the snapshot iteration cannot throw a CME.
+        return new LinkedHashSet<>(leakedVmRefs);
+    }
+
+    /** Persist the cloud after mutating the leaked-VM set, logging rather than throwing if the save fails. */
+    private static void saveQuietly() {
+        try {
+            Jenkins.get().save();
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, e, () -> "Could not persist the XCP-ng cloud's leaked-VM set");
+        }
     }
 
     /**

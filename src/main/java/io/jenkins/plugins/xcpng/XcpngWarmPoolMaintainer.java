@@ -42,6 +42,14 @@ public class XcpngWarmPoolMaintainer extends AsyncPeriodicWork {
                     // One cloud's failure must not stop the others being reconciled this tick.
                     LOGGER.log(Level.WARNING, e, () -> "Warm-pool reconcile failed for cloud " + xcpng.name);
                 }
+                try {
+                    // Reissue any teardown that failed and left a VM recorded as leaked. Separate try so a
+                    // sweep failure does not skip the next cloud, and so a reconcile failure above does not
+                    // skip this cloud's sweep.
+                    xcpng.sweepLeakedVms();
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.WARNING, e, () -> "Leaked-VM sweep failed for cloud " + xcpng.name);
+                }
             }
         }
     }

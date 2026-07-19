@@ -33,7 +33,8 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
 
     /**
      * Guards against a second reap while the first is already in flight. Cleared when the reap task
-     * finishes (so a failed teardown can be retried) and reset to false on deserialization.
+     * finishes, which only releases the per-agent lock: the node is gone by then (see {@link #reap}), so
+     * the clear is not a retry hook. Reset to false on deserialization.
      */
     private transient boolean reaping;
 
@@ -183,9 +184,13 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
                 } catch (Exception e) {
                     LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + agent.getNodeName());
                 } finally {
-                    // Clear the guard whatever happened. On success the node is already gone, so the next
-                    // reap short-circuits on the getNode() check; on a transient failure this lets a later
-                    // periodic check retry the teardown rather than leaving the VM to leak forever.
+                    // Clear the guard whatever happened; this only releases the per-agent lock, it is not a
+                    // teardown retry. AbstractCloudSlave.terminate removes the node in its own finally whether
+                    // or not _terminate's destroy threw, so by the time this runs getNode() is null and the
+                    // next check() short-circuits (XcpngRetentionStrategy.check line ~78) -- nothing here ever
+                    // reissues the destroy. A destroy that did throw is instead recorded as a leaked VM on the
+                    // cloud (XcpngAgent._terminate -> XcpngCloud.recordLeakedVm) and re-destroyed by
+                    // XcpngWarmPoolMaintainer on a later tick, which is the only path that actually retries.
                     synchronized (this) {
                         reaping = false;
                     }
