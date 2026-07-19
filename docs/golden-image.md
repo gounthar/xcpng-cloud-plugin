@@ -129,12 +129,14 @@ rewritten each boot). An inbound-only fleet sets no key and stays SSH-closed.
 
 ## The from-scratch seed (cloud-init)
 
-`image/seed/` holds the files that make up a NoCloud seed for the from-scratch `import_raw_vdi`
-bootstrap: `user-data.tmpl`, `meta-data.tmpl`, and a static `network-config`. The clone path no
-longer uses these (it seeds over xenstore, above); they remain for the from-scratch path, whose
-freshly imported disk has no persisted network and so needs cloud-init to bring one up.
+The clone path seeds over xenstore (above) and needs no NoCloud seed. A from-scratch `import_raw_vdi`
+bootstrap does: its freshly imported disk has no persisted network, so cloud-init has to bring one up.
+That path is manual and unwired — nothing in the plugin assembles or consumes a seed — so the repo
+ships no seed files (an earlier `image/seed/` sketch was removed, see issue #36). If you bootstrap by
+hand, build the three-file NoCloud seed yourself: a `user-data`, a `meta-data` carrying `instance-id`,
+and a static `network-config`.
 
-`meta-data.tmpl` carries `instance-id`, and it must be **unique per clone**. Use the VM's XAPI UUID.
+`meta-data`'s `instance-id` must be **unique per clone**. Use the VM's XAPI UUID.
 
 cloud-init re-runs its per-instance modules only when the datasource's `instance-id` differs from
 the one cached on disk. Pin a constant id and the first clone works. Then boot the golden image once
@@ -176,11 +178,12 @@ MAC absent from the bridge) that looks like a boot stall, but is not. golden's *
 they inherit golden's persisted, cloud-init-configured network from disk.
 
 **So a from-scratch bootstrap is ordinary, given one thing: a correct cloud-init network config in the
-seed.** `image/seed/` now includes a static `network-config` (`dhcp4: true`, `match: name "e*"`)
-beside `user-data` and `meta-data`, and cloud-init applies it as long as the `instance-id` is fresh
-and unique per clone (the silent-skip trap above). These are seed *files*; assembling and attaching
-the NoCloud seed is still M3, so nothing in the plugin consumes them yet. Verified **by hand** on the
-lab pool: a fresh bare `import_raw_vdi` disk (golden's pristine source, no persisted network) plus a
+seed.** A static `network-config` (`dhcp4: true`, `match: name "e*"`) beside `user-data` and
+`meta-data` is what cloud-init applies, as long as the `instance-id` is fresh and unique per clone (the
+silent-skip trap above). Assembling and attaching that NoCloud seed is a manual step; the plugin seeds
+over xenstore and consumes no seed files (the earlier `image/seed/` sketch was removed, see issue #36).
+Verified **by hand** on the lab pool: a fresh bare `import_raw_vdi` disk (golden's pristine source, no
+persisted network) plus a
 seed carrying this exact `network-config` booted and brought up DHCP (the guest MAC was learned on
 the `xenbr0` bridge and the vif showed real bidirectional traffic), where the same disk with a seed
 lacking `network-config` came up networkless. When M3 wires the seed, the from-scratch path works;

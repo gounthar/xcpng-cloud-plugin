@@ -21,7 +21,6 @@ set -euo pipefail
 JAVA_MAJOR=21
 ADOPTIUM_KEYRING=/etc/apt/keyrings/adoptium.asc
 ADOPTIUM_LIST=/etc/apt/sources.list.d/adoptium.list
-GUEST_TOOLS_DEB='Linux/xe-guest-utilities_7.30.0-18_amd64.deb'
 # Fallback source of xenstore-read, the client the agent service uses to read its per-clone seed. On
 # Debian 13 xe-guest-utilities 7.30 already ships /usr/bin/xenstore-read, so ensure_xenstore_client
 # usually finds it present and skips this. xenstore-utils covers an image that has no guest tools.
@@ -90,8 +89,15 @@ install_guest_tools() {
     (
         trap 'umount /mnt/gt 2>/dev/null || true' EXIT
         mount -o ro /dev/sr0 /mnt/gt
+        # Glob the deb rather than pin its version: the exact xe-guest-utilities filename is a property
+        # of whatever guest-tools.iso the pool ships, so pinning it makes the next XCP-ng point update
+        # break the build inside apt-get with no hint the ISO layout changed. Fail loudly on zero or on
+        # more than one match, so a future ISO shipping two versions is an error, not an arbitrary pick.
+        set -- /mnt/gt/Linux/xe-guest-utilities_*_amd64.deb
+        [ -e "$1" ] || die "no xe-guest-utilities deb on /dev/sr0 (looked in /mnt/gt/Linux)"
+        [ "$#" -eq 1 ] || die "multiple xe-guest-utilities debs on the tools ISO: $*"
         # apt-get, not dpkg -i: the .deb may pull dependencies, which dpkg does not resolve.
-        apt-get install -y -q "/mnt/gt/${GUEST_TOOLS_DEB}"
+        apt-get install -y -q "$1"
     )
     rmdir /mnt/gt 2>/dev/null || true
 
@@ -115,8 +121,8 @@ ensure_xenstore_client() {
 
 install_agent_service() {
     # Bake the inbound-agent launcher and its systemd unit into the image. Unlike the M2 hand path and
-    # the earlier cloud-init sketch (image/seed/user-data.tmpl), the per-clone values are not templated
-    # in: the launcher reads them from xenstore at boot, where the plugin writes vm-data/jenkins/{url,
+    # an earlier, since-removed cloud-init sketch, the per-clone values are not templated in: the
+    # launcher reads them from xenstore at boot, where the plugin writes vm-data/jenkins/{url,
     # name,secret} onto the clone before it starts. One baked unit serves every clone; nothing per-agent
     # is rendered at provision time.
     log "installing the xenstore-seeded inbound agent service"
@@ -306,8 +312,15 @@ src=$(findmnt -no SOURCE / || true)                  # e.g. /dev/xvda1
 dev=$(lsblk -no PKNAME "$src" 2>/dev/null || true)   # e.g. xvda
 num=$(printf '%s' "$src" | grep -o '[0-9]*$' || true)
 [ -n "$dev" ] && [ -n "$num" ] || exit 0
-growpart "/dev/$dev" "$num" 2>/dev/null || true
-resize2fs "$src" 2>/dev/null || true
+# growpart exits 1 for NOCHANGE (the partition already fills the disk) and 2 for a real error: a
+# missing sfdisk, an unexpected layout, or a filesystem needing fsck first. Treat only NOCHANGE as
+# success and let stderr reach the journal, so a root FS left at base-image size -- whose first
+# symptom is DiskSpaceMonitor benching the agent mid-build -- leaves evidence instead of a green
+# oneshot with an empty journal. resize2fs no-ops cleanly (exit 0) once the FS already fills.
+rc=0
+growpart "/dev/$dev" "$num" || rc=$?
+[ "$rc" -le 1 ] || echo "jenkins-agent-growroot: growpart exit $rc, root partition not grown" >&2
+resize2fs "$src" || echo "jenkins-agent-growroot: resize2fs failed, root filesystem not grown" >&2
 GROW
     chmod 0755 /usr/local/bin/jenkins-agent-growroot
 

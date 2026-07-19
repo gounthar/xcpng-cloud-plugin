@@ -9,6 +9,10 @@
 > "Correction: we never had a boot problem" section at the end. Read that first; treat the OVMF /
 > seed-content / device-model theorising below as a record of a wrong turn, not as findings.
 
+> **Note (later):** the `image/seed/` files this log cites — `user-data`, `meta-data`, `network-config`
+> — were removed as a dead, contradictory sketch (see issue #36). The recipe still holds; only the
+> committed files are gone. For a from-scratch bootstrap, rebuild the NoCloud seed by hand.
+
 *Recorded 2026-07-12 from the `vates-2` session, against the lab pool (XCP-ng 8.3.0, XAPI 26.1).
 Two controlled experiments on real hardware. Every test VM was destroyed by ref in a `finally`;
 `jenkins-golden-debian` and `jenkins-ci-m2-probe` were never touched.*
