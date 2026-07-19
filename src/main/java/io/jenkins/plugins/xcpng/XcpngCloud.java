@@ -1047,7 +1047,7 @@ public class XcpngCloud extends Cloud {
             try (XapiClient client = new XapiClient(
                     url, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned)) {
                 client.ping();
-                return FormValidation.ok("Connected to the pool.");
+                return connectedResult(trustSelfSigned);
             } catch (RuntimeException e) {
                 // The button is admin-only and the message carries no secret, so it is returned to the
                 // operator as the diagnostic they asked for; the stack trace is kept server-side. A
@@ -1059,6 +1059,19 @@ public class XcpngCloud extends Cloud {
                         ? FormValidation.error("Connection failed; see the system log for details.")
                         : FormValidation.error("Connection failed: " + detail);
             }
+        }
+
+        /**
+         * The result of a successful {@code Test connection}. When the connection was made with TLS
+         * verification off, downgrade the message to a warning so the operator is told, on the form, that
+         * they connected over an unverified link carrying the pool credential, rather than seeing a clean
+         * success that hides it. Package-private so it can be asserted without a live pool.
+         */
+        static FormValidation connectedResult(boolean trustSelfSigned) {
+            return trustSelfSigned
+                    ? FormValidation.warning("Connected to the pool, but TLS verification was disabled because"
+                            + " \"Trust self-signed certificate\" is on.")
+                    : FormValidation.ok("Connected to the pool.");
         }
     }
 }

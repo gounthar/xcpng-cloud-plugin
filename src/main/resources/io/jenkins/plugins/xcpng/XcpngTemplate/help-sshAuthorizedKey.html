@@ -1,0 +1,7 @@
+<div>
+  Optional. A single SSH <b>public</b> key, on one line, seeded into each clone over xenstore so you can
+  log in to a running agent for diagnostics. Paste exactly one public key (for example an
+  <code>ssh-ed25519 AAAA...</code> line); anything that looks like a private key, or more than one key, is
+  rejected. The private half must never reach an agent. Leave it blank if you do not need SSH access;
+  the agent connects to the controller over an inbound WebSocket and does not need SSH to function.
+</div>
