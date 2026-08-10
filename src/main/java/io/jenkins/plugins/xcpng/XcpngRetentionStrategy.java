@@ -10,6 +10,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -52,6 +53,14 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
      */
     private transient LongSupplier clock;
 
+    /**
+     * Reads whether a computer is free of work. Null in production, where {@link #idle} asks the computer
+     * itself; a test injects one because {@code Computer.isIdle()} is final and reads private executor state,
+     * and an agent that never really connects can never run a build to drive it false. Transient: behaviour,
+     * never persisted.
+     */
+    private transient Predicate<AbstractCloudComputer<?>> idleProbe;
+
     public XcpngRetentionStrategy(int idleMinutes) {
         super(idleMinutes);
         this.idleMinutes = idleMinutes;
@@ -76,7 +85,7 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         // boot, network, or JNLP misconfiguration) is offline forever, and gating on online would leave
         // its VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
         // net is for, and matches the superclass CloudRetentionStrategy.
-        if (idleMinutes > 0 && computer.isIdle()) {
+        if (idleMinutes > 0 && idle(computer)) {
             long idleMillis = now() - computer.getIdleStartMilliseconds();
             if (idleMillis > TimeUnit.MINUTES.toMillis(idleMinutes)) {
                 reap(computer);
@@ -88,6 +97,11 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     /** The current instant in millis, from the injected clock in tests or the system clock in production. */
     private long now() {
         return clock != null ? clock.getAsLong() : System.currentTimeMillis();
+    }
+
+    /** Whether the computer has no work in hand, from the injected probe in tests or the computer itself. */
+    private boolean idle(AbstractCloudComputer<?> computer) {
+        return idleProbe != null ? idleProbe.test(computer) : computer.isIdle();
     }
 
     /** Whether the computer backs an unused warm spare that should be kept hot rather than idle-reaped. */
@@ -108,11 +122,19 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
 
     @Override
     public void taskAccepted(Executor executor, Queue.Task task) {
+        if (!(executor.getOwner() instanceof AbstractCloudComputer<?> computer)) {
+            return;
+        }
+        // This agent has its one build now, so refuse any further assignment from this moment rather than
+        // waiting for the completion reap to do it. Without this the computer stays assignable in the window
+        // between the build finishing and the reap taking effect, and a second build landing there would both
+        // run on a no-longer-pristine VM and be killed by the teardown already under way.
+        computer.setAcceptingTasks(false);
         // The spare has work now: drop the warm exemption so it reverts to ordinary single-use behaviour
         // (reclaimed by taskCompleted below, or by the idle net if the build never completes). A build is
         // already running by the time this fires, so the computer is not idle and check() would not reap
         // it anyway; this simply keeps the exemption predicate honest for any later idle moment.
-        if (executor.getOwner().getNode() instanceof XcpngAgent agent) {
+        if (computer.getNode() instanceof XcpngAgent agent) {
             agent.markUsed();
         }
     }
@@ -127,15 +149,20 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         reapOwner(executor);
     }
 
+    /**
+     * Reap the agent whose build just finished. The idle re-check is deliberately skipped here: the executor
+     * still holds the finished executable while its listeners run, so the computer reads busy and the very
+     * reap that makes single-use work would abandon itself every time.
+     */
     private void reapOwner(Executor executor) {
         if (executor.getOwner() instanceof AbstractCloudComputer<?> computer) {
-            reap(computer);
+            reap(computer, reapExecutor(), false);
         }
     }
 
-    /** Reap on the remoting pool, the production path for the idle net and a build's completion. */
+    /** Reap on the remoting pool, the production path for the idle net. */
     private void reap(AbstractCloudComputer<?> computer) {
-        reap(computer, reapExecutor());
+        reap(computer, reapExecutor(), true);
     }
 
     /** The executor the idle net and task-completion reap on: an injected one in tests, the remoting pool otherwise. */
@@ -154,9 +181,23 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     }
 
     /**
+     * Test seam: report a computer busy without a real build. {@code Computer.isIdle()} is final and reads
+     * private executor state, and these agents never really connect, so there is no other way to drive the
+     * accept-versus-reap race.
+     */
+    void setIdleProbe(Predicate<AbstractCloudComputer<?>> idleProbe) {
+        this.idleProbe = idleProbe;
+    }
+
+    /**
      * Reclaim this agent asynchronously, at most once at a time. Package-visible, and with the executor a
      * parameter, so {@link XcpngCloud#reconcileWarmPool} can drain a surplus warm spare through this very
      * method rather than reimplementing it.
+     *
+     * <p>Both of those callers decide to reclaim an agent by reading {@code isIdle()}, and the destroy lands
+     * some time after that read. Refusing further tasks and re-reading the computer under the queue lock
+     * before the teardown (see {@link #idleUnderQueueLock}) is what stops a build assigned inside that window
+     * from losing its VM mid-run.
      *
      * <p>Sharing the path is what makes the {@link #reaping} guard meaningful. A warm spare that never came
      * online is not exempt (see {@link #exemptFromIdleReap}), so the idle net below and a warm-pool drain can
@@ -165,6 +206,16 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
      * destroying. The guard is per-agent, since each {@link XcpngAgent} holds its own strategy instance.
      */
     synchronized void reap(AbstractCloudComputer<?> computer, ExecutorService executor) {
+        reap(computer, executor, true);
+    }
+
+    /**
+     * @param requireIdle whether to abandon the teardown if the computer turns out to have work in hand.
+     *     True for the idle net and the warm-pool drain: both decided to reclaim this agent while it was
+     *     idle, and a build assigned in between must not be killed by the destroy. False for the completion
+     *     path, where the finished build still counts as work in hand (see {@link #reapOwner}).
+     */
+    private synchronized void reap(AbstractCloudComputer<?> computer, ExecutorService executor, boolean requireIdle) {
         if (reaping) {
             return;
         }
@@ -172,12 +223,25 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
             return;
         }
         reaping = true;
-        // Refuse further work immediately so nothing new is scheduled onto a node about to die.
+        // Refuse further work immediately so nothing new is scheduled onto a node about to die. This is
+        // published before the re-check below reads the computer back, which is what makes that read
+        // meaningful rather than another sample of a moving target.
         computer.setAcceptingTasks(false);
         LOGGER.log(Level.FINE, () -> "Reclaiming XCP-ng agent " + agent.getNodeName());
         try {
             executor.submit(() -> {
                 try {
+                    if (requireIdle && !idleUnderQueueLock(computer)) {
+                        // A build was assigned between the caller's idle check and here. Destroying the VM
+                        // now would kill it with a channel loss and no explanation, so leave the agent alone
+                        // and let the completion reap reclaim it when the build finishes. The node stays
+                        // non-accepting: it is a used, single-use agent from this point either way.
+                        LOGGER.log(
+                                Level.INFO,
+                                () -> "Not reclaiming XCP-ng agent " + agent.getNodeName()
+                                        + ": it took on work after the reclamation was decided");
+                        return;
+                    }
                     agent.terminate();
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
@@ -203,5 +267,22 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
             LOGGER.log(Level.WARNING, e, () -> "Could not schedule reclamation of agent " + agent.getNodeName());
             reaping = false;
         }
+    }
+
+    /**
+     * Whether the computer has no work in hand, read while holding the queue lock so the answer cannot be
+     * invalidated by an assignment already in flight. {@code setAcceptingTasks(false)} has been published by
+     * the time this runs, so a scheduling pass either finished before the lock was taken, in which case its
+     * assignment is visible here, or starts after it is released and finds the node refusing work. Read
+     * without the lock, the window would stay open: the queue samples {@code isAcceptingTasks} at the start
+     * of a pass and assigns at the end of it, so a pass already under way can still place a build on a node
+     * that has just stopped accepting.
+     *
+     * <p>Only the read is under the lock. The teardown itself must not be: {@code destroyWithDisks} is a
+     * blocking network call, and holding the queue lock across it would stall scheduling for the whole
+     * controller for as long as the pool takes to answer.
+     */
+    private boolean idleUnderQueueLock(AbstractCloudComputer<?> computer) {
+        return Queue.callWithLock(() -> idle(computer));
     }
 }
