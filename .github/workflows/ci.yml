@@ -142,7 +142,7 @@ jobs:
       # updatecli (updatecli/updatecli.d/packer.yaml), which dependabot cannot do for a curl'd binary.
       - name: Install Packer
         env:
-          PACKER_VERSION: 1.15.4  # updatecli: hashicorp/packer
+          PACKER_VERSION: 1.16.0  # updatecli: hashicorp/packer
         run: |
           curl -fsSL -o /tmp/packer.zip \
             "https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip"
