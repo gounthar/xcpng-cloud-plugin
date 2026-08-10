@@ -1,0 +1,66 @@
+# Release Drafter keeps one draft release open, accumulating merged pull requests into
+# notes and computing the next version from their labels. Nothing is published until a
+# human presses publish; that press creates the tag, which fires `release.yml` to build
+# and attach the .hpi.
+#
+# This mirrors what JEP-229 continuous delivery does inside the jenkinsci org, so if the
+# plugin is ever donated the change is swapping in `cd.yaml` rather than rethinking how
+# releases are decided. See the Releases section of README.md.
+---
+name-template: '$RESOLVED_VERSION'
+tag-template: '$RESOLVED_VERSION'
+
+categories:
+  - title: Features
+    labels:
+      - enhancement
+  - title: Bug fixes
+    labels:
+      - bug
+  - title: Documentation
+    labels:
+      - documentation
+  - title: Build, CI, and dependencies
+    labels:
+      - build
+      - dependencies
+      - github_actions
+      - java
+
+# `default: patch` matters more than the individual entries: an unlabeled pull request
+# still lands somewhere sensible instead of silently deciding the version for us.
+version-resolver:
+  major:
+    labels:
+      - major
+      - breaking
+  minor:
+    labels:
+      - minor
+      - enhancement
+  patch:
+    labels:
+      - patch
+      - bug
+      - documentation
+      - dependencies
+      - build
+      - github_actions
+      - java
+  default: patch
+
+exclude-labels:
+  - skip-changelog
+
+change-template: '- $TITLE (#$NUMBER) @$AUTHOR'
+no-changes-template: '- No user-visible changes'
+
+template: |
+  $CHANGES
+
+  **Full changelog**: https://github.com/$OWNER/$REPOSITORY/compare/$PREVIOUS_TAG...$RESOLVED_VERSION
+
+  ## Installing
+
+  This plugin is not in the Jenkins update centre. Download the `.hpi` below and install it
+  through *Manage Jenkins → Plugins → Advanced settings → Deploy Plugin*.

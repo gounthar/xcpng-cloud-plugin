@@ -238,6 +238,30 @@ mvn hpi:run -Dhost=0.0.0.0 -Dport=8080
 
 Jenkins is then available at `http://localhost:8080/jenkins`.
 
+## Releases
+
+The plugin is not in the Jenkins update centre, which only distributes plugins hosted in the
+`jenkinsci` organisation. A release here is a [GitHub release](../../releases) carrying an `.hpi`.
+Install it through *Manage Jenkins → Plugins → Advanced settings → Deploy Plugin*; updates are
+manual, and the update centre will not offer them.
+
+Releases are cut when the shipped `.hpi` would behave differently for someone running it — a new
+capability, or a correctness fix on the provision and teardown paths. Dependency bumps and
+test-only changes ride along with the next such release rather than earning one.
+
+Mechanically, [Release Drafter](.github/release-drafter.yml) keeps a draft release open on `main`,
+sorting merged pull requests into notes and deriving the next version from their labels: `major`
+or `breaking`, `minor` or `enhancement`, and everything else a patch. Publishing that draft is a
+human decision. Publishing creates the tag, which fires
+[`release.yml`](.github/workflows/release.yml) to build the `.hpi` at exactly that version and
+attach it.
+
+If the plugin is donated to `jenkinsci`, this is replaced by
+[JEP-229 continuous delivery](https://www.jenkins.io/redirect/continuous-delivery-of-plugins): a
+`cd.yaml` calling `jenkins-infra/github-reusable-workflows`, which publishes to
+`repo.jenkins-ci.org` and needs organisation secrets. It reads the same labels, so only the
+publishing half changes. The `.mvn/` incrementals wiring that donation requires is already here.
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE); it is also declared in `pom.xml`.
