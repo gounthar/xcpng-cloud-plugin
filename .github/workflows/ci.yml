@@ -41,6 +41,35 @@ jobs:
       - name: Build, test and package
         run: mvn -B -ntp verify
 
+  # A workflow file that fails the Actions schema does not produce a lint error anyone can read.
+  # GitHub attributes the invalid file to the triggering push and emits a run with zero jobs and a
+  # failure conclusion, on an event the file does not even subscribe to. yamllint reports nothing,
+  # because the YAML is well formed — it is the schema that is wrong. That is how `workflows: write`,
+  # a permission scope GITHUB_TOKEN does not have, sat in updatecli.yaml across a review, a bot
+  # review, and a pull request that claimed to fix the resulting red run.
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned for the same reason Packer is below, and bumped the same way, by updatecli
+      # (updatecli/updatecli.d/actionlint.yaml): the version lives in a run: step that curls a
+      # tarball, which is exactly the manifest-less case dependabot cannot read.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12  # updatecli: rhysd/actionlint
+        run: |
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          sudo tar -xzf /tmp/actionlint.tar.gz -C /usr/local/bin actionlint
+          actionlint --version
+
+      # actionlint shells out to shellcheck for every run: block it finds, and ubuntu-latest ships
+      # shellcheck, so this lints the shell embedded in these workflows as well as their schema.
+      - name: Lint the workflow files
+        run: actionlint -color
+
   # tools/ destroys VMs and their disks on a live hypervisor. Every bug review found in it
   # was on an error path, which is exactly what never gets exercised by hand. These tests
   # run against a fake XAPI: they guard control flow, not the XAPI contract. The contract is
