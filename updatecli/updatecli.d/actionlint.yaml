@@ -1,0 +1,54 @@
+---
+# actionlint is installed in ci.yml by curling a release tarball, so its version sits in a `run:`
+# step with no manifest behind it. Same blind spot as Packer next door, same remedy. A separate
+# pipeline file rather than a third target in packer.yaml: updatecli opens one pull request per
+# file, and a linter bump and an image-builder bump have nothing to say to each other.
+
+name: 'ci: bump actionlint'
+
+scms:
+  default:
+    kind: github
+    spec:
+      user: "{{ .github.user }}"
+      email: "{{ .github.email }}"
+      owner: "{{ .github.owner }}"
+      repository: "{{ .github.repository }}"
+      token: "{{ requiredEnv .github.token }}"
+      username: "{{ .github.username }}"
+      branch: "{{ .github.branch }}"
+
+sources:
+  actionlintLatestVersion:
+    name: "Latest actionlint release"
+    kind: githubrelease
+    spec:
+      owner: "rhysd"
+      repository: "actionlint"
+      token: "{{ requiredEnv .github.token }}"
+      username: "{{ .github.username }}"
+      # versionfilter, not versioning. The latter is the older spelling and is silently ignored.
+      versionfilter:
+        kind: semver
+    transformers:
+      - trimprefix: "v"
+
+targets:
+  actionlintCli:
+    name: "ACTIONLINT_VERSION in the ci workflow"
+    kind: file
+    scmid: default
+    sourceid: actionlintLatestVersion
+    spec:
+      file: ".github/workflows/ci.yml"
+      matchpattern: 'ACTIONLINT_VERSION: .*'
+      replacepattern: 'ACTIONLINT_VERSION: {{ source "actionlintLatestVersion" }}  # updatecli: rhysd/actionlint'
+
+actions:
+  default:
+    kind: github/pullrequest
+    scmid: default
+    title: 'ci: bump actionlint to {{ source "actionlintLatestVersion" }}'
+    spec:
+      labels:
+        - dependencies

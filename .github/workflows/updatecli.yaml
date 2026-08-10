@@ -33,12 +33,16 @@ jobs:
     # avoid. If an event ever lacks a repository object, `null == false` is false and the job
     # skips, which is the safe direction.
     if: github.event.repository.fork == false
+    # Enough to push a branch and open the pull request, and no more. There is no `workflows`
+    # scope for GITHUB_TOKEN — `workflow` is a classic personal access token scope, and naming it
+    # here made the whole file fail the Actions schema, which GitHub reports as a run with zero
+    # jobs attributed to the triggering push rather than as a lint error. The actionlint job in
+    # ci.yml exists so that cannot merge again.
     permissions:
       contents: write
       pull-requests: write
-      workflows: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned. Dependabot's github-actions ecosystem keeps this one current.
       - name: Install Updatecli
