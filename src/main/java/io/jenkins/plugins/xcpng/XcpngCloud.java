@@ -800,8 +800,10 @@ public class XcpngCloud extends Cloud {
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             try {
                 client.start(clone);
+                // The cloud itself, not just its name: the agent snapshots this cloud's connection
+                // parameters so it can still destroy its VM if the cloud is later deleted or renamed.
                 XcpngAgent agent =
-                        new XcpngAgent(displayName, name, clone.value(), template, idleMinutes, activityId, warm);
+                        new XcpngAgent(displayName, this, clone.value(), template, idleMinutes, activityId, warm);
                 LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
                 return agent;
             } catch (Exception e) {
@@ -872,9 +874,27 @@ public class XcpngCloud extends Cloud {
         if (clientFactory != null) {
             return clientFactory.open(this);
         }
+        return openClient(poolUrl, credentialsId, trustSelfSigned, "cloud '" + name + "'");
+    }
+
+    /**
+     * Build a live {@link XapiClient} from a set of connection parameters, resolving the credential from
+     * the store at this moment rather than from anything persisted. Static and parameterised because
+     * {@link XcpngAgent#_terminate} needs the same construction from its own connection snapshot when the
+     * cloud that provisioned it has been deleted or renamed and there is no instance left to ask; keeping
+     * one implementation means the two paths cannot drift on TLS trust or credential scoping.
+     *
+     * @param owner what the parameters belong to, for the message thrown when the credential is gone.
+     */
+    @NonNull
+    static HypervisorClient openClient(
+            @CheckForNull String poolUrl,
+            @CheckForNull String credentialsId,
+            boolean trustSelfSigned,
+            @NonNull String owner) {
         StandardUsernamePasswordCredentials credentials = DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
         if (credentials == null) {
-            throw new IllegalStateException("No XAPI credentials configured for cloud '" + name + "'.");
+            throw new IllegalStateException("No XAPI credentials configured for " + owner + ".");
         }
         return new XapiClient(
                 poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned);

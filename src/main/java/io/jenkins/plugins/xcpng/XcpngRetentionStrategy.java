@@ -113,8 +113,10 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     /**
      * Pure exemption rule, split out so its input combinations are unit-testable without a live computer.
      * A warm spare is kept only while it is both online (an offline one that never connected must still be
-     * reaped so its VM does not leak) and still attached to a live cloud (a spare whose cloud was deleted
-     * must lose the exemption, or the idle net could never reclaim it).
+     * reaped so its VM does not leak) and still attached to a live cloud: a spare whose cloud was deleted
+     * belongs to no pool the plugin still provisions against, so keeping it hot would hold a VM for a queue
+     * that can never route work to it. The idle net then reclaims both halves — the node, and (through the
+     * agent's connection snapshot, see {@link XcpngAgent#_terminate}) the VM behind it.
      */
     static boolean exemptFromIdleReap(boolean warm, boolean online, boolean cloudPresent) {
         return warm && online && cloudPresent;
