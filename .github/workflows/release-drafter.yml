@@ -28,6 +28,12 @@ jobs:
       # Creating and updating the draft release is a write to repository contents. The
       # workflow-level `contents: read` above stays as the floor for anything added later.
       contents: write
+      # Both scopes are required, and naming one is what makes the other necessary: a
+      # permissions block replaces the token defaults outright rather than adding to them,
+      # so listing only `contents` would leave pull-requests at `none`. Release Drafter
+      # reads merged pull requests to categorise them and to resolve the version from their
+      # labels, so it would draft empty notes. This pair is what upstream's README documents.
+      pull-requests: read
     steps:
       - uses: release-drafter/release-drafter@v7.7.0
         env:
