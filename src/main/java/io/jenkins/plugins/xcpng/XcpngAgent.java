@@ -26,7 +26,10 @@ import org.jenkinsci.plugins.cloudstats.TrackedItem;
  * <p>Inbound/JNLP by design: the agent dials out to the controller, so the plugin needs no IP
  * discovery and no controller-to-agent reachability. The clone's {@link VmRef} value is held here so
  * that terminating the node destroys the VM and its disks; the reference back to the owning cloud is
- * by name, since the {@link XcpngCloud} instance is not serialised with the node.
+ * by name, since the {@link XcpngCloud} instance is not serialised with the node. Because a name can
+ * stop resolving — the cloud deleted, or renamed out from under a running agent — the node also carries
+ * a snapshot of that cloud's non-secret connection parameters, so teardown can still reach the pool and
+ * destroy the VM rather than strand it.
  *
  * <p>Implements {@link TrackedItem} so cloud-stats can tie this node, and its {@link XcpngComputer}, back
  * to the provisioning activity the {@link XcpngCloud} started for it.
@@ -60,6 +63,26 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private final String vmRef;
 
     /**
+     * Connection parameters copied off the owning cloud at provision time, so this agent can still reach the
+     * pool to destroy its VM when {@link #getCloud()} no longer resolves — the cloud deleted from the
+     * configuration, or renamed, which is the same thing to an agent holding a name.
+     *
+     * <p>Non-secret by construction, and deliberately the same three values the cloud persists: the pool URL,
+     * the <em>ID</em> of the XAPI credential, and whether to trust a self-signed pool certificate. The
+     * credential itself is still resolved from the store at point of use, so nothing secret reaches the node's
+     * {@code config.xml}. Null on an agent persisted before this snapshot existed; {@link #_terminate} treats
+     * that absence as "no fallback available" rather than normalising it, since there is nothing to normalise
+     * it to.
+     */
+    @CheckForNull
+    private final String poolUrl;
+
+    @CheckForNull
+    private final String credentialsId;
+
+    private final boolean trustSelfSigned;
+
+    /**
      * The cloud-stats provisioning activity this agent belongs to. Serialisable and persisted with the
      * node so a controller restart keeps the correlation; {@link #getId()} hands it to cloud-stats.
      */
@@ -78,9 +101,23 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     private transient volatile boolean warm;
 
+    /**
+     * How a client is opened from the {@link #poolUrl} snapshot when the owning cloud is gone. Null in
+     * production, where {@link #openClientFromSnapshot()} builds an {@code XapiClient} through
+     * {@link XcpngCloud#openClient(String, String, boolean, String)}; a test injects an in-memory fake and
+     * asserts the snapshot it was handed. Transient: behaviour, not configuration, and never persisted.
+     */
+    private transient ConnectionClientFactory connectionClientFactory;
+
+    /**
+     * @param cloud the cloud provisioning this agent. Passed whole rather than by name so the connection
+     *     snapshot cannot drift from the name it is recorded against; the agent keeps only the name and the
+     *     three non-secret connection parameters, never a reference to the cloud itself, which is not
+     *     serialised with the node.
+     */
     public XcpngAgent(
             @NonNull String name,
-            @NonNull String cloudName,
+            @NonNull XcpngCloud cloud,
             @NonNull String vmRef,
             @NonNull XcpngTemplate template,
             int idleMinutes,
@@ -97,10 +134,13 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 new JNLPLauncher(),
                 new XcpngRetentionStrategy(idleMinutes),
                 Collections.emptyList());
-        this.cloudName = cloudName;
+        this.cloudName = cloud.name;
         this.vmRef = vmRef;
         this.activityId = activityId;
         this.warm = warm;
+        this.poolUrl = cloud.getPoolUrl();
+        this.credentialsId = cloud.getCredentialsId();
+        this.trustSelfSigned = cloud.isTrustSelfSigned();
     }
 
     /** The VM this agent runs on, as an opaque backend handle. */
@@ -113,6 +153,23 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @NonNull
     public String getCloudName() {
         return cloudName;
+    }
+
+    /** Pool URL snapshotted from the owning cloud; null on an agent persisted before the snapshot existed. */
+    @CheckForNull
+    public String getPoolUrl() {
+        return poolUrl;
+    }
+
+    /** ID of the XAPI credential snapshotted from the owning cloud, never the credential itself. */
+    @CheckForNull
+    public String getCredentialsId() {
+        return credentialsId;
+    }
+
+    /** Whether the owning cloud was configured to trust a self-signed pool certificate. */
+    public boolean isTrustSelfSigned() {
+        return trustSelfSigned;
     }
 
     /** The cloud that provisioned this agent, or null if it has since been removed from the config. */
@@ -170,12 +227,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     protected void _terminate(TaskListener listener) {
         XcpngCloud cloud = getCloud();
         if (cloud == null) {
-            LOGGER.log(
-                    Level.WARNING,
-                    () -> "Cloud '" + cloudName + "' is gone; VM " + vmRef + " for agent " + getNodeName()
-                            + " may be orphaned");
-            listener.getLogger()
-                    .println("XCP-ng cloud '" + cloudName + "' not found; VM " + vmRef + " may be orphaned.");
+            terminateWithoutCloud(listener);
             return;
         }
         listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
@@ -196,6 +248,90 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     .println("Failed to destroy VM " + vmRef + "; recorded for later cleanup: " + e.getMessage());
             cloud.recordLeakedVm(vmRef);
         }
+    }
+
+    /**
+     * Destroy the VM without an owning cloud to ask, using the connection snapshot taken at provision time.
+     *
+     * <p>The cloud being gone is not an edge case an administrator has to go looking for: deleting a cloud
+     * while its agents run does it, and so does renaming one, since the node holds a name and the UI replaces
+     * the instance under the new one. Before the snapshot existed this method's predecessor logged a warning
+     * and returned, and because the base class removes the node in a {@code finally} either way, that return
+     * dropped the last reference to {@link #vmRef} — one VM and its copy-on-write disks stranded on the pool
+     * per running agent, recoverable only by hand with {@code tools/reaper.py}.
+     *
+     * <p>Two cases still strand the VM, and both are logged at SEVERE and named on the build log because
+     * nothing downstream can recover them: an agent persisted before the snapshot existed, which reloads with
+     * no parameters to connect with, and a snapshot that no longer opens — its credential deleted from the
+     * store, or the pool unreachable. The cloud's durable leaked-VM set cannot stand in for either, since
+     * {@link XcpngCloud#recordLeakedVm} lives on the very cloud that no longer exists.
+     */
+    private void terminateWithoutCloud(TaskListener listener) {
+        if (poolUrl == null) {
+            LOGGER.log(
+                    Level.SEVERE,
+                    () -> "Cloud '" + cloudName + "' is gone and agent " + getNodeName()
+                            + " predates the connection snapshot, so VM " + vmRef
+                            + " cannot be destroyed; reclaim it with tools/reaper.py");
+            listener.getLogger()
+                    .println("XCP-ng cloud '" + cloudName + "' not found and this agent holds no connection"
+                            + " details; VM " + vmRef + " is orphaned. Reclaim it with tools/reaper.py.");
+            return;
+        }
+        LOGGER.log(
+                Level.WARNING,
+                () -> "Cloud '" + cloudName + "' is gone; destroying VM " + vmRef + " for agent " + getNodeName()
+                        + " from the connection snapshot taken when it was provisioned");
+        listener.getLogger()
+                .println("XCP-ng cloud '" + cloudName + "' not found; destroying VM " + vmRef
+                        + " from this agent's connection snapshot.");
+        try (HypervisorClient client = openClientFromSnapshot()) {
+            client.destroyWithDisks(new VmRef(vmRef));
+        } catch (RuntimeException e) {
+            LOGGER.log(
+                    Level.SEVERE,
+                    e,
+                    () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName() + " after cloud '"
+                            + cloudName + "' was removed; no cloud remains to retry it, so reclaim the VM with"
+                            + " tools/reaper.py");
+            listener.getLogger()
+                    .println("Failed to destroy VM " + vmRef + " and cloud '" + cloudName
+                            + "' is gone, so it cannot be retried: " + e.getMessage()
+                            + ". Reclaim it with tools/reaper.py.");
+        }
+    }
+
+    /**
+     * Open a session to the pool from this agent's connection snapshot. Production resolves the credential
+     * from the store and builds an {@code XapiClient} through the same helper {@link XcpngCloud#openClient()}
+     * uses, so the two paths cannot differ on TLS trust or credential scoping; a test injects a fake through
+     * {@link #setConnectionClientFactory} and asserts the snapshot it receives. The caller owns the returned
+     * client and must close it.
+     */
+    @NonNull
+    private HypervisorClient openClientFromSnapshot() {
+        if (connectionClientFactory != null) {
+            return connectionClientFactory.open(poolUrl, credentialsId, trustSelfSigned);
+        }
+        return XcpngCloud.openClient(poolUrl, credentialsId, trustSelfSigned, "the removed cloud '" + cloudName + "'");
+    }
+
+    /** Test seam: replace how the cloud-gone fallback opens a client with an in-memory fake. */
+    void setConnectionClientFactory(ConnectionClientFactory connectionClientFactory) {
+        this.connectionClientFactory = connectionClientFactory;
+    }
+
+    /**
+     * How {@link #openClientFromSnapshot()} obtains a client. Production leaves this null; a test supplies an
+     * in-memory fake, which is handed the snapshot itself rather than this agent, so a test can assert the
+     * three parameters actually survived provisioning. Not {@code Serializable} on purpose: it is held only in
+     * the transient {@link #connectionClientFactory} field and never reaches the node's {@code config.xml}.
+     */
+    @FunctionalInterface
+    interface ConnectionClientFactory {
+        @NonNull
+        HypervisorClient open(
+                @CheckForNull String poolUrl, @CheckForNull String credentialsId, boolean trustSelfSigned);
     }
 
     @Extension

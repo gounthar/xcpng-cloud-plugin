@@ -9,6 +9,7 @@ import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
 import hudson.util.FormValidation;
+import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -84,6 +85,48 @@ class XcpngCloudTest {
         String xml = Files.readString(configXml);
         assertTrue(xml.contains("xcpng-root"), "the credential ID should be stored");
         assertFalse(xml.contains(secret), "the plaintext password must never reach the cloud config");
+    }
+
+    /**
+     * The agent's connection snapshot follows the same rule one level down: a provisioned node persists the
+     * pool URL, the credential ID and the TLS-trust flag — which is what lets teardown destroy the VM after
+     * the cloud is deleted or renamed — and never the password behind that ID.
+     */
+    @Test
+    void agentSnapshotIsPersistedButTheSecretIsNot(JenkinsRule r) throws Exception {
+        String secret = "sup3r-s3cret-pw";
+        SystemCredentialsProvider.getInstance()
+                .getCredentials()
+                .add(new UsernamePasswordCredentialsImpl(
+                        CredentialsScope.GLOBAL, "xcpng-root", "XCP-ng lab", "root", secret));
+        SystemCredentialsProvider.getInstance().save();
+
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
+        XcpngCloud cloud =
+                new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", true, 2, List.of(template));
+        cloud.setClientFactory(c -> new FakeHypervisorClient("jenkins-golden-debian"));
+        cloud.setWaitForOnline(false);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(
+                template,
+                "xcpng-agent-1",
+                new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-agent-1"),
+                false);
+        r.jenkins.addNode(agent);
+
+        Path nodeXml = r.jenkins.getRootDir().toPath().resolve(Path.of("nodes", "xcpng-agent-1", "config.xml"));
+        String xml = Files.readString(nodeXml);
+        assertTrue(xml.contains("https://pool.example.test"), "the pool URL should be stored: " + xml);
+        assertTrue(xml.contains("xcpng-root"), "the credential ID should be stored: " + xml);
+        assertFalse(xml.contains(secret), "the plaintext password must never reach the node config");
+
+        // Read back through XStream, the way the controller reloads a node on restart: a snapshot that
+        // persisted but did not survive deserialization would leave teardown with nothing to connect with.
+        XcpngAgent reloaded = (XcpngAgent) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertEquals("https://pool.example.test", reloaded.getPoolUrl());
+        assertEquals("xcpng-root", reloaded.getCredentialsId());
+        assertTrue(reloaded.isTrustSelfSigned(), "the TLS-trust flag must survive the round trip");
     }
 
     /**
@@ -201,7 +244,7 @@ class XcpngCloudTest {
         // What the operator actually gets: one executor, whatever the old config asked for.
         XcpngAgent agent = new XcpngAgent(
                 "xcpng-legacy-1",
-                "xcpng",
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 1, List.of()),
                 "vm/legacy/1",
                 t,
                 10,

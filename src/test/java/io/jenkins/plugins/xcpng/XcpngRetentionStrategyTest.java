@@ -4,17 +4,26 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.model.Executor;
 import hudson.slaves.AbstractCloudComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
+import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
+import jenkins.model.Jenkins;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -35,6 +44,10 @@ class XcpngRetentionStrategyTest {
 
     private static final int IDLE_MINUTES = 10;
 
+    private static final String POOL_URL = "https://pool.example.test";
+
+    private static final String CREDENTIALS_ID = "cred";
+
     /** An {@link AbstractCloudComputer} that reports online, to stand in for a spare that has connected. */
     private static final class OnlineComputer extends XcpngComputer {
         OnlineComputer(XcpngAgent agent) {
@@ -49,12 +62,106 @@ class XcpngRetentionStrategyTest {
 
     /** A cloud whose clients are the given fake, registered so agents can resolve it back by name. */
     private static XcpngCloud cloudBackedBy(JenkinsRule r, FakeHypervisorClient fake) {
-        XcpngCloud cloud =
-                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 3, List.of(LINUX_TEMPLATE));
+        return cloudBackedBy(r, fake, "xcpng");
+    }
+
+    /**
+     * As above under a chosen name, for the rename case. {@code trustSelfSigned} is deliberately true rather
+     * than the more obvious false: the cloud-gone tests assert the flag reached the agent's connection
+     * snapshot, and against a false the assertion would pass just as happily on a hardcoded default.
+     */
+    private static XcpngCloud cloudBackedBy(JenkinsRule r, FakeHypervisorClient fake, String name) {
+        XcpngCloud cloud = new XcpngCloud(name, POOL_URL, CREDENTIALS_ID, true, 3, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
         cloud.setWaitForOnline(false);
         r.jenkins.clouds.add(cloud);
         return cloud;
+    }
+
+    /**
+     * A {@link XcpngAgent.ConnectionClientFactory} that answers with the given fake and records the
+     * connection snapshot it was handed, so a test can assert the parameters survived provisioning rather
+     * than only that some client was opened.
+     */
+    private static final class RecordingConnectionFactory implements XcpngAgent.ConnectionClientFactory {
+
+        private final HypervisorClient client;
+        private final RuntimeException failure;
+        private String poolUrl;
+        private String credentialsId;
+        private boolean trustSelfSigned;
+        private int opens;
+
+        RecordingConnectionFactory(HypervisorClient client) {
+            this(client, null);
+        }
+
+        /** {@code failure}, when set, is thrown instead of returning a client: the credential-is-gone case. */
+        RecordingConnectionFactory(HypervisorClient client, RuntimeException failure) {
+            this.client = client;
+            this.failure = failure;
+        }
+
+        @Override
+        public HypervisorClient open(String poolUrl, String credentialsId, boolean trustSelfSigned) {
+            this.poolUrl = poolUrl;
+            this.credentialsId = credentialsId;
+            this.trustSelfSigned = trustSelfSigned;
+            opens++;
+            if (failure != null) {
+                throw failure;
+            }
+            return client;
+        }
+    }
+
+    /** Collect this plugin's log records for the duration of a call, to assert what an operator would see. */
+    private static List<LogRecord> whileCapturingAgentLog(ThrowingRunnable body) throws Exception {
+        List<LogRecord> records = Collections.synchronizedList(new ArrayList<>());
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        Logger logger = Logger.getLogger(XcpngAgent.class.getName());
+        logger.addHandler(handler);
+        try {
+            body.run();
+        } finally {
+            logger.removeHandler(handler);
+        }
+        return records;
+    }
+
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
+    }
+
+    /** Whether any captured record at the given level mentions each of the fragments. */
+    private static boolean logged(List<LogRecord> records, Level level, String... fragments) {
+        return records.stream().anyMatch(record -> {
+            if (!level.equals(record.getLevel())) {
+                return false;
+            }
+            String message = record.getMessage();
+            if (message == null) {
+                return false;
+            }
+            for (String fragment : fragments) {
+                if (!message.contains(fragment)) {
+                    return false;
+                }
+            }
+            return true;
+        });
     }
 
     private static ProvisioningActivity.Id activityId(String nodeName) {
@@ -93,7 +200,8 @@ class XcpngRetentionStrategyTest {
     void markUsedClearsTheWarmFlag(JenkinsRule r) throws Exception {
         XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
         ProvisioningActivity.Id id = new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-warm-1");
-        XcpngAgent spare = new XcpngAgent("xcpng-warm-1", "xcpng", "vm/xcpng-warm-1/1", template, 10, id, true);
+        XcpngCloud cloud = new XcpngCloud("xcpng", POOL_URL, CREDENTIALS_ID, true, 1, List.of(template));
+        XcpngAgent spare = new XcpngAgent("xcpng-warm-1", cloud, "vm/xcpng-warm-1/1", template, 10, id, true);
 
         assertTrue(spare.isWarm(), "a spare is warm at birth");
         spare.markUsed();
@@ -507,23 +615,131 @@ class XcpngRetentionStrategyTest {
                 "a failed destroy must record the VM as leaked for later reclamation: " + cloud.leakedVmRefs());
     }
 
+    // ---- Teardown once the owning cloud no longer resolves ----
+
     /**
-     * An agent whose cloud has been deleted from the configuration must terminate cleanly: no client is
-     * opened, no VM destroyed, the node still removed. Otherwise teardown would dereference a missing cloud.
+     * An agent whose cloud has been deleted from the configuration must still destroy its VM, using the
+     * connection snapshot taken at provision time. The base class removes the node either way, so a teardown
+     * that gave up here would drop the last reference to the VM ref and strand the clone and its
+     * copy-on-write disks on the pool until someone ran {@code tools/reaper.py} by hand.
+     *
+     * <p>The assertions on the snapshot the fallback was handed are the other half: without them a fallback
+     * that opened a client from nothing, or from the wrong cloud's parameters, would pass just as well.
      */
     @Test
-    void terminateReturnsCleanlyWhenTheCloudIsGone(JenkinsRule r) throws Exception {
+    void terminateDestroysTheVmFromTheSnapshotWhenTheCloudIsGone(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(r, fake);
         XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
         r.jenkins.addNode(agent);
+        RecordingConnectionFactory connections = new RecordingConnectionFactory(fake);
+        agent.setConnectionClientFactory(connections);
 
         // The administrator removes the cloud while the agent still runs; its cloudName now resolves to nothing.
         r.jenkins.clouds.remove(cloud);
 
         assertDoesNotThrow(agent::terminate, "terminating an agent whose cloud is gone must not throw");
 
-        assertEquals(0, destroyCount(fake), "no VM can be destroyed once the cloud is gone: " + fake.calls());
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                "a deleted cloud must not strand the VM: " + fake.calls());
+        assertEquals(1, connections.opens, "the fallback must open exactly one client");
+        assertEquals(POOL_URL, connections.poolUrl, "the fallback must use the snapshotted pool URL");
+        assertEquals(CREDENTIALS_ID, connections.credentialsId, "the fallback must use the snapshotted credential ID");
+        assertTrue(connections.trustSelfSigned, "the fallback must carry the snapshotted TLS-trust setting");
         assertFalse(r.jenkins.getNodes().contains(agent), "the node must still be removed");
+    }
+
+    /**
+     * Renaming a cloud is the same bug as deleting it: the agent holds a name, and the UI replaces the
+     * instance under the new one while its agents still carry the old. The re-added cloud is configured
+     * identically, so nothing but the name differs — and that alone used to be enough to leak the VM.
+     */
+    @Test
+    void terminateDestroysTheVmWhenTheCloudWasRenamed(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        RecordingConnectionFactory connections = new RecordingConnectionFactory(fake);
+        agent.setConnectionClientFactory(connections);
+
+        // The same pool, the same credential, a different name: the agent's cloudName resolves to nothing.
+        r.jenkins.clouds.remove(cloud);
+        cloudBackedBy(r, fake, "xcpng-renamed");
+        assertNull(agent.getCloud(), "a renamed cloud must no longer resolve for an agent holding the old name");
+
+        agent.terminate();
+
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                "a renamed cloud must not strand the VM: " + fake.calls());
+        assertEquals(1, connections.opens, "the fallback must open exactly one client");
+        assertFalse(r.jenkins.getNodes().contains(agent), "the node must still be removed");
+    }
+
+    /**
+     * The first residual the fix cannot recover: the cloud is gone <em>and</em> its credential has been
+     * deleted from the store, so no client can be opened at all. The node must still go away, and the
+     * operator must be told at SEVERE that {@code tools/reaper.py} is the recovery path — there is no cloud
+     * left to hold the ref in a durable leaked-VM set, so nothing will retry this by itself.
+     */
+    @Test
+    void terminateNamesTheReaperWhenTheCredentialIsGoneToo(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        agent.setConnectionClientFactory(
+                new RecordingConnectionFactory(fake, new IllegalStateException("No XAPI credentials configured")));
+        r.jenkins.clouds.remove(cloud);
+
+        List<LogRecord> log = whileCapturingAgentLog(
+                () -> assertDoesNotThrow(agent::terminate, "an unopenable client must not propagate out of teardown"));
+
+        assertEquals(0, destroyCount(fake), "no destroy can have been issued: " + fake.calls());
+        assertTrue(
+                logged(log, Level.SEVERE, agent.getVmRef(), "tools/reaper.py"),
+                "an unrecoverable leak must name the VM and the reaper at SEVERE: " + messages(log));
+        assertFalse(r.jenkins.getNodes().contains(agent), "the node must still be removed");
+    }
+
+    /**
+     * The second residual: an agent persisted before the connection snapshot existed reloads with no
+     * parameters to connect with, so a deleted cloud still strands its VM. That agent must not throw on the
+     * way out, and must say at SEVERE that the reaper is the only recovery — rather than reporting a failed
+     * destroy it never attempted.
+     *
+     * <p>The fixture is a real agent serialised and stripped of the snapshot elements, which is exactly the
+     * shape XStream hands back for a {@code config.xml} written before those fields existed.
+     */
+    @Test
+    void terminateNamesTheReaperForAnAgentPredatingTheSnapshot(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent provisioned = agent(cloud, "xcpng-agent-1", false);
+
+        String xml = Jenkins.XSTREAM2.toXML(provisioned);
+        String legacyXml = xml.replaceAll("\\s*<poolUrl>[^<]*</poolUrl>", "")
+                .replaceAll("\\s*<credentialsId>[^<]*</credentialsId>", "")
+                .replaceAll("\\s*<trustSelfSigned>[^<]*</trustSelfSigned>", "");
+        XcpngAgent legacy = (XcpngAgent) Jenkins.XSTREAM2.fromXML(legacyXml);
+        assertNull(legacy.getPoolUrl(), "the fixture must really predate the snapshot, or it proves nothing");
+
+        r.jenkins.addNode(legacy);
+        r.jenkins.clouds.remove(cloud);
+
+        List<LogRecord> log = whileCapturingAgentLog(
+                () -> assertDoesNotThrow(legacy::terminate, "an agent with no snapshot must not throw on the way out"));
+
+        assertEquals(0, destroyCount(fake), "there is nothing to open a client with: " + fake.calls());
+        assertTrue(
+                logged(log, Level.SEVERE, legacy.getVmRef(), "tools/reaper.py"),
+                "the operator must be pointed at the reaper at SEVERE: " + messages(log));
+        assertFalse(r.jenkins.getNodes().contains(legacy), "the node must still be removed");
+    }
+
+    private static List<String> messages(List<LogRecord> records) {
+        return records.stream().map(LogRecord::getMessage).toList();
     }
 }
