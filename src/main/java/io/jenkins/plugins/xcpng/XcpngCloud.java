@@ -578,8 +578,9 @@ public class XcpngCloud extends Cloud {
      * reimplemented here, so both routes to reclaiming a spare share one monitor and one in-flight guard. A
      * warm spare that never came online keeps no idle exemption, so the retention thread can be reaping the
      * very spare this tick just picked as surplus; going through the strategy makes one of the two back off
-     * instead of both firing {@code destroyWithDisks} at the same VM. The strategy also owns refusing further
-     * tasks, which closes the window between the idle check above and the destroy.
+     * instead of both firing {@code destroyWithDisks} at the same VM. The strategy also owns the window
+     * between the idle check above and the destroy: it refuses further tasks, then re-reads the computer
+     * under the queue lock and abandons the teardown if a build got in first.
      *
      * <p>The executor is passed down because {@code destroyWithDisks} is a blocking network call and this runs
      * while holding the cloud's monitor: a slow or hanging pool must not stall the maintainer tick, nor block

@@ -14,6 +14,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -21,9 +22,10 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /**
  * The retention and teardown lifecycle: the idle-net math and its warm-spare exemption, the warm to used
- * flip on task acceptance, the single-use reap on task completion, and the async teardown itself, guard and
- * error paths included. The reaps are driven on an injected executor and the idle-timeout math off an
- * injected clock, so each path runs to completion within the test rather than on the remoting pool.
+ * flip on task acceptance, the single-use reap on task completion, the window between deciding to reclaim an
+ * agent and destroying its VM, and the async teardown itself, guard and error paths included. The reaps are
+ * driven on an injected executor, the idle-timeout math off an injected clock, and the busy check off an
+ * injected probe, so each path runs to completion within the test rather than on the remoting pool.
  */
 @WithJenkins
 class XcpngRetentionStrategyTest {
@@ -251,6 +253,27 @@ class XcpngRetentionStrategyTest {
         assertFalse(spare.isWarm(), "accepting a build must clear the warm flag on the owning agent");
     }
 
+    /**
+     * Accepting a build must also stop the computer taking any further one. These agents are single-use, so a
+     * second build would run on a VM that is no longer pristine, and would be killed by the teardown the first
+     * build's completion reap has already started. Leaving that to the completion reap is too late: the
+     * computer stays assignable in the window between the build finishing and the reap taking effect.
+     */
+    @Test
+    void taskAcceptedStopsTheComputerTakingFurtherWork(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent spare = agent(cloud, "xcpng-warm-1", true);
+        r.jenkins.addNode(spare);
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, spare.toComputer());
+        Executor executor = computer.getExecutors().get(0);
+        assertTrue(computer.isAcceptingTasks(), "the spare accepts work before it has any");
+
+        new XcpngRetentionStrategy(IDLE_MINUTES).taskAccepted(executor, null);
+
+        assertFalse(computer.isAcceptingTasks(), "a single-use agent must refuse work the moment it has some");
+    }
+
     /** A build finishing reaps its single-use agent: the VM is destroyed with its disks. */
     @Test
     void taskCompletedReapsTheAgent(JenkinsRule r) throws Exception {
@@ -274,6 +297,100 @@ class XcpngRetentionStrategyTest {
                     "a completed build must reap its single-use agent: " + fake.calls());
         } finally {
             reaps.shutdownNow();
+        }
+    }
+
+    /**
+     * The completion reap must fire even though the computer reads busy: the executor still holds the
+     * finished executable while its listeners run. Applying the idle re-check to this caller too would make
+     * every single-use agent abandon its own reap and leak its VM, which is why the two entry points differ.
+     */
+    @Test
+    void taskCompletedReapsEvenThoughTheFinishedBuildStillReadsAsWork(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, agent.toComputer());
+        Executor executor = computer.getExecutors().get(0);
+
+        XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
+        strategy.setIdleProbe(c -> false);
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        strategy.setReapExecutor(reaps);
+        try {
+            strategy.taskCompleted(executor, null, 0L);
+
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the completion reap should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                    "a busy-reading computer must not stop the completion reap: " + fake.calls());
+        } finally {
+            reaps.shutdownNow();
+        }
+    }
+
+    // ---- The accept-versus-reap window ----
+
+    /**
+     * A build assigned after the drain passed its idle check, but before the teardown ran, must keep its VM.
+     * The teardown is queued behind a gate so the build can land in exactly that window; the reap has to
+     * notice and abandon itself rather than hard-destroying the VM under a running build.
+     *
+     * <p>The bail-out is a deferral, not a reprieve: the second half asserts the in-flight guard was released,
+     * so the agent that took the build is still reclaimable afterwards. A bail that left the guard set would
+     * trade a killed build for a leaked VM.
+     */
+    @Test
+    void reapAbandonsTheTeardownWhenABuildGetsInFirst(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent spare = agent(cloud, "xcpng-warm-1", true);
+        r.jenkins.addNode(spare);
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, spare.toComputer());
+
+        AtomicBoolean idle = new AtomicBoolean(true);
+        XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
+        strategy.setIdleProbe(c -> idle.get());
+
+        // One worker, parked on a gate, so the teardown sits queued while the build is assigned: that is the
+        // race, and it is why a check made inline in reap() would not be enough to catch this.
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        reaps.submit(() -> {
+            gate.await();
+            return null;
+        });
+        try {
+            strategy.reap(computer, reaps);
+            idle.set(false); // the queue puts a build on the very spare the drain just picked
+
+            gate.countDown();
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the queued teardown should have run");
+            assertEquals(
+                    0,
+                    destroyCount(fake),
+                    "a build that got in before the teardown must not lose its VM: " + fake.calls());
+            assertTrue(r.jenkins.getNodes().contains(spare), "the agent running that build must still exist");
+        } finally {
+            gate.countDown();
+            reaps.shutdownNow();
+        }
+
+        idle.set(true);
+        ExecutorService later = Executors.newSingleThreadExecutor();
+        try {
+            strategy.reap(computer, later);
+
+            later.shutdown();
+            assertTrue(later.awaitTermination(30, TimeUnit.SECONDS), "the later teardown should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + spare.getVmRef()),
+                    "abandoning a teardown must leave the agent reclaimable, not leak it: " + fake.calls());
+        } finally {
+            later.shutdownNow();
         }
     }
 
