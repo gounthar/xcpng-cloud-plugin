@@ -600,10 +600,11 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Record a VM the plugin failed to destroy during teardown, so it is reclaimed later rather than leaked.
-     * Called from {@link XcpngAgent#_terminate} on a {@code destroyWithDisks} failure, at which point the base
-     * class is about to remove the node and this set becomes the last reference to the VM. Persisted at once so
-     * the ref survives a restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
+     * Record a VM the plugin failed to destroy, so it is reclaimed later rather than leaked. Called on both
+     * {@code destroyWithDisks} failure paths: {@link XcpngAgent#_terminate}, where the base class is about to
+     * remove the node, and the cleanup destroy in {@link #provisionNode}, where the clone never became an agent
+     * at all. Either way this set becomes the last reference to the VM. Persisted at once so the ref survives a
+     * restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
      */
     void recordLeakedVm(@NonNull String vmRef) {
         // add() is atomic on the CopyOnWriteArraySet and returns whether the ref was new, so only a genuine
@@ -813,6 +814,11 @@ public class XcpngCloud extends Cloud {
                 try {
                     client.destroyWithDisks(clone);
                 } catch (RuntimeException cleanup) {
+                    // The cleanup destroy usually fails for the same reason the provision did: the pool went
+                    // unreachable mid-operation. Record the ref so the durable sweep retries it, exactly as a
+                    // failed teardown does. Without this the clone is invisible to Jenkins the moment this
+                    // method throws, and only tools/reaper.py could ever find it again.
+                    recordLeakedVm(clone.value());
                     LOGGER.log(
                             Level.WARNING,
                             cleanup,
