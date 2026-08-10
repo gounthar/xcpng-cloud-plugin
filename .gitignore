@@ -11,6 +11,7 @@ __pycache__/
 .env
 CLAUDE.md
 CONTEXT.md
+CONTEXT-*.md
 *.credentials.json
 *.pem
 golden_key*
