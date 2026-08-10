@@ -110,10 +110,22 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private transient ConnectionClientFactory connectionClientFactory;
 
     /**
+     * Wrap a freshly cloned, running VM in a single-use inbound agent. Called from
+     * {@link XcpngCloud#provisionNode}, which is the only site that builds one.
+     *
+     * @param name the node name, which is also the clone's VM name and the identity its inbound agent
+     *     presents to the controller.
      * @param cloud the cloud provisioning this agent. Passed whole rather than by name so the connection
      *     snapshot cannot drift from the name it is recorded against; the agent keeps only the name and the
      *     three non-secret connection parameters, never a reference to the cloud itself, which is not
      *     serialised with the node.
+     * @param vmRef the clone's opaque backend handle, destroyed with its disks when the node is removed.
+     * @param template the template this agent was cloned from, which supplies its labels.
+     * @param idleMinutes the timeout handed to this agent's {@link XcpngRetentionStrategy}.
+     * @param activityId the cloud-stats activity to correlate this agent's phases against. The same
+     *     instance the planned node carries, since cloud-stats matches ids per instance.
+     * @param warm whether this is a warm-pool spare, exempt from the idle reap until it takes its first
+     *     build.
      */
     public XcpngAgent(
             @NonNull String name,
@@ -329,6 +341,17 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     @FunctionalInterface
     interface ConnectionClientFactory {
+
+        /**
+         * Open a session to the pool these parameters describe. The caller owns the returned client and
+         * closes it; an implementation that cannot open one throws, and the cloud-gone teardown treats
+         * that as the unrecoverable case rather than a retryable one.
+         *
+         * @param poolUrl the snapshotted pool URL, null on an agent predating the snapshot.
+         * @param credentialsId the snapshotted credential ID, resolved against the store by the caller.
+         * @param trustSelfSigned whether the removed cloud was configured to accept a self-signed
+         *     pool certificate.
+         */
         @NonNull
         HypervisorClient open(
                 @CheckForNull String poolUrl, @CheckForNull String credentialsId, boolean trustSelfSigned);

@@ -92,6 +92,7 @@ class XcpngRetentionStrategyTest {
         private boolean trustSelfSigned;
         private int opens;
 
+        /** A factory that always answers with {@code client}, for the paths where the fallback succeeds. */
         RecordingConnectionFactory(HypervisorClient client) {
             this(client, null);
         }
@@ -102,6 +103,7 @@ class XcpngRetentionStrategyTest {
             this.failure = failure;
         }
 
+        /** Record the snapshot, then answer with the fake or throw, whichever this factory was built for. */
         @Override
         public HypervisorClient open(String poolUrl, String credentialsId, boolean trustSelfSigned) {
             this.poolUrl = poolUrl;
@@ -119,14 +121,18 @@ class XcpngRetentionStrategyTest {
     private static List<LogRecord> whileCapturingAgentLog(ThrowingRunnable body) throws Exception {
         List<LogRecord> records = Collections.synchronizedList(new ArrayList<>());
         Handler handler = new Handler() {
+
+            /** Keep every record; the level and message filtering belongs to the logged() helper, not here. */
             @Override
             public void publish(LogRecord record) {
                 records.add(record);
             }
 
+            /** Nothing is buffered: publish appends straight to the list, so there is nothing to flush. */
             @Override
             public void flush() {}
 
+            /** No resource is held, so closing is a no-op; the handler is detached by the caller's finally. */
             @Override
             public void close() {}
         };
@@ -140,8 +146,14 @@ class XcpngRetentionStrategyTest {
         return records;
     }
 
+    /**
+     * A body for {@link #whileCapturingAgentLog}. {@link Runnable} will not do: the calls under capture are
+     * {@code terminate()} and the assertions around it, which throw checked exceptions.
+     */
     @FunctionalInterface
     private interface ThrowingRunnable {
+
+        /** Run the captured body, letting any checked exception out to the caller's test method. */
         void run() throws Exception;
     }
 
@@ -739,6 +751,7 @@ class XcpngRetentionStrategyTest {
         assertFalse(r.jenkins.getNodes().contains(legacy), "the node must still be removed");
     }
 
+    /** The captured messages alone, so a failing log assertion prints what was logged instead of object ids. */
     private static List<String> messages(List<LogRecord> records) {
         return records.stream().map(LogRecord::getMessage).toList();
     }
