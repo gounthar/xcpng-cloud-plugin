@@ -336,11 +336,66 @@ class XcpngProvisionTest {
 
         // The fake agent never really connects, so drive the connect hook directly: onOnline is what fires
         // once an inbound agent has read the seed and no longer needs the secret in the VM record.
-        new XcpngComputerListener().onOnline(computer, hudson.model.TaskListener.NULL);
+        ExecutorService scrubs = Executors.newSingleThreadExecutor();
+        XcpngComputerListener listener = new XcpngComputerListener();
+        listener.setScrubExecutor(scrubs);
+        try {
+            listener.onOnline(computer, hudson.model.TaskListener.NULL);
 
-        assertTrue(
-                fake.calls().contains("clearGuestSecret:" + agent.getVmRef()),
-                "coming online must scrub the seed secret for the agent's VM, calls were " + fake.calls());
+            scrubs.shutdown();
+            assertTrue(scrubs.awaitTermination(30, TimeUnit.SECONDS), "the scrub should finish");
+            assertTrue(
+                    fake.calls().contains("clearGuestSecret:" + agent.getVmRef()),
+                    "coming online must scrub the seed secret for the agent's VM, calls were " + fake.calls());
+        } finally {
+            scrubs.shutdownNow();
+        }
+    }
+
+    @Test
+    void onlineHandsTheScrubOffTheConnectingThread(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent =
+                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-2", activityId("xcpng-agent-2"));
+        r.jenkins.addNode(agent);
+        Computer computer = agent.toComputer();
+
+        // A single worker, occupied by a task that will not return until the gate opens: whatever onOnline
+        // hands over sits in the queue behind it. That models the case the change exists for -- a pool slow
+        // or unreachable exactly while clones connect -- without needing a real timeout to elapse. A scrub
+        // done inline would reach the client here regardless of the gate, so the pre-gate assertion below is
+        // what separates the two.
+        ExecutorService scrubs = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        scrubs.execute(() -> {
+            try {
+                gate.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        XcpngComputerListener listener = new XcpngComputerListener();
+        listener.setScrubExecutor(scrubs);
+        try {
+            listener.onOnline(computer, hudson.model.TaskListener.NULL);
+
+            assertTrue(
+                    fake.calls().stream().noneMatch(call -> call.startsWith("clearGuestSecret:")),
+                    "onOnline must return with the scrub still queued, not run it on the connecting thread, "
+                            + "calls were " + fake.calls());
+
+            gate.countDown();
+            scrubs.shutdown();
+            assertTrue(scrubs.awaitTermination(30, TimeUnit.SECONDS), "the queued scrub should finish");
+            assertTrue(
+                    fake.calls().contains("clearGuestSecret:" + agent.getVmRef()),
+                    "the deferred scrub must still reach the client once a worker is free, calls were " + fake.calls());
+        } finally {
+            gate.countDown();
+            scrubs.shutdownNow();
+        }
     }
 
     @Test
