@@ -1,0 +1,83 @@
+# Builds the .hpi at a released version and attaches it to that release.
+#
+# The plugin is not in the Jenkins update centre, so a release is a GitHub release carrying an
+# .hpi that people install through Manage Jenkins → Plugins → Advanced settings → Deploy Plugin.
+# When the plugin is donated this job is replaced by JEP-229 continuous delivery, which publishes
+# to repo.jenkins-ci.org and needs jenkinsci org secrets.
+#
+# Triggering on `release: published` rather than on a tag push is deliberate: the release starts
+# life as a Release Drafter draft, and publishing that draft is what creates the tag. Watching the
+# release event means the one human action fires exactly one build, with the release already there
+# to upload into.
+---
+name: release
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild and reattach an .hpi to
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  hpi:
+    name: build and attach the .hpi
+    runs-on: ubuntu-latest
+    permissions:
+      # Uploading a release asset is a write to repository contents.
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      # A tag name is only settable by someone who can already push here, but it reaches a
+      # checkout ref, a Maven property and a shell command, so it is checked against the shape
+      # releases actually use before any of that. It also catches the likelier mistake by far:
+      # a hand-typed tag that would silently produce an .hpi versioned something absurd.
+      - name: The tag must look like a version
+        run: |
+          printf '%s' "$TAG" | grep -Eq '^[0-9]+\.[0-9]+(\.[0-9]+)?$' || {
+            echo "::error::refusing to build from tag '$TAG'; expected a version like 0.2.0"
+            exit 1
+          }
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5.6.0
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      # revision and changelist come from pom.xml as 0.1.0 and -SNAPSHOT. Overriding both is not
+      # cosmetic: maven-hpi-plugin stamps any -SNAPSHOT build as `private-<sha>-<user>` in the
+      # manifest, and Jenkins then shows the plugin as a private build rather than as the released
+      # version. The hand-built 0.1 asset has exactly that defect — its filename says 0.1.0 while its
+      # manifest says `0.1.0-SNAPSHOT (private-c9311f84-poddingue)`. This is also what JEP-229 does at
+      # release time; .mvn/maven.config's incrementals settings apply under -Dset.changelist, which is
+      # the per-commit snapshot path, not this one.
+      - name: Build and test at the released version
+        run: mvn -B -ntp -Drevision="$TAG" -Dchangelist= clean verify
+
+      # The parent POM sets finalName to the bare artifactId, so Maven produces target/xcpng-cloud.hpi
+      # with no version in it. gh names the asset after the file, and an asset called xcpng-cloud.hpi
+      # is indistinguishable from every other release's once downloaded, so rename it first.
+      - name: Name the artifact for the release
+        run: |
+          test -f target/xcpng-cloud.hpi
+          mv target/xcpng-cloud.hpi "target/xcpng-cloud-${TAG}.hpi"
+
+      # --clobber so a rerun replaces the asset instead of failing on a name that already exists.
+      - name: Attach the .hpi to the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" "target/xcpng-cloud-${TAG}.hpi" --clobber

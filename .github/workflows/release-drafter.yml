@@ -1,0 +1,34 @@
+# Keeps a draft release open on main, accumulating merged pull requests into release notes
+# and computing the next version from their labels. It never publishes: a human does that,
+# and that press creates the tag, which fires release.yml to build and attach the .hpi.
+#
+# Inside the jenkinsci org this job is not written by hand — JEP-229 continuous delivery
+# supplies it, along with the publish step, through the reusable workflow at
+# jenkins-infra/github-reusable-workflows/.github/workflows/maven-cd.yml. That needs
+# MAVEN_USERNAME and MAVEN_TOKEN org secrets, so it cannot run under a personal account.
+# Deciding versions from labels here means donation day swaps one workflow file rather than
+# changing how releases are decided. Configuration lives in .github/release-drafter.yml.
+---
+name: release-drafter
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  draft:
+    name: update the release draft
+    runs-on: ubuntu-latest
+    permissions:
+      # Creating and updating the draft release is a write to repository contents. The
+      # workflow-level `contents: read` above stays as the floor for anything added later.
+      contents: write
+    steps:
+      - uses: release-drafter/release-drafter@v7.7.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
