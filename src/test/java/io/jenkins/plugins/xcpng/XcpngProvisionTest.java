@@ -1120,6 +1120,31 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void aFailedProvisionCleanupIsRecordedThenReclaimedOnTheNextSweep(JenkinsRule r) {
+        // Both failures at once, which is the realistic pairing: the pool goes unreachable, so the start throws
+        // and the cleanup destroy that follows throws on the same blip. The clone exists on the pool and no
+        // agent was ever built around it, so this set is the only thing that can still name it.
+        FakeHypervisorClient fake =
+                new FakeHypervisorClient("jenkins-golden-debian").failStart().failDestroy();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        assertThrows(
+                HypervisorException.class,
+                () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1")));
+        assertTrue(
+                cloud.leakedVmRefs().contains("vm/xcpng-agent-1/1"),
+                "a cleanup destroy that failed must record the clone as leaked: " + cloud.leakedVmRefs());
+
+        // The pool recovers; the sweep reclaims it with no operator and no external reaper involved.
+        fake.recoverDestroy();
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(), "the recovered sweep must reclaim the clone: " + cloud.leakedVmRefs());
+    }
+
+    @Test
     void theMaintainerSweepsLeakedVms(JenkinsRule r) {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
