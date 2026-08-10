@@ -7,6 +7,7 @@ import hudson.slaves.ComputerListener;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -50,7 +51,20 @@ public class XcpngComputerListener extends ComputerListener {
         if (!(c instanceof XcpngComputer) || !(c.getNode() instanceof XcpngAgent agent)) {
             return;
         }
-        scrubExecutor().execute(() -> scrub(agent));
+        try {
+            scrubExecutor().execute(() -> scrub(agent));
+        } catch (RejectedExecutionException e) {
+            // The remoting pool is a cached one, so it only rejects once shut down: Jenkins is going down
+            // and the VM is about to stop mattering. Logged rather than thrown, because the connection
+            // sequence must not carry a failure from an optimization it does not depend on -- the same
+            // reason scrub() swallows its own. Core would catch this and leave the agent online anyway;
+            // the point is that this class promises never to throw.
+            LOGGER.log(
+                    Level.WARNING,
+                    e,
+                    () -> "Could not schedule the seed-secret scrub for agent " + agent.getNodeName() + " (VM "
+                            + agent.getVmRef() + ")");
+        }
     }
 
     /**

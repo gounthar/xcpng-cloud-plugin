@@ -399,6 +399,34 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void onlineSurvivesAnExecutorThatRejectsTheScrub(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent =
+                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-3", activityId("xcpng-agent-3"));
+        r.jenkins.addNode(agent);
+        Computer computer = agent.toComputer();
+
+        // An already-shut-down executor is what the remoting pool becomes while Jenkins is going down, and
+        // it is the only state a cached pool rejects from. An agent connecting at that moment must still
+        // come online: this listener promises to log its failures rather than throw them, and handing the
+        // work off is no exception to that.
+        ExecutorService scrubs = Executors.newSingleThreadExecutor();
+        scrubs.shutdown();
+        assertTrue(scrubs.awaitTermination(30, TimeUnit.SECONDS), "the empty executor should shut down at once");
+        XcpngComputerListener listener = new XcpngComputerListener();
+        listener.setScrubExecutor(scrubs);
+
+        assertDoesNotThrow(
+                () -> listener.onOnline(computer, hudson.model.TaskListener.NULL),
+                "a rejected scrub must not escape into the connection sequence");
+        assertTrue(
+                fake.calls().stream().noneMatch(call -> call.startsWith("clearGuestSecret:")),
+                "a rejected scrub cannot have reached the client, calls were " + fake.calls());
+    }
+
+    @Test
     void onlineIgnoresANonXcpngComputer(JenkinsRule r) throws Exception {
         // A listener firing for some other cloud's computer must not open a client or touch a VM. Guard it
         // with the built-in master computer, which is never an XcpngComputer.
