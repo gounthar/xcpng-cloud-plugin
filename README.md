@@ -238,6 +238,34 @@ mvn hpi:run -Dhost=0.0.0.0 -Dport=8080
 
 Jenkins is then available at `http://localhost:8080/jenkins`.
 
+## Dependency updates
+
+[Dependabot](.github/dependabot.yml) owns everything it can read: `pom.xml`, and the `uses:` lines
+in the workflows. Two versions have no manifest behind them — the Packer and actionlint releases
+that [`ci.yml`](.github/workflows/ci.yml) downloads in `run:` steps, and the builder plugin pinned
+inside the Packer template. Those are bumped weekly by
+[updatecli](.github/workflows/updatecli.yaml), which opens a pull request per manifest in
+[`updatecli/updatecli.d/`](updatecli/updatecli.d).
+
+**updatecli needs a repository secret named `UPDATECLI_TOKEN`, and fails with a named error
+without one.** The built-in `GITHUB_TOKEN` cannot do the job: it is a GitHub App installation
+token, and GitHub refuses any push from one that touches `.github/workflows/`, which is where
+`PACKER_VERSION` and `ACTIONLINT_VERSION` live. No workflow `permissions:` setting changes that —
+there is no `workflows` scope to grant, and `contents: write` does not cover workflow files.
+
+Create it as a classic personal access token with the `repo` and `workflow` scopes, or a
+fine-grained token with Contents, Pull requests, and Workflows all set to read and write. Give it
+the shortest expiry you are willing to renew: it can rewrite this repository's CI, which is the
+most valuable thing in it.
+
+Two consequences of using a token that belongs to a person rather than to the Actions app. Its
+pull requests do trigger CI, where `GITHUB_TOKEN` ones would arrive unchecked. And the pushes are
+attributed to the token's owner, while the commits themselves stay authored as `GitHub Actions`
+per [`updatecli/values.github-action.yaml`](updatecli/values.github-action.yaml).
+
+Forks skip the job entirely, so a fork needs no secret and will never try to open pull requests
+against this repository.
+
 ## Releases
 
 The plugin is not in the Jenkins update centre, which only distributes plugins hosted in the
