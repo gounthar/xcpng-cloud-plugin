@@ -46,6 +46,12 @@ for the deliberate scope cuts.
 
 Single-use is intentional: every build gets a clean machine, and nothing survives between builds.
 
+Agents serve only builds whose label expression matches their template's labels. A build with no label
+expression is never routed here, and never causes a clone: these VMs are single-use, so an unlabeled
+job landing on one would consume and destroy it, and a warm spare taken that way sends the labeled
+build it was held for back to a cold clone. That is also why a template must carry at least one label
+— a template with none could never be reached at all.
+
 Each agent therefore runs exactly one executor, and this is not configurable. A second executor would
 put two builds on one VM, and the reap fires when a build completes, so the first to finish would
 destroy the VM under the other. Scale throughput with `maxInstances` (more clones), not with executors
@@ -83,7 +89,8 @@ spare.
 3. Tick **Trust self-signed certificate** only if the pool presents a self-signed certificate. See
    [Security notes](#security-notes) before enabling it.
 4. Add one or more **Templates**. Each template names a golden image, a label expression, and the
-   shape of the agents cloned from it.
+   shape of the agents cloned from it. The label expression is required, and is how builds reach these
+   agents: give the jobs you want on XCP-ng a matching label.
 5. Use **Test connection** to confirm the controller can authenticate against the pool.
 
 ### Through Configuration as Code
@@ -134,7 +141,7 @@ Template fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Template name | `templateName` | Name of the golden-image VM or template on the pool to clone. |
-| Labels | `labelString` | Label expression a build must request to be matched to this template. |
+| Labels | `labelString` | Label expression a build must request to be matched to this template. Required: agents are exclusive to their labels, so a template without any is unreachable. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
 | Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |
 | Warm pool size | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. See [Warm pool](#warm-pool). |

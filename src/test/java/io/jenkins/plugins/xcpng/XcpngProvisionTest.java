@@ -11,8 +11,10 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.model.Computer;
+import hudson.model.FreeStyleProject;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Queue;
 import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
@@ -21,6 +23,7 @@ import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -209,6 +212,83 @@ class XcpngProvisionTest {
                 "dropping the bad key must be logged at WARNING");
     }
 
+    /**
+     * A template configured before labels became load-bearing kept working by serving unlabeled builds.
+     * It now provisions nothing, and the form check only fires when someone opens the form — so an
+     * upgraded controller that quietly stopped cloning would leave the operator nothing to read. The
+     * warning is that something to read.
+     */
+    @Test
+    void readResolveWarnsAboutATemplateWithNoLabels(JenkinsRule r) {
+        Logger logger = Logger.getLogger(XcpngTemplate.class.getName());
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.addHandler(handler);
+        try {
+            String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                    + "  <templateName>jenkins-golden-debian</templateName>\n"
+                    + "  <labelString></labelString>\n"
+                    + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+            jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertTrue(
+                records.stream()
+                        .anyMatch(rec -> rec.getLevel() == Level.WARNING
+                                && String.valueOf(rec.getMessage()).contains("has no labels")),
+                "a template that can never provision must say so at load: " + records);
+    }
+
+    /**
+     * The other half of the pair: a template that does carry labels must load silently. Without this,
+     * the warning above could fire for every template and the test would still pass.
+     */
+    @Test
+    void readResolveIsSilentForATemplateWithLabels(JenkinsRule r) {
+        Logger logger = Logger.getLogger(XcpngTemplate.class.getName());
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.addHandler(handler);
+        try {
+            String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                    + "  <templateName>jenkins-golden-debian</templateName>\n"
+                    + "  <labelString>xcpng-linux</labelString>\n"
+                    + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+            jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertFalse(
+                records.stream()
+                        .anyMatch(rec -> String.valueOf(rec.getMessage()).contains("has no labels")),
+                "a labelled template must load without the warning: " + records);
+    }
+
     @Test
     void provisionSeedsTheOptionalSshKeyWhenTheTemplateHasOne(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
@@ -271,6 +351,38 @@ class XcpngProvisionTest {
 
         assertTrue(cloud.canProvision(new Cloud.CloudState(Label.get("xcpng-linux"), 0)));
         assertFalse(cloud.canProvision(new Cloud.CloudState(Label.get("windows"), 0)));
+    }
+
+    /**
+     * The provisioning half of {@link XcpngAgent#USAGE_MODE}. A null label is core asking on behalf of
+     * the unlabeled queue, and this cloud declines it: the agents it would clone are {@code EXCLUSIVE}
+     * and could never run the build that prompted the ask. Answering yes would not merely waste one
+     * clone — {@code UnlabeledLoadStatistics} counts only {@code NORMAL} nodes, so the demand would
+     * still read as unmet and the pool would keep churning against it up to the cap.
+     */
+    @Test
+    void anUnlabeledBuildCannotProvision(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+
+        assertFalse(
+                cloud.canProvision(new Cloud.CloudState(null, 0)),
+                "a build with no label expression must not pull a clone off the pool");
+    }
+
+    /**
+     * Separate from {@link #anUnlabeledBuildCannotProvision} on purpose. Both entry points read the same
+     * rule, so one mutation reverting it should take both down — and as two assertions in one test, the
+     * second would never be reached to prove it.
+     */
+    @Test
+    void anUnlabeledBuildPlansNoNodes(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+
+        assertTrue(
+                cloud.provision(new Cloud.CloudState(null, 0), 5).isEmpty(),
+                "provision must plan nothing for a null label even when it is called anyway");
     }
 
     @Test
@@ -802,6 +914,45 @@ class XcpngProvisionTest {
             gate.countDown();
             exec.shutdownNow();
         }
+    }
+
+    /**
+     * The harm #76 names, on the node that suffers it worst: a spare held hot for {@code xcpng-linux}
+     * must not be taken by a build that asked for nothing, because taking it also destroys it and sends
+     * the labeled build the pool exists for back to a cold clone.
+     *
+     * <p>{@link Node#canTake} is the predicate the queue actually consults, and it is the honest
+     * assertion here. The fake never brings an agent online, so "the unlabeled job did not run on the
+     * spare" would pass just as happily against {@code Mode.NORMAL} — against a node no build could
+     * reach either way. The labeled case is asserted alongside it so that a blockage arising from
+     * something unrelated (a permission, a node not accepting tasks) cannot masquerade as a pass.
+     */
+    @Test
+    void anUnlabeledBuildCannotTakeAWarmSpare(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2, 1);
+        r.jenkins.clouds.add(cloud);
+        reconcileAndSettle(cloud);
+        assertEquals(1, warmNodeCount(r), "the spare must be up before anything can compete for it");
+
+        Node spare = r.jenkins.getNodes().stream()
+                .filter(n -> n instanceof XcpngAgent agent && agent.isWarm())
+                .findFirst()
+                .orElseThrow();
+
+        FreeStyleProject unlabeled = r.createFreeStyleProject("unlabeled");
+        FreeStyleProject labeled = r.createFreeStyleProject("labeled");
+        labeled.setAssignedLabel(Label.get("xcpng-linux"));
+
+        assertNotNull(
+                spare.canTake(buildableItem(unlabeled)),
+                "a build with no label expression must not be able to take a spare held for xcpng-linux");
+        assertNull(
+                spare.canTake(buildableItem(labeled)), "the build the spare exists for must still be able to take it");
+    }
+
+    /** A queue item in the state the scheduler evaluates candidate nodes against. */
+    private static Queue.BuildableItem buildableItem(FreeStyleProject project) {
+        return new Queue.BuildableItem(new Queue.WaitingItem(Calendar.getInstance(), project, List.of()));
     }
 
     // ---- Warm pool (slice D): draining a surplus ----

@@ -916,9 +916,18 @@ public class XcpngCloud extends Cloud {
         return null;
     }
 
+    /**
+     * Whether {@code template}'s labels satisfy {@code label}.
+     *
+     * <p>A null label is a job with no label constraint, and this cloud declines it. That is the
+     * provisioning half of {@link XcpngAgent#USAGE_MODE}: the agents are {@code EXCLUSIVE}, so a build
+     * with no label expression can never be scheduled onto one. Core asks anyway — {@code NodeProvisioner}
+     * passes a null label to {@link #canProvision} on behalf of the unlabeled queue — so answering yes
+     * here would clone a VM for a build that cannot use it, and, because {@code UnlabeledLoadStatistics}
+     * counts only {@code NORMAL} nodes, the demand it was cloned for never looks satisfied.
+     */
     private static boolean labelMatches(@CheckForNull Label label, XcpngTemplate template) {
-        // A null label is a job with no label constraint; any template may serve it.
-        return label == null || label.matches(Label.parse(template.getLabelString()));
+        return label != null && label.matches(Label.parse(template.getLabelString()));
     }
 
     /**
