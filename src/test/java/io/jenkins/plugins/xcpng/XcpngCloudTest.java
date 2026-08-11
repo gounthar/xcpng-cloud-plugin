@@ -277,6 +277,34 @@ class XcpngCloudTest {
     }
 
     /**
+     * An agent whose node {@code config.xml} was written before the mode changed carries
+     * {@code <mode>NORMAL</mode>}, and {@code Slave.mode} is a persisted field rather than a transient
+     * one, so XStream restores it and the constructor never runs. Without {@code readResolve} asserting
+     * the mode, such an agent comes back from a restart still able to take unlabeled builds: the very
+     * bug the mode exists to prevent, outliving the upgrade that fixed it.
+     */
+    @Test
+    void aLegacyAgentPersistedAsNormalReloadsAsExclusive(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngAgent>\n"
+                + "  <name>xcpng-legacy-mode-1</name>\n"
+                + "  <description>XCP-ng ephemeral agent</description>\n"
+                + "  <remoteFS>/home/debian/agent</remoteFS>\n"
+                + "  <numExecutors>1</numExecutors>\n"
+                + "  <mode>NORMAL</mode>\n"
+                + "  <label>xcpng-linux</label>\n"
+                + "  <cloudName>xcpng</cloudName>\n"
+                + "  <vmRef>vm/legacy/1</vmRef>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngAgent>\n";
+
+        XcpngAgent agent = (XcpngAgent) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+
+        assertEquals(
+                hudson.model.Node.Mode.EXCLUSIVE,
+                agent.getMode(),
+                "a persisted NORMAL must not survive a reload and keep taking unlabeled builds");
+    }
+
+    /**
      * {@code minInstances} is an optional warm-pool setter. A template persisted before it existed
      * reloads with the field at 0, which is exactly the "warm pool off" default, so no warm agents are
      * ever booted for a legacy config.

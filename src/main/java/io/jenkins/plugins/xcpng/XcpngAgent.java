@@ -237,9 +237,16 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * agent must never come back as a spare: that guarantees a used agent cannot be revived and run a
      * second build on a dirty VM. Reassigning the transient field here (rather than relying on the default)
      * also keeps serialization analysis satisfied that it is handled, matching {@link XcpngCloud#readResolve}.
+     *
+     * <p>The usage mode is re-applied for a different reason. {@code Slave.mode} is a persisted field, not a
+     * transient one, and the constructor does not run on deserialization: an agent whose {@code config.xml}
+     * was written before {@link #USAGE_MODE} became {@code EXCLUSIVE} carries {@code NORMAL} and would come
+     * back able to accept unlabeled builds. That is exactly the bug the mode exists to prevent, surviving a
+     * controller restart, so the mode is asserted here rather than trusted from the file.
      */
     protected Object readResolve() {
         warm = false;
+        setMode(USAGE_MODE);
         return super.readResolve();
     }
 
