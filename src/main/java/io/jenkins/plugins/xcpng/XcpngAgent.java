@@ -115,10 +115,31 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * <p>Transient: it lives only for this controller session. On a restart a reloaded agent comes back
      * not-warm by default, which is deliberate. It guarantees a <em>used</em> agent can never be revived
      * as a spare and run a second build on a no-longer-pristine VM, so single-use holds by construction;
-     * the only cost is that genuine unused spares are reaped and re-booted after a restart. Volatile
-     * because the retention thread reads it while the executor thread clears it.
+     * the only cost is that genuine unused spares are reaped and re-booted after a restart (see
+     * {@link #reloaded}, which is what carries out that reap). Volatile because the retention thread reads
+     * it while the executor thread clears it.
      */
     private transient volatile boolean warm;
+
+    /**
+     * True on an agent restored from disk by a controller restart. Set in {@link #readResolve} and nowhere
+     * else, which is what makes it exact: {@code readResolve} runs on deserialization only, so this marks
+     * precisely the agents that outlived a restart and no others.
+     *
+     * <p>The retention strategy reclaims such an agent rather than waiting out {@code idleMinutes} (see
+     * {@link XcpngRetentionStrategy#check}). Both reasons for that are about a restart erasing the state
+     * single-use relies on. {@link #warm} is transient, so a spare and a spent agent are indistinguishable
+     * once reloaded; and {@code SlaveComputer.acceptingTasks} is transient too, defaulting to {@code true}
+     * in its constructor, so the {@code setAcceptingTasks(false)} that {@link
+     * XcpngRetentionStrategy#taskAccepted} applied to a used agent does not survive either. An agent whose
+     * build finished just before the controller died therefore comes back accepting work on a VM that is no
+     * longer pristine. Reaping every reloaded agent is what closes that, and it cannot be narrowed to
+     * warm-only spares without persisting the very distinction {@link #warm}'s javadoc says must not exist.
+     *
+     * <p>Volatile for the same reason as {@link #warm}: the retention thread reads it off a different thread
+     * from the one that deserialized the node.
+     */
+    private transient volatile boolean reloaded;
 
     /**
      * How a client is opened from the {@link #poolUrl} snapshot when the owning cloud is gone. Null in
@@ -222,6 +243,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         return warm;
     }
 
+    /** True on an agent restored from disk by a controller restart, which the retention strategy reclaims. */
+    public boolean isReloaded() {
+        return reloaded;
+    }
+
     /**
      * Mark this spare as used, so it is no longer exempt from idle-reaping and reverts to single-use
      * behaviour. Called when the agent accepts its first build. Idempotent, and a plain field write:
@@ -238,6 +264,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * second build on a dirty VM. Reassigning the transient field here (rather than relying on the default)
      * also keeps serialization analysis satisfied that it is handled, matching {@link XcpngCloud#readResolve}.
      *
+     * <p>{@link #reloaded} is raised for the other half of the same problem. Clearing {@code warm} stops a
+     * spent agent being kept hot, but on its own it leaves that agent sitting there as an ordinary idle node,
+     * accepting work again (the computer's accepting-tasks flag does not survive a restart either) until
+     * {@code idleMinutes} expires. The flag tells the retention strategy to reclaim it now instead.
+     *
      * <p>The usage mode is re-applied for a different reason. {@code Slave.mode} is a persisted field, not a
      * transient one, and the constructor does not run on deserialization: an agent whose {@code config.xml}
      * was written before {@link #USAGE_MODE} became {@code EXCLUSIVE} carries {@code NORMAL} and would come
@@ -246,6 +277,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     protected Object readResolve() {
         warm = false;
+        reloaded = true;
         setMode(USAGE_MODE);
         return super.readResolve();
     }
