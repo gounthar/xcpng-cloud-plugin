@@ -517,7 +517,7 @@ public class XcpngCloud extends Cloud {
         // are not headroom yet, and letting the next tick see the freed capacity is the honest reading.
         int capacity = Math.max(0, maxInstances - active - inFlight.get());
         for (XcpngTemplate template : templates) {
-            int target = template.getMinInstances();
+            int target = warmTarget(template);
             if (target <= 0) {
                 continue;
             }
@@ -546,7 +546,7 @@ public class XcpngCloud extends Cloud {
             if (spares == null) {
                 continue;
             }
-            int surplus = spares.size() - Math.max(0, template.getMinInstances());
+            int surplus = spares.size() - warmTarget(template);
             for (XcpngAgent spare : spares) {
                 if (surplus <= 0) {
                     break;
@@ -559,6 +559,30 @@ public class XcpngCloud extends Cloud {
         for (XcpngAgent spare : orphanedSpares) {
             drainSpare(spare);
         }
+    }
+
+    /**
+     * How many warm spares this template should be holding. The configured {@code minInstances}, floored at
+     * zero, except that a template with no labels is worth none.
+     *
+     * <p>Agents are {@link XcpngAgent#USAGE_MODE} — {@code EXCLUSIVE} — and {@link #canProvision} declines a
+     * null label, so a build reaches these agents only by naming a label the template carries. A template
+     * carrying none matches nothing, and a spare cloned from it would sit warm until its cloud was
+     * reconfigured, holding a slot against {@code maxInstances} that a template builds can actually reach
+     * would otherwise have. {@link XcpngTemplate#readResolve} already warns at load that such a template
+     * provisions nothing; the warm pool is the one path that would have gone on provisioning anyway, which
+     * made that warning false rather than merely unheeded.
+     *
+     * <p>Returning zero rather than skipping the template also drains spares an earlier release, or an
+     * administrator clearing the label field on a running controller, has already left behind: the drain
+     * half measures surplus against this same number, so they go from "at target" to "all surplus".
+     */
+    private static int warmTarget(@NonNull XcpngTemplate template) {
+        String labels = template.getLabelString();
+        if (labels == null || labels.isBlank()) {
+            return 0;
+        }
+        return Math.max(0, template.getMinInstances());
     }
 
     private static int warmCount(@NonNull Map<String, List<XcpngAgent>> warmByTemplate, @NonNull String templateName) {

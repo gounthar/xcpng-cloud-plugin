@@ -1080,6 +1080,54 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void anUnlabeledTemplateProvisionsNoWarmSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "", 2, 2048);
+        template.setMinInstances(2);
+        XcpngCloud cloud = warmCloudOver(fake, 4, template);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+
+        // The on-demand path already refuses this template -- canProvision declines a null label and an
+        // EXCLUSIVE agent takes nothing else -- so a spare cloned here could never be taken by any build.
+        // Provisioning it anyway would burn a slot against maxInstances for the life of the configuration.
+        assertEquals(
+                0,
+                warmNodeCount(r),
+                "a template with no labels must not keep warm spares, since nothing can ever take them");
+        assertTrue(
+                fake.calls().stream().noneMatch(c -> c.startsWith("cloneFromTemplate:")),
+                "no clone should have been attempted at all: " + fake.calls());
+    }
+
+    @Test
+    void clearingATemplatesLabelsDrainsItsWarmSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud labelled = warmCloudOver(fake, 4, warmTemplate("jenkins-golden-debian", 1));
+        r.jenkins.clouds.add(labelled);
+        reconcileAndSettle(labelled);
+        assertEquals(1, warmNodeCount(r), "the labelled template should have kept one spare");
+
+        // Reconfiguring a cloud in the UI or via JCasC replaces the Cloud object rather than mutating it,
+        // so an administrator clearing the label field is modelled by a fresh cloud of the same name whose
+        // template carries no labels. The spare already on the node list is matched by cloud name and by
+        // the template name on its activity id, both of which are unchanged.
+        XcpngTemplate unlabeled = new XcpngTemplate("jenkins-golden-debian", "", 2, 2048);
+        unlabeled.setMinInstances(1);
+        XcpngCloud cleared = warmCloudOver(fake, 4, unlabeled);
+        r.jenkins.clouds.remove(labelled);
+        r.jenkins.clouds.add(cleared);
+
+        reconcileAndSettle(cleared);
+
+        // minInstances still reads 1, so measuring surplus against it would leave this spare in place
+        // forever. It is measured against the same zero the fill half uses, which makes it all surplus.
+        assertEquals(0, warmNodeCount(r), "a spare whose template lost its labels must be drained, not held at target");
+        assertEquals(1, destroyCount(fake), "the drained spare's VM should have been destroyed: " + fake.calls());
+    }
+
+    @Test
     void warmMaintainerExtensionIsRegistered(JenkinsRule r) {
         assertEquals(
                 1,
