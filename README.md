@@ -133,7 +133,7 @@ Cloud fields:
 | Credentials | `credentialsId` | ID of the username/password credential used for XAPI login. |
 | Trust self-signed certificate | `trustSelfSigned` | Skip TLS verification against the pool. Off by default. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
-| Idle minutes | `idleMinutes` | Minutes an agent may sit idle before it is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this is only the safety net for a clone that connects but never receives work. A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
+| Idle minutes | `idleMinutes` | Minutes an agent may sit idle before it is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this is only the safety net for a clone that connects but never receives work. A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). **Must exceed the time a clone takes to boot and connect**: an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). |
 | Templates | `templates` | One or more agent templates (see below). |
 
 Template fields:
@@ -207,6 +207,20 @@ is up.
   mismatch: the agent JRE must match the controller's Java major version (Java 21 here). A mismatch
   throws `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
   offline cause in the UI.
+- **If the clone has no address at all, none of the above is reachable** and there is nothing to read
+  with `journalctl`, because you cannot log in. Check `networks` on the VM record
+  (`xe vm-param-get uuid=<vm> param-name=networks`, or the guest metrics in Xen Orchestra). An empty
+  `networks={}` while the guest tools report `PV_drivers_detected: True` and `live: True` means the
+  guest booted, the tools are running over xenstore, and the interface never came up. Confirm from
+  dom0 with `tcpdump -i vifN.0 -e 'ether src <clone MAC>'`: no packets at all, not even a DHCP
+  `DISCOVER`, points at the image rather than at the network. The usual cause is a network config in
+  the image pinned to a MAC, which `VM.clone` regenerates; see
+  [`docs/golden-image.md`](docs/golden-image.md).
+
+**A build never starts and agents are provisioned in a loop.** Check that `idleMinutes` comfortably
+exceeds the time a clone takes to boot and connect. An agent that has never come online holds no idle
+exemption, so a short timeout reclaims it mid-boot, the queue asks for another, and the cycle repeats
+with nothing ever connecting. The default of 10 is fine; a value like 1 is not.
 
 ## Known limitations
 
