@@ -11,4 +11,11 @@
     after you save the configuration, and a consumed spare's replacement takes up to a minute to appear.
     A spare that boots but never connects is still reclaimed by the idle timeout.
   </p>
+  <p>
+    A controller restart costs every spare its warm marker, which is not persisted on purpose. The old
+    spare reconnects as an ordinary agent and the maintainer clones a replacement, so a restart
+    temporarily doubles this template's VM count until the old one ages out on <b>Idle minutes</b>.
+    Leave room under <b>Max instances</b> for that, or the cloud sits at its cap for the length of the
+    idle timeout.
+  </p>
 </div>

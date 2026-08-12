@@ -64,10 +64,19 @@ build lands on a live executor instead of waiting for a cold clone. A background
 roughly once a minute, so a spare appears up to a minute after you save the configuration, and after a
 spare is consumed by a build its replacement is cloned within about a minute. Warm agents are still
 single-use and count against `maxInstances`. A spare that boots but never connects is still reclaimed by
-the idle timeout. The "warm" marker is intentionally not persisted, so after a controller restart every
-existing spare loses its exemption, is reaped by the idle net, and is re-cloned by the maintainer; this
-churn is deliberate, since it guarantees a VM that has already run a build can never be revived as a
-spare.
+the idle timeout.
+
+The "warm" marker is intentionally not persisted, so a controller restart costs every existing spare its
+exemption. That churn is deliberate: it guarantees a VM that has already run a build can never be revived
+as a spare. It does not happen all at once, though, and the order is worth knowing before you size a
+pool. The old spare reconnects as an ordinary agent, the maintainer sees no warm spares and clones a
+replacement within about a minute, and only then does the idle net reclaim the old one, after
+`idleMinutes` has elapsed. Both run at the same time in between. **So a restart temporarily doubles the
+number of VMs a template holds, for the length of the idle timeout**, and if `maxInstances` is small the
+cloud can sit at its cap with no headroom for that whole window. Builds are not blocked by it, since both
+agents are idle and carry the template's labels, but nothing new can be provisioned until the old spare
+ages out. Measured on the lab pool: replacement cloned 65 s after the restart, old spare destroyed
+10 min 45 s after it reconnected, with `idleMinutes` at 10.
 
 ## Requirements
 
