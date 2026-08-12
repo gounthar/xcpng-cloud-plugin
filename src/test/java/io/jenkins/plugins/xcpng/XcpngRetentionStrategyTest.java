@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Handler;
@@ -418,8 +420,14 @@ class XcpngRetentionStrategyTest {
      * a running build. The completion reap reclaims the agent afterwards.
      *
      * <p>The agent is still closed to <em>further</em> work, which is the half worth asserting: refusing tasks
-     * is published before the teardown is even queued, so a used agent that came back accepting work stops
-     * accepting it immediately, whether or not this particular reap goes through.
+     * is unconditional and published before any teardown is queued, so a used agent that came back accepting
+     * work stops accepting it immediately, whether or not this particular reap goes through.
+     *
+     * <p>The task count is the other half. Queueing a reap that can only bail out under the queue lock costs a
+     * task and an INFO line on every retention tick, which on a long build is once a minute for hours, so the
+     * teardown is only scheduled once the agent is actually idle. Asserting zero submissions is what holds
+     * that: a check that scheduled the doomed reap anyway would still destroy nothing and still pass the three
+     * assertions above it.
      */
     @Test
     void checkDoesNotDestroyTheVmOfABuildThatLandedOnAReloadedAgent(JenkinsRule r) throws Exception {
@@ -432,19 +440,24 @@ class XcpngRetentionStrategyTest {
 
         XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
         strategy.setIdleProbe(c -> false); // a build from the restored queue is already running here
-        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        ThreadPoolExecutor reaps = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>());
         strategy.setReapExecutor(reaps);
         try {
             strategy.check(computer);
+            strategy.check(computer); // a second tick, because the churn this guards against is per-tick
 
             reaps.shutdown();
-            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the queued teardown should have run");
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "any queued teardown should have run");
             assertEquals(
                     0,
                     destroyCount(fake),
                     "a build dispatched during startup must not lose its VM to the reload reap: " + fake.calls());
             assertTrue(r.jenkins.getNodes().contains(reloaded), "the agent running that build must still exist");
             assertFalse(computer.isAcceptingTasks(), "a reloaded agent must stop taking new work either way");
+            assertEquals(
+                    0,
+                    reaps.getTaskCount(),
+                    "a busy reloaded agent must not queue a teardown that can only bail out, once per tick");
         } finally {
             reaps.shutdownNow();
         }

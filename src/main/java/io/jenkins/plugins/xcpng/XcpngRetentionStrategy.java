@@ -90,11 +90,21 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         // maxInstances for the whole idle timeout while the warm pool clones its replacement.
         //
         // Going through reap() rather than terminating here is what makes this safe during startup, when the
-        // restored queue is dispatching: reap refuses further work immediately, then re-reads the computer
-        // under the queue lock and abandons the teardown if a build got in first (see idleUnderQueueLock).
-        // Such a build keeps its executor and the completion reap reclaims the agent when it finishes.
+        // restored queue is dispatching: reap re-reads the computer under the queue lock and abandons the
+        // teardown if a build got in first (see idleUnderQueueLock). Such a build keeps its executor and the
+        // completion reap reclaims the agent when it finishes.
+        //
+        // The two halves are deliberately split. Refusing work is unconditional, because that is the half
+        // that closes the dirty-VM window and it must not wait for the agent to fall idle. Scheduling the
+        // teardown is gated on the agent being idle, because otherwise every retention tick would queue a
+        // reap that can only bail out under the queue lock: on a long build that is one pointless task and
+        // one INFO line per minute, for hours. The completion reap covers the busy case, and if it somehow
+        // does not fire, the agent falls idle and the next check picks it up here.
         if (isReloaded(computer)) {
-            reap(computer);
+            computer.setAcceptingTasks(false);
+            if (idle(computer)) {
+                reap(computer);
+            }
             return 1;
         }
         // Otherwise, deliberately not gated on isOnline(): a clone that started but never connected (bad
