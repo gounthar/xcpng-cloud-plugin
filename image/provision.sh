@@ -421,7 +421,16 @@ cleanup_for_template() {
 # This belongs beside the ssh host keys and /etc/machine-id above. All three are builder identity a
 # clone must not inherit; this one was simply missed.
 unpin_network_from_mac() {
-    [ -d /etc/netplan ] || return 0
+    # No netplan means some other renderer is in charge, usually installer-written ifupdown. Nothing
+    # here can be rewritten and the MAC check below has nothing to read, so say so rather than
+    # returning quietly: a silent skip looks identical to a successful check in the build log.
+    # Validating an arbitrary renderer is deliberately out of scope; what this function owns is the
+    # file cloud-init renders. An image using something else must make its own guarantee that the
+    # interface config does not name a MAC.
+    if [ ! -d /etc/netplan ]; then
+        log "no /etc/netplan; skipping the MAC-pin rewrite and its check (another renderer is in use)"
+        return 0
+    fi
     log "unpinning netplan from the builder MAC"
     cat > /etc/netplan/50-cloud-init.yaml <<'NETPLAN'
 # Rewritten by provision.sh at template time. Do not reintroduce a `match: macaddress:` here:
@@ -443,10 +452,16 @@ NETPLAN
     # major check above: cheap here, and roughly forty minutes plus one baffling offline node to
     # diagnose in the field.
     #
-    # Anchored to a YAML key, not a bare substring. The warning comment written above contains the
-    # word `macaddress`, so `grep -q macaddress` matches this function's own output and fails every
+    # Comments are stripped before matching, because the warning written just above contains the word
+    # `macaddress`; a bare `grep -q macaddress` matches this function's own output and fails every
     # build including the correct ones. Caught by running the check against a patched disk.
-    if grep -rqE '^[[:space:]]*macaddress:' /etc/netplan/ 2>/dev/null; then
+    #
+    # The pattern then accepts any way netplan can spell the key, not just the block style cloud-init
+    # happens to emit: `macaddress: x`, the flow mapping `match: {macaddress: x}`, and a quoted
+    # `"macaddress": x`. An anchored line-based match passed the last two, and the whole point of
+    # this check is to catch a config we did not write.
+    if sed 's/#.*//' /etc/netplan/*.yaml /etc/netplan/*.yml 2>/dev/null \
+        | grep -qE '(^|[[:space:],{])"?macaddress"?[[:space:]]*:'; then
         die "netplan still pins a MAC after cleanup; clones of this image would boot with no network"
     fi
 }

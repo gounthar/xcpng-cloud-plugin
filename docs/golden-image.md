@@ -35,7 +35,7 @@ launcher; the **private key never leaves you**.
 
 One image serves both launchers. What differs is the per-clone xenstore data, not the disk.
 
-## Building it with Packer (recommended)
+## Building it with Packer (intended path, not yet working)
 
 `image/xcpng-jenkins-agent.pkr.hcl` uses `github.com/vatesfr/xenserver`, the builder Vates maintains
 and develops alongside their Terraform provider. That is the ecosystem sentence worth having: Packer
@@ -55,22 +55,30 @@ packer build image/
 The build produces a template named `jenkins-agent-debian13`, which is what you put in the cloud's
 template field.
 
-> **Honesty about state (updated 2026-07-12).** `packer validate` passes and CI runs it on every push.
-> `packer build` has now been run against the lab pool, and the previously-unverified step **works**:
-> the builder uploaded the netinst ISO to the `local-iso` SR, created the VM, connected VNC, and drove
-> the Debian installer via `boot_command`, and the installer kernel loaded. The build then blocked at the
-> **preseed fetch**, for an environment reason, not a template one: the builder serves
-> `image/http/preseed.cfg` over HTTP on the machine running `packer`, and when that machine is behind
-> WSL2 NAT the building VM on the LAN cannot reach it (confirmed: dom0 could not reach the packer HTTP
-> port on either the WSL or Windows address). This is the same inbound-reachability wall as the M2
-> agent. **Run `packer build` from a host the pool can reach on the LAN**: either WSL2 mirrored
-> networking, a `netsh portproxy` for the packer HTTP port (pin `http_port_min`/`max` so it is stable),
-> or, cleanest, a golden-image **clone as the builder** (pool-adjacent, disposable, CI-shaped). The
-> `boot_command`/preseed pairing itself is validated up to that fetch. Everything durable about the
-> image is in `image/provision.sh`, which CI executes for real inside a `debian:13` container on every
-> push. The manual path below also works.
+> **Honesty about state (updated 2026-08-12). `packer build` has never produced an image.** This
+> supersedes the 2026-07-12 note, which said the `boot_command`/preseed pairing was validated up to
+> the preseed fetch and blamed the hang on WSL2 NAT. That was too generous. The boot command was
+> never delivering kernel arguments at all, so the installer never reached the point of fetching a
+> preseed, and the network theory was fitted to a symptom rather than measured. See
+> [#107](https://github.com/gounthar/xcpng-cloud-plugin/issues/107).
+>
+> Two bugs, both since fixed, neither visible in the Packer log: `boot_wait` was shorter than the
+> host takes to render the isolinux menu, so the keystrokes were read as menu shortcuts and selected
+> the accessible/speech-synthesis entry, which then waited forever on `Press enter to continue
+> anyway.`; and the parameters were typed with no kernel label, so `auto=true` was offered as a boot
+> label rather than as a parameter. With both fixed the installer gets further and still does not
+> finish, so treat this path as **unproven**.
+>
+> The Packer log is useless for diagnosing this: it prints `Wait for VM's IP to become known to us`
+> and then nothing, identically whether the boot command landed or not. Watch the console instead.
+> Each domain's VNC is a unix socket on dom0, so `ssh -L 5901:/var/run/xen/vnc-<domid> root@<host>`
+> plus any RFB client shows what the installer is actually doing; authentication is `None`.
+>
+> **Use the manual path below.** Everything durable about the image is in `image/provision.sh`,
+> which CI executes for real inside a `debian:13` container on every push, and which is what built
+> the working lab template.
 
-## Building it by hand
+## Building it by hand (what actually works today)
 
 1. Create a VM from the shipped **Debian Trixie 13** template, or import a Debian generic cloud
    image. Give it a disk on a **file-based SR** (`ext`, `nfs`): `VM.clone` is copy-on-write there.
