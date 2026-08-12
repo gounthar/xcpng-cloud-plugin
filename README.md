@@ -64,10 +64,23 @@ build lands on a live executor instead of waiting for a cold clone. A background
 roughly once a minute, so a spare appears up to a minute after you save the configuration, and after a
 spare is consumed by a build its replacement is cloned within about a minute. Warm agents are still
 single-use and count against `maxInstances`. A spare that boots but never connects is still reclaimed by
-the idle timeout. The "warm" marker is intentionally not persisted, so after a controller restart every
-existing spare loses its exemption, is reaped by the idle net, and is re-cloned by the maintainer; this
-churn is deliberate, since it guarantees a VM that has already run a build can never be revived as a
-spare.
+the idle timeout.
+
+The "warm" marker is intentionally not persisted, so a controller restart costs every existing spare its
+exemption. That churn is deliberate: it guarantees a VM that has already run a build can never be revived
+as a spare. It does not happen all at once, though, and the order is worth knowing before you size a
+pool. The old spare reconnects as an ordinary agent, the maintainer sees no warm spares and clones a
+replacement within about a minute, and only then does the idle net reclaim the old one, after
+`idleMinutes` has elapsed. Both run at the same time in between.
+
+**So a restart can temporarily hold twice the VMs a template is configured for, for up to the length of
+the idle timeout.** Two things bound that. The replacement is only cloned if `maxInstances` has room for
+it, so a cloud already at its cap simply waits instead of doubling. And the old spare is an ordinary
+single-use agent, so a build landing on it destroys it and frees the slot early; the full idle timeout is
+the worst case, not the normal one. While the window is open a cloud sitting at `maxInstances` provisions
+nothing new, though builds still run, since both agents are idle and carry the template's labels.
+Measured on the lab pool with `maxInstances` 2 and `idleMinutes` 10: replacement cloned 65 s after the
+restart, old spare destroyed 10 min 45 s after it reconnected.
 
 ## Requirements
 
