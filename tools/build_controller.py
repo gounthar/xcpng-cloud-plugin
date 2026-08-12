@@ -188,11 +188,18 @@ def fetch_image(workdir):
     raw = workdir / "debian-13-genericcloud-amd64.raw"
     urllib.request.urlretrieve(IMAGE_URL, qcow)
 
-    sums = urllib.request.urlopen(SUMS_URL, timeout=60).read().decode()
+    with urllib.request.urlopen(SUMS_URL, timeout=60) as response:
+        sums = response.read().decode()
     want = next(
         line.split()[0] for line in sums.splitlines() if line.endswith(qcow.name)
     )
-    if hashlib.sha512(qcow.read_bytes()).hexdigest() != want:
+    # Chunked rather than qcow.read_bytes(): the image is a few hundred MiB and there is no
+    # reason to hold all of it at once just to hash it.
+    digest = hashlib.sha512()
+    with open(qcow, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != want:
         raise SystemExit(f"checksum mismatch for {qcow.name}; refusing to import it")
     print("  sha512 OK")
 
@@ -231,7 +238,8 @@ def import_vdi(x, sr, path, name, virtual_size=None):
         with open(path, "rb") as fh:
             req = urllib.request.Request(url, data=fh, method="PUT")
             req.add_header("Content-Length", str(size))
-            urllib.request.urlopen(req, timeout=3600, context=x._ctx)
+            with urllib.request.urlopen(req, timeout=3600, context=x._ctx):
+                pass
         print(f"  imported {name} in {time.monotonic() - started:.1f}s")
     except Exception:
         # reaper.py iterates VMs, so a VDI attached to no VM leaks where nothing will find
@@ -251,16 +259,27 @@ def await_void_task(x, task, poll=2, timeout=900):
     the transport timeout while the VM carries on booting.
     """
     deadline = time.monotonic() + timeout
-    while True:
-        status = x.call("task.get_status", task)
-        if status != "pending":
-            break
-        if time.monotonic() > deadline:
-            raise XapiError("TASK_TIMEOUT", task)
-        time.sleep(poll)
-    if status != "success":
-        raise XapiError(f"TASK_{status.upper()}", x.call("task.get_error_info", task))
-    x.call("task.destroy", task)
+    try:
+        while True:
+            status = x.call("task.get_status", task)
+            if status != "pending":
+                break
+            if time.monotonic() > deadline:
+                raise XapiError("TASK_TIMEOUT", task)
+            time.sleep(poll)
+        if status != "success":
+            raise XapiError(
+                f"TASK_{status.upper()}", x.call("task.get_error_info", task)
+            )
+    finally:
+        # Destroy the task on every exit path. A timeout or a failed task otherwise leaks a
+        # task record on the pool, which is exactly the case that raises. Mirrors
+        # Xapi.await_task, including swallowing a destroy failure: the caller's own error is
+        # the one worth propagating.
+        try:
+            x.call("task.destroy", task)
+        except XapiError:
+            pass
 
 
 def run_reservation_hook(hook, mac, name):
@@ -512,9 +531,8 @@ def main(argv=None):
     if args.reservation_hook:
         run_reservation_hook(args.reservation_hook, args.mac, args.name)
 
-    docker_key = (
-        urllib.request.urlopen(DOCKER_KEY_URL, timeout=60).read().decode().rstrip("\n")
-    )
+    with urllib.request.urlopen(DOCKER_KEY_URL, timeout=60) as response:
+        docker_key = response.read().decode().rstrip("\n")
 
     with Xapi() as x:
         vm = build(x, args, pubkey, docker_key)

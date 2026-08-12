@@ -1,6 +1,6 @@
 """Tests for build_controller.py.
 
-Nothing here touches a pool. What these guard is the part that is easy to get wrong and
+Nothing here touches a pool. What they guard is the part that is easy to get wrong and
 expensive to discover: the seed cloud-init is handed, the ordering the XAPI calls go out in,
 and the cleanup that runs when an import fails. Each of those has already cost a rebuild
 once.
@@ -101,6 +101,36 @@ def test_user_data_authorises_the_given_key():
 # -- import cleanup ---------------------------------------------------------
 
 
+class _FakeResponse:
+    """The shape urlopen really returns: a context manager that closes.
+
+    The previous fake returned None, which only worked because the caller dropped the
+    response on the floor without closing it. A fake that accepts what the real API would
+    not is how an unclosed-response bug stays invisible.
+    """
+
+    def __init__(self, body=b""):
+        self._body = body
+        self.closed = False
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.closed = True
+        return False
+
+
+def fake_urlopen(*args, **kwargs):
+    """Hands back the response it produced, so a test can assert it was closed."""
+    fake_urlopen.last = _FakeResponse()
+    return fake_urlopen.last
+
+
+
 def test_a_failed_import_destroys_its_own_vdi(monkeypatch, tmp_path):
     """reaper.py iterates VMs, so a VDI attached to nothing leaks where nothing will find it."""
     image = tmp_path / "disk.raw"
@@ -122,7 +152,7 @@ def test_import_sizes_the_vdi_up_front_rather_than_resizing(monkeypatch, tmp_pat
     """VDI.resize straight after an import fails VDI_IN_USE, so the size is set at create."""
     image = tmp_path / "disk.raw"
     image.write_bytes(b"0" * 16)
-    monkeypatch.setattr(bc.urllib.request, "urlopen", lambda *a, **k: None)
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
 
     seen = {}
 
@@ -135,6 +165,9 @@ def test_import_sizes_the_vdi_up_front_rather_than_resizing(monkeypatch, tmp_pat
 
     assert seen["virtual_size"] == str(40 * 1024**3)
     assert "VDI.resize" not in x.calls
+    # The upload response has to be closed. Without this the `with` could be dropped and
+    # every other assertion here would still pass.
+    assert fake_urlopen.last.closed, "the import_raw_vdi response must be closed"
 
 
 # -- void task handling -----------------------------------------------------
@@ -153,6 +186,17 @@ def test_await_void_task_raises_on_failure():
     )
     with pytest.raises(XapiError):
         bc.await_void_task(x, "OpaqueRef:task", poll=0)
+    # The failing path is the one that leaks: a task record stays on the pool for every
+    # failed start unless the destroy runs from a finally.
+    assert "task.destroy" in x.calls
+
+
+def test_await_void_task_destroys_the_task_on_timeout():
+    """A timeout raises from a different branch than a failure, so it needs its own case."""
+    x = RecordingXapi({"task.get_status": "pending"})
+    with pytest.raises(XapiError):
+        bc.await_void_task(x, "OpaqueRef:task", poll=0, timeout=0)
+    assert "task.destroy" in x.calls
 
 
 # -- the reservation hook ---------------------------------------------------
