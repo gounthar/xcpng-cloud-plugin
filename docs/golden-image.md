@@ -49,10 +49,17 @@ export PKR_VAR_remote_password=...        # never commit this
 
 # Where debian-installer fetches the preseed. Leave this unset only if the pool can reach the
 # machine running Packer on the port Packer picks. It cannot under WSL2's default NAT, which passes
-# outbound and blocks inbound, and the failure is a silent hang rather than a connection error —
-# see item 3 below. Serve image/http/preseed.cfg from any host on the pool's LAN and point at it:
+# outbound and blocks inbound, and the failure is a silent hang rather than a connection error
+# (see item 3 below). Serve image/http/preseed.cfg from any host on the pool's LAN and point at it:
 #     python3 -m http.server 8000    # in image/http/, on a pool-reachable host
 export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
+
+# RE-COPY preseed.cfg TO THAT HOST BEFORE EVERY BUILD. What the installer reads is a copy, and
+# nothing keeps it in sync with the repo. A build launched to verify a preseed change will happily
+# fetch a months-old file, reproduce the bug you just fixed, and look like the fix did not work.
+# Caught doing exactly this: the served copy was 69 lines against the repo's 133, missing both the
+# apt-setup answers and the whole guest-tools block. Compare the two before you trust a result:
+#     curl -fsS "$PKR_VAR_preseed_url" | diff - image/http/preseed.cfg && echo in sync
 
 packer init  image/
 packer validate image/
@@ -64,7 +71,13 @@ template field. Override it with `PKR_VAR_template_name` to build alongside an e
 rather than colliding with it — that is where the `-v3` name in the status note below comes from, and
 whatever name you choose is the one the cloud's template field has to match.
 
-> **Status (updated 2026-08-12): `packer build` now completes.** It produced
+> **Status (updated 2026-08-12): `packer build` completes, but NOT unattended.** It stops once, at
+> item 4 below, and needs a single Return on the VM console to continue:
+> `python3 tools/vnc_console.py 127.0.0.1 5901 --key 0xff0d`. Measured on a run that was otherwise
+> hands-off: 17m09s end to end, template registered and exported. Tracked as
+> [#110](https://github.com/gounthar/xcpng-cloud-plugin/issues/110).
+>
+> An earlier version of this block said the build completes full stop. It produced
 > `jenkins-agent-debian13-v3` on the lab pool (the `-v3` is a `PKR_VAR_template_name` override, so
 > the run sat beside the two existing templates instead of replacing them), the plugin cloned that
 > template, the agent connected, and a build ran and passed on it. Before today it had never produced
@@ -90,8 +103,18 @@ whatever name you choose is the one the cloud's template field has to match.
 >    block wrongly dismissed it; what that note got wrong was only its claim that the boot command
 >    had been validated, since no kernel argument was arriving at all.
 > 4. apt-setup stopped on `An attempt to configure apt to install additional packages from the media
->    failed`, a blocking dialog in an otherwise unattended install. The preseed now answers the
->    cdrom questions.
+>    failed`, a blocking dialog in an otherwise unattended install. **STILL NOT FIXED, tracked as
+>    [#110](https://github.com/gounthar/xcpng-cloud-plugin/issues/110). The build needs one Return on
+>    the console to get past it.** It was fixed wrongly the first time and read as fixed only because
+>    the run after it went green. The preseed answers `apt-setup/cdrom/set-failed`, a boolean reading
+>    "Scan extra installation media?"; what blocks is `apt-setup/cdrom/failed`, an *error* template
+>    titled "apt configuration problem". One word apart, near-identical body text.
+>
+>    Root cause, from the installed system's `/var/log/installer/syslog`: `apt-cdrom` adds the
+>    netinst fine, then *"Repeat this process for the rest of the CDs in your set"* and moves to the
+>    second optical device. That is the XCP-ng Tools ISO, attached by the builder via
+>    `tools_iso_name`, and it is not a Debian disc, so apt-cdrom exits 1 and `40cdrom` bails with
+>    `db_input critical`. Attach only the netinst and you never reach it, which is how it hid.
 > 5. The builder learns the VM's address from XAPI, XAPI learns it from `xe-guest-utilities`, and
 >    `provision.sh` installs that over the SSH connection the address is needed for. The preseed now
 >    installs the guest tools from the Tools ISO during the install, before Packer needs to connect.
