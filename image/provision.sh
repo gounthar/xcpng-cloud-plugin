@@ -442,7 +442,11 @@ NETPLAN
     # Fail the build rather than ship an image whose clones are mute. Same reasoning as the Java
     # major check above: cheap here, and roughly forty minutes plus one baffling offline node to
     # diagnose in the field.
-    if grep -rq 'macaddress' /etc/netplan/ 2>/dev/null; then
+    #
+    # Anchored to a YAML key, not a bare substring. The warning comment written above contains the
+    # word `macaddress`, so `grep -q macaddress` matches this function's own output and fails every
+    # build including the correct ones. Caught by running the check against a patched disk.
+    if grep -rqE '^[[:space:]]*macaddress:' /etc/netplan/ 2>/dev/null; then
         die "netplan still pins a MAC after cleanup; clones of this image would boot with no network"
     fi
 }
