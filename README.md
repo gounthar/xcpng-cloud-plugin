@@ -71,12 +71,16 @@ exemption. That churn is deliberate: it guarantees a VM that has already run a b
 as a spare. It does not happen all at once, though, and the order is worth knowing before you size a
 pool. The old spare reconnects as an ordinary agent, the maintainer sees no warm spares and clones a
 replacement within about a minute, and only then does the idle net reclaim the old one, after
-`idleMinutes` has elapsed. Both run at the same time in between. **So a restart temporarily doubles the
-number of VMs a template holds, for the length of the idle timeout**, and if `maxInstances` is small the
-cloud can sit at its cap with no headroom for that whole window. Builds are not blocked by it, since both
-agents are idle and carry the template's labels, but nothing new can be provisioned until the old spare
-ages out. Measured on the lab pool: replacement cloned 65 s after the restart, old spare destroyed
-10 min 45 s after it reconnected, with `idleMinutes` at 10.
+`idleMinutes` has elapsed. Both run at the same time in between.
+
+**So a restart can temporarily hold twice the VMs a template is configured for, for up to the length of
+the idle timeout.** Two things bound that. The replacement is only cloned if `maxInstances` has room for
+it, so a cloud already at its cap simply waits instead of doubling. And the old spare is an ordinary
+single-use agent, so a build landing on it destroys it and frees the slot early; the full idle timeout is
+the worst case, not the normal one. While the window is open a cloud sitting at `maxInstances` provisions
+nothing new, though builds still run, since both agents are idle and carry the template's labels.
+Measured on the lab pool with `maxInstances` 2 and `idleMinutes` 10: replacement cloned 65 s after the
+restart, old spare destroyed 10 min 45 s after it reconnected.
 
 ## Requirements
 

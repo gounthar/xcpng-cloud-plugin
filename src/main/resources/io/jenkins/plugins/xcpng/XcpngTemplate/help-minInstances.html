@@ -13,9 +13,10 @@
   </p>
   <p>
     A controller restart costs every spare its warm marker, which is not persisted on purpose. The old
-    spare reconnects as an ordinary agent and the maintainer clones a replacement, so a restart
-    temporarily doubles this template's VM count until the old one ages out on <b>Idle minutes</b>.
-    Leave room under <b>Max instances</b> for that, or the cloud sits at its cap for the length of the
-    idle timeout.
+    spare reconnects as an ordinary agent and the maintainer clones a replacement, so this template can
+    briefly hold twice its configured spares. The replacement is only cloned if <b>Max instances</b> has
+    room, and the old spare is destroyed as soon as a build lands on it, so the wait is bounded by
+    <b>Idle minutes</b> rather than always lasting that long. Leave room under <b>Max instances</b> for
+    the overlap, or the cloud provisions nothing new until the old spare goes.
   </p>
 </div>
