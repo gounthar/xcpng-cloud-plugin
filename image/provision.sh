@@ -7,7 +7,7 @@
 # running it twice is a no-op. The env-var switches exist so CI can exercise the Java path in a
 # plain debian:13 container, where there is no CD-ROM and no cloud-init to clean.
 #
-#   SKIP_GUEST_TOOLS=1   do not install xe-guest-utilities from /dev/sr0
+#   SKIP_GUEST_TOOLS=1   do not install xe-guest-utilities from the tools ISO
 #   SKIP_CLEANUP=1       do not run cloud-init clean or reset machine identity
 #
 # Why Temurin and not the distro JDK: Jenkins core is compiled at class-file major 65, so an agent
@@ -78,23 +78,41 @@ verify_java() {
 install_guest_tools() {
     # Without these the guest never writes its IP to xenstore, and XAPI reports networks={} for the
     # lifetime of the VM. The inbound launcher does not need an IP, but every other tool does.
-    [ -e /dev/sr0 ] || die "no /dev/sr0: attach guest-tools.iso, or set SKIP_GUEST_TOOLS=1"
-    log "installing xe-guest-utilities from /dev/sr0"
+    # Find the tools ISO rather than assuming /dev/sr0. Under Packer there are two optical devices:
+    # sr0 is the Debian netinst the VM booted from and sr1 is the XCP-ng Tools ISO, so hardcoding sr0
+    # mounts the installer and then dies claiming the deb is missing. On a hand-built VM with only the
+    # tools ISO attached, sr0 is correct and this loop finds it first anyway.
+    local tools_dev=""
+    for dev in /dev/sr*; do
+        [ -b "$dev" ] || continue
+        mkdir -p /mnt/gt
+        if mount -o ro "$dev" /mnt/gt 2>/dev/null; then
+            if ls /mnt/gt/Linux/xe-guest-utilities_*_amd64.deb >/dev/null 2>&1; then
+                umount /mnt/gt
+                tools_dev="$dev"
+                break
+            fi
+            umount /mnt/gt
+        fi
+    done
+    [ -n "$tools_dev" ] \
+        || die "no XCP-ng guest tools ISO on any /dev/sr*: attach guest-tools.iso, or set SKIP_GUEST_TOOLS=1"
+    log "installing xe-guest-utilities from ${tools_dev}"
     mkdir -p /mnt/gt
 
     # A subshell with an EXIT trap, not `trap ... RETURN`: under `set -e`, a failing command aborts
-    # the shell rather than returning from the function, so a RETURN trap never fires and /dev/sr0
+    # the shell rather than returning from the function, so a RETURN trap never fires and the ISO
     # stays mounted for the next run to trip over. An EXIT trap in a subshell fires on both the
     # clean exit and the set -e abort. Verified against `set -e` + a failing install.
     (
         trap 'umount /mnt/gt 2>/dev/null || true' EXIT
-        mount -o ro /dev/sr0 /mnt/gt
+        mount -o ro "$tools_dev" /mnt/gt
         # Glob the deb rather than pin its version: the exact xe-guest-utilities filename is a property
         # of whatever guest-tools.iso the pool ships, so pinning it makes the next XCP-ng point update
         # break the build inside apt-get with no hint the ISO layout changed. Fail loudly on zero or on
         # more than one match, so a future ISO shipping two versions is an error, not an arbitrary pick.
         set -- /mnt/gt/Linux/xe-guest-utilities_*_amd64.deb
-        [ -e "$1" ] || die "no xe-guest-utilities deb on /dev/sr0 (looked in /mnt/gt/Linux)"
+        [ -e "$1" ] || die "no xe-guest-utilities deb on ${tools_dev} (looked in /mnt/gt/Linux)"
         [ "$#" -eq 1 ] || die "multiple xe-guest-utilities debs on the tools ISO: $*"
         # apt-get, not dpkg -i: the .deb may pull dependencies, which dpkg does not resolve.
         apt-get install -y -q "$1"
