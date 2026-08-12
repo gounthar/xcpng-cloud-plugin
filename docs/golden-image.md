@@ -80,10 +80,22 @@ template field.
 >    `provision.sh` installs that over the SSH connection the address is needed for. The preseed now
 >    installs the guest tools from the Tools ISO during the install, before Packer needs to connect.
 >
-> **If a build ever hangs here again, look at the console, not the log.** Each domain's VNC is a
-> unix socket on dom0: `ssh -L 5901:/var/run/xen/vnc-<domid> root@<host>` and point any RFB client at
-> it; authentication is `None`. Every one of the five was diagnosed that way, several after long
-> stretches of guessing at it from the outside.
+> **If a build ever hangs here again, look at the console, not the log.**
+> [`docs/golden-image-boot-bisect.md`](golden-image-boot-bisect.md) already said this in July, under
+> the heading "Methodological lesson (the expensive one)": *"We reasoned from four indirect proxies
+> for a full day and never once looked at the console. One VNC capture settled it in seconds. Look at
+> the actual screen first. Step one, not step fifty."* That advice was then re-learned from scratch in
+> August, at the cost of most of a day and four confident wrong explanations, which is a better
+> argument for reading it than anything written here.
+>
+> `tools/vnc_console.py` makes it a single command, with no `vncdo` to install first:
+>
+> ```sh
+> xe vm-list name-label=<vm> params=dom-id --minimal
+> ssh -L 5901:/var/run/xen/vnc-<domid> root@<host>
+> python3 tools/vnc_console.py 127.0.0.1 5901 screen.png
+> python3 tools/vnc_console.py 127.0.0.1 5901 --key 0xff0d   # answer a blocking dialog
+> ```
 
 ## Building it by hand
 
