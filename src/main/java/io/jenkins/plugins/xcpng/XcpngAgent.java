@@ -59,6 +59,25 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     static final int EXECUTORS_PER_AGENT = 1;
 
+    /**
+     * Node usage mode, fixed at {@link Node.Mode#EXCLUSIVE} and deliberately not configurable.
+     *
+     * <p>{@code NORMAL} means "use this node as much as possible", which makes builds carrying no label
+     * expression eligible for these VMs. On a single-use agent that is not a scheduling nicety. A warm
+     * spare held hot for a template's labels can be taken by the first unlabeled job to queue, and since
+     * the agent is destroyed when that build finishes, the labeled build the pool exists for then waits
+     * for a cold clone — the exact latency the warm pool was configured to remove. On a controller whose
+     * built-in executors are busy or set to 0, it also turns ordinary unlabeled load into one
+     * clone-boot-destroy cycle per build, against a pool the administrator never routed those jobs to.
+     *
+     * <p>{@code EXCLUSIVE} restricts these agents to builds whose label expression matches the template's
+     * labels. {@link XcpngCloud} declines to provision for a null label for the same reason, and the two
+     * halves have to stay agreed: core's {@code UnlabeledLoadStatistics} counts only {@code NORMAL} nodes,
+     * so an EXCLUSIVE agent contributes no unlabeled capacity. A cloud that still answered unlabeled
+     * demand would clone VMs that could never run the build that asked for them, and keep doing it.
+     */
+    static final Node.Mode USAGE_MODE = Node.Mode.EXCLUSIVE;
+
     private final String cloudName;
     private final String vmRef;
 
@@ -141,7 +160,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 "XCP-ng ephemeral agent",
                 REMOTE_FS,
                 EXECUTORS_PER_AGENT,
-                Node.Mode.NORMAL,
+                USAGE_MODE,
                 template.getLabelString(),
                 new JNLPLauncher(),
                 new XcpngRetentionStrategy(idleMinutes),
@@ -218,9 +237,16 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * agent must never come back as a spare: that guarantees a used agent cannot be revived and run a
      * second build on a dirty VM. Reassigning the transient field here (rather than relying on the default)
      * also keeps serialization analysis satisfied that it is handled, matching {@link XcpngCloud#readResolve}.
+     *
+     * <p>The usage mode is re-applied for a different reason. {@code Slave.mode} is a persisted field, not a
+     * transient one, and the constructor does not run on deserialization: an agent whose {@code config.xml}
+     * was written before {@link #USAGE_MODE} became {@code EXCLUSIVE} carries {@code NORMAL} and would come
+     * back able to accept unlabeled builds. That is exactly the bug the mode exists to prevent, surviving a
+     * controller restart, so the mode is asserted here rather than trusted from the file.
      */
     protected Object readResolve() {
         warm = false;
+        setMode(USAGE_MODE);
         return super.readResolve();
     }
 

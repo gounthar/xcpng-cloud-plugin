@@ -147,6 +147,19 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         if (minInstances < 0) {
             minInstances = 0;
         }
+        // Labels used to be optional in effect: a template with none served builds that asked for nothing.
+        // Agents are EXCLUSIVE now and the cloud declines a null label, so such a template provisions
+        // nothing at all. An upgraded controller would simply stop cloning, with nothing to read anywhere,
+        // so say it at load. Warn rather than reject, for the same reason the SSH key above is dropped
+        // rather than thrown on: one template must not stop the controller loading. The field is final,
+        // so there is nothing to normalise here — doCheckLabelString is where it gets fixed.
+        if (labelString == null || labelString.isBlank()) {
+            LOGGER.log(
+                    Level.WARNING,
+                    () -> "Template " + templateName + " has no labels, so nothing will ever be provisioned"
+                            + " from it: these agents only run builds whose label expression matches."
+                            + " Set a label on the template in the cloud's configuration.");
+        }
         return this;
     }
 
@@ -231,6 +244,20 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         public FormValidation doCheckTemplateName(@QueryParameter String value) {
             return value == null || value.isBlank()
                     ? FormValidation.error(Messages.XcpngTemplate_templateName_required())
+                    : FormValidation.ok();
+        }
+
+        /**
+         * Labels are required, because they are the only way a build can reach these agents. Provisioned
+         * nodes are {@link XcpngAgent#USAGE_MODE} — {@code EXCLUSIVE} — and {@link XcpngCloud} declines to
+         * provision for a build with no label expression, so a template with no labels is not a
+         * general-purpose template, it is one nothing can ever schedule onto. Before those two changed it
+         * silently meant "serve unlabeled builds"; this says so at the form rather than leaving a config
+         * that looks configured and provisions nothing.
+         */
+        public FormValidation doCheckLabelString(@QueryParameter String value) {
+            return value == null || value.isBlank()
+                    ? FormValidation.error(Messages.XcpngTemplate_labelString_required())
                     : FormValidation.ok();
         }
 
