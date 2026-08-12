@@ -149,10 +149,19 @@ jobs:
           sudo unzip -qo /tmp/packer.zip -d /usr/local/bin
           packer --version
 
+      # `preseed/late_command` is one logical line spread over ~25 continuations, mixing d-i's shell
+      # with `in-target` and two levels of quoting. A stray apostrophe or an unbalanced `if` there
+      # does not fail validate, does not fail any test, and surfaces only as a Packer build that
+      # hangs on "Wait for VM's IP" with nothing in the log — the exact signature of the five bugs in
+      # #107. Joining the continuations and running `sh -n` over each embedded `sh -c` body catches
+      # that class in a second. It checks syntax only; nothing here executes the installer.
+      - name: The preseed late_command must be valid shell
+        run: python3 .github/scripts/check_preseed.py image/http/preseed.cfg
+
       # Schema-checks every field against the real vatesfr/xenserver builder. It does not, and
-      # cannot, build here: CI has no pool. `packer build` has been run by hand against the lab
-      # pool and works up to the WSL-NAT-blocked preseed fetch; see the template header and
-      # docs/golden-image.md. CI only validates.
+      # cannot, build here: CI has no pool. `packer build` now completes against the lab pool
+      # (2026-08-12, one pool, Debian 13); see the template header and docs/golden-image.md.
+      # CI only validates.
       - name: Init and validate
         env:
           # packer init resolves the vatesfr/xenserver plugin through the GitHub API. Unauthenticated,

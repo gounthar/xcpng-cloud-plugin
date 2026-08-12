@@ -47,18 +47,34 @@ export PKR_VAR_remote_host=192.168.1.87
 export PKR_VAR_remote_username=root
 export PKR_VAR_remote_password=...        # never commit this
 
+# Where debian-installer fetches the preseed. Leave this unset only if the pool can reach the
+# machine running Packer on the port Packer picks. It cannot under WSL2's default NAT, which passes
+# outbound and blocks inbound, and the failure is a silent hang rather than a connection error —
+# see item 3 below. Serve image/http/preseed.cfg from any host on the pool's LAN and point at it:
+#     python3 -m http.server 8000    # in image/http/, on a pool-reachable host
+export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
+
 packer init  image/
 packer validate image/
 packer build image/
 ```
 
 The build produces a template named `jenkins-agent-debian13`, which is what you put in the cloud's
-template field.
+template field. Override it with `PKR_VAR_template_name` to build alongside an existing template
+rather than colliding with it — that is where the `-v3` name in the status note below comes from, and
+whatever name you choose is the one the cloud's template field has to match.
 
 > **Status (updated 2026-08-12): `packer build` now completes.** It produced
-> `jenkins-agent-debian13-v3` on the lab pool, the plugin cloned that template, the agent connected,
-> and a build ran and passed on it. Before today it had never produced an image at all, despite this
-> section having called it the recommended path since it was written.
+> `jenkins-agent-debian13-v3` on the lab pool (the `-v3` is a `PKR_VAR_template_name` override, so
+> the run sat beside the two existing templates instead of replacing them), the plugin cloned that
+> template, the agent connected, and a build ran and passed on it. Before today it had never produced
+> an image at all, despite this section having called it the recommended path since it was written.
+>
+> **What that run does and does not establish.** It is one build, on one pool, on Debian 13, with the
+> preseed served from a LAN host via `preseed_url`. Untested: Packer's own built-in HTTP server from
+> a build host the pool can reach, any other pool or Debian version, and the no-netplan branch in
+> `provision.sh`, which CI cannot enter because it runs with `SKIP_CLEANUP`. The five fixes below are
+> each verified against the failure they address; none of them is verified as portable.
 >
 > Five separate things were wrong, and none of them was visible in the Packer log, which prints
 > `Wait for VM's IP to become known to us` and then nothing in every one of these cases. All are
@@ -79,6 +95,11 @@ template field.
 > 5. The builder learns the VM's address from XAPI, XAPI learns it from `xe-guest-utilities`, and
 >    `provision.sh` installs that over the SSH connection the address is needed for. The preseed now
 >    installs the guest tools from the Tools ISO during the install, before Packer needs to connect.
+>    That step cannot be fatal — a hand-built image legitimately has no Tools ISO attached, and a
+>    preseed has no way to tell which caller it is running for — so instead it logs every decision to
+>    **`/var/log/xcpng-guest-tools.log`** in the installed system. If a build hangs here again, that
+>    file says whether the ISO was found and whether the package installed, which is the difference
+>    between this deadlock and a slow boot.
 >
 > **If a build ever hangs here again, look at the console, not the log.**
 > [`docs/golden-image-boot-bisect.md`](golden-image-boot-bisect.md) already said this in July, under
