@@ -1117,7 +1117,7 @@ class XcpngProvisionTest {
         XcpngWarmPoolMaintainer maintainer = ExtensionList.lookupSingleton(XcpngWarmPoolMaintainer.class);
 
         long delay = maintainer.getInitialDelay();
-        assertTrue(delay >= 0, "a negative initial delay would be rejected by the scheduler: " + delay);
+        assertTrue(delay > 0, "the delay is short rather than zero, so a restart's churn can settle: " + delay);
         assertTrue(
                 delay * 4 <= maintainer.getRecurrencePeriod(),
                 "the first pass should run well inside the first period, not at a random point in it: " + delay);
