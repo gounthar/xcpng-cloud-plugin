@@ -75,6 +75,24 @@ variable "debian_version" {
   default = "13.4.0"
 }
 
+// Where the installer fetches the preseed from. Empty means "use Packer's own HTTP server", which is
+// right whenever the machine running Packer is reachable from the pool on the LAN.
+//
+// It is not reachable when Packer runs behind NAT, which includes WSL2 in its default mode. Packer
+// still starts its server and still advertises an address, so nothing looks wrong: the installer
+// boots, tries to fetch, cannot, and stalls on a screen that says nothing. The build then sits until
+// ssh_wait_timeout with a log that only ever says "Wait for VM's IP to become known to us".
+//
+// Measured on this lab from dom0: Packer advertised 192.168.1.145:8000 while its server was bound
+// inside WSL at 172.18.157.37:8000, and neither address answered from the pool.
+//
+// Set this to a URL the pool can reach and serve image/http/preseed.cfg there yourself.
+variable "preseed_url" {
+  type        = string
+  description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server (needs LAN reachability)."
+  default     = ""
+}
+
 source "xenserver-iso" "jenkins-agent" {
   iso_url = "https://cdimage.debian.org/cdimage/archive/${var.debian_version}/amd64/iso-cd/debian-${var.debian_version}-amd64-netinst.iso"
   // From that directory's SHA256SUMS. Never hand-written.
@@ -123,7 +141,7 @@ source "xenserver-iso" "jenkins-agent" {
   boot_command = [
     "<esc><wait>",
     "auto ",
-    "url=http://{{ .HTTPIP }}:{{ .HTTPPort }}/preseed.cfg ",
+    "url=${var.preseed_url != "" ? var.preseed_url : "http://{{ .HTTPIP }}:{{ .HTTPPort }}/preseed.cfg"} ",
     "<enter>"
   ]
 

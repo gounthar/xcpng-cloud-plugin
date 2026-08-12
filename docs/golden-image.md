@@ -35,7 +35,7 @@ launcher; the **private key never leaves you**.
 
 One image serves both launchers. What differs is the per-clone xenstore data, not the disk.
 
-## Building it with Packer (intended path, not yet working)
+## Building it with Packer (recommended)
 
 `image/xcpng-jenkins-agent.pkr.hcl` uses `github.com/vatesfr/xenserver`, the builder Vates maintains
 and develops alongside their Terraform provider. That is the ecosystem sentence worth having: Packer
@@ -47,38 +47,101 @@ export PKR_VAR_remote_host=192.168.1.87
 export PKR_VAR_remote_username=root
 export PKR_VAR_remote_password=...        # never commit this
 
+# Where debian-installer fetches the preseed. Leave this unset only if the pool can reach the
+# machine running Packer on the port Packer picks. It cannot under WSL2's default NAT, which passes
+# outbound and blocks inbound, and the failure is a silent hang rather than a connection error
+# (see item 3 below). Serve image/http/preseed.cfg from any host on the pool's LAN and point at it:
+#     python3 -m http.server 8000    # in image/http/, on a pool-reachable host
+export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
+
+# RE-COPY preseed.cfg TO THAT HOST BEFORE EVERY BUILD. What the installer reads is a copy, and
+# nothing keeps it in sync with the repo. A build launched to verify a preseed change will happily
+# fetch a months-old file, reproduce the bug you just fixed, and look like the fix did not work.
+# Caught doing exactly this: the served copy was 69 lines against the repo's 133, missing both the
+# apt-setup answers and the whole guest-tools block. Compare the two before you trust a result:
+#     curl -fsS "$PKR_VAR_preseed_url" | diff - image/http/preseed.cfg && echo in sync
+
 packer init  image/
 packer validate image/
 packer build image/
 ```
 
 The build produces a template named `jenkins-agent-debian13`, which is what you put in the cloud's
-template field.
+template field. Override it with `PKR_VAR_template_name` to build alongside an existing template
+rather than colliding with it — that is where the `-v3` name in the status note below comes from, and
+whatever name you choose is the one the cloud's template field has to match.
 
-> **Honesty about state (updated 2026-08-12). `packer build` has never produced an image.** This
-> supersedes the 2026-07-12 note, which said the `boot_command`/preseed pairing was validated up to
-> the preseed fetch and blamed the hang on WSL2 NAT. That was too generous. The boot command was
-> never delivering kernel arguments at all, so the installer never reached the point of fetching a
-> preseed, and the network theory was fitted to a symptom rather than measured. See
-> [#107](https://github.com/gounthar/xcpng-cloud-plugin/issues/107).
+> **Status (updated 2026-08-12): `packer build` completes, but NOT unattended.** It stops once, at
+> item 4 below, and needs a single Return on the VM console to continue:
+> `python3 tools/vnc_console.py 127.0.0.1 5901 --key 0xff0d`. Measured on a run that was otherwise
+> hands-off: 17m09s end to end, template registered and exported. Tracked as
+> [#110](https://github.com/gounthar/xcpng-cloud-plugin/issues/110).
 >
-> Two bugs, both since fixed, neither visible in the Packer log: `boot_wait` was shorter than the
-> host takes to render the isolinux menu, so the keystrokes were read as menu shortcuts and selected
-> the accessible/speech-synthesis entry, which then waited forever on `Press enter to continue
-> anyway.`; and the parameters were typed with no kernel label, so `auto=true` was offered as a boot
-> label rather than as a parameter. With both fixed the installer gets further and still does not
-> finish, so treat this path as **unproven**.
+> An earlier version of this block said the build completes full stop. It produced
+> `jenkins-agent-debian13-v3` on the lab pool (the `-v3` is a `PKR_VAR_template_name` override, so
+> the run sat beside the two existing templates instead of replacing them), the plugin cloned that
+> template, the agent connected, and a build ran and passed on it. Before today it had never produced
+> an image at all, despite this section having called it the recommended path since it was written.
 >
-> The Packer log is useless for diagnosing this: it prints `Wait for VM's IP to become known to us`
-> and then nothing, identically whether the boot command landed or not. Watch the console instead.
-> Each domain's VNC is a unix socket on dom0, so `ssh -L 5901:/var/run/xen/vnc-<domid> root@<host>`
-> plus any RFB client shows what the installer is actually doing; authentication is `None`.
+> **What that run does and does not establish.** It is one build, on one pool, on Debian 13, with the
+> preseed served from a LAN host via `preseed_url`. Untested: Packer's own built-in HTTP server from
+> a build host the pool can reach, any other pool or Debian version, and the no-netplan branch in
+> `provision.sh`, which CI cannot enter because it runs with `SKIP_CLEANUP`. The five fixes below are
+> each verified against the failure they address; none of them is verified as portable.
 >
-> **Use the manual path below.** Everything durable about the image is in `image/provision.sh`,
-> which CI executes for real inside a `debian:13` container on every push, and which is what built
-> the working lab template.
+> Five separate things were wrong, and none of them was visible in the Packer log, which prints
+> `Wait for VM's IP to become known to us` and then nothing in every one of these cases. All are
+> fixed; see [#107](https://github.com/gounthar/xcpng-cloud-plugin/issues/107).
+>
+> 1. `boot_wait` was shorter than this host takes to draw the isolinux menu, so the keystrokes were
+>    read as menu shortcuts and selected the accessible/speech-synthesis entry, which waits forever
+>    on `Press enter to continue anyway.`
+> 2. The kernel parameters were typed with no boot label, so `auto=true` was offered as a label.
+> 3. Packer serves the preseed from the machine running Packer, which is unreachable from the pool
+>    behind WSL2's default NAT. The `preseed_url` variable now lets you serve it anywhere the pool
+>    can reach. **The July note about WSL2 NAT was right about this**, and an earlier version of this
+>    block wrongly dismissed it; what that note got wrong was only its claim that the boot command
+>    had been validated, since no kernel argument was arriving at all.
+> 4. apt-setup stopped on `An attempt to configure apt to install additional packages from the media
+>    failed`, a blocking dialog in an otherwise unattended install. **STILL NOT FIXED, tracked as
+>    [#110](https://github.com/gounthar/xcpng-cloud-plugin/issues/110). The build needs one Return on
+>    the console to get past it.** It was fixed wrongly the first time and read as fixed only because
+>    the run after it went green. The preseed answers `apt-setup/cdrom/set-failed`, a boolean reading
+>    "Scan extra installation media?"; what blocks is `apt-setup/cdrom/failed`, an *error* template
+>    titled "apt configuration problem". One word apart, near-identical body text.
+>
+>    Root cause, from the installed system's `/var/log/installer/syslog`: `apt-cdrom` adds the
+>    netinst fine, then *"Repeat this process for the rest of the CDs in your set"* and moves to the
+>    second optical device. That is the XCP-ng Tools ISO, attached by the builder via
+>    `tools_iso_name`, and it is not a Debian disc, so apt-cdrom exits 1 and `40cdrom` bails with
+>    `db_input critical`. Attach only the netinst and you never reach it, which is how it hid.
+> 5. The builder learns the VM's address from XAPI, XAPI learns it from `xe-guest-utilities`, and
+>    `provision.sh` installs that over the SSH connection the address is needed for. The preseed now
+>    installs the guest tools from the Tools ISO during the install, before Packer needs to connect.
+>    That step cannot be fatal — a hand-built image legitimately has no Tools ISO attached, and a
+>    preseed has no way to tell which caller it is running for — so instead it logs every decision to
+>    **`/var/log/xcpng-guest-tools.log`** in the installed system. If a build hangs here again, that
+>    file says whether the ISO was found and whether the package installed, which is the difference
+>    between this deadlock and a slow boot.
+>
+> **If a build ever hangs here again, look at the console, not the log.**
+> [`docs/golden-image-boot-bisect.md`](golden-image-boot-bisect.md) already said this in July, under
+> the heading "Methodological lesson (the expensive one)": *"We reasoned from four indirect proxies
+> for a full day and never once looked at the console. One VNC capture settled it in seconds. Look at
+> the actual screen first. Step one, not step fifty."* That advice was then re-learned from scratch in
+> August, at the cost of most of a day and four confident wrong explanations, which is a better
+> argument for reading it than anything written here.
+>
+> `tools/vnc_console.py` makes it a single command, with no `vncdo` to install first:
+>
+> ```sh
+> xe vm-list name-label=<vm> params=dom-id --minimal
+> ssh -L 5901:/var/run/xen/vnc-<domid> root@<host>
+> python3 tools/vnc_console.py 127.0.0.1 5901 screen.png
+> python3 tools/vnc_console.py 127.0.0.1 5901 --key 0xff0d   # answer a blocking dialog
+> ```
 
-## Building it by hand (what actually works today)
+## Building it by hand
 
 1. Create a VM from the shipped **Debian Trixie 13** template, or import a Debian generic cloud
    image. Give it a disk on a **file-based SR** (`ext`, `nfs`): `VM.clone` is copy-on-write there.
