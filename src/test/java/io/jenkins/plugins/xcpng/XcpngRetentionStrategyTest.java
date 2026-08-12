@@ -351,6 +351,105 @@ class XcpngRetentionStrategyTest {
         }
     }
 
+    // ---- Agents that outlived a controller restart ----
+
+    /**
+     * The reloaded flag has to discriminate, so both halves are asserted here: a freshly provisioned agent
+     * must not report reloaded, and the same agent round-tripped through XStream must. The round trip is the
+     * fixture on purpose, because {@code readResolve} is the only thing that raises the flag and only
+     * deserialization calls it.
+     */
+    @Test
+    void onlyAnAgentRestoredFromDiskReportsReloaded(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent provisioned = agent(cloud, "xcpng-agent-1", false);
+
+        assertFalse(provisioned.isReloaded(), "an agent provisioned in this session did not survive a restart");
+
+        XcpngAgent reloaded = (XcpngAgent) Jenkins.XSTREAM2.fromXML(Jenkins.XSTREAM2.toXML(provisioned));
+
+        assertTrue(reloaded.isReloaded(), "an agent restored from its config.xml must report reloaded");
+        assertFalse(reloaded.isWarm(), "and must still come back not-warm, which is the older half of this");
+    }
+
+    /**
+     * A reloaded agent is reclaimed on the first check, well inside {@code idleMinutes}. Two pieces of state
+     * die with the controller: the warm flag, so a spent agent and an unused spare cannot be told apart, and
+     * the computer's accepting-tasks flag, which constructs true again and re-opens a used agent to work on a
+     * VM that is no longer pristine. Waiting out the timeout also holds a second slot against
+     * {@code maxInstances} while the warm pool clones the replacement.
+     *
+     * <p>The clock is pinned 30 seconds past idle start, far short of the ten-minute timeout, so nothing here
+     * can pass by falling through to the idle net: {@code checkDoesNotReapAnAgentBeforeItsIdleTimeout} runs
+     * the same instant against a freshly provisioned agent and asserts no reap.
+     */
+    @Test
+    void checkReapsAReloadedAgentWithoutWaitingForTheIdleTimeout(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent provisioned = agent(cloud, "xcpng-agent-1", false);
+        XcpngAgent reloaded = (XcpngAgent) Jenkins.XSTREAM2.fromXML(Jenkins.XSTREAM2.toXML(provisioned));
+        r.jenkins.addNode(reloaded);
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, reloaded.toComputer());
+
+        long idleStart = computer.getIdleStartMilliseconds();
+        XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
+        strategy.setClock(() -> idleStart + 30_000L);
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(computer);
+
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the reap should finish");
+            assertTrue(
+                    fake.calls().contains("destroyWithDisks:" + reloaded.getVmRef()),
+                    "an agent that outlived a restart must be reclaimed, not left to age out: " + fake.calls());
+        } finally {
+            reaps.shutdownNow();
+        }
+    }
+
+    /**
+     * The restored queue dispatches while Jenkins is still starting, so a build can land on a reloaded agent
+     * before the first check runs. That build must keep its VM: the reap goes through the guarded path, which
+     * re-reads the computer under the queue lock and abandons the teardown rather than destroying the VM under
+     * a running build. The completion reap reclaims the agent afterwards.
+     *
+     * <p>The agent is still closed to <em>further</em> work, which is the half worth asserting: refusing tasks
+     * is published before the teardown is even queued, so a used agent that came back accepting work stops
+     * accepting it immediately, whether or not this particular reap goes through.
+     */
+    @Test
+    void checkDoesNotDestroyTheVmOfABuildThatLandedOnAReloadedAgent(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent provisioned = agent(cloud, "xcpng-agent-1", false);
+        XcpngAgent reloaded = (XcpngAgent) Jenkins.XSTREAM2.fromXML(Jenkins.XSTREAM2.toXML(provisioned));
+        r.jenkins.addNode(reloaded);
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, reloaded.toComputer());
+
+        XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(IDLE_MINUTES);
+        strategy.setIdleProbe(c -> false); // a build from the restored queue is already running here
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(computer);
+
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the queued teardown should have run");
+            assertEquals(
+                    0,
+                    destroyCount(fake),
+                    "a build dispatched during startup must not lose its VM to the reload reap: " + fake.calls());
+            assertTrue(r.jenkins.getNodes().contains(reloaded), "the agent running that build must still exist");
+            assertFalse(computer.isAcceptingTasks(), "a reloaded agent must stop taking new work either way");
+        } finally {
+            reaps.shutdownNow();
+        }
+    }
+
     // ---- taskAccepted / taskCompleted wiring ----
 
     /**

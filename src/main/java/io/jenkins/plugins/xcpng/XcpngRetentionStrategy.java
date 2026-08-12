@@ -81,6 +81,22 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         if (isExemptWarmSpare(computer)) {
             return 1;
         }
+        // An agent that outlived a controller restart is reclaimed on the first check rather than left to
+        // age out. A restart erases both pieces of state single-use depends on: XcpngAgent.warm is transient,
+        // so a spare and a spent agent are indistinguishable afterwards, and SlaveComputer.acceptingTasks is
+        // transient too and constructs true, so the refusal taskAccepted stamped on a used agent is gone as
+        // well. Left alone, an agent whose build finished just as the controller died comes back accepting
+        // work on a VM that is no longer pristine, and a genuine spare holds a second slot against
+        // maxInstances for the whole idle timeout while the warm pool clones its replacement.
+        //
+        // Going through reap() rather than terminating here is what makes this safe during startup, when the
+        // restored queue is dispatching: reap refuses further work immediately, then re-reads the computer
+        // under the queue lock and abandons the teardown if a build got in first (see idleUnderQueueLock).
+        // Such a build keeps its executor and the completion reap reclaims the agent when it finishes.
+        if (isReloaded(computer)) {
+            reap(computer);
+            return 1;
+        }
         // Otherwise, deliberately not gated on isOnline(): a clone that started but never connected (bad
         // boot, network, or JNLP misconfiguration) is offline forever, and gating on online would leave
         // its VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
@@ -108,6 +124,11 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
     private static boolean isExemptWarmSpare(AbstractCloudComputer<?> computer) {
         return computer.getNode() instanceof XcpngAgent agent
                 && exemptFromIdleReap(agent.isWarm(), computer.isOnline(), agent.getCloud() != null);
+    }
+
+    /** Whether the computer backs an agent that came back from a controller restart. */
+    private static boolean isReloaded(AbstractCloudComputer<?> computer) {
+        return computer.getNode() instanceof XcpngAgent agent && agent.isReloaded();
     }
 
     /**
