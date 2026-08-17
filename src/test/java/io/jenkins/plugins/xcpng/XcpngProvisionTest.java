@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.ExtensionList;
 import hudson.model.Computer;
 import hudson.model.FreeStyleProject;
 import hudson.model.Label;
@@ -1099,6 +1100,50 @@ class XcpngProvisionTest {
         assertTrue(
                 fake.calls().stream().noneMatch(c -> c.startsWith("cloneFromTemplate:")),
                 "no clone should have been attempted at all: " + fake.calls());
+    }
+
+    /**
+     * The first reconcile after a restart must not wait a random fraction of a minute, because a restart
+     * has just reclaimed every warm spare and nothing replaces them until this work first runs.
+     *
+     * <p>The determinism assertion is the one that does the work, and it is not decoration. Core's
+     * {@code PeriodicWork.getInitialDelay()} returns {@code Math.abs(RANDOM.nextLong()) % period}, so a
+     * bounds-only check ("well under a period") passes against the unoverridden default a quarter of the
+     * time — a fixture agreeable enough to certify the bug. Asserting instead that repeated calls agree
+     * discriminates against a random draw outright.
+     */
+    @Test
+    void theFirstReconcileDoesNotWaitARandomFractionOfAPeriod(JenkinsRule r) {
+        XcpngWarmPoolMaintainer maintainer = ExtensionList.lookupSingleton(XcpngWarmPoolMaintainer.class);
+
+        long delay = maintainer.getInitialDelay();
+        assertTrue(delay > 0, "the delay is short rather than zero, so a restart's churn can settle: " + delay);
+        assertTrue(
+                delay * 4 <= maintainer.getRecurrencePeriod(),
+                "the first pass should run well inside the first period, not at a random point in it: " + delay);
+        for (int i = 0; i < 100; i++) {
+            assertEquals(delay, maintainer.getInitialDelay(), "the initial delay must not be a random draw");
+        }
+    }
+
+    /**
+     * The scheduled entry point fills the pool. Every other warm-pool test calls {@code reconcileWarmPool}
+     * directly, which leaves the one method the Jenkins timer actually invokes uncovered — so a maintainer
+     * that iterated the wrong clouds, or swallowed the reconcile entirely, would pass all of them.
+     */
+    @Test
+    void aMaintainerTickFillsTheWarmPool(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2);
+        r.jenkins.clouds.add(cloud);
+
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(launches);
+        ExtensionList.lookupSingleton(XcpngWarmPoolMaintainer.class).execute(TaskListener.NULL);
+        launches.shutdown();
+        assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool launches should finish");
+
+        assertEquals(2, warmNodeCount(r), "a maintainer tick should fill the pool to minInstances");
     }
 
     @Test

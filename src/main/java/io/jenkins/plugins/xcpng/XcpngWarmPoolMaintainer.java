@@ -4,6 +4,7 @@ import hudson.Extension;
 import hudson.model.AsyncPeriodicWork;
 import hudson.model.TaskListener;
 import hudson.slaves.Cloud;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -22,6 +23,9 @@ public class XcpngWarmPoolMaintainer extends AsyncPeriodicWork {
 
     private static final Logger LOGGER = Logger.getLogger(XcpngWarmPoolMaintainer.class.getName());
 
+    /** How long after startup the first reconcile runs. See {@link #getInitialDelay()}. */
+    private static final long INITIAL_DELAY_MILLIS = TimeUnit.SECONDS.toMillis(10);
+
     public XcpngWarmPoolMaintainer() {
         super("XCP-ng warm pool maintainer");
     }
@@ -30,6 +34,36 @@ public class XcpngWarmPoolMaintainer extends AsyncPeriodicWork {
     @Override
     public long getRecurrencePeriod() {
         return MIN;
+    }
+
+    /**
+     * Run the first reconcile promptly instead of at a random point in the first period.
+     *
+     * <p>{@link hudson.model.PeriodicWork#getInitialDelay()} returns
+     * {@code Math.abs(RANDOM.nextLong()) % getRecurrencePeriod()}, so with a one-minute period the first
+     * pass lands anywhere in a 60 second window. That is the right default for the many periodic tasks
+     * whose only requirement is not to start in lockstep with each other, and it is the wrong one here.
+     * A controller restart reclaims every warm spare it had — {@link XcpngAgent#readResolve} cannot see a
+     * transient {@code warm} flag, so a reloaded spare is reaped rather than adopted — and until this
+     * maintainer's first pass runs, nothing replaces them. The pool therefore holds no spare for however
+     * long the random draw happened to be, on top of the clone-and-boot that is real work.
+     *
+     * <p>A fixed short delay is safe here specifically because of when core schedules periodic work.
+     * {@code PeriodicWork.init()} carries {@code @Initializer(after = InitMilestone.JOB_CONFIG_ADAPTED)},
+     * while nodes are loaded by the "Loading global config" task, which attains
+     * {@code SYSTEM_CONFIG_LOADED} — three milestones earlier. The node list this reconcile reads is
+     * therefore fully populated before the maintainer is scheduled at all, so bringing the first pass
+     * forward cannot make it read a deficit that is not real and clone against it. (Verified against
+     * jenkins-core 2.555.3 with {@code javap}; both facts are load-bearing, so re-check them rather than
+     * assume if this is ever revisited on a newer core.)
+     *
+     * <p>The delay is short rather than zero so that a restart's own churn — agents reconnecting, the
+     * reclaim of the previous spares — has settled before the deficit is counted. It costs a few seconds
+     * of a gap that was up to a minute.
+     */
+    @Override
+    public long getInitialDelay() {
+        return INITIAL_DELAY_MILLIS;
     }
 
     @Override
