@@ -254,6 +254,57 @@ class XcpngCloudTest {
     }
 
     /**
+     * A provisioned agent is {@code EXCLUSIVE}, so only builds whose label expression matches the
+     * template's labels are scheduled onto it. {@code NORMAL} — "use this node as much as possible" —
+     * would let any unlabeled build take a single-use VM, including a warm spare held for a label, and
+     * destroy it on the way out.
+     */
+    @Test
+    void aProvisionedAgentOnlyServesMatchingLabels(JenkinsRule r) throws Exception {
+        XcpngAgent agent = new XcpngAgent(
+                "xcpng-agent-1",
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 1, List.of()),
+                "vm/xcpng-agent-1/1",
+                new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048),
+                10,
+                new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-agent-1"),
+                false);
+
+        assertEquals(
+                hudson.model.Node.Mode.EXCLUSIVE,
+                agent.getMode(),
+                "NORMAL would make every unlabeled build eligible for a single-use VM");
+    }
+
+    /**
+     * An agent whose node {@code config.xml} was written before the mode changed carries
+     * {@code <mode>NORMAL</mode>}, and {@code Slave.mode} is a persisted field rather than a transient
+     * one, so XStream restores it and the constructor never runs. Without {@code readResolve} asserting
+     * the mode, such an agent comes back from a restart still able to take unlabeled builds: the very
+     * bug the mode exists to prevent, outliving the upgrade that fixed it.
+     */
+    @Test
+    void aLegacyAgentPersistedAsNormalReloadsAsExclusive(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngAgent>\n"
+                + "  <name>xcpng-legacy-mode-1</name>\n"
+                + "  <description>XCP-ng ephemeral agent</description>\n"
+                + "  <remoteFS>/home/debian/agent</remoteFS>\n"
+                + "  <numExecutors>1</numExecutors>\n"
+                + "  <mode>NORMAL</mode>\n"
+                + "  <label>xcpng-linux</label>\n"
+                + "  <cloudName>xcpng</cloudName>\n"
+                + "  <vmRef>vm/legacy/1</vmRef>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngAgent>\n";
+
+        XcpngAgent agent = (XcpngAgent) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+
+        assertEquals(
+                hudson.model.Node.Mode.EXCLUSIVE,
+                agent.getMode(),
+                "a persisted NORMAL must not survive a reload and keep taking unlabeled builds");
+    }
+
+    /**
      * {@code minInstances} is an optional warm-pool setter. A template persisted before it existed
      * reloads with the field at 0, which is exactly the "warm pool off" default, so no warm agents are
      * ever booted for a legacy config.
@@ -280,6 +331,21 @@ class XcpngCloudTest {
         assertEquals(0, t.getMinInstances(), "a negative warm-pool size must clamp to 0");
         t.setMinInstances(2);
         assertEquals(2, t.getMinInstances(), "a positive warm-pool size must be kept as-is");
+    }
+
+    /**
+     * Labels are what a build uses to reach these agents, and the only thing: the nodes are
+     * {@code EXCLUSIVE} and the cloud declines a null label, so a template with no labels provisions
+     * nothing. Reject it at the form rather than accept a config that looks complete and never runs.
+     */
+    @Test
+    void aTemplateWithoutLabelsIsRejected(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckLabelString(null).kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckLabelString("").kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckLabelString("   ").kind, "whitespace is not a label");
+        assertEquals(FormValidation.Kind.OK, d.doCheckLabelString("xcpng-linux").kind);
     }
 
     /**

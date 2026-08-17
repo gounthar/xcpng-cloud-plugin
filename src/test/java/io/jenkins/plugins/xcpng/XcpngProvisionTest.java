@@ -10,9 +10,12 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.ExtensionList;
 import hudson.model.Computer;
+import hudson.model.FreeStyleProject;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Queue;
 import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
@@ -21,6 +24,7 @@ import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.ArrayList;
+import java.util.Calendar;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +42,7 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import jenkins.model.Jenkins;
 import jenkins.model.JenkinsLocationConfiguration;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.plugins.cloudstats.CloudStatistics;
@@ -209,6 +214,83 @@ class XcpngProvisionTest {
                 "dropping the bad key must be logged at WARNING");
     }
 
+    /**
+     * A template configured before labels became load-bearing kept working by serving unlabeled builds.
+     * It now provisions nothing, and the form check only fires when someone opens the form — so an
+     * upgraded controller that quietly stopped cloning would leave the operator nothing to read. The
+     * warning is that something to read.
+     */
+    @Test
+    void readResolveWarnsAboutATemplateWithNoLabels(JenkinsRule r) {
+        Logger logger = Logger.getLogger(XcpngTemplate.class.getName());
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.addHandler(handler);
+        try {
+            String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                    + "  <templateName>jenkins-golden-debian</templateName>\n"
+                    + "  <labelString></labelString>\n"
+                    + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+            jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertTrue(
+                records.stream()
+                        .anyMatch(rec -> rec.getLevel() == Level.WARNING
+                                && String.valueOf(rec.getMessage()).contains("has no labels")),
+                "a template that can never provision must say so at load: " + records);
+    }
+
+    /**
+     * The other half of the pair: a template that does carry labels must load silently. Without this,
+     * the warning above could fire for every template and the test would still pass.
+     */
+    @Test
+    void readResolveIsSilentForATemplateWithLabels(JenkinsRule r) {
+        Logger logger = Logger.getLogger(XcpngTemplate.class.getName());
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.addHandler(handler);
+        try {
+            String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                    + "  <templateName>jenkins-golden-debian</templateName>\n"
+                    + "  <labelString>xcpng-linux</labelString>\n"
+                    + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+            jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertFalse(
+                records.stream()
+                        .anyMatch(rec -> String.valueOf(rec.getMessage()).contains("has no labels")),
+                "a labelled template must load without the warning: " + records);
+    }
+
     @Test
     void provisionSeedsTheOptionalSshKeyWhenTheTemplateHasOne(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
@@ -271,6 +353,38 @@ class XcpngProvisionTest {
 
         assertTrue(cloud.canProvision(new Cloud.CloudState(Label.get("xcpng-linux"), 0)));
         assertFalse(cloud.canProvision(new Cloud.CloudState(Label.get("windows"), 0)));
+    }
+
+    /**
+     * The provisioning half of {@link XcpngAgent#USAGE_MODE}. A null label is core asking on behalf of
+     * the unlabeled queue, and this cloud declines it: the agents it would clone are {@code EXCLUSIVE}
+     * and could never run the build that prompted the ask. Answering yes would not merely waste one
+     * clone — {@code UnlabeledLoadStatistics} counts only {@code NORMAL} nodes, so the demand would
+     * still read as unmet and the pool would keep churning against it up to the cap.
+     */
+    @Test
+    void anUnlabeledBuildCannotProvision(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+
+        assertFalse(
+                cloud.canProvision(new Cloud.CloudState(null, 0)),
+                "a build with no label expression must not pull a clone off the pool");
+    }
+
+    /**
+     * Separate from {@link #anUnlabeledBuildCannotProvision} on purpose. Both entry points read the same
+     * rule, so one mutation reverting it should take both down — and as two assertions in one test, the
+     * second would never be reached to prove it.
+     */
+    @Test
+    void anUnlabeledBuildPlansNoNodes(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+
+        assertTrue(
+                cloud.provision(new Cloud.CloudState(null, 0), 5).isEmpty(),
+                "provision must plan nothing for a null label even when it is called anyway");
     }
 
     @Test
@@ -746,6 +860,26 @@ class XcpngProvisionTest {
                 .count();
     }
 
+    private static long cloneCount(FakeHypervisorClient fake) {
+        return fake.calls().stream()
+                .filter(c -> c.startsWith("cloneFromTemplate:"))
+                .count();
+    }
+
+    /**
+     * An agent in the state a controller restart leaves behind: provisioned as a warm spare, then round-tripped
+     * through XStream so {@link XcpngAgent#readResolve} runs. That clears {@code warm} and raises
+     * {@code reloaded}, which is exactly what the restart does and is why such an agent is no longer counted as
+     * a spare by the reconcile while still counting against the cap.
+     */
+    private static XcpngAgent reloadedSpare(XcpngCloud cloud, String displayName) throws Exception {
+        XcpngAgent spare = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, displayName, activityId(displayName), true);
+        XcpngAgent reloaded = (XcpngAgent) Jenkins.XSTREAM2.fromXML(Jenkins.XSTREAM2.toXML(spare));
+        assertTrue(reloaded.isReloaded(), "the round trip must produce the post-restart state this test is about");
+        assertFalse(reloaded.isWarm(), "a reloaded agent is indistinguishable from a spent one, so it is not warm");
+        return reloaded;
+    }
+
     private static int warmNodeCount(JenkinsRule r) {
         int count = 0;
         for (Node node : r.jenkins.getNodes()) {
@@ -802,6 +936,45 @@ class XcpngProvisionTest {
             gate.countDown();
             exec.shutdownNow();
         }
+    }
+
+    /**
+     * The harm #76 names, on the node that suffers it worst: a spare held hot for {@code xcpng-linux}
+     * must not be taken by a build that asked for nothing, because taking it also destroys it and sends
+     * the labeled build the pool exists for back to a cold clone.
+     *
+     * <p>{@link Node#canTake} is the predicate the queue actually consults, and it is the honest
+     * assertion here. The fake never brings an agent online, so "the unlabeled job did not run on the
+     * spare" would pass just as happily against {@code Mode.NORMAL} — against a node no build could
+     * reach either way. The labeled case is asserted alongside it so that a blockage arising from
+     * something unrelated (a permission, a node not accepting tasks) cannot masquerade as a pass.
+     */
+    @Test
+    void anUnlabeledBuildCannotTakeAWarmSpare(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2, 1);
+        r.jenkins.clouds.add(cloud);
+        reconcileAndSettle(cloud);
+        assertEquals(1, warmNodeCount(r), "the spare must be up before anything can compete for it");
+
+        Node spare = r.jenkins.getNodes().stream()
+                .filter(n -> n instanceof XcpngAgent agent && agent.isWarm())
+                .findFirst()
+                .orElseThrow();
+
+        FreeStyleProject unlabeled = r.createFreeStyleProject("unlabeled");
+        FreeStyleProject labeled = r.createFreeStyleProject("labeled");
+        labeled.setAssignedLabel(Label.get("xcpng-linux"));
+
+        assertNotNull(
+                spare.canTake(buildableItem(unlabeled)),
+                "a build with no label expression must not be able to take a spare held for xcpng-linux");
+        assertNull(
+                spare.canTake(buildableItem(labeled)), "the build the spare exists for must still be able to take it");
+    }
+
+    /** A queue item in the state the scheduler evaluates candidate nodes against. */
+    private static Queue.BuildableItem buildableItem(FreeStyleProject project) {
+        return new Queue.BuildableItem(new Queue.WaitingItem(Calendar.getInstance(), project, List.of()));
     }
 
     // ---- Warm pool (slice D): draining a surplus ----
@@ -926,6 +1099,162 @@ class XcpngProvisionTest {
         // already destroying, which is what routing both through the strategy's guard exists to prevent.
         assertEquals(
                 1, destroyCount(fake), "a spare must be destroyed once, not once per reclaim route: " + fake.calls());
+    }
+
+    @Test
+    void anUnlabeledTemplateProvisionsNoWarmSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "", 2, 2048);
+        template.setMinInstances(2);
+        XcpngCloud cloud = warmCloudOver(fake, 4, template);
+        r.jenkins.clouds.add(cloud);
+
+        reconcileAndSettle(cloud);
+
+        // The on-demand path already refuses this template -- canProvision declines a null label and an
+        // EXCLUSIVE agent takes nothing else -- so a spare cloned here could never be taken by any build.
+        // Provisioning it anyway would burn a slot against maxInstances for the life of the configuration.
+        assertEquals(
+                0,
+                warmNodeCount(r),
+                "a template with no labels must not keep warm spares, since nothing can ever take them");
+        assertTrue(
+                fake.calls().stream().noneMatch(c -> c.startsWith("cloneFromTemplate:")),
+                "no clone should have been attempted at all: " + fake.calls());
+    }
+
+    /**
+     * The first reconcile after a restart must not wait a random fraction of a minute, because a restart
+     * has just reclaimed every warm spare and nothing replaces them until this work first runs.
+     *
+     * <p>The determinism assertion is the one that does the work, and it is not decoration. Core's
+     * {@code PeriodicWork.getInitialDelay()} returns {@code Math.abs(RANDOM.nextLong()) % period}, so a
+     * bounds-only check ("well under a period") passes against the unoverridden default a quarter of the
+     * time — a fixture agreeable enough to certify the bug. Asserting instead that repeated calls agree
+     * discriminates against a random draw outright.
+     */
+    @Test
+    void theFirstReconcileDoesNotWaitARandomFractionOfAPeriod(JenkinsRule r) {
+        XcpngWarmPoolMaintainer maintainer = ExtensionList.lookupSingleton(XcpngWarmPoolMaintainer.class);
+
+        long delay = maintainer.getInitialDelay();
+        assertTrue(delay > 0, "the delay is short rather than zero, so a restart's churn can settle: " + delay);
+        assertTrue(
+                delay * 4 <= maintainer.getRecurrencePeriod(),
+                "the first pass should run well inside the first period, not at a random point in it: " + delay);
+        for (int i = 0; i < 100; i++) {
+            assertEquals(delay, maintainer.getInitialDelay(), "the initial delay must not be a random draw");
+        }
+    }
+
+    /**
+     * With a free slot under the cap, the replacement for a spare a restart reclaimed is cloned while that
+     * agent is still registered. The two overlap already, because the reconcile counts a reloaded agent
+     * against {@code maxInstances} but not against the warm target: it is active capacity and not a spare, so
+     * the deficit is full and the launch goes out without waiting for the teardown.
+     *
+     * <p>This is pinned as a test rather than left as a reading of the arithmetic because #116 proposed the
+     * overlap as work still to do. It is not, for the case that issue measured.
+     */
+    @Test
+    void aRestartsReplacementIsClonedWhileTheReclaimedAgentIsStillRegistered(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 2, 1);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent reclaimed = reloadedSpare(cloud, "xcpng-spare-1");
+        r.jenkins.addNode(reclaimed);
+        long clonesBefore = cloneCount(fake);
+
+        reconcileAndSettle(cloud);
+
+        assertEquals(
+                clonesBefore + 1,
+                cloneCount(fake),
+                "the replacement must be cloned in this tick, not after the old agent's teardown: " + fake.calls());
+        assertTrue(
+                r.jenkins.getNodes().contains(reclaimed),
+                "the reclaimed agent is still registered while its replacement clones, which is the overlap");
+    }
+
+    /**
+     * A cloud whose cap leaves no free slot cannot overlap, and does not pretend to: the reloaded agent holds
+     * the only slot, so the reconcile clones nothing until that teardown returns the capacity. Overlapping
+     * here would mean running {@code maxInstances + 1} VMs, which is the doubling #113 removed.
+     *
+     * <p>So the gap this case still has cannot be closed by cloning earlier. It can only be closed by
+     * reconciling sooner after the slot frees, which is a different change from the one #116 proposed.
+     */
+    @Test
+    void aCloudAtItsCapClonesNoReplacementUntilTheReclaimedAgentIsGone(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 1, 1);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent reclaimed = reloadedSpare(cloud, "xcpng-spare-1");
+        r.jenkins.addNode(reclaimed);
+        long clonesBefore = cloneCount(fake);
+
+        reconcileAndSettle(cloud);
+
+        assertEquals(
+                clonesBefore,
+                cloneCount(fake),
+                "a cloud at its cap must not clone a replacement over the top of the agent still holding the slot: "
+                        + fake.calls());
+
+        // Once the slot is actually free, the very next reconcile fills it. Nothing else changes.
+        r.jenkins.removeNode(reclaimed);
+        reconcileAndSettle(cloud);
+
+        assertEquals(
+                clonesBefore + 1,
+                cloneCount(fake),
+                "the freed slot must be refilled by the next reconcile: " + fake.calls());
+    }
+
+    /**
+     * The scheduled entry point fills the pool. Every other warm-pool test calls {@code reconcileWarmPool}
+     * directly, which leaves the one method the Jenkins timer actually invokes uncovered — so a maintainer
+     * that iterated the wrong clouds, or swallowed the reconcile entirely, would pass all of them.
+     */
+    @Test
+    void aMaintainerTickFillsTheWarmPool(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2);
+        r.jenkins.clouds.add(cloud);
+
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(launches);
+        ExtensionList.lookupSingleton(XcpngWarmPoolMaintainer.class).execute(TaskListener.NULL);
+        launches.shutdown();
+        assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool launches should finish");
+
+        assertEquals(2, warmNodeCount(r), "a maintainer tick should fill the pool to minInstances");
+    }
+
+    @Test
+    void clearingATemplatesLabelsDrainsItsWarmSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud labelled = warmCloudOver(fake, 4, warmTemplate("jenkins-golden-debian", 1));
+        r.jenkins.clouds.add(labelled);
+        reconcileAndSettle(labelled);
+        assertEquals(1, warmNodeCount(r), "the labelled template should have kept one spare");
+
+        // Reconfiguring a cloud in the UI or via JCasC replaces the Cloud object rather than mutating it,
+        // so an administrator clearing the label field is modelled by a fresh cloud of the same name whose
+        // template carries no labels. The spare already on the node list is matched by cloud name and by
+        // the template name on its activity id, both of which are unchanged.
+        XcpngTemplate unlabeled = new XcpngTemplate("jenkins-golden-debian", "", 2, 2048);
+        unlabeled.setMinInstances(1);
+        XcpngCloud cleared = warmCloudOver(fake, 4, unlabeled);
+        r.jenkins.clouds.remove(labelled);
+        r.jenkins.clouds.add(cleared);
+
+        reconcileAndSettle(cleared);
+
+        // minInstances still reads 1, so measuring surplus against it would leave this spare in place
+        // forever. It is measured against the same zero the fill half uses, which makes it all surplus.
+        assertEquals(0, warmNodeCount(r), "a spare whose template lost its labels must be drained, not held at target");
+        assertEquals(1, destroyCount(fake), "the drained spare's VM should have been destroyed: " + fake.calls());
     }
 
     @Test

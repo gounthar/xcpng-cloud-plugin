@@ -75,6 +75,24 @@ variable "debian_version" {
   default = "13.4.0"
 }
 
+// Where the installer fetches the preseed from. Empty means "use Packer's own HTTP server", which is
+// right whenever the machine running Packer is reachable from the pool on the LAN.
+//
+// It is not reachable when Packer runs behind NAT, which includes WSL2 in its default mode. Packer
+// still starts its server and still advertises an address, so nothing looks wrong: the installer
+// boots, tries to fetch, cannot, and stalls on a screen that says nothing. The build then sits until
+// ssh_wait_timeout with a log that only ever says "Wait for VM's IP to become known to us".
+//
+// Measured on this lab from dom0: Packer advertised 192.168.1.145:8000 while its server was bound
+// inside WSL at 172.18.157.37:8000, and neither address answered from the pool.
+//
+// Set this to a URL the pool can reach and serve image/http/preseed.cfg there yourself.
+variable "preseed_url" {
+  type        = string
+  description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server (needs LAN reachability)."
+  default     = ""
+}
+
 source "xenserver-iso" "jenkins-agent" {
   iso_url = "https://cdimage.debian.org/cdimage/archive/${var.debian_version}/amd64/iso-cd/debian-${var.debian_version}-amd64-netinst.iso"
   // From that directory's SHA256SUMS. Never hand-written.
@@ -97,16 +115,33 @@ source "xenserver-iso" "jenkins-agent" {
   vcpus_atstartup = 2
   disk_size       = 10240
 
-  // UNVERIFIED. Debian netinst is driven by preseed, not by cloud-init autoinstall, so this types
-  // kernel arguments at the isolinux prompt over VNC. The upstream Ubuntu example uses floppy_files
-  // with cloud-init, which does not apply here.
+  // Debian netinst is driven by preseed, not by cloud-init autoinstall, so this types kernel
+  // arguments at the isolinux boot prompt over VNC. The upstream Ubuntu example uses floppy_files
+  // with cloud-init, which does not apply here. The VM is legacy BIOS (no firmware/device-model
+  // override below), so the ISO boots isolinux and ESC at its menu drops to a `boot:` prompt.
+  //
+  // Two things were wrong here before, and together they meant no kernel argument ever reached the
+  // installer. Confirmed by screenshotting the VNC console rather than inferring from the fact that
+  // the build hung.
+  //
+  // First, boot_wait was 5s, which is shorter than this host takes to get the isolinux menu up. The
+  // keystrokes landed in the menu instead of at a prompt and were read as menu shortcuts, which
+  // selected the accessible/speech-synthesis entry. It probed for a sound card for 20s, found none,
+  // and sat on "Press enter to continue anyway" until the 60m SSH timeout. The VM burned 19s of CPU
+  // in 48 minutes and never touched the network, so from outside it looked like a slow install.
+  //
+  // Second, the parameters were typed with no kernel label in front of them. At a `boot:` prompt the
+  // first word is the label to boot, so `auto=true` was being offered as a label rather than as a
+  // parameter. `auto` is a real Debian label and already implies auto=true and priority=critical,
+  // so naming it is both correct and shorter.
   http_directory = "image/http"
-  boot_wait      = "5s"
+  // Generous on purpose: too long only costs seconds, too short costs a 60-minute timeout and a
+  // hang that does not look like a boot problem.
+  boot_wait = "20s"
   boot_command = [
     "<esc><wait>",
-    "auto=true ",
-    "priority=critical ",
-    "url=http://{{ .HTTPIP }}:{{ .HTTPPort }}/preseed.cfg ",
+    "auto ",
+    "url=${var.preseed_url != "" ? var.preseed_url : "http://{{ .HTTPIP }}:{{ .HTTPPort }}/preseed.cfg"} ",
     "<enter>"
   ]
 

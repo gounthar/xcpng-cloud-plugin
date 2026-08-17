@@ -46,6 +46,12 @@ for the deliberate scope cuts.
 
 Single-use is intentional: every build gets a clean machine, and nothing survives between builds.
 
+Agents serve only builds whose label expression matches their template's labels. A build with no label
+expression is never routed here, and never causes a clone: these VMs are single-use, so an unlabeled
+job landing on one would consume and destroy it, and a warm spare taken that way sends the labeled
+build it was held for back to a cold clone. That is also why a template must carry at least one label
+— a template with none could never be reached at all.
+
 Each agent therefore runs exactly one executor, and this is not configurable. A second executor would
 put two builds on one VM, and the reap fires when a build completes, so the first to finish would
 destroy the VM under the other. Scale throughput with `maxInstances` (more clones), not with executors
@@ -58,10 +64,23 @@ build lands on a live executor instead of waiting for a cold clone. A background
 roughly once a minute, so a spare appears up to a minute after you save the configuration, and after a
 spare is consumed by a build its replacement is cloned within about a minute. Warm agents are still
 single-use and count against `maxInstances`. A spare that boots but never connects is still reclaimed by
-the idle timeout. The "warm" marker is intentionally not persisted, so after a controller restart every
-existing spare loses its exemption, is reaped by the idle net, and is re-cloned by the maintainer; this
-churn is deliberate, since it guarantees a VM that has already run a build can never be revived as a
-spare.
+the idle timeout.
+
+The "warm" marker is intentionally not persisted, so a controller restart costs every existing spare its
+exemption. That churn is deliberate: it guarantees a VM that has already run a build can never be revived
+as a spare. It does not happen all at once, though, and the order is worth knowing before you size a
+pool. The old spare reconnects as an ordinary agent, the maintainer sees no warm spares and clones a
+replacement within about a minute, and only then does the idle net reclaim the old one, after
+`idleMinutes` has elapsed. Both run at the same time in between.
+
+**So a restart can temporarily hold twice the VMs a template is configured for, for up to the length of
+the idle timeout.** Two things bound that. The replacement is only cloned if `maxInstances` has room for
+it, so a cloud already at its cap simply waits instead of doubling. And the old spare is an ordinary
+single-use agent, so a build landing on it destroys it and frees the slot early; the full idle timeout is
+the worst case, not the normal one. While the window is open a cloud sitting at `maxInstances` provisions
+nothing new, though builds still run, since both agents are idle and carry the template's labels.
+Measured on the lab pool with `maxInstances` 2 and `idleMinutes` 10: replacement cloned 65 s after the
+restart, old spare destroyed 10 min 45 s after it reconnected.
 
 ## Requirements
 
@@ -82,8 +101,9 @@ spare.
 2. Set the **Pool URL** (for example `https://192.168.1.87`) and select the XAPI **Credentials**.
 3. Tick **Trust self-signed certificate** only if the pool presents a self-signed certificate. See
    [Security notes](#security-notes) before enabling it.
-4. Add one or more **Templates**. Each template names a golden image, a label expression, and the
-   shape of the agents cloned from it.
+4. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
+   the shape of the agents cloned from it. At least one label is required, and labels are how builds
+   reach these agents: give the jobs you want on XCP-ng a matching label expression.
 5. Use **Test connection** to confirm the controller can authenticate against the pool.
 
 ### Through Configuration as Code
@@ -126,7 +146,7 @@ Cloud fields:
 | Credentials | `credentialsId` | ID of the username/password credential used for XAPI login. |
 | Trust self-signed certificate | `trustSelfSigned` | Skip TLS verification against the pool. Off by default. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
-| Idle minutes | `idleMinutes` | Minutes an agent may sit idle before it is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this is only the safety net for a clone that connects but never receives work. A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
+| Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
 | Templates | `templates` | One or more agent templates (see below). |
 
 Template fields:
@@ -134,7 +154,7 @@ Template fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Template name | `templateName` | Name of the golden-image VM or template on the pool to clone. |
-| Labels | `labelString` | Label expression a build must request to be matched to this template. |
+| Labels | `labelString` | Space-separated labels the agents cloned from this template will carry. A build is matched to this template when its label expression is satisfied by them. Required: agents are exclusive to their labels, so a template without any is unreachable. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
 | Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |
 | Warm pool size | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. See [Warm pool](#warm-pool). |
@@ -200,6 +220,20 @@ is up.
   mismatch: the agent JRE must match the controller's Java major version (Java 21 here). A mismatch
   throws `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
   offline cause in the UI.
+- **If the clone has no address at all, none of the above is reachable** and there is nothing to read
+  with `journalctl`, because you cannot log in. Check `networks` on the VM record
+  (`xe vm-param-get uuid=<vm> param-name=networks`, or the guest metrics in Xen Orchestra). An empty
+  `networks={}` while the guest tools report `PV_drivers_detected: True` and `live: True` means the
+  guest booted, the tools are running over xenstore, and the interface never came up. Confirm from
+  dom0 with `tcpdump -i vifN.0 -e 'ether src <clone MAC>'`: no packets at all, not even a DHCP
+  `DISCOVER`, points at the image rather than at the network. The usual cause is a network config in
+  the image pinned to a MAC, which `VM.clone` regenerates; see
+  [`docs/golden-image.md`](docs/golden-image.md).
+
+**A build never starts and agents are provisioned in a loop.** Check that `idleMinutes` comfortably
+exceeds the time a clone takes to boot and connect. An agent that has never come online holds no idle
+exemption, so a short timeout reclaims it mid-boot, the queue asks for another, and the cycle repeats
+with nothing ever connecting. The default of 10 is fine; a value like 1 is not.
 
 ## Known limitations
 
