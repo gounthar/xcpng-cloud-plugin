@@ -46,7 +46,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -169,11 +168,21 @@ public class XcpngCloud extends Cloud {
     private transient ExecutorService provisionExecutor;
 
     /**
-     * Whether a triggered reconcile is already queued. Set by {@link #requestReconcile} and cleared by the
-     * queued pass itself; see that method for why it is cleared before the pass runs rather than after.
-     * Transient; the field initializer covers a fresh instance and {@link #readResolve} a deserialized one.
+     * Guards the triggered-reconcile scheduling state below. A dedicated monitor rather than the cloud's own:
+     * a pass holds the cloud monitor for its whole duration, so scheduling decisions taken on it would
+     * serialize behind the very pass they are about. Never held while calling {@link #reconcileWarmPool}, so
+     * it cannot participate in a lock cycle. Transient; {@link #readResolve} recreates it.
      */
-    private transient AtomicBoolean reconcileQueued = new AtomicBoolean();
+    private transient Object reconcileLock = new Object();
+
+    /**
+     * Whether a triggered pass is in flight, and whether one more was asked for while it ran. Together they
+     * bound the work a burst of teardowns can create at one running pass plus at most one follow-up, however
+     * many triggers arrive. Guarded by {@link #reconcileLock}; transient, so a reloaded cloud starts idle.
+     */
+    private transient boolean reconcilePassRunning;
+
+    private transient boolean reconcileRerunRequested;
 
     /**
      * Executor for triggered warm-pool reconciles. Null in production, where {@link #reconcileExecutor()}
@@ -252,8 +261,8 @@ public class XcpngCloud extends Cloud {
         if (warmInFlightByTemplate == null) {
             warmInFlightByTemplate = new ConcurrentHashMap<>();
         }
-        if (reconcileQueued == null) {
-            reconcileQueued = new AtomicBoolean();
+        if (reconcileLock == null) {
+            reconcileLock = new Object();
         }
         // A config predating the leaked-VM set deserializes it to null (XStream skips the initializer). Any
         // refs an older controller persisted are gone, but a live sweep must still have a set to work with.
@@ -594,9 +603,16 @@ public class XcpngCloud extends Cloud {
      *
      * <p>Debounced rather than fired per removal. A drain of several surplus spares, or a mass teardown, would
      * otherwise raise one reconcile each and every one of them would queue on this cloud's monitor behind the
-     * first. The flag is cleared before the pass runs rather than after, deliberately: a trigger arriving while
-     * a pass is under way then queues one more, because that trigger's freed slot may not have been visible to
-     * the pass already running. At most one extra pass is ever in flight.
+     * first, each holding a thread of whatever pool runs them. Instead a trigger arriving while a pass is in
+     * flight only sets {@link #reconcileRerunRequested}, and the running task loops once more when it finishes:
+     * that trigger's freed slot may not have been visible to the pass already under way, so one follow-up is
+     * owed, but only one however many triggers arrive.
+     *
+     * <p>The follow-up runs in the same task rather than as a fresh submission, which is what bounds the pool
+     * usage at one thread. An earlier version cleared a single flag as the task's first statement and then
+     * blocked on the cloud monitor; because {@code Computer.threadPoolForRemoting} is multi-threaded, every
+     * later trigger passed the guard and took another worker with it. See
+     * {@code triggersDuringARunningPassDoNotEachQueueTheirOwn}.
      *
      * <p>This method never takes the cloud monitor itself — it flags and submits, nothing more — and that is
      * what makes it safe to call from the reap path. {@link #reconcileWarmPool} holds this monitor while
@@ -611,25 +627,49 @@ public class XcpngCloud extends Cloud {
         if (!hasWarmPool()) {
             return;
         }
-        if (!reconcileQueued.compareAndSet(false, true)) {
-            return;
+        synchronized (reconcileLock) {
+            if (reconcilePassRunning) {
+                // A pass is already in flight. Owe it one more run and take no thread of our own.
+                reconcileRerunRequested = true;
+                return;
+            }
+            reconcilePassRunning = true;
         }
         try {
-            reconcileExecutor().submit(() -> {
-                reconcileQueued.set(false);
-                try {
-                    reconcileWarmPool();
-                } catch (RuntimeException e) {
-                    // Mirrors XcpngWarmPoolMaintainer: a failed reconcile is logged rather than left to the
-                    // pool's uncaught handler, and the next tick tries again.
-                    LOGGER.log(Level.WARNING, e, () -> "Triggered warm-pool reconcile failed for cloud " + name);
-                }
-            });
+            reconcileExecutor().submit(this::runReconcilePasses);
         } catch (RejectedExecutionException e) {
-            // The pool refuses only while shutting down. Clear the flag rather than leaving it raised, so a
-            // later trigger is not swallowed by a queued pass that will never run.
-            reconcileQueued.set(false);
+            // The pool refuses only while shutting down. Put the state back rather than leaving it claimed,
+            // so a later trigger is not swallowed by a pass that will never run.
+            synchronized (reconcileLock) {
+                reconcilePassRunning = false;
+                reconcileRerunRequested = false;
+            }
             LOGGER.log(Level.FINE, e, () -> "Could not schedule a triggered warm-pool reconcile for cloud " + name);
+        }
+    }
+
+    /**
+     * Run reconcile passes until nothing more is owed. Called only from the task {@link #requestReconcile}
+     * submits, and only ever by one thread at a time, because that submission is the sole transition into
+     * {@link #reconcilePassRunning}.
+     */
+    private void runReconcilePasses() {
+        while (true) {
+            try {
+                reconcileWarmPool();
+            } catch (RuntimeException e) {
+                // Mirrors XcpngWarmPoolMaintainer: a failed reconcile is logged rather than left to the
+                // pool's uncaught handler, and the next tick tries again. A failure must not strand
+                // reconcilePassRunning either, or no trigger would ever be honoured again.
+                LOGGER.log(Level.WARNING, e, () -> "Triggered warm-pool reconcile failed for cloud " + name);
+            }
+            synchronized (reconcileLock) {
+                if (!reconcileRerunRequested) {
+                    reconcilePassRunning = false;
+                    return;
+                }
+                reconcileRerunRequested = false;
+            }
         }
     }
 

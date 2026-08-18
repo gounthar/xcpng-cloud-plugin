@@ -1379,6 +1379,52 @@ class XcpngProvisionTest {
     }
 
     /**
+     * Triggers arriving while a pass is already running must not each queue their own pass.
+     *
+     * <p>{@link #aBurstOfFreedSlotsCollapsesIntoOneQueuedReconcile} does not cover this and cannot:
+     * its single worker is occupied, so the queued task never starts, never reaches the point where
+     * it releases the debounce, and the flag looks airtight. {@code Computer.threadPoolForRemoting}
+     * is multi-threaded, so in production the queued task does start, releases the debounce, and
+     * only then blocks on the cloud monitor. Every later trigger then passes the guard and takes
+     * another remoting worker with it.
+     *
+     * <p>Holding the cloud monitor in the test thread is what makes that window wide enough to
+     * observe: a pass cannot finish while the test holds it, so anything the guard lets through is
+     * visible as a second submission.
+     */
+    @Test
+    void triggersDuringARunningPassDoNotEachQueueTheirOwn(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3, 2);
+        r.jenkins.clouds.add(cloud);
+        AtomicInteger submitted = new AtomicInteger();
+        ExecutorService reconciles =
+                new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>()) {
+                    @Override
+                    public void execute(Runnable command) {
+                        submitted.incrementAndGet();
+                        super.execute(command);
+                    }
+                };
+        cloud.setReconcileExecutor(reconciles);
+        try {
+            synchronized (cloud) {
+                // Every trigger from here on finds a pass in flight and blocked, which is the state
+                // a mass teardown produces against a real remoting pool.
+                for (int i = 0; i < 10; i++) {
+                    cloud.requestReconcile();
+                    Thread.sleep(20);
+                }
+                assertEquals(
+                        1,
+                        submitted.get(),
+                        "a pass already in flight must absorb later triggers, not let each queue its own");
+            }
+        } finally {
+            reconciles.shutdownNow();
+        }
+    }
+
+    /**
      * A cloud holding no warm pool clones nothing when one of its agents is reclaimed.
      *
      * <p>Plainly what this is: a regression guard, and not evidence the trigger works. The deficit is zero
