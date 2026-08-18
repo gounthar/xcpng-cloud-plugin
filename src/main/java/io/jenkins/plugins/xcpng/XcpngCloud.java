@@ -168,6 +168,31 @@ public class XcpngCloud extends Cloud {
     private transient ExecutorService provisionExecutor;
 
     /**
+     * Guards the triggered-reconcile scheduling state below. A dedicated monitor rather than the cloud's own:
+     * a pass holds the cloud monitor for its whole duration, so scheduling decisions taken on it would
+     * serialize behind the very pass they are about. Never held while calling {@link #reconcileWarmPool}, so
+     * it cannot participate in a lock cycle. Transient; {@link #readResolve} recreates it.
+     */
+    private transient Object reconcileLock = new Object();
+
+    /**
+     * Whether a triggered pass is in flight, and whether one more was asked for while it ran. Together they
+     * bound the work a burst of teardowns can create at one running pass plus at most one follow-up, however
+     * many triggers arrive. Guarded by {@link #reconcileLock}; transient, so a reloaded cloud starts idle.
+     */
+    private transient boolean reconcilePassRunning;
+
+    private transient boolean reconcileRerunRequested;
+
+    /**
+     * Executor for triggered warm-pool reconciles. Null in production, where {@link #reconcileExecutor()}
+     * falls back to {@code Computer.threadPoolForRemoting}: a reconcile is bookkeeping plus non-blocking
+     * clone submits, so it does not warrant the provisioning pool's long-wait threads. A test injects a
+     * controllable one. Transient: behaviour, never persisted.
+     */
+    private transient ExecutorService reconcileExecutor;
+
+    /**
      * Executor for warm-pool drains. Null in production, where {@link #reapExecutor()} falls back to
      * {@code Computer.threadPoolForRemoting} (the same pool {@link XcpngRetentionStrategy} reaps on: a
      * teardown is a short blocking call, unlike a provision's minutes-long online wait, so it does not
@@ -235,6 +260,9 @@ public class XcpngCloud extends Cloud {
         }
         if (warmInFlightByTemplate == null) {
             warmInFlightByTemplate = new ConcurrentHashMap<>();
+        }
+        if (reconcileLock == null) {
+            reconcileLock = new Object();
         }
         // A config predating the leaked-VM set deserializes it to null (XStream skips the initializer). Any
         // refs an older controller persisted are gone, but a live sweep must still have a set to work with.
@@ -562,6 +590,100 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
+     * Ask for a warm-pool reconcile now, because a slot this cloud owns has just been freed. Called from the
+     * teardown path in {@link XcpngRetentionStrategy#reap}, which is the moment the capacity a spare's
+     * replacement needs actually comes back.
+     *
+     * <p>Without it the replacement waits for {@link XcpngWarmPoolMaintainer}'s next tick, and how long that
+     * is depends on nothing but where the teardown happened to fall in a one-minute period. Measured against
+     * the lab pool on the build-completion path with {@code maxInstances == minInstances}: 13.9s, 46.0s and
+     * 46.6s, on top of about 32s of guest boot. A cloud with headroom escapes this only when a build outlasts
+     * the recurrence period, so that a mid-build tick clones the replacement while the old agent still runs;
+     * with builds shorter than the period the same wait comes back.
+     *
+     * <p>Debounced rather than fired per removal. A drain of several surplus spares, or a mass teardown, would
+     * otherwise raise one reconcile each and every one of them would queue on this cloud's monitor behind the
+     * first, each holding a thread of whatever pool runs them. Instead a trigger arriving while a pass is in
+     * flight only sets {@link #reconcileRerunRequested}, and the running task loops once more when it finishes:
+     * that trigger's freed slot may not have been visible to the pass already under way, so one follow-up is
+     * owed, but only one however many triggers arrive.
+     *
+     * <p>The follow-up runs in the same task rather than as a fresh submission, which is what bounds the pool
+     * usage at one thread. An earlier version cleared a single flag as the task's first statement and then
+     * blocked on the cloud monitor; because {@code Computer.threadPoolForRemoting} is multi-threaded, every
+     * later trigger passed the guard and took another worker with it. See
+     * {@code triggersDuringARunningPassDoNotEachQueueTheirOwn}.
+     *
+     * <p>This method never takes the cloud monitor itself — it flags and submits, nothing more — and that is
+     * what makes it safe to call from the reap path. {@link #reconcileWarmPool} holds this monitor while
+     * {@link #drainSpare} calls into {@link XcpngRetentionStrategy}'s, so the lock order in this plugin is
+     * cloud then agent strategy; a trigger that reconciled inline from a thread holding a strategy monitor
+     * would take the two the other way round, and a concurrent drain makes that reachable rather than
+     * theoretical. Running the pass on an executor also keeps a teardown from waiting on a provisioning round.
+     */
+    void requestReconcile() {
+        // A cloud holding no warm pool has no deficit a freed slot could fill, so there is nothing to do and
+        // no reason to take the monitor.
+        if (!hasWarmPool()) {
+            return;
+        }
+        synchronized (reconcileLock) {
+            if (reconcilePassRunning) {
+                // A pass is already in flight. Owe it one more run and take no thread of our own.
+                reconcileRerunRequested = true;
+                return;
+            }
+            reconcilePassRunning = true;
+        }
+        try {
+            reconcileExecutor().submit(this::runReconcilePasses);
+        } catch (RejectedExecutionException e) {
+            // The pool refuses only while shutting down. Put the state back rather than leaving it claimed,
+            // so a later trigger is not swallowed by a pass that will never run.
+            synchronized (reconcileLock) {
+                reconcilePassRunning = false;
+                reconcileRerunRequested = false;
+            }
+            LOGGER.log(Level.FINE, e, () -> "Could not schedule a triggered warm-pool reconcile for cloud " + name);
+        }
+    }
+
+    /**
+     * Run reconcile passes until nothing more is owed. Called only from the task {@link #requestReconcile}
+     * submits, and only ever by one thread at a time, because that submission is the sole transition into
+     * {@link #reconcilePassRunning}.
+     */
+    private void runReconcilePasses() {
+        while (true) {
+            try {
+                reconcileWarmPool();
+            } catch (RuntimeException e) {
+                // Mirrors XcpngWarmPoolMaintainer: a failed reconcile is logged rather than left to the
+                // pool's uncaught handler, and the next tick tries again. A failure must not strand
+                // reconcilePassRunning either, or no trigger would ever be honoured again.
+                LOGGER.log(Level.WARNING, e, () -> "Triggered warm-pool reconcile failed for cloud " + name);
+            }
+            synchronized (reconcileLock) {
+                if (!reconcileRerunRequested) {
+                    reconcilePassRunning = false;
+                    return;
+                }
+                reconcileRerunRequested = false;
+            }
+        }
+    }
+
+    /** Whether any template on this cloud wants warm spares at all. */
+    private boolean hasWarmPool() {
+        for (XcpngTemplate template : templates) {
+            if (warmTarget(template) > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * How many warm spares this template should be holding. The configured {@code minInstances}, floored at
      * zero, except that a template with no labels is worth none.
      *
@@ -723,6 +845,21 @@ public class XcpngCloud extends Cloud {
     /** Test seam: run warm-pool drains on a controllable executor. */
     void setReapExecutor(ExecutorService reapExecutor) {
         this.reapExecutor = reapExecutor;
+    }
+
+    /**
+     * Executor that runs triggered warm-pool reconciles. Production shares {@code Computer.threadPoolForRemoting}
+     * with the drains; a test injects one via {@link #setReconcileExecutor} so a trigger's pass has run by the
+     * time it asserts.
+     */
+    @NonNull
+    private ExecutorService reconcileExecutor() {
+        return reconcileExecutor != null ? reconcileExecutor : Computer.threadPoolForRemoting;
+    }
+
+    /** Test seam: run triggered warm-pool reconciles on a controllable executor. */
+    void setReconcileExecutor(ExecutorService reconcileExecutor) {
+        this.reconcileExecutor = reconcileExecutor;
     }
 
     /** Test seam: reservations taken but not yet settled, for asserting the cap accounting. */
