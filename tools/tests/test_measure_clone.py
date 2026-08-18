@@ -11,18 +11,32 @@ from xapi import XapiError
 
 
 class CycleXapi:
-    """Enough XAPI for one_cycle. Set boot_fails or teardown_fails to steer it."""
+    """Enough XAPI for one_cycle. Set boot_fails or teardown_fails to steer it.
+
+    Deliberately answers no synchronous VM.start: call() refuses any method it was not
+    given, so a regression to the blocking form fails loudly instead of being humoured.
+    await_task refuses the start task for the same reason -- a void verb settles with no
+    reference, so routing one through the strict helper is a bug the fake must not absorb.
+    """
 
     def __init__(self, boot_fails=False, teardown_fails=False):
         self.boot_fails = boot_fails
         self.teardown_fails = teardown_fails
         self.destroyed = False
+        self.methods = []
 
     def sr_free_bytes(self, sr):
         return 10 * 2**30
 
     def await_task(self, task):
+        self.methods.append(f"await_task:{task}")
+        assert task != "OpaqueRef:start-task", "a void verb must go through await_void_task"
         return "OpaqueRef:vm"
+
+    def await_void_task(self, task, timeout=None):
+        self.methods.append(f"await_void_task:{task}")
+        if self.boot_fails:
+            raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
 
     def destroy_with_disks(self, vm):
         self.destroyed = True
@@ -31,12 +45,11 @@ class CycleXapi:
         return ["vdi-1"]
 
     def call(self, method, *params):
+        self.methods.append(method)
         if method in ("Async.VM.clone", "Async.VM.copy"):
             return "OpaqueRef:task"
-        if method == "VM.start":
-            if self.boot_fails:
-                raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
-            return None
+        if method == "Async.VM.start":
+            return "OpaqueRef:start-task"
         if method == "VM.get_power_state":
             return "Running"
         if method == "VM.get_guest_metrics":
@@ -59,6 +72,20 @@ def test_clone_mode_is_labelled_from_the_sr_type(cow, full_copy, expected):
     """On an LVM SR, VM.clone full-copies. Labelling its timings CoW corrupts the verdict."""
     result = measure_clone.one_cycle(CycleXapi(), "src", "sr", 1, full_copy=full_copy, cow=cow)
     assert result["mode"] == expected
+
+
+def test_the_probe_is_started_through_the_async_task_path():
+    """#79: a synchronous VM.start blocks server-side until the VM is up, so a start
+    crossing the client's 30s read timeout surfaced as TRANSPORT_ERROR while the VM kept
+    booting. The cycle's timings were discarded and the finally tore the probe down
+    mid-boot, so a slow-but-working host read as a failed cycle -- and, when every cycle
+    tripped, as a failed kill criterion produced by the instrument rather than the pool.
+    """
+    x = CycleXapi()
+    measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True)
+
+    assert "Async.VM.start" in x.methods, "the probe was not started asynchronously"
+    assert "await_void_task:OpaqueRef:start-task" in x.methods, "the start task went unawaited"
 
 
 def test_probe_vm_is_destroyed_when_boot_fails():
