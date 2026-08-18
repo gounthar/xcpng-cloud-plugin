@@ -142,9 +142,10 @@ class TaskCalls:
 @pytest.mark.parametrize(
     "result, why",
     [
-        ("", "the shape the pool returned for a successful Async.VM.start"),
-        (None, "get_result may answer null rather than an empty string"),
-        ("<value/>", "an empty XML value carries no reference either"),
+        ("<value></value>", "measured on the pool: what a settled void task really holds"),
+        ("", "an empty body, should a backend answer that instead"),
+        (None, "get_result may answer null rather than a string"),
+        ("<value/>", "the self-closing spelling of the same empty value"),
     ],
 )
 def test_a_void_task_settles_without_raising(client, result, why):
