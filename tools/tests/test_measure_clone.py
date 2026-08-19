@@ -19,10 +19,14 @@ class CycleXapi:
     reference, so routing one through the strict helper is a bug the fake must not absorb.
     """
 
-    def __init__(self, boot_fails=False, teardown_fails=False, clear_fails=False):
+    def __init__(self, boot_fails=False, teardown_fails=False, clear_fails=False,
+                 vdi_survives=False):
         self.boot_fails = boot_fails
         self.teardown_fails = teardown_fails
         self.clear_fails = clear_fails
+        # A teardown that reports success while the disk quietly outlives it is the leak
+        # class the per-ref check exists for; a count-based check on a shared SR misses it.
+        self.vdi_survives = vdi_survives
         self.destroyed = False
         self.methods = []
 
@@ -39,11 +43,15 @@ class CycleXapi:
         if self.boot_fails:
             raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
 
+    def disk_vdis(self, vm):
+        self.methods.append("disk_vdis")
+        return ["OpaqueRef:vdi-leaf"]
+
     def destroy_with_disks(self, vm):
         self.destroyed = True
         if self.teardown_fails:
             raise XapiError("VM_DESTROY_FAILED", vm)
-        return ["vdi-1"]
+        return ["OpaqueRef:vdi-leaf"]
 
     def call(self, method, *params):
         self.methods.append(method)
@@ -64,6 +72,13 @@ class CycleXapi:
             return "OpaqueRef:gm"
         if method == "VM_guest_metrics.get_networks":
             return {"0/ip": "10.0.0.5"}
+        if method == "VDI.get_uuid":
+            # Destroyed refs answer HANDLE_INVALID on the pool (measured 2026-08-19);
+            # a surviving ref answers its uuid. teardown_fails means nothing was
+            # destroyed, so the ref survives in that case too.
+            if self.vdi_survives or self.teardown_fails:
+                return "leaked-vdi-uuid"
+            raise XapiError("HANDLE_INVALID", ["VDI", params[0]])
         raise AssertionError(method)
 
 
@@ -151,6 +166,53 @@ def test_a_failing_teardown_does_not_mask_the_original_error():
     assert caught.value.message == "BOOT_TIMEOUT"
 
 
+def test_a_clean_cycle_asks_after_its_own_vdis_and_finds_them_gone():
+    """The leak check must actually run: an empty leaks list from a check that never
+    happened is indistinguishable from a clean teardown, so pin the question itself."""
+    x = CycleXapi()
+    leaks = []
+    measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True, leaks=leaks)
+
+    assert leaks == []
+    assert "disk_vdis" in x.methods, "the probe's disks were never captured"
+    assert "VDI.get_uuid" in x.methods, "nothing asked whether the disks still exist"
+
+
+def test_a_vdi_that_survives_a_successful_teardown_is_reported_leaked():
+    """destroy_with_disks reporting success is a claim, not a fact: it prints-and-continues
+    on a stuck disk by design. The per-ref check catches the disk that outlived it."""
+    x = CycleXapi(vdi_survives=True)
+    leaks = []
+    measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True, leaks=leaks)
+
+    assert leaks == ["OpaqueRef:vdi-leaf"]
+
+
+def test_leaks_are_recorded_on_the_failure_path_too():
+    """The failure path is where leaks come from, so the accumulator must be fed from the
+    finally, not from the return value the exception discards."""
+    x = CycleXapi(boot_fails=True, teardown_fails=True)
+    leaks = []
+    with pytest.raises(XapiError, match="BOOT_TIMEOUT"):
+        measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True, leaks=leaks)
+
+    assert leaks == ["OpaqueRef:vdi-leaf"]
+
+
+def test_an_unanswered_existence_check_reads_as_leaked(capsys):
+    """Only HANDLE_INVALID means gone. A transport error means the question went
+    unanswered, and treating that as gone would turn a network blip into a clean bill:
+    exactly the false pass the per-ref check exists to prevent."""
+    class UnreachableXapi:
+        def call(self, method, ref):
+            raise XapiError("TRANSPORT_ERROR", f"{method}: read timed out")
+
+    leaked = measure_clone.leaked_vdis(UnreachableXapi(), ["OpaqueRef:vdi-unknown"])
+
+    assert leaked == ["OpaqueRef:vdi-unknown"]
+    assert "could not verify" in capsys.readouterr().err
+
+
 # -- main(): the orphan check must survive a failed cycle -------------------
 
 class MainXapi:
@@ -212,18 +274,18 @@ def harness(monkeypatch):
     return _harness
 
 
-def _passing_cycle(x, source, sr, index, full_copy, cow):
+def _passing_cycle(x, source, sr, index, full_copy, cow, leaks=None):
     mode = "VM.copy (full)" if full_copy else "VM.clone (CoW)"
     return {"mode": mode, "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
 
 
-def _always_fails(x, source, sr, index, full_copy, cow):
+def _always_fails(x, source, sr, index, full_copy, cow, leaks=None):
     raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
 
 
 def test_a_failed_cycle_still_reports_the_cycles_that_passed(harness, capsys):
     """Issue #2: one bad cycle used to unwind past the VDI-delta check entirely."""
-    def cycle(x, source, sr, index, full_copy, cow):
+    def cycle(x, source, sr, index, full_copy, cow, leaks=None):
         if index == 2:
             raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
         return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
@@ -240,15 +302,18 @@ def test_a_failed_cycle_still_reports_the_cycles_that_passed(harness, capsys):
 
 def test_orphaned_vdis_are_still_caught_when_a_cycle_fails(harness, capsys):
     """The orphan check is why this script exists. A failed cycle must not hide a leak."""
-    def cycle(x, source, sr, index, full_copy, cow):
+    def cycle(x, source, sr, index, full_copy, cow, leaks=None):
         if index == 1:
+            leaks.append("OpaqueRef:vdi-from-failed-cycle")
             raise XapiError("BOOT_TIMEOUT", "OpaqueRef:vm")
         return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
 
-    harness(MainXapi(vdis_before=5, vdis_after=7), cycle)
+    harness(MainXapi(), cycle)
     rc = measure_clone.main()
 
-    assert "ORPHANED VDIs" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "ORPHANED VDIs" in err
+    assert "OpaqueRef:vdi-from-failed-cycle" in err, "the leaked ref was not named"
     assert rc == 1
 
 
@@ -311,6 +376,42 @@ def test_a_transport_error_during_uuid_lookup_is_not_reported_as_no_vm(harness):
 
     with pytest.raises(XapiError, match="TRANSPORT_ERROR"):
         measure_clone.main()
+
+
+def test_a_moving_sr_count_alone_is_not_called_a_leak(harness, capsys):
+    """#128: the SR-wide count moves with the garbage collector and with other sessions.
+
+    Measured on the pool: a clone's 'base copy' coalesces anywhere from 10s to over 135s
+    after teardown, and another session's VMs land in the same count. Both runs of the
+    #126 confirmation printed ORPHANED VDIs and exited 1 on a pool that was not leaking.
+    The count stays in the output as context; the verdict comes from asking about the
+    exact refs our probes carried.
+    """
+    harness(MainXapi(vdis_before=5, vdis_after=7), _passing_cycle)
+    rc = measure_clone.main()
+    out = capsys.readouterr()
+
+    assert rc == 0, "a count delta with no leaked ref must not fail the run"
+    assert "ORPHANED" not in out.err
+    assert "+2" in out.out, "the delta should still be printed as context"
+
+
+def test_a_surviving_vdi_fails_the_run_even_when_the_count_settles(harness, capsys):
+    """The inverse trap: a teardown that reports success while the disk outlives it.
+
+    An SR-wide count can mask that too (the GC coalescing an unrelated base copy brings
+    the number back down). The per-ref check cannot be fooled by arithmetic.
+    """
+    def cycle(x, source, sr, index, full_copy, cow, leaks=None):
+        leaks.append("OpaqueRef:vdi-survivor")
+        return {"mode": "VM.clone (CoW)", "clone": 0.5, "online": 12.0, "disk_mib": 0.0}
+
+    harness(MainXapi(vdis_before=5, vdis_after=5), cycle)
+    rc = measure_clone.main()
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "OpaqueRef:vdi-survivor" in err
 
 
 def test_a_clean_run_exits_zero(harness):
