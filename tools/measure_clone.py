@@ -51,7 +51,29 @@ def wait_ip(x, vm, timeout=IP_TIMEOUT):
     return None
 
 
-def one_cycle(x, source, sr, index, full_copy, cow):
+def leaked_vdis(x, captured):
+    """The VDIs a probe carried that still exist after its teardown.
+
+    Asks about each specific ref rather than diffing an SR-wide count: the count also moves
+    with the SR garbage collector (a clone's 'base copy' coalesces on its own schedule,
+    measured anywhere from 10s to over 135s on the same pool in one day) and with anything
+    other sessions create, so it cannot tell our leak from their work. A destroyed ref
+    answers HANDLE_INVALID and nothing else does, so any other error means the question
+    went unanswered and the honest reading is "still there".
+    """
+    leaked = []
+    for vdi in captured:
+        try:
+            x.call("VDI.get_uuid", vdi)
+        except XapiError as e:
+            if e.message == "HANDLE_INVALID":
+                continue
+            print(f"warning: could not verify VDI {vdi}: {e}", file=sys.stderr)
+        leaked.append(vdi)
+    return leaked
+
+
+def one_cycle(x, source, sr, index, full_copy, cow, leaks=None):
     name = f"jenkins-ci-probe-{index}"
     if full_copy:
         mode = "VM.copy (full)"
@@ -96,12 +118,25 @@ def one_cycle(x, source, sr, index, full_copy, cow):
         t_ip = time.monotonic() - t2
     finally:
         t3 = time.monotonic()
+        # Capture the probe's disks before the destroy so the leak check below can ask
+        # about each specific ref afterwards. Runs on the failure path too, which is where
+        # a leak is most likely, so it lives in the finally rather than beside the result.
+        try:
+            captured = x.disk_vdis(vm)
+        except XapiError:
+            captured = []
         try:
             vdis = x.destroy_with_disks(vm)
         except XapiError as e:
             # Never mask whatever sent us here. reaper.py reclaims jenkins-ci-* probes.
             print(f"warning: teardown of {name!r} failed: {e}", file=sys.stderr)
             vdis = []
+        cycle_leaked = leaked_vdis(x, captured)
+        if cycle_leaked:
+            print(f"  ORPHANED: {name!r} left {len(cycle_leaked)} VDI(s) behind: "
+                  f"{', '.join(cycle_leaked)}", file=sys.stderr)
+        if leaks is not None:
+            leaks.extend(cycle_leaked)
         t_teardown = time.monotonic() - t3
 
     total = t_clone + t_boot + t_ip
@@ -168,14 +203,16 @@ def main():
 
         results = []
         failed = []
+        leaks = []
 
         def cycle(index, full_copy):
             # one_cycle tears its own VM down on the way out, so a failure leaks nothing.
-            # What a failure must not do is skip the SR accounting below: the orphan check
-            # is the reason this script exists, and the cycles that already passed have
-            # evidence worth reading. Record it and carry on.
+            # What a failure must not do is skip the orphan accounting: that check is the
+            # reason this script exists, and the cycles that already passed have evidence
+            # worth reading. Record it and carry on. Leaks land in the accumulator even
+            # when the cycle raises, since the failure path is where they come from.
             try:
-                results.append(one_cycle(x, source, sr, index, full_copy=full_copy, cow=cow))
+                results.append(one_cycle(x, source, sr, index, full_copy=full_copy, cow=cow, leaks=leaks))
             except XapiError as e:
                 failed.append(index)
                 print(f"  cycle {index} failed: {e}", file=sys.stderr)
@@ -190,7 +227,11 @@ def main():
         free_after = x.sr_free_bytes(sr)
         print(f"\nafter {len(results)}/{attempted} cycles: "
               f"{free_after / 2**30:.2f} GiB free, {vdis_after} VDIs")
-        print(f"VDI delta: {vdis_after - vdis_before:+d}   "
+        # Context only, no verdict: this count also moves with the SR garbage collector
+        # (a clone's base copy coalesces on its own schedule) and with anything other
+        # sessions create on a shared pool. The verdict comes from the per-cycle leak
+        # check, which asks about the exact VDIs our probes carried.
+        print(f"SR-wide VDI delta (informational): {vdis_after - vdis_before:+d}   "
               f"space delta: {(free_after - free_before) / 2**30:+.3f} GiB")
 
         clones = [r for r in results if r["mode"].startswith("VM.clone")]
@@ -218,8 +259,9 @@ def main():
             print(f"{len(failed)} of {attempted} cycles failed: "
                   f"{', '.join(str(i) for i in failed)}", file=sys.stderr)
             rc = 1
-        if vdis_after != vdis_before:
-            print("ORPHANED VDIs - teardown is leaking.", file=sys.stderr)
+        if leaks:
+            print(f"ORPHANED VDIs - teardown leaked {len(leaks)}: "
+                  f"{', '.join(leaks)}", file=sys.stderr)
             rc = 1
         return rc
 
