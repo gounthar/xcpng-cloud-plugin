@@ -219,7 +219,11 @@ class Xapi:
         """
         vdis = self.disk_vdis(vm)  # capture first
         if self.call("VM.get_power_state", vm) != "Halted":
-            self.call("VM.hard_shutdown", vm)
+            # Async, for the same reason as VM.start: a synchronous hard_shutdown blocks
+            # server-side until the domain is down, and one crossing the 30s transport
+            # timeout would fail this teardown while the shutdown proceeds regardless.
+            # The task deadline bounds the wait instead of the per-request timeout.
+            self.await_void_task(self.call("Async.VM.hard_shutdown", vm))
         self.call("VM.destroy", vm)
         destroyed = []
         for vdi in vdis:  # then reap the disks the VM left behind
