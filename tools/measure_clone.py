@@ -2,7 +2,7 @@
 
 Measures the three phases the Jenkins plugin will live inside:
     clone   - Async.VM.clone (copy-on-write) or Async.VM.copy (full disk copy)
-    boot    - VM.start until power_state == Running
+    boot    - Async.VM.start until power_state == Running
     online  - until guest tools report an IP via VM_guest_metrics.networks
 
 The last phase is the honest proxy for "agent could connect": it is the moment the
@@ -20,9 +20,10 @@ import time
 from xapi import COW_SR_TYPES, Xapi, XapiError
 
 IP_TIMEOUT = 180
+BOOT_TIMEOUT = 120
 
 
-def wait_running(x, vm, timeout=120):
+def wait_running(x, vm, timeout=BOOT_TIMEOUT):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if x.call("VM.get_power_state", vm) == "Running":
@@ -73,7 +74,12 @@ def one_cycle(x, source, sr, index, full_copy, cow):
     # invalidate the orphan check this script exists to perform.
     t1 = time.monotonic()
     try:
-        x.call("VM.start", vm, False, False)
+        # Async, because a synchronous VM.start blocks server-side until the VM is up:
+        # a start crossing the client's 30s read timeout surfaces as TRANSPORT_ERROR
+        # while the VM boots on regardless, so a slow-but-working host reads as a
+        # failed cycle and the finally below tears the probe down mid-boot.
+        start = x.call("Async.VM.start", vm, False, False)
+        x.await_void_task(start, timeout=BOOT_TIMEOUT)
         wait_running(x, vm)
         t_boot = time.monotonic() - t1
 
