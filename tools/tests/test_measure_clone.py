@@ -154,9 +154,13 @@ def test_a_failing_teardown_does_not_mask_the_original_error():
 # -- main(): the orphan check must survive a failed cycle -------------------
 
 class MainXapi:
-    def __init__(self, vdis_before=5, vdis_after=5):
+    def __init__(self, vdis_before=5, vdis_after=5, name_matches=None):
         self._before, self._after = vdis_before, vdis_after
         self._seen = 0
+        # refs VM.get_by_name_label returns; default is today's single-match case
+        self.name_matches = ["OpaqueRef:src"] if name_matches is None else name_matches
+        self.uuid_lookups = []
+        self.uuid_error = None  # XapiError message VM.get_by_uuid raises, if any
 
     def __enter__(self):
         return self
@@ -176,7 +180,18 @@ class MainXapi:
 
     def call(self, method, *params):
         if method == "VM.get_by_name_label":
-            return ["OpaqueRef:src"]
+            return self.name_matches
+        if method == "VM.get_by_uuid":
+            self.uuid_lookups.append(params[0])
+            if self.uuid_error:
+                raise XapiError(self.uuid_error, ["VM", params[0]])
+            return "OpaqueRef:src"
+        if method == "VM.get_record":
+            return {
+                "uuid": f"0000000-fake-uuid-for-{params[0]}",
+                "is_a_template": params[0] == "OpaqueRef:src-template",
+                "power_state": "Halted",
+            }
         if method == "VM.get_power_state":
             return "Halted"
         if method == "SR.get_type":
@@ -235,6 +250,67 @@ def test_orphaned_vdis_are_still_caught_when_a_cycle_fails(harness, capsys):
 
     assert "ORPHANED VDIs" in capsys.readouterr().err
     assert rc == 1
+
+
+def test_a_duplicate_name_is_refused_and_every_candidate_is_named(harness, capsys):
+    """#125: name_label is not unique, so matches[0] is whichever object XAPI lists first.
+
+    Live on the pool when filed: jenkins-golden-debian resolved to a template and a
+    non-template, and which one a run cloned was list order. When the template won, the
+    failure surfaced at VM.start and read like a boot problem. Refuse instead, and print
+    enough per candidate that the operator can tell which is which without a second tool.
+    """
+    x = MainXapi(name_matches=["OpaqueRef:src-template", "OpaqueRef:src"])
+    ran = []
+    harness(x, lambda *a, **k: ran.append(a))
+    rc = measure_clone.main()
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert not ran, "a cycle ran against an ambiguous source"
+    assert "2 VMs are named" in err
+    assert err.count("uuid=") == 2, "not every candidate was named"
+    assert "is_a_template=True" in err and "is_a_template=False" in err, (
+        "the flag that distinguishes the candidates is missing")
+    assert err.count("power=") == 2, "power state is part of telling the candidates apart"
+
+
+def test_a_uuid_source_bypasses_the_name_lookup(harness):
+    """A uuid is the unambiguous handle, so it must not go through get_by_name_label."""
+    x = MainXapi()
+    harness(x, _passing_cycle)
+    monkey_uuid = "ea9c8a68-c875-35a4-1c6b-6a12f6d2c583"
+    measure_clone.sys.argv[1:1] = ["--source", monkey_uuid]
+    rc = measure_clone.main()
+
+    assert rc == 0
+    assert x.uuid_lookups == [monkey_uuid], "the uuid was not resolved via VM.get_by_uuid"
+
+
+def test_an_unknown_uuid_reads_as_no_vm_not_as_a_crash(harness, capsys):
+    """UUID_INVALID is what the pool raises for a well-formed uuid that matches nothing
+    (measured on XAPI 26.1; the docs offered VM_NOT_FOUND and HANDLE_INVALID, both wrong
+    for this call). That one means "no matches" and gets the friendly message."""
+    x = MainXapi()
+    x.uuid_error = "UUID_INVALID"
+    harness(x, _passing_cycle)
+    measure_clone.sys.argv[1:1] = ["--source", "00000000-0000-4000-8000-000000000000"]
+    rc = measure_clone.main()
+
+    assert rc == 2
+    assert "no VM named" in capsys.readouterr().err
+
+
+def test_a_transport_error_during_uuid_lookup_is_not_reported_as_no_vm(harness):
+    """Anything else must propagate: 'no VM named X' over a dead network or a bad
+    password points the operator at the wrong problem entirely."""
+    x = MainXapi()
+    x.uuid_error = "TRANSPORT_ERROR"
+    harness(x, _passing_cycle)
+    measure_clone.sys.argv[1:1] = ["--source", "00000000-0000-4000-8000-000000000000"]
+
+    with pytest.raises(XapiError, match="TRANSPORT_ERROR"):
+        measure_clone.main()
 
 
 def test_a_clean_run_exits_zero(harness):
