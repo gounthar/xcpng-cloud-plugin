@@ -50,6 +50,8 @@ class CycleXapi:
             return "OpaqueRef:task"
         if method == "Async.VM.start":
             return "OpaqueRef:start-task"
+        if method == "VM.set_is_a_template":
+            return ""
         if method == "VM.get_power_state":
             return "Running"
         if method == "VM.get_guest_metrics":
@@ -86,6 +88,30 @@ def test_the_probe_is_started_through_the_async_task_path():
 
     assert "Async.VM.start" in x.methods, "the probe was not started asynchronously"
     assert "await_void_task:OpaqueRef:start-task" in x.methods, "the start task went unawaited"
+
+
+@pytest.mark.parametrize("full_copy", [False, True])
+def test_the_template_flag_is_cleared_between_the_clone_and_the_start(full_copy):
+    """#126: a clone of a template is itself a template, and XAPI will not start one.
+
+    Every golden image on the pool is a template, and the only non-template candidates are
+    Running (so main() rejects them) and carry no guest tools. So without this the tool that
+    exists to produce the clone-to-online numbers cannot complete a single cycle, and the
+    refusal surfaces at the start and reads like a boot problem.
+
+    Ordering is the part worth pinning: clearing the flag after the start attempt would be
+    useless, and a test that only asserted the call happened would pass against it.
+    """
+    x = CycleXapi()
+    measure_clone.one_cycle(x, "src", "sr", 1, full_copy=full_copy, cow=True)
+
+    clone = "Async.VM.copy" if full_copy else "Async.VM.clone"
+    assert "VM.set_is_a_template" in x.methods, "the clone was left as a template"
+    assert (
+        x.methods.index(clone)
+        < x.methods.index("VM.set_is_a_template")
+        < x.methods.index("Async.VM.start")
+    ), f"the flag was not cleared between the clone and the start: {x.methods}"
 
 
 def test_probe_vm_is_destroyed_when_boot_fails():
