@@ -125,7 +125,14 @@ def main():
         if UUID_ARG.fullmatch(args.source):
             try:
                 matches = [x.call("VM.get_by_uuid", args.source)]
-            except XapiError:
+            except XapiError as e:
+                # Only "no such uuid" means no matches. Swallowing everything here would
+                # print "no VM named ..." over a dead network or a bad password, which
+                # points the operator at the wrong problem entirely. UUID_INVALID is what
+                # this pool actually raises (measured, XAPI 26.1); the docs' VM_NOT_FOUND
+                # and HANDLE_INVALID both turned out to be wrong for this call.
+                if e.message != "UUID_INVALID":
+                    raise
                 matches = []
         else:
             matches = x.call("VM.get_by_name_label", args.source)

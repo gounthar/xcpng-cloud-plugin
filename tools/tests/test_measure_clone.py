@@ -160,6 +160,7 @@ class MainXapi:
         # refs VM.get_by_name_label returns; default is today's single-match case
         self.name_matches = ["OpaqueRef:src"] if name_matches is None else name_matches
         self.uuid_lookups = []
+        self.uuid_error = None  # XapiError message VM.get_by_uuid raises, if any
 
     def __enter__(self):
         return self
@@ -182,6 +183,8 @@ class MainXapi:
             return self.name_matches
         if method == "VM.get_by_uuid":
             self.uuid_lookups.append(params[0])
+            if self.uuid_error:
+                raise XapiError(self.uuid_error, ["VM", params[0]])
             return "OpaqueRef:src"
         if method == "VM.get_record":
             return {
@@ -269,6 +272,7 @@ def test_a_duplicate_name_is_refused_and_every_candidate_is_named(harness, capsy
     assert err.count("uuid=") == 2, "not every candidate was named"
     assert "is_a_template=True" in err and "is_a_template=False" in err, (
         "the flag that distinguishes the candidates is missing")
+    assert err.count("power=") == 2, "power state is part of telling the candidates apart"
 
 
 def test_a_uuid_source_bypasses_the_name_lookup(harness):
@@ -281,6 +285,32 @@ def test_a_uuid_source_bypasses_the_name_lookup(harness):
 
     assert rc == 0
     assert x.uuid_lookups == [monkey_uuid], "the uuid was not resolved via VM.get_by_uuid"
+
+
+def test_an_unknown_uuid_reads_as_no_vm_not_as_a_crash(harness, capsys):
+    """UUID_INVALID is what the pool raises for a well-formed uuid that matches nothing
+    (measured on XAPI 26.1; the docs offered VM_NOT_FOUND and HANDLE_INVALID, both wrong
+    for this call). That one means "no matches" and gets the friendly message."""
+    x = MainXapi()
+    x.uuid_error = "UUID_INVALID"
+    harness(x, _passing_cycle)
+    measure_clone.sys.argv[1:1] = ["--source", "00000000-0000-4000-8000-000000000000"]
+    rc = measure_clone.main()
+
+    assert rc == 2
+    assert "no VM named" in capsys.readouterr().err
+
+
+def test_a_transport_error_during_uuid_lookup_is_not_reported_as_no_vm(harness):
+    """Anything else must propagate: 'no VM named X' over a dead network or a bad
+    password points the operator at the wrong problem entirely."""
+    x = MainXapi()
+    x.uuid_error = "TRANSPORT_ERROR"
+    harness(x, _passing_cycle)
+    measure_clone.sys.argv[1:1] = ["--source", "00000000-0000-4000-8000-000000000000"]
+
+    with pytest.raises(XapiError, match="TRANSPORT_ERROR"):
+        measure_clone.main()
 
 
 def test_a_clean_run_exits_zero(harness):
