@@ -19,9 +19,10 @@ class CycleXapi:
     reference, so routing one through the strict helper is a bug the fake must not absorb.
     """
 
-    def __init__(self, boot_fails=False, teardown_fails=False):
+    def __init__(self, boot_fails=False, teardown_fails=False, clear_fails=False):
         self.boot_fails = boot_fails
         self.teardown_fails = teardown_fails
+        self.clear_fails = clear_fails
         self.destroyed = False
         self.methods = []
 
@@ -50,6 +51,13 @@ class CycleXapi:
             return "OpaqueRef:task"
         if method == "Async.VM.start":
             return "OpaqueRef:start-task"
+        if method == "VM.set_is_a_template":
+            # Pinned, not waved through: a fake that accepts any arguments here passes
+            # against production clearing the flag on the wrong VM, or setting it True.
+            assert params == ("OpaqueRef:vm", False), params
+            if self.clear_fails:
+                raise XapiError("VM_BAD_POWER_STATE", "OpaqueRef:vm")
+            return ""
         if method == "VM.get_power_state":
             return "Running"
         if method == "VM.get_guest_metrics":
@@ -88,12 +96,51 @@ def test_the_probe_is_started_through_the_async_task_path():
     assert "await_void_task:OpaqueRef:start-task" in x.methods, "the start task went unawaited"
 
 
+@pytest.mark.parametrize("full_copy", [False, True])
+def test_the_template_flag_is_cleared_between_the_clone_and_the_start(full_copy):
+    """#126: a clone of a template is itself a template, and XAPI will not start one.
+
+    Every golden image on the pool is a template, and the only non-template candidates are
+    Running (so main() rejects them) and carry no guest tools. So without this the tool that
+    exists to produce the clone-to-online numbers cannot complete a single cycle, and the
+    refusal surfaces at the start and reads like a boot problem.
+
+    Ordering is the part worth pinning: clearing the flag after the start attempt would be
+    useless, and a test that only asserted the call happened would pass against it.
+    """
+    x = CycleXapi()
+    measure_clone.one_cycle(x, "src", "sr", 1, full_copy=full_copy, cow=True)
+
+    clone = "Async.VM.copy" if full_copy else "Async.VM.clone"
+    assert "VM.set_is_a_template" in x.methods, "the clone was left as a template"
+    # Anchored on await_task rather than on the clone call: the submission only proves a task
+    # exists, and the VM whose flag is being cleared does not exist until that task settles.
+    assert (
+        x.methods.index(clone)
+        < x.methods.index("await_task:OpaqueRef:task")
+        < x.methods.index("VM.set_is_a_template")
+        < x.methods.index("Async.VM.start")
+    ), f"the flag was not cleared between the clone and the start: {x.methods}"
+
+
 def test_probe_vm_is_destroyed_when_boot_fails():
     """A BOOT_TIMEOUT that skipped teardown would leave the probe running on the pool."""
     x = CycleXapi(boot_fails=True)
     with pytest.raises(XapiError, match="BOOT_TIMEOUT"):
         measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True)
     assert x.destroyed, "the probe VM leaked on the failure path"
+
+
+def test_probe_vm_is_destroyed_when_the_template_clear_fails():
+    """The clear sits inside the try for this reason, and the reason deserves a test.
+
+    Placed beside the clone call instead it would read the same and leak the clone on any
+    failure, which is the one thing the finally exists to prevent.
+    """
+    x = CycleXapi(clear_fails=True)
+    with pytest.raises(XapiError, match="VM_BAD_POWER_STATE"):
+        measure_clone.one_cycle(x, "src", "sr", 1, full_copy=False, cow=True)
+    assert x.destroyed, "the clone leaked when the template clear failed"
 
 
 def test_a_failing_teardown_does_not_mask_the_original_error():

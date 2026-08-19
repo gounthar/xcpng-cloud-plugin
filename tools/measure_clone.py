@@ -72,8 +72,14 @@ def one_cycle(x, source, sr, index, full_copy, cow):
     # Past this point the VM exists, so teardown has to happen on every path out.
     # A BOOT_TIMEOUT that skipped it would leave the probe running and quietly
     # invalidate the orphan check this script exists to perform.
-    t1 = time.monotonic()
     try:
+        # VM.clone of a template yields a template, and XAPI refuses to start one, so every
+        # golden image on the pool is unusable as a --source without this. XapiClient does
+        # the same thing at the same point. Inside the try so a failure here still tears the
+        # clone down, and before t1 so the boot figure stays start-to-Running.
+        x.call("VM.set_is_a_template", vm, False)
+
+        t1 = time.monotonic()
         # Async, because a synchronous VM.start blocks server-side until the VM is up:
         # a start crossing the client's 30s read timeout surfaces as TRANSPORT_ERROR
         # while the VM boots on regardless, so a slow-but-working host reads as a
