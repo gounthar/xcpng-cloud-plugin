@@ -448,7 +448,11 @@ public final class XapiClient implements HypervisorClient {
         // The operator-side safety net is tools/reaper.py --dom0-check, which reads `xl list` off
         // dom0 before a sweep. See README "Known limitations".
         if (!"Halted".equals(call("VM.get_power_state", vm.value()).asText(""))) {
-            call("VM.hard_shutdown", vm.value());
+            // Async, for the same reason start and stop are: a synchronous hard_shutdown blocks
+            // server-side until the domain is down, and one crossing the transport's 30s request
+            // timeout would fail this whole teardown as a leak while the shutdown proceeds
+            // regardless. The task deadline bounds the wait instead of the per-request timeout.
+            awaitTask(call("Async.VM.hard_shutdown", vm.value()).asText());
         }
         call("VM.destroy", vm.value());
         List<String> orphaned = new ArrayList<>();

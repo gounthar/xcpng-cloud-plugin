@@ -230,10 +230,23 @@ def test_teardown_attempts_every_vdi_and_reports_only_the_dead(client, monkeypat
     attempted = []
     monkeypatch.setattr(Xapi, "disk_vdis", lambda self, vm: ["vdi-a", "vdi-b", "vdi-c"])
 
+    methods = []
+
     def fake_call(method, *params):
+        # No synchronous VM.hard_shutdown here, on purpose: a regression to the blocking
+        # form must fail loudly rather than be humoured (#73, same rule as VM.start).
+        methods.append(method)
         if method == "VM.get_power_state":
             return "Running"
-        if method in ("VM.hard_shutdown", "VM.destroy"):
+        if method == "Async.VM.hard_shutdown":
+            return "OpaqueRef:task-shutdown"
+        if method == "task.get_status":
+            return "success"
+        if method == "task.get_result":
+            return ""
+        if method == "task.destroy":
+            return None
+        if method == "VM.destroy":
             return None
         if method == "VDI.destroy":
             attempted.append(params[0])
@@ -247,3 +260,6 @@ def test_teardown_attempts_every_vdi_and_reports_only_the_dead(client, monkeypat
 
     assert attempted == ["vdi-a", "vdi-b", "vdi-c"], "gave up after the first failure"
     assert destroyed == ["vdi-a", "vdi-c"], "reported a disk as destroyed that survived"
+    assert methods.index("Async.VM.hard_shutdown") < methods.index("VM.destroy"), (
+        "the shutdown must complete before the destroy")
+    assert "task.get_status" in methods, "the shutdown task went unawaited"
