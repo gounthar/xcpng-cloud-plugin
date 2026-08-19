@@ -13,6 +13,7 @@ every VDI, so the storage-leak trap is measured, not assumed.
 """
 
 import argparse
+import re
 import statistics
 import sys
 import time
@@ -21,6 +22,7 @@ from xapi import COW_SR_TYPES, Xapi, XapiError
 
 IP_TIMEOUT = 180
 BOOT_TIMEOUT = 120
+UUID_ARG = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def wait_running(x, vm, timeout=BOOT_TIMEOUT):
@@ -113,15 +115,34 @@ def one_cycle(x, source, sr, index, full_copy, cow):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--source", default="alpine-test-1")
+    p.add_argument("--source", default="alpine-test-1",
+                   help="VM name_label, or a uuid (the unambiguous handle when names collide)")
     p.add_argument("--clones", type=int, default=3)
     p.add_argument("--copies", type=int, default=1)
     args = p.parse_args()
 
     with Xapi() as x:
-        matches = x.call("VM.get_by_name_label", args.source)
+        if UUID_ARG.fullmatch(args.source):
+            try:
+                matches = [x.call("VM.get_by_uuid", args.source)]
+            except XapiError:
+                matches = []
+        else:
+            matches = x.call("VM.get_by_name_label", args.source)
         if not matches:
             print(f"no VM named {args.source!r}", file=sys.stderr)
+            return 2
+        if len(matches) > 1:
+            # name_label is not unique, so matches[0] is whichever object XAPI lists first.
+            # The objects are not interchangeable (one live case: a template and a non-template
+            # sharing a name), so picking one silently runs a different experiment per listing
+            # order. Refuse and name every candidate, the same line XapiClient draws.
+            print(f"{len(matches)} VMs are named {args.source!r}; "
+                  "rename them or address the right one by uuid:", file=sys.stderr)
+            for ref in matches:
+                rec = x.call("VM.get_record", ref)
+                print(f"  uuid={rec['uuid']}  is_a_template={rec['is_a_template']}  "
+                      f"power={rec['power_state']}", file=sys.stderr)
             return 2
         source = matches[0]
         if x.call("VM.get_power_state", source) != "Halted":
