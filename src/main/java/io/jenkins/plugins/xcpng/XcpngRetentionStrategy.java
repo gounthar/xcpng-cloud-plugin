@@ -276,6 +276,28 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
                         return;
                     }
                     agent.terminate();
+                    // The node is gone now -- AbstractCloudSlave.terminate removes it in its own finally -- so
+                    // the slot it held against maxInstances is free and a warm pool may have a deficit it could
+                    // not fill a moment ago. Ask for a reconcile at this moment rather than leaving it to the
+                    // maintainer's next tick, which lands anywhere in a one-minute period (#120).
+                    //
+                    // Placement is load-bearing. Here, in the success path, rather than in the finally below:
+                    // the requireIdle branch above abandons the teardown with the node still registered and no
+                    // slot freed, and a reconcile fired for that would be asking about capacity that never
+                    // came back. A terminate that throws is the one case this misses; the node is removed
+                    // regardless, so that freed slot waits for the maintainer, and the VM behind it is already
+                    // recorded as leaked for the sweep.
+                    //
+                    // requestReconcile only raises a flag and submits, never taking the cloud monitor on this
+                    // thread. That is what keeps this call clear of the lock order the plugin already has:
+                    // reconcileWarmPool holds the cloud monitor while drainSpare calls into this class's, so a
+                    // trigger that reconciled inline while holding a strategy monitor would take the two the
+                    // other way round, and a concurrent drain makes that a real deadlock rather than a
+                    // theoretical one.
+                    XcpngCloud cloud = agent.getCloud();
+                    if (cloud != null) {
+                        cloud.requestReconcile();
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                 } catch (Exception e) {

@@ -2,7 +2,7 @@
 
 Measures the three phases the Jenkins plugin will live inside:
     clone   - Async.VM.clone (copy-on-write) or Async.VM.copy (full disk copy)
-    boot    - VM.start until power_state == Running
+    boot    - Async.VM.start until power_state == Running
     online  - until guest tools report an IP via VM_guest_metrics.networks
 
 The last phase is the honest proxy for "agent could connect": it is the moment the
@@ -13,6 +13,7 @@ every VDI, so the storage-leak trap is measured, not assumed.
 """
 
 import argparse
+import re
 import statistics
 import sys
 import time
@@ -20,9 +21,11 @@ import time
 from xapi import COW_SR_TYPES, Xapi, XapiError
 
 IP_TIMEOUT = 180
+BOOT_TIMEOUT = 120
+UUID_ARG = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
-def wait_running(x, vm, timeout=120):
+def wait_running(x, vm, timeout=BOOT_TIMEOUT):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if x.call("VM.get_power_state", vm) == "Running":
@@ -48,7 +51,29 @@ def wait_ip(x, vm, timeout=IP_TIMEOUT):
     return None
 
 
-def one_cycle(x, source, sr, index, full_copy, cow):
+def leaked_vdis(x, captured):
+    """The VDIs a probe carried that still exist after its teardown.
+
+    Asks about each specific ref rather than diffing an SR-wide count: the count also moves
+    with the SR garbage collector (a clone's 'base copy' coalesces on its own schedule,
+    measured anywhere from 10s to over 135s on the same pool in one day) and with anything
+    other sessions create, so it cannot tell our leak from their work. A destroyed ref
+    answers HANDLE_INVALID and nothing else does, so any other error means the question
+    went unanswered and the honest reading is "still there".
+    """
+    leaked = []
+    for vdi in captured:
+        try:
+            x.call("VDI.get_uuid", vdi)
+        except XapiError as e:
+            if e.message == "HANDLE_INVALID":
+                continue
+            print(f"warning: could not verify VDI {vdi}: {e}", file=sys.stderr)
+        leaked.append(vdi)
+    return leaked
+
+
+def one_cycle(x, source, sr, index, full_copy, cow, leaks=None):
     name = f"jenkins-ci-probe-{index}"
     if full_copy:
         mode = "VM.copy (full)"
@@ -71,9 +96,20 @@ def one_cycle(x, source, sr, index, full_copy, cow):
     # Past this point the VM exists, so teardown has to happen on every path out.
     # A BOOT_TIMEOUT that skipped it would leave the probe running and quietly
     # invalidate the orphan check this script exists to perform.
-    t1 = time.monotonic()
     try:
-        x.call("VM.start", vm, False, False)
+        # VM.clone of a template yields a template, and XAPI refuses to start one, so every
+        # golden image on the pool is unusable as a --source without this. XapiClient does
+        # the same thing at the same point. Inside the try so a failure here still tears the
+        # clone down, and before t1 so the boot figure stays start-to-Running.
+        x.call("VM.set_is_a_template", vm, False)
+
+        t1 = time.monotonic()
+        # Async, because a synchronous VM.start blocks server-side until the VM is up:
+        # a start crossing the client's 30s read timeout surfaces as TRANSPORT_ERROR
+        # while the VM boots on regardless, so a slow-but-working host reads as a
+        # failed cycle and the finally below tears the probe down mid-boot.
+        start = x.call("Async.VM.start", vm, False, False)
+        x.await_void_task(start, timeout=BOOT_TIMEOUT)
         wait_running(x, vm)
         t_boot = time.monotonic() - t1
 
@@ -82,12 +118,25 @@ def one_cycle(x, source, sr, index, full_copy, cow):
         t_ip = time.monotonic() - t2
     finally:
         t3 = time.monotonic()
+        # Capture the probe's disks before the destroy so the leak check below can ask
+        # about each specific ref afterwards. Runs on the failure path too, which is where
+        # a leak is most likely, so it lives in the finally rather than beside the result.
+        try:
+            captured = x.disk_vdis(vm)
+        except XapiError:
+            captured = []
         try:
             vdis = x.destroy_with_disks(vm)
         except XapiError as e:
             # Never mask whatever sent us here. reaper.py reclaims jenkins-ci-* probes.
             print(f"warning: teardown of {name!r} failed: {e}", file=sys.stderr)
             vdis = []
+        cycle_leaked = leaked_vdis(x, captured)
+        if cycle_leaked:
+            print(f"  ORPHANED: {name!r} left {len(cycle_leaked)} VDI(s) behind: "
+                  f"{', '.join(cycle_leaked)}", file=sys.stderr)
+        if leaks is not None:
+            leaks.extend(cycle_leaked)
         t_teardown = time.monotonic() - t3
 
     total = t_clone + t_boot + t_ip
@@ -101,15 +150,41 @@ def one_cycle(x, source, sr, index, full_copy, cow):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--source", default="alpine-test-1")
+    p.add_argument("--source", default="alpine-test-1",
+                   help="VM name_label, or a uuid (the unambiguous handle when names collide)")
     p.add_argument("--clones", type=int, default=3)
     p.add_argument("--copies", type=int, default=1)
     args = p.parse_args()
 
     with Xapi() as x:
-        matches = x.call("VM.get_by_name_label", args.source)
+        if UUID_ARG.fullmatch(args.source):
+            try:
+                matches = [x.call("VM.get_by_uuid", args.source)]
+            except XapiError as e:
+                # Only "no such uuid" means no matches. Swallowing everything here would
+                # print "no VM named ..." over a dead network or a bad password, which
+                # points the operator at the wrong problem entirely. UUID_INVALID is what
+                # this pool actually raises (measured, XAPI 26.1); the docs' VM_NOT_FOUND
+                # and HANDLE_INVALID both turned out to be wrong for this call.
+                if e.message != "UUID_INVALID":
+                    raise
+                matches = []
+        else:
+            matches = x.call("VM.get_by_name_label", args.source)
         if not matches:
             print(f"no VM named {args.source!r}", file=sys.stderr)
+            return 2
+        if len(matches) > 1:
+            # name_label is not unique, so matches[0] is whichever object XAPI lists first.
+            # The objects are not interchangeable (one live case: a template and a non-template
+            # sharing a name), so picking one silently runs a different experiment per listing
+            # order. Refuse and name every candidate, the same line XapiClient draws.
+            print(f"{len(matches)} VMs are named {args.source!r}; "
+                  "rename them or address the right one by uuid:", file=sys.stderr)
+            for ref in matches:
+                rec = x.call("VM.get_record", ref)
+                print(f"  uuid={rec['uuid']}  is_a_template={rec['is_a_template']}  "
+                      f"power={rec['power_state']}", file=sys.stderr)
             return 2
         source = matches[0]
         if x.call("VM.get_power_state", source) != "Halted":
@@ -128,14 +203,16 @@ def main():
 
         results = []
         failed = []
+        leaks = []
 
         def cycle(index, full_copy):
             # one_cycle tears its own VM down on the way out, so a failure leaks nothing.
-            # What a failure must not do is skip the SR accounting below: the orphan check
-            # is the reason this script exists, and the cycles that already passed have
-            # evidence worth reading. Record it and carry on.
+            # What a failure must not do is skip the orphan accounting: that check is the
+            # reason this script exists, and the cycles that already passed have evidence
+            # worth reading. Record it and carry on. Leaks land in the accumulator even
+            # when the cycle raises, since the failure path is where they come from.
             try:
-                results.append(one_cycle(x, source, sr, index, full_copy=full_copy, cow=cow))
+                results.append(one_cycle(x, source, sr, index, full_copy=full_copy, cow=cow, leaks=leaks))
             except XapiError as e:
                 failed.append(index)
                 print(f"  cycle {index} failed: {e}", file=sys.stderr)
@@ -150,7 +227,11 @@ def main():
         free_after = x.sr_free_bytes(sr)
         print(f"\nafter {len(results)}/{attempted} cycles: "
               f"{free_after / 2**30:.2f} GiB free, {vdis_after} VDIs")
-        print(f"VDI delta: {vdis_after - vdis_before:+d}   "
+        # Context only, no verdict: this count also moves with the SR garbage collector
+        # (a clone's base copy coalesces on its own schedule) and with anything other
+        # sessions create on a shared pool. The verdict comes from the per-cycle leak
+        # check, which asks about the exact VDIs our probes carried.
+        print(f"SR-wide VDI delta (informational): {vdis_after - vdis_before:+d}   "
               f"space delta: {(free_after - free_before) / 2**30:+.3f} GiB")
 
         clones = [r for r in results if r["mode"].startswith("VM.clone")]
@@ -178,8 +259,9 @@ def main():
             print(f"{len(failed)} of {attempted} cycles failed: "
                   f"{', '.join(str(i) for i in failed)}", file=sys.stderr)
             rc = 1
-        if vdis_after != vdis_before:
-            print("ORPHANED VDIs - teardown is leaking.", file=sys.stderr)
+        if leaks:
+            print(f"ORPHANED VDIs - teardown leaked {len(leaks)}: "
+                  f"{', '.join(leaks)}", file=sys.stderr)
             rc = 1
         return rc
 

@@ -115,6 +115,110 @@ def test_missing_env_var_does_not_leak_the_password(monkeypatch):
     assert "hunter2" not in str(caught.value)
 
 
+# -- async task helpers -----------------------------------------------------
+
+class TaskCalls:
+    """The task.* calls the settle loop makes, plus a record of which ones it made."""
+
+    def __init__(self, result="", status="success", error_info="none"):
+        self.result = result
+        self.status = status
+        self.error_info = error_info
+        self.methods = []
+
+    def __call__(self, method, *params):
+        self.methods.append(method)
+        if method == "task.get_status":
+            return self.status
+        if method == "task.get_result":
+            return self.result
+        if method == "task.get_error_info":
+            return self.error_info
+        if method == "task.destroy":
+            return None
+        raise AssertionError(method)
+
+
+@pytest.mark.parametrize(
+    "result, why",
+    [
+        ("<value></value>", "measured on the pool: what a settled void task really holds"),
+        ("", "an empty body, should a backend answer that instead"),
+        (None, "get_result may answer null rather than a string"),
+        ("<value/>", "the self-closing spelling of the same empty value"),
+    ],
+)
+def test_a_void_task_settles_without_raising(client, result, why):
+    """A void verb settles with no result, and that is success rather than a parse failure.
+
+    Measured on the lab pool: Async.VM.start left the VM at power_state=Running with a
+    domid, while await_task raised TASK_RESULT_UNPARSEABLE at the empty result. Every void
+    verb the plugin uses is affected -- start, hard_shutdown, destroy.
+    """
+    client.call = TaskCalls(result=result)
+    assert client.await_void_task("OpaqueRef:task") is None, why
+
+
+def test_await_task_still_demands_a_reference(client):
+    """Keeping two helpers is only worth anything if the strict one stayed strict.
+
+    Should this go green, await_task began handing None to callers that asked for a VM
+    ref, and one_cycle would carry that None into the start call as its VM.
+    """
+    client.call = TaskCalls(result="")
+    with pytest.raises(XapiError) as caught:
+        client.await_task("OpaqueRef:task")
+    assert caught.value.message == "TASK_RESULT_UNPARSEABLE"
+
+
+def test_await_task_extracts_the_reference_from_the_result(client):
+    client.call = TaskCalls(result="<value>OpaqueRef:41be2902-cc37-1371-f036-519b05a820c6</value>")
+    assert client.await_task("OpaqueRef:t") == "OpaqueRef:41be2902-cc37-1371-f036-519b05a820c6"
+
+
+def test_the_unparseable_raise_quotes_the_result_it_rejected(client):
+    """The task is destroyed on the way out, so this raise is the last chance to say what
+    settled. Without it a caller cannot tell a void success from a genuine surprise."""
+    client.call = TaskCalls(result="<value>nonsense</value>")
+    with pytest.raises(XapiError, match="nonsense"):
+        client.await_task("OpaqueRef:task")
+
+
+def test_a_settled_task_is_destroyed_on_both_paths(client):
+    """One leaked task record per probe is how a long measuring run silts up the pool."""
+    void = TaskCalls(result="")
+    client.call = void
+    client.await_void_task("OpaqueRef:task")
+    assert "task.destroy" in void.methods, "the void path left its task behind"
+
+    strict = TaskCalls(result="")
+    client.call = strict
+    with pytest.raises(XapiError):
+        client.await_task("OpaqueRef:task")
+    assert "task.destroy" in strict.methods, "the raising path left its task behind"
+
+
+@pytest.mark.parametrize("status", ["failure", "cancelled"])
+def test_a_task_that_did_not_succeed_raises_with_its_error_info(client, status):
+    """Void tolerance must not reach a real failure: an empty result is success only when
+    the status says so, and the error info is what names the cause."""
+    client.call = TaskCalls(status=status, error_info=["VM_BAD_POWER_STATE"])
+    with pytest.raises(XapiError) as caught:
+        client.await_void_task("OpaqueRef:task")
+    assert caught.value.message == f"TASK_{status.upper()}"
+    assert caught.value.data == ["VM_BAD_POWER_STATE"]
+
+
+def test_a_task_that_never_settles_times_out(client):
+    """The deadline moved into _settle_task along with the rest of the loop."""
+    calls = TaskCalls(status="pending")
+    client.call = calls
+    with pytest.raises(XapiError) as caught:
+        client.await_void_task("OpaqueRef:task", poll=0, timeout=-1)
+    assert caught.value.message == "TASK_TIMEOUT"
+    assert "task.destroy" in calls.methods, "a timed-out task was left on the pool"
+
+
 # -- destroy_with_disks -----------------------------------------------------
 
 def test_teardown_attempts_every_vdi_and_reports_only_the_dead(client, monkeypatch):
@@ -126,10 +230,23 @@ def test_teardown_attempts_every_vdi_and_reports_only_the_dead(client, monkeypat
     attempted = []
     monkeypatch.setattr(Xapi, "disk_vdis", lambda self, vm: ["vdi-a", "vdi-b", "vdi-c"])
 
+    methods = []
+
     def fake_call(method, *params):
+        # No synchronous VM.hard_shutdown here, on purpose: a regression to the blocking
+        # form must fail loudly rather than be humoured (#73, same rule as VM.start).
+        methods.append(method)
         if method == "VM.get_power_state":
             return "Running"
-        if method in ("VM.hard_shutdown", "VM.destroy"):
+        if method == "Async.VM.hard_shutdown":
+            return "OpaqueRef:task-shutdown"
+        if method == "task.get_status":
+            return "success"
+        if method == "task.get_result":
+            return ""
+        if method == "task.destroy":
+            return None
+        if method == "VM.destroy":
             return None
         if method == "VDI.destroy":
             attempted.append(params[0])
@@ -143,3 +260,6 @@ def test_teardown_attempts_every_vdi_and_reports_only_the_dead(client, monkeypat
 
     assert attempted == ["vdi-a", "vdi-b", "vdi-c"], "gave up after the first failure"
     assert destroyed == ["vdi-a", "vdi-c"], "reported a disk as destroyed that survived"
+    assert methods.index("Async.VM.hard_shutdown") < methods.index("VM.destroy"), (
+        "the shutdown must complete before the destroy")
+    assert "task.get_status" in methods, "the shutdown task went unawaited"

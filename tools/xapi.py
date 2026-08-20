@@ -147,19 +147,21 @@ class Xapi:
     def __exit__(self, *exc):
         self.logout()
 
-    # -- async task helper ------------------------------------------------
+    # -- async task helpers -----------------------------------------------
 
-    def await_task(self, task, poll=0.25, timeout=900):
-        """Block until an Async.* task settles; return the OpaqueRef it produced."""
+    def _settle_task(self, task, poll, timeout):
+        """Block until an Async.* task settles; return its raw result string.
+
+        The result has to be carried back from here rather than re-read by the caller: the
+        finally below destroys the task, so once this returns there is no task record left
+        to ask what happened.
+        """
         deadline = time.monotonic() + timeout
         try:
             while True:
                 status = self.call("task.get_status", task)
                 if status == "success":
-                    match = OPAQUE_REF.search(self.call("task.get_result", task) or "")
-                    if not match:
-                        raise XapiError("TASK_RESULT_UNPARSEABLE", task)
-                    return match.group(0)
+                    return self.call("task.get_result", task) or ""
                 if status in ("failure", "cancelled"):
                     raise XapiError(f"TASK_{status.upper()}", self.call("task.get_error_info", task))
                 if time.monotonic() > deadline:
@@ -170,6 +172,28 @@ class Xapi:
                 self.call("task.destroy", task)
             except XapiError:
                 pass
+
+    def await_task(self, task, poll=0.25, timeout=900):
+        """Await a task that yields an object reference (VM.clone); return the OpaqueRef.
+
+        Strict on purpose: a caller that asked for a ref and silently got None would carry
+        it into the next call as a VM ref. Void verbs want await_void_task instead. The
+        raise quotes the result because the task is gone by the time it surfaces.
+        """
+        result = self._settle_task(task, poll, timeout)
+        match = OPAQUE_REF.search(result)
+        if not match:
+            raise XapiError("TASK_RESULT_UNPARSEABLE", f"{task} settled with {result!r}")
+        return match.group(0)
+
+    def await_void_task(self, task, poll=0.25, timeout=900):
+        """Await a task whose verb returns nothing: VM.start, hard_shutdown, destroy.
+
+        Those settle with an empty result, which is success and not a parse failure. The
+        Java client draws the same line: awaitTask hands back the raw result, awaitTaskRef
+        is the only one that insists on a reference.
+        """
+        self._settle_task(task, poll, timeout)
 
     # -- the verbs the plugin needs ---------------------------------------
 
@@ -195,7 +219,11 @@ class Xapi:
         """
         vdis = self.disk_vdis(vm)  # capture first
         if self.call("VM.get_power_state", vm) != "Halted":
-            self.call("VM.hard_shutdown", vm)
+            # Async, for the same reason as VM.start: a synchronous hard_shutdown blocks
+            # server-side until the domain is down, and one crossing the 30s transport
+            # timeout would fail this teardown while the shutdown proceeds regardless.
+            # The task deadline bounds the wait instead of the per-request timeout.
+            self.await_void_task(self.call("Async.VM.hard_shutdown", vm))
         self.call("VM.destroy", vm)
         destroyed = []
         for vdi in vdis:  # then reap the disks the VM left behind

@@ -37,6 +37,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -1209,6 +1210,246 @@ class XcpngProvisionTest {
                 clonesBefore + 1,
                 cloneCount(fake),
                 "the freed slot must be refilled by the next reconcile: " + fake.calls());
+    }
+
+    /**
+     * Reap this computer through its own retention strategy, then let everything that teardown sets off run
+     * out: the teardown itself, the reconcile it triggers, and any launch that reconcile submits. Three
+     * executors because they are three in production, and draining them in that order is what makes the
+     * assertion afterwards a statement about a settled system rather than a sample of a racing one.
+     *
+     * <p>Deliberately never calls {@code reconcileWarmPool}. Every test below is about what the teardown
+     * alone produces, so a reconcile driven from the test would answer the question for it.
+     */
+    private static void reapAndSettle(XcpngCloud cloud, AbstractCloudComputer<?> computer) throws Exception {
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        ExecutorService reconciles = Executors.newSingleThreadExecutor();
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        cloud.setReconcileExecutor(reconciles);
+        cloud.setProvisionExecutor(launches);
+        XcpngRetentionStrategy strategy =
+                assertInstanceOf(XcpngRetentionStrategy.class, computer.getRetentionStrategy());
+
+        strategy.reap(computer, reaps);
+
+        reaps.shutdown();
+        assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the teardown should finish");
+        reconciles.shutdown();
+        assertTrue(reconciles.awaitTermination(30, TimeUnit.SECONDS), "the triggered reconcile should finish");
+        launches.shutdown();
+        assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the replacement launch should finish");
+    }
+
+    /**
+     * At {@code maxInstances == minInstances} the spare holds the only slot, so its replacement cannot be
+     * cloned until the teardown returns that capacity — pinned by
+     * {@link #aCloudAtItsCapClonesNoReplacementUntilTheReclaimedAgentIsGone}. The teardown itself must
+     * therefore ask for the reconcile, because the only other thing that would is the maintainer's next
+     * tick, up to a full minute later (#120).
+     *
+     * <p>No reconcile is driven from the test. The clone asserted here is the one the teardown asked for.
+     */
+    @Test
+    void reclaimingTheLastSpareAtTheCapClonesItsReplacementWithoutWaitingForATick(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 1, 1);
+        r.jenkins.clouds.add(cloud);
+        reconcileAndSettle(cloud);
+        assertEquals(1, warmNodeCount(r), "the spare must be up before there is anything to reclaim");
+        XcpngAgent spare =
+                assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, spare.getComputer());
+        long clonesBefore = cloneCount(fake);
+
+        reapAndSettle(cloud, computer);
+
+        assertEquals(
+                clonesBefore + 1,
+                cloneCount(fake),
+                "the freed slot must be refilled by the teardown, not by a later tick: " + fake.calls());
+        assertEquals(1, warmNodeCount(r), "the pool should be back at its target");
+    }
+
+    /**
+     * The same, with headroom under the cap and a spare that has been taken by a build. The lab run added
+     * this row: a cloud at {@code min 1 / max 2} escapes the wait only when a build outlasts the maintainer's
+     * period, so that a mid-build tick clones the replacement while the old agent still runs. Take the build
+     * under that period — no tick between the spare being used and its teardown, which is what this sets up —
+     * and the wait comes straight back. So it is pinned rather than assumed to follow from the cap case.
+     */
+    @Test
+    void reclaimingAUsedSpareWithHeadroomClonesItsReplacementWithoutWaitingForATick(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 2, 1);
+        r.jenkins.clouds.add(cloud);
+        reconcileAndSettle(cloud);
+        assertEquals(1, warmNodeCount(r), "the spare must be up before a build can take it");
+        XcpngAgent spare =
+                assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
+        // A build took it, so it is a used single-use agent and no longer a spare: the pool is one short from
+        // this moment, and nothing has reconciled since.
+        spare.markUsed();
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, spare.getComputer());
+        long clonesBefore = cloneCount(fake);
+
+        reapAndSettle(cloud, computer);
+
+        assertEquals(
+                clonesBefore + 1,
+                cloneCount(fake),
+                "the used spare's replacement must be cloned on its teardown: " + fake.calls());
+        assertEquals(1, warmNodeCount(r), "the pool should be back at its target");
+    }
+
+    /**
+     * A trigger arriving while the pool's launches are still in flight adds nothing. The deficit already
+     * subtracts {@code warmInFlight}, so the reconcile a freed slot asks for sees the target covered by
+     * provisions that have not registered yet, rather than covering it a second time.
+     */
+    @Test
+    void aTriggeredReconcileAddsNothingToLaunchesAlreadyInFlight(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3, 2);
+        r.jenkins.clouds.add(cloud);
+        // One worker held on a gate, so the first pass's launches keep their reservations and never register.
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        CountDownLatch gate = new CountDownLatch(1);
+        launches.submit(() -> {
+            gate.await();
+            return null;
+        });
+        cloud.setProvisionExecutor(launches);
+        ExecutorService reconciles = Executors.newSingleThreadExecutor();
+        cloud.setReconcileExecutor(reconciles);
+        try {
+            cloud.reconcileWarmPool();
+            assertEquals(2, cloud.inFlightCount(), "the first pass should reserve the whole target");
+
+            cloud.requestReconcile();
+            reconciles.shutdown();
+            assertTrue(reconciles.awaitTermination(30, TimeUnit.SECONDS), "the triggered reconcile should finish");
+
+            assertEquals(2, cloud.inFlightCount(), "a trigger must not provision over launches already in flight");
+        } finally {
+            gate.countDown();
+            launches.shutdownNow();
+        }
+    }
+
+    /**
+     * Several slots freed at once — a drain of surplus spares, or a mass teardown — must collapse into one
+     * queued reconcile rather than one per removal, each of which would then queue on the cloud's monitor
+     * behind the first.
+     *
+     * <p>The single worker is occupied for the whole burst, so no queued pass can run and clear the flag
+     * while it arrives. That is the case the debounce exists for; counting submissions rather than clones is
+     * what makes it visible, since a second pass over a pool already at its target would clone nothing and
+     * look identical.
+     */
+    @Test
+    void aBurstOfFreedSlotsCollapsesIntoOneQueuedReconcile(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3, 2);
+        r.jenkins.clouds.add(cloud);
+        AtomicInteger submitted = new AtomicInteger();
+        CountDownLatch gate = new CountDownLatch(1);
+        ExecutorService reconciles =
+                new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>()) {
+                    @Override
+                    public void execute(Runnable command) {
+                        submitted.incrementAndGet();
+                        super.execute(command);
+                    }
+                };
+        cloud.setReconcileExecutor(reconciles);
+        try {
+            reconciles.submit(() -> {
+                gate.await();
+                return null;
+            });
+            submitted.set(0); // the gate task is scaffolding, not a reconcile
+
+            for (int i = 0; i < 5; i++) {
+                cloud.requestReconcile();
+            }
+
+            assertEquals(1, submitted.get(), "a burst of freed slots should collapse into one queued reconcile");
+        } finally {
+            gate.countDown();
+            reconciles.shutdownNow();
+        }
+    }
+
+    /**
+     * Triggers arriving while a pass is already running must not each queue their own pass.
+     *
+     * <p>{@link #aBurstOfFreedSlotsCollapsesIntoOneQueuedReconcile} does not cover this and cannot:
+     * its single worker is occupied, so the queued task never starts, never reaches the point where
+     * it releases the debounce, and the flag looks airtight. {@code Computer.threadPoolForRemoting}
+     * is multi-threaded, so in production the queued task does start, releases the debounce, and
+     * only then blocks on the cloud monitor. Every later trigger then passes the guard and takes
+     * another remoting worker with it.
+     *
+     * <p>Holding the cloud monitor in the test thread is what makes that window wide enough to
+     * observe: a pass cannot finish while the test holds it, so anything the guard lets through is
+     * visible as a second submission.
+     */
+    @Test
+    void triggersDuringARunningPassDoNotEachQueueTheirOwn(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3, 2);
+        r.jenkins.clouds.add(cloud);
+        AtomicInteger submitted = new AtomicInteger();
+        ExecutorService reconciles =
+                new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>()) {
+                    @Override
+                    public void execute(Runnable command) {
+                        submitted.incrementAndGet();
+                        super.execute(command);
+                    }
+                };
+        cloud.setReconcileExecutor(reconciles);
+        try {
+            synchronized (cloud) {
+                // Every trigger from here on finds a pass in flight and blocked, which is the state
+                // a mass teardown produces against a real remoting pool.
+                for (int i = 0; i < 10; i++) {
+                    cloud.requestReconcile();
+                    Thread.sleep(20);
+                }
+                assertEquals(
+                        1,
+                        submitted.get(),
+                        "a pass already in flight must absorb later triggers, not let each queue its own");
+            }
+        } finally {
+            reconciles.shutdownNow();
+        }
+    }
+
+    /**
+     * A cloud holding no warm pool clones nothing when one of its agents is reclaimed.
+     *
+     * <p>Plainly what this is: a regression guard, and not evidence the trigger works. The deficit is zero
+     * here with or without it, so no mutation of this change can turn this test red — delete the trigger
+     * outright and it still passes. It is here to catch a later change that made a teardown provision on an
+     * on-demand cloud, which would be a fresh VM after every build with nothing asking for one. #33 has this
+     * repo on record for a javadoc claiming coverage its test did not have, so this one says so instead.
+     */
+    @Test
+    void reclaimingAnAgentOnACloudWithNoWarmPoolClonesNothing(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 2, 0);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent =
+                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-used-1", activityId("xcpng-used-1"), false);
+        r.jenkins.addNode(agent);
+        AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, agent.getComputer());
+        long clonesBefore = cloneCount(fake);
+
+        reapAndSettle(cloud, computer);
+
+        assertEquals(
+                clonesBefore,
+                cloneCount(fake),
+                "an on-demand cloud must not provision anything on a teardown: " + fake.calls());
     }
 
     /**

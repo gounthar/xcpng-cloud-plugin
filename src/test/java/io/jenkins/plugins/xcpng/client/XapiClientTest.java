@@ -314,6 +314,27 @@ class XapiClientTest {
     }
 
     @Test
+    void destroyWithDisksShutsARunningVmDownThroughTheAsyncTaskPath() {
+        // #73: a synchronous hard_shutdown blocks server-side until the domain is down, so one
+        // crossing the transport's 30s timeout failed the whole teardown as a leak while the
+        // shutdown proceeded regardless. Same mismatch measured live for VM.start on this pool.
+        ScriptedTransport t = new ScriptedTransport();
+        t.powerState = "Running";
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.destroyWithDisks(new VmRef("OpaqueRef:vm-1"));
+
+        List<String> methods = t.methods();
+        assertTrue(methods.contains("Async.VM.hard_shutdown"), "the shutdown was not asynchronous");
+        assertTrue(
+                methods.indexOf("Async.VM.hard_shutdown") < methods.indexOf("task.get_status"),
+                "the shutdown task went unawaited");
+        assertTrue(
+                methods.indexOf("task.get_status") < methods.indexOf("VM.destroy"),
+                "the destroy must wait for the shutdown to settle");
+    }
+
+    @Test
     void destroyWithDisksDestroysASharedVdiOnlyOnce() {
         ScriptedTransport t = new ScriptedTransport();
         t.extraDisk = true; // two Disk VBDs
@@ -520,6 +541,12 @@ class XapiClientTest {
                         case "Async.VM.clone" -> "OpaqueRef:task-clone";
                         case "Async.VM.start" -> "OpaqueRef:task-start";
                         case "Async.VM.clean_shutdown" -> "OpaqueRef:task-stop";
+                        case "Async.VM.hard_shutdown" -> "OpaqueRef:task-hard-shutdown";
+                        // Answering the synchronous form would humour the exact regression #73
+                        // removes; a fake more agreeable than the pool hides the bug (see the
+                        // repo rule that came out of #24 and #42).
+                        case "VM.hard_shutdown" ->
+                            throw new AssertionError("synchronous VM.hard_shutdown: use the async task path");
                         case "task.get_status" -> taskStatus;
                         // Clone-like tasks wrap a hex OpaqueRef; void tasks (start, clean_shutdown) settle
                         // with an empty result. Returning a ref for everything would hide the void-task bug.
