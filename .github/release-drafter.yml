@@ -6,51 +6,73 @@
 # This mirrors what JEP-229 continuous delivery does inside the jenkinsci org, so if the
 # plugin is ever donated the change is swapping in `cd.yaml` rather than rethinking how
 # releases are decided. See the Releases section of README.md.
+#
+# Everything below lives in one `categories` list on purpose. Release Drafter deprecated
+# the three separate spellings this file used to carry -- `categories[*].labels`, the
+# top-level `exclude-labels`, and `version-resolver.{major,minor,patch}.labels` -- in
+# favour of entries in this list distinguished by `type`. The run log named all eight
+# before the migration; upstream documents the move in release-drafter/release-drafter#1558.
 ---
 name-template: '$RESOLVED_VERSION'
 tag-template: '$RESOLVED_VERSION'
 
 categories:
   - title: Features
-    labels:
-      - enhancement
+    when:
+      labels:
+        - enhancement
   - title: Bug fixes
-    labels:
-      - bug
+    when:
+      labels:
+        - bug
   - title: Documentation
-    labels:
-      - documentation
+    when:
+      labels:
+        - documentation
   - title: Build, CI, and dependencies
-    labels:
-      - build
-      - dependencies
-      - github_actions
-      - java
+    when:
+      labels:
+        - build
+        - dependencies
+        - github_actions
+        - java
 
-# `default: patch` matters more than the individual entries: an unlabeled pull request
-# still lands somewhere sensible instead of silently deciding the version for us.
-version-resolver:
-  major:
-    labels:
-      - major
-      - breaking
-  minor:
-    labels:
-      - minor
-      - enhancement
-  patch:
-    labels:
-      - patch
-      - bug
-      - documentation
-      - dependencies
-      - build
-      - github_actions
-      - java
-  default: patch
+  - type: 'pre-exclude'
+    when:
+      label: skip-changelog
 
-exclude-labels:
-  - skip-changelog
+  # The version resolves from the `type: version-resolver` entries below, and the last one
+  # is the important line: it carries no `when:`, which is how the old `default: patch` is
+  # spelled in the new form. It matters more than any individual label entry, because an
+  # unlabelled pull request still lands somewhere sensible instead of silently deciding the
+  # version for us. Dropping it does not break the parse -- it stops resolving a version at
+  # all for an unlabelled pull request, and that surfaces only when a release is cut.
+  # Where two entries match, the highest increment wins.
+  - type: 'version-resolver'
+    semver-increment: major
+    when:
+      labels:
+        - major
+        - breaking
+  - type: 'version-resolver'
+    semver-increment: minor
+    when:
+      labels:
+        - minor
+        - enhancement
+  - type: 'version-resolver'
+    semver-increment: patch
+    when:
+      labels:
+        - patch
+        - bug
+        - documentation
+        - dependencies
+        - build
+        - github_actions
+        - java
+  - type: 'version-resolver'
+    semver-increment: patch
 
 change-template: '- $TITLE (#$NUMBER) @$AUTHOR'
 no-changes-template: '- No user-visible changes'
