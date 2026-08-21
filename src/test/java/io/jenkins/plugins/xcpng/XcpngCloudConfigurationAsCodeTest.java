@@ -171,6 +171,29 @@ class XcpngCloudConfigurationAsCodeTest {
                         + log.stream().map(LogRecord::getMessage).toList());
     }
 
+    /**
+     * A controller that imported a legacy document must not hand the retired key back out again.
+     *
+     * <p>{@code exportMatchesExpectedYaml} cannot catch this: it starts from a document that never carried
+     * {@code trustSelfSigned}, so the value is already the default and would be omitted however the getter
+     * behaved. Only a cloud that actually imported the old key can tell whether the export path resurrects
+     * it, and an export that did would put a dead setting into configuration that outlives this migration.
+     */
+    @Test
+    void exportOmitsTheRetiredKeyAfterALegacyImport(JenkinsRule r) throws Exception {
+        ConfigurationAsCode.get()
+                .configure(getClass()
+                        .getResource("configuration-as-code-legacy-trust.yaml")
+                        .toExternalForm());
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-legacy");
+        assertNotNull(cloud, "the fixture must really have imported, or this proves nothing");
+
+        String exported = exportedClouds();
+        assertFalse(
+                exported.contains("trustSelfSigned"),
+                "an imported legacy cloud must not export the retired key: " + exported);
+    }
+
     /** A record's message, never null: {@code LogRecord#getMessage} is nullable and the handler keeps all. */
     private static String messageOf(LogRecord record) {
         String message = record.getMessage();

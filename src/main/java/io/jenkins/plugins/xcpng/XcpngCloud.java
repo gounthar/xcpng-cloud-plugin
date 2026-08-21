@@ -308,23 +308,6 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Bind, and refuse, the option {@link #certificateFingerprint} replaced.
-     *
-     * <p>This exists for configuration-as-code and for no other reason. JCasC binds by property name, and an
-     * unknown one is not a soft failure: it raises {@code UnknownAttributesException}, which rejects the
-     * <em>entire</em> configuration document rather than this cloud. A controller whose YAML still carried
-     * {@code trustSelfSigned} would therefore come up with none of its configuration applied, and be told
-     * about it as a complaint about an attribute name. Giving the retired name somewhere to land turns that
-     * back into the same outcome the {@code config.xml} path already had: the document applies, the cloud
-     * exists, and it fails closed with a warning that says what to do.
-     *
-     * <p>The value is recorded and never honoured. There is no getter on purpose, so an export cannot
-     * reintroduce the key into a document that no longer needs it.
-     *
-     * @deprecated set a {@code certificateFingerprint} instead; this is accepted only so an old document
-     *     still loads, and it has no effect on how the pool's certificate is verified.
-     */
-    /**
      * Present so configuration-as-code can find the retired attribute at all, and for no other purpose.
      *
      * <p>JCasC discovers attributes from <em>getters</em> and then resolves a setter for each one:
@@ -332,9 +315,13 @@ public class XcpngCloud extends Cloud {
      * none. A {@code @DataBoundSetter} on its own is therefore invisible to it, which is exactly the state
      * this fix was first written in, and the document still failed with {@code UnknownAttributesException}.
      *
-     * <p>Exporting it back is not a concern: {@code DataBoundConfigurator} compares each value against a
-     * freshly constructed default before writing it out, and {@code false} is that default, so a cloud that
-     * never carried the option does not gain the key. {@code exportMatchesExpectedYaml} is the guard.
+     * <p>It reports {@code false} unconditionally, which is deliberate and is the whole reason it can exist
+     * safely. {@code DataBoundConfigurator} compares each value against a freshly constructed default before
+     * writing it out and omits anything equal to it, so a getter that answered {@code true} for a legacy
+     * cloud would put {@code trustSelfSigned: true} back into every document exported from that controller,
+     * resurrecting a dead key in configuration that outlives this migration. Only the export path reads this
+     * method; the migration logic reads the field directly, so reporting the neutral value costs nothing and
+     * cannot mask a real setting. {@code exportOmitsTheRetiredKeyAfterALegacyImport} is the guard.
      *
      * <p>This getter, not the {@code @DataBoundSetter} beside it, is the load-bearing half. Mutation-checked
      * both ways: removing the annotation from the setter changes nothing, because JCasC pairs a getter with
@@ -351,7 +338,7 @@ public class XcpngCloud extends Cloud {
      * purpose; read {@link #getCertificateFingerprint} to find out how this cloud verifies the pool.
      */
     public boolean isTrustSelfSigned() {
-        return trustSelfSigned;
+        return false;
     }
 
     /**
