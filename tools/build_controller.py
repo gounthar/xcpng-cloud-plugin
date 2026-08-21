@@ -35,6 +35,7 @@ run left behind, so it is safe to iterate on.
 import argparse
 import hashlib
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,15 @@ from xapi import Xapi, XapiError
 IMAGE_URL = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
 SUMS_URL = "https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS"
 DOCKER_KEY_URL = "https://download.docker.com/linux/debian/gpg"
+
+# Stamped into every VDI this script creates, and required before the orphan sweep destroys
+# anything. It lives here rather than inline at the two call sites on purpose: the sweep
+# matches what the create writes, and a literal in each place lets them drift apart silently.
+VDI_MARKER = "built by tools/build_controller.py"
+
+# External binaries the build shells out to. Checked before the image download rather than
+# after it, so a missing package costs a second instead of a few hundred MiB.
+REQUIRED_BINARIES = ("genisoimage", "qemu-img")
 
 # Xensource's registered OUI. Deriving a MAC inside it keeps the address stable across
 # rebuilds without colliding with a real vendor's range.
@@ -191,8 +201,13 @@ def fetch_image(workdir):
     with urllib.request.urlopen(SUMS_URL, timeout=60) as response:
         sums = response.read().decode()
     want = next(
-        line.split()[0] for line in sums.splitlines() if line.endswith(qcow.name)
+        (line.split()[0] for line in sums.splitlines() if line.endswith(qcow.name)),
+        None,
     )
+    if want is None:
+        # A renamed upstream artifact reaches here. Without the default, next() raises a bare
+        # StopIteration and the operator gets a traceback that names nothing.
+        raise SystemExit(f"no SHA512SUMS entry for {qcow.name}; refusing to import it")
     # Chunked rather than qcow.read_bytes(): the image is a few hundred MiB and there is no
     # reason to hold all of it at once just to hash it.
     digest = hashlib.sha512()
@@ -223,7 +238,7 @@ def import_vdi(x, sr, path, name, virtual_size=None):
         "VDI.create",
         {
             "name_label": name,
-            "name_description": "built by tools/build_controller.py",
+            "name_description": VDI_MARKER,
             "SR": sr,
             "virtual_size": str(virtual_size or size),
             "type": "user",
@@ -302,8 +317,16 @@ def run_reservation_hook(hook, mac, name):
     return reserved or None
 
 
-def destroy_existing(x, name):
-    """Remove a previous build of this VM, and sweep VDIs an earlier failure stranded."""
+def destroy_existing(x, name, sr):
+    """Remove a previous build of this VM, and sweep VDIs an earlier failure stranded.
+
+    The sweep is deliberately narrow. ``debian-13-genericcloud`` is the name anyone importing
+    a stock Debian cloud image lands on, and this pool is shared, so matching a label alone
+    would let a re-run destroy a disk belonging to someone else's work. Requiring the marker
+    this script stamps at VDI.create, and staying inside the SR this run writes to, keeps it
+    to disks we made. Same lesson as the reaper's owner marker (#25): a name prefix is a
+    guess about ownership, a stamp is a record of it.
+    """
     for ref, rec in x.call("VM.get_all_records").items():
         if rec["name_label"] != name:
             continue
@@ -331,6 +354,8 @@ def destroy_existing(x, name):
     for ref, rec in x.call("VDI.get_all_records").items():
         if (
             rec["name_label"] in ("debian-13-genericcloud", f"{name}-cidata")
+            and rec["name_description"] == VDI_MARKER
+            and rec["SR"] == sr
             and not rec["VBDs"]
         ):
             x.call("VDI.destroy", ref)
@@ -394,8 +419,8 @@ def parse_args(argv=None):
 
 def build(x, args, pubkey, docker_key):
     """Create the VM and start it. Returns its VM ref."""
-    destroy_existing(x, args.name)
     sr = find_ext_sr(x)
+    destroy_existing(x, args.name, sr)
 
     tools_iso = None
     for ref, rec in x.call("VDI.get_all_records").items():
@@ -526,6 +551,12 @@ def wait_for_address(x, vm, timeout):
 
 def main(argv=None):
     args = parse_args(argv)
+    missing = [b for b in REQUIRED_BINARIES if shutil.which(b) is None]
+    if missing:
+        raise SystemExit(
+            f"missing required {'binaries' if len(missing) > 1 else 'binary'}: "
+            f"{', '.join(missing)}. On Debian: apt install genisoimage qemu-utils"
+        )
     pubkey = pathlib.Path(args.pubkey).expanduser().read_text().strip()
     print(f"MAC: {args.mac}")
     if args.reservation_hook:

@@ -214,6 +214,153 @@ def test_a_failing_reservation_hook_is_not_fatal(monkeypatch):
     )
 
 
+# -- the orphan sweep -------------------------------------------------------
+
+
+def sweep_pool(vdis):
+    """A pool holding `vdis`, with the VM scan empty so only the sweep runs."""
+    return RecordingXapi({"VM.get_all_records": {}, "VDI.get_all_records": vdis})
+
+
+def orphan(label, description=bc.VDI_MARKER, sr="OpaqueRef:sr", vbds=None):
+    return {
+        "name_label": label,
+        "name_description": description,
+        "SR": sr,
+        "VBDs": vbds or [],
+    }
+
+
+def test_the_sweep_destroys_this_scripts_own_stranded_disks():
+    x = sweep_pool(
+        {
+            "OpaqueRef:root": orphan("debian-13-genericcloud"),
+            "OpaqueRef:seed": orphan("ctl-cidata"),
+        }
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert sorted(x.destroyed_vdis) == ["OpaqueRef:root", "OpaqueRef:seed"]
+
+
+def test_the_sweep_spares_a_matching_label_this_script_did_not_create():
+    """The pool is shared. `debian-13-genericcloud` is the name anyone importing a stock
+    Debian cloud image lands on, so a label match alone would destroy another operator's
+    disk with no confirmation and no recovery."""
+    x = sweep_pool(
+        {"OpaqueRef:theirs": orphan("debian-13-genericcloud", description="")}
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert x.destroyed_vdis == [], "a disk without our marker is not ours to destroy"
+
+
+def test_the_sweep_stays_inside_the_sr_this_run_writes_to():
+    x = sweep_pool(
+        {"OpaqueRef:elsewhere": orphan("debian-13-genericcloud", sr="OpaqueRef:other")}
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert x.destroyed_vdis == []
+
+
+def test_the_sweep_leaves_an_attached_disk_alone():
+    """A VDI with a VBD belongs to a live VM, marker or not."""
+    x = sweep_pool(
+        {"OpaqueRef:live": orphan("debian-13-genericcloud", vbds=["OpaqueRef:vbd"])}
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert x.destroyed_vdis == []
+
+
+def test_the_seed_vdi_is_scoped_to_the_name_being_rebuilt():
+    """Two controllers on one pool: rebuilding one must not take the other's seed."""
+    x = sweep_pool({"OpaqueRef:other-seed": orphan("other-cidata")})
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert x.destroyed_vdis == []
+
+
+def test_the_marker_the_sweep_matches_is_the_one_the_create_writes(monkeypatch, tmp_path):
+    """These two moved apart once already because each held its own string literal. If a
+    rename breaks this, the sweep silently stops finding anything rather than failing."""
+    image = tmp_path / "disk.raw"
+    image.write_bytes(b"0" * 16)
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+
+    seen = {}
+
+    def create(record):
+        seen.update(record)
+        return "OpaqueRef:vdi"
+
+    bc.import_vdi(
+        RecordingXapi({"VDI.create": create}),
+        "OpaqueRef:sr",
+        image,
+        "debian-13-genericcloud",
+    )
+
+    x = sweep_pool(
+        {
+            "OpaqueRef:o": orphan(
+                "debian-13-genericcloud", description=seen["name_description"]
+            )
+        }
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert x.destroyed_vdis == ["OpaqueRef:o"]
+
+
+# -- the image checksum -----------------------------------------------------
+
+
+def test_a_missing_checksum_line_names_the_artifact(monkeypatch, tmp_path):
+    """A renamed upstream artifact hits this. A bare next() raises StopIteration, and the
+    operator gets a traceback naming nothing."""
+    monkeypatch.setattr(
+        bc.urllib.request, "urlretrieve", lambda url, dest: pathlib.Path(dest).write_bytes(b"x")
+    )
+    monkeypatch.setattr(bc.urllib.request, "urlopen", lambda *a, **k: _FakeSums(b"abc  some-other-image.qcow2\n"))
+
+    with pytest.raises(SystemExit) as exc:
+        bc.fetch_image(tmp_path)
+    assert "debian-13-genericcloud-amd64.qcow2" in str(exc.value)
+
+
+class _FakeSums:
+    def __init__(self, body):
+        self.body = body
+
+    def read(self):
+        return self.body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+# -- the binary preflight ---------------------------------------------------
+
+
+def test_missing_binaries_are_reported_before_anything_is_downloaded(monkeypatch, tmp_path):
+    """Without this the FileNotFoundError lands after a few hundred MiB have been fetched."""
+    key = tmp_path / "k.pub"
+    key.write_text("ssh-ed25519 AAAA test\n")
+
+    def nothing_installed(binary):
+        return None
+
+    monkeypatch.setattr(bc.shutil, "which", nothing_installed)
+    downloaded = []
+    monkeypatch.setattr(
+        bc.urllib.request, "urlretrieve", lambda *a, **k: downloaded.append(a)
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        bc.main(["--pubkey", str(key)])
+    assert "genisoimage" in str(exc.value) and "qemu-img" in str(exc.value)
+    assert downloaded == [], "the check must run before the download, not after"
+
+
 # -- argument validation ----------------------------------------------------
 
 
