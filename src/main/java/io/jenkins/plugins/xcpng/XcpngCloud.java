@@ -19,6 +19,7 @@ import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
+import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
 import io.jenkins.plugins.xcpng.client.VmRef;
@@ -65,7 +66,7 @@ import org.kohsuke.stapler.verb.POST;
  * Provisions ephemeral build agents on an XCP-ng pool.
  *
  * <p>The plugin's {@code config.xml} holds only non-secrets and a credential ID: the pool URL, the
- * ID of the XAPI username/password credential, whether to trust a self-signed pool certificate, an
+ * ID of the XAPI username/password credential, the pinned certificate fingerprint if the pool needs one, an
  * instance cap, and the agent templates. The secret itself is resolved from the credentials store at
  * point of use and never written here.
  *
@@ -105,7 +106,24 @@ public class XcpngCloud extends Cloud {
 
     private final String poolUrl;
     private final String credentialsId;
-    private final boolean trustSelfSigned;
+    /**
+     * SHA-256 fingerprint of the certificate this pool is expected to present, or null for ordinary
+     * verification against the JVM trust store. A stock XCP-ng pool is self-signed, so this is how such a
+     * pool is reached; there is no longer any setting that accepts an unrecognised certificate.
+     */
+    @CheckForNull
+    private final String certificateFingerprint;
+
+    /**
+     * The switch this field replaced, kept only so {@link #readResolve} can recognise a config written
+     * before pinning existed and say so. Never read for a trust decision and never written: a cloud that
+     * arrives with this set and no fingerprint is refused, not quietly downgraded. Not final because it is
+     * no longer a constructor parameter -- XStream is the only thing that ever assigns it.
+     *
+     * @deprecated superseded by {@link #certificateFingerprint}; present for migration diagnostics only.
+     */
+    @Deprecated
+    private boolean trustSelfSigned;
     // Not final: readResolve re-applies the constructor's guards when XStream loads an older config
     // that predates these fields (the constructor does not run on deserialization).
     private int maxInstances;
@@ -224,7 +242,7 @@ public class XcpngCloud extends Cloud {
             @NonNull String name,
             String poolUrl,
             String credentialsId,
-            boolean trustSelfSigned,
+            String certificateFingerprint,
             int maxInstances,
             List<XcpngTemplate> templates) {
         super(name);
@@ -232,7 +250,11 @@ public class XcpngCloud extends Cloud {
         // would otherwise validate in the form yet break URI.create when the endpoint is built.
         this.poolUrl = poolUrl == null ? null : poolUrl.trim();
         this.credentialsId = credentialsId;
-        this.trustSelfSigned = trustSelfSigned;
+        // Normalise here so what is persisted is what every handshake compares against, whatever
+        // punctuation the operator pasted. An unparseable value is rejected by doCheckCertificateFingerprint
+        // on the form; reaching here with one (JCasC, a hand-edited config.xml) leaves it unset rather than
+        // half-applied, and the connection then fails closed against the pool's real certificate.
+        this.certificateFingerprint = normalizeOrNull(certificateFingerprint);
         this.maxInstances = maxInstances <= 0 ? 1 : maxInstances;
         this.templates = templates == null ? new ArrayList<>() : new ArrayList<>(templates);
     }
@@ -276,6 +298,17 @@ public class XcpngCloud extends Cloud {
         // awaitOnline poll without sleeping and time out instantly. Restore the production wait.
         onlineTimeoutMillis = TimeUnit.MINUTES.toMillis(ONLINE_TIMEOUT_MINUTES);
         onlinePollMillis = ONLINE_POLL_MILLIS;
+        // A cloud saved before pinning existed carries trustSelfSigned and no fingerprint. There is no
+        // longer a code path that accepts an unrecognised certificate, so this cannot be honoured; say so
+        // at load, loudly and by name, rather than letting the operator discover it as an opaque handshake
+        // failure the first time a build queues. The connection now fails closed, which is the point.
+        if (trustSelfSigned && certificateFingerprint == null) {
+            LOGGER.warning("Cloud '" + name + "' was saved with the removed \"Trust self-signed certificate\""
+                    + " option, which accepted any certificate from any host. It has no replacement setting."
+                    + " This cloud will not connect until an administrator opens its configuration, runs Test"
+                    + " connection to read the pool's certificate fingerprint, and saves it in the Certificate"
+                    + " fingerprint field.");
+        }
         return this;
     }
 
@@ -287,8 +320,27 @@ public class XcpngCloud extends Cloud {
         return credentialsId;
     }
 
-    public boolean isTrustSelfSigned() {
-        return trustSelfSigned;
+    @CheckForNull
+    public String getCertificateFingerprint() {
+        return certificateFingerprint;
+    }
+
+    /**
+     * The canonical form of {@code raw}, or null if it is absent or unparseable. Null rather than a
+     * throw, because the two callers -- the constructor and JCasC binding -- must not fail a whole
+     * controller boot over one malformed field; failing closed at connect time is the safer half.
+     */
+    @CheckForNull
+    private static String normalizeOrNull(String raw) {
+        if (raw == null || raw.isBlank()) {
+            return null;
+        }
+        try {
+            return CertificateFingerprint.normalize(raw);
+        } catch (IllegalArgumentException e) {
+            LOGGER.warning("Ignoring an unparseable certificate fingerprint: " + e.getMessage());
+            return null;
+        }
     }
 
     public int getMaxInstances() {
@@ -1035,7 +1087,7 @@ public class XcpngCloud extends Cloud {
         if (clientFactory != null) {
             return clientFactory.open(this);
         }
-        return openClient(poolUrl, credentialsId, trustSelfSigned, "cloud '" + name + "'");
+        return openClient(poolUrl, credentialsId, certificateFingerprint, "cloud '" + name + "'");
     }
 
     /**
@@ -1051,14 +1103,14 @@ public class XcpngCloud extends Cloud {
     static HypervisorClient openClient(
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
-            boolean trustSelfSigned,
+            @CheckForNull String certificateFingerprint,
             @NonNull String owner) {
         StandardUsernamePasswordCredentials credentials = DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
         if (credentials == null) {
             throw new IllegalStateException("No XAPI credentials configured for " + owner + ".");
         }
         return new XapiClient(
-                poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned);
+                poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), certificateFingerprint);
     }
 
     /** Test seam: replace how a client is opened with an in-memory fake. */
@@ -1187,7 +1239,7 @@ public class XcpngCloud extends Cloud {
             if (scheme.equalsIgnoreCase("http")) {
                 // Plain http sends the XAPI credential (typically the pool's root password) and every
                 // session token in cleartext. XAPI speaks TLS out of the box, and a self-signed pool
-                // certificate is already handled by trustSelfSigned, so no ordinary setup needs http.
+                // certificate is already handled by pinning its fingerprint, so no ordinary setup needs http.
                 return FormValidation.error(Messages.XcpngCloud_poolUrl_http());
             }
             if (uri.getHost() == null) {
@@ -1219,11 +1271,33 @@ public class XcpngCloud extends Cloud {
                     .includeCurrentValue(credentialsId);
         }
 
+        /**
+         * Validate a pasted fingerprint's syntax. A wrong-but-well-formed fingerprint cannot be caught
+         * here -- only the pool can say that, which is what Test connection is for -- but a truncated or
+         * mistyped one can, and catching it on the form beats a handshake failure that looks like a
+         * network problem.
+         */
+        @POST
+        public FormValidation doCheckCertificateFingerprint(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+            if (value == null || value.isBlank()) {
+                // Empty is legitimate: a pool whose certificate chains to a CA the JVM already trusts
+                // needs no pin. Test connection is what tells the operator which case they are in.
+                return FormValidation.ok();
+            }
+            try {
+                CertificateFingerprint.normalize(value);
+                return FormValidation.ok();
+            } catch (IllegalArgumentException e) {
+                return FormValidation.error(Messages.XcpngCloud_certificateFingerprint_malformed(e.getMessage()));
+            }
+        }
+
         @RequirePOST
         public FormValidation doTestConnection(
                 @QueryParameter String poolUrl,
                 @QueryParameter String credentialsId,
-                @QueryParameter boolean trustSelfSigned) {
+                @QueryParameter String certificateFingerprint) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.error(Messages.XcpngCloud_poolUrl_required());
@@ -1237,20 +1311,34 @@ public class XcpngCloud extends Cloud {
                 // letting it fail deeper in XapiClient as a less actionable transport error.
                 return urlCheck;
             }
+            final String pin;
+            try {
+                pin = certificateFingerprint == null || certificateFingerprint.isBlank()
+                        ? null
+                        : CertificateFingerprint.normalize(certificateFingerprint);
+            } catch (IllegalArgumentException e) {
+                return FormValidation.error(Messages.XcpngCloud_certificateFingerprint_malformed(e.getMessage()));
+            }
             StandardUsernamePasswordCredentials credentials = lookupCredentials(url, credentialsId);
             if (credentials == null) {
                 return FormValidation.error(Messages.XcpngCloud_credentials_required());
             }
             try (XapiClient client = new XapiClient(
-                    url, credentials.getUsername(), credentials.getPassword().getPlainText(), trustSelfSigned)) {
+                    url, credentials.getUsername(), credentials.getPassword().getPlainText(), pin)) {
                 client.ping();
-                return connectedResult(trustSelfSigned);
+                return connectedResult(pin);
             } catch (RuntimeException e) {
                 // The button is admin-only and the message carries no secret, so it is returned to the
                 // operator as the diagnostic they asked for; the stack trace is kept server-side. A
                 // RuntimeException with no message (a bare NPE) would render as "Connection failed: null",
                 // so fall back to a generic line and let the logged trace carry the detail.
                 LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + url + " failed");
+                if (pin == null && isTlsFailure(e)) {
+                    // The pool presented a certificate the JVM will not vouch for, which is the normal
+                    // state of a stock XCP-ng host. This is the half of trust-on-first-use a human
+                    // completes: show what was presented and let the operator confirm it is their pool.
+                    return untrustedResult(url);
+                }
                 String detail = e.getMessage();
                 return detail == null || detail.isBlank()
                         ? FormValidation.error(Messages.XcpngCloud_testConnection_failedNoDetail())
@@ -1259,15 +1347,47 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * The result of a successful {@code Test connection}. When the connection was made with TLS
-         * verification off, downgrade the message to a warning so the operator is told, on the form, that
-         * they connected over an unverified link carrying the pool credential, rather than seeing a clean
-         * success that hides it. Package-private so it can be asserted without a live pool.
+         * True when {@code failure} was a TLS problem rather than an HTTP, credential or routing one.
+         * Decided by walking the cause chain for {@link javax.net.ssl.SSLException}, because the client
+         * wraps transport failures in {@code HypervisorException} and the distinction matters: only a TLS
+         * failure should send the operator to the fingerprint, and a bad password over a perfectly good
+         * connection must not.
          */
-        static FormValidation connectedResult(boolean trustSelfSigned) {
-            return trustSelfSigned
-                    ? FormValidation.warning(Messages.XcpngCloud_testConnection_okInsecure())
-                    : FormValidation.ok(Messages.XcpngCloud_testConnection_ok());
+        private static boolean isTlsFailure(Throwable failure) {
+            for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+                if (cause instanceof javax.net.ssl.SSLException) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * The pool's certificate is not trusted and nothing is pinned yet: read what it presents and offer
+         * that fingerprint for the operator to confirm. Read with a trust manager that records the
+         * certificate and then refuses it, so this diagnostic never itself completes a handshake with an
+         * unverified peer -- nothing is sent, only looked at.
+         */
+        private static FormValidation untrustedResult(String url) {
+            try {
+                return FormValidation.warning(
+                        Messages.XcpngCloud_testConnection_untrusted(CertificateFingerprint.fetch(url)));
+            } catch (IOException probeFailure) {
+                LOGGER.log(Level.WARNING, probeFailure, () -> "Could not read the certificate presented by " + url);
+                return FormValidation.error(Messages.XcpngCloud_testConnection_probeFailed(probeFailure.getMessage()));
+            }
+        }
+
+        /**
+         * The result of a successful {@code Test connection}. Both outcomes are secure, so both are a
+         * plain OK: either the pool's certificate chained to a CA the JVM trusts, or it matched the
+         * fingerprint the operator pinned. The warning this method used to return -- connected, but over a
+         * link with verification switched off -- no longer has a case that can produce it.
+         */
+        static FormValidation connectedResult(@CheckForNull String certificateFingerprint) {
+            return certificateFingerprint == null
+                    ? FormValidation.ok(Messages.XcpngCloud_testConnection_ok())
+                    : FormValidation.ok(Messages.XcpngCloud_testConnection_okPinned());
         }
     }
 }

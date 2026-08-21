@@ -4,7 +4,7 @@ jenkins:
         name: "xcpng-lab"
         poolUrl: "https://192.168.1.87"
         credentialsId: "xcpng-root"
-        trustSelfSigned: true
+        certificateFingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
         maxInstances: 3
         templates:
           - templateName: "jenkins-golden-debian"
