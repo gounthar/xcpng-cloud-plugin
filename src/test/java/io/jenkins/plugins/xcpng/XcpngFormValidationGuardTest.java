@@ -1,6 +1,7 @@
 package io.jenkins.plugins.xcpng;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -71,6 +72,26 @@ class XcpngFormValidationGuardTest {
 
     private record NamedCheck(String name, java.util.function.Supplier<FormValidation> call) {}
 
+    /** One validator, with a value it must accept and a value it must reject. */
+    private record Endpoint(String descriptor, String method, String accepted, String rejected) {}
+
+    private static final String CLOUD = "io.jenkins.plugins.xcpng.XcpngCloud";
+    private static final String TEMPLATE = "io.jenkins.plugins.xcpng.XcpngTemplate";
+
+    /**
+     * All seven, so neither the GET nor the POST assertion can be satisfied by one representative method.
+     * {@code checkMinInstances} is reached over HTTP with no cloud in the ancestor path, so it sees a null
+     * cloud and falls back to the plain non-negative rule.
+     */
+    private static final List<Endpoint> ENDPOINTS = List.of(
+            new Endpoint(CLOUD, "checkPoolUrl", "https://pool.example.test", "http://pool.example.test"),
+            new Endpoint(TEMPLATE, "checkTemplateName", "jenkins-agent-debian13", ""),
+            new Endpoint(TEMPLATE, "checkLabelString", "xcpng-linux", ""),
+            new Endpoint(TEMPLATE, "checkNumCpus", "2", "0"),
+            new Endpoint(TEMPLATE, "checkMemoryMb", "2048", "0"),
+            new Endpoint(TEMPLATE, "checkMinInstances", "0", "-1"),
+            new Endpoint(TEMPLATE, "checkSshAuthorizedKey", "", "-----BEGIN OPENSSH PRIVATE KEY-----"));
+
     /** A user without ADMINISTER is refused by every one of the seven, not merely by the first. */
     @Test
     void aBystanderCannotReachAnyFieldValidator(JenkinsRule r) {
@@ -117,33 +138,49 @@ class XcpngFormValidationGuardTest {
                 throw new AssertionError(url + " was reachable over GET", e);
             }
         };
-        String cloud = "descriptorByName/io.jenkins.plugins.xcpng.XcpngCloud/";
-        String tpl = "descriptorByName/io.jenkins.plugins.xcpng.XcpngTemplate/";
-        assertGetIsNotRouted.accept(cloud + "checkPoolUrl?value=https://pool.example.test");
-        assertGetIsNotRouted.accept(tpl + "checkTemplateName?value=jenkins-agent-debian13");
-        assertGetIsNotRouted.accept(tpl + "checkLabelString?value=xcpng-linux");
-        assertGetIsNotRouted.accept(tpl + "checkNumCpus?value=2");
-        assertGetIsNotRouted.accept(tpl + "checkMemoryMb?value=2048");
-        assertGetIsNotRouted.accept(tpl + "checkMinInstances?value=0");
-        assertGetIsNotRouted.accept(tpl + "checkSshAuthorizedKey?value=");
+        for (Endpoint e : ENDPOINTS) {
+            assertGetIsNotRouted.accept("descriptorByName/" + e.descriptor() + "/" + e.method() + "?value="
+                    + java.net.URLEncoder.encode(e.accepted(), java.nio.charset.StandardCharsets.UTF_8));
+        }
     }
 
     /**
-     * The counterpart, and the one that would catch a broken form: the same URLs answer over POST. Since
-     * Jenkins 2.285 field validation POSTs by default ({@code registerValidator} in
-     * {@code hudson-behavior.js} reads {@code checkMethod || "post"}), so no {@code checkMethod="post"}
-     * is needed in {@code config.jelly} at this baseline — which is what this asserts.
+     * The counterpart, and the one that would catch a broken form: the same URLs answer over POST, for
+     * every validator rather than one representative. Since Jenkins 2.285 field validation POSTs by
+     * default ({@code registerValidator} in {@code hudson-behavior.js} reads
+     * {@code checkMethod || "post"}), so no {@code checkMethod="post"} is needed in
+     * {@code config.jelly} at this baseline, and this is what asserts that.
+     *
+     * <p>Each validator gets both halves: a value it must accept, and a value it must reject. Accepting
+     * everything would pass against a validator wired to a method that never returns an error, which is
+     * the too-agreeable fixture this repo keeps getting caught by.
      */
     @Test
-    void aPostReachesTheValidatorAndItAnswers(JenkinsRule r) throws Exception {
+    void aPostReachesEveryValidatorAndItAnswers(JenkinsRule r) throws Exception {
         lockDown(r);
         JenkinsRule.WebClient wc = r.createWebClient().login("alice");
-        String body = postCheck(r, wc, "io.jenkins.plugins.xcpng.XcpngTemplate", "checkLabelString", "");
-        assertTrue(
-                body.contains("error") || body.contains("required"),
-                "a blank label should come back as an error, got: " + body);
-        String ok = postCheck(r, wc, "io.jenkins.plugins.xcpng.XcpngTemplate", "checkLabelString", "xcpng-linux");
-        assertTrue(ok.isBlank() || !ok.contains("error"), "a valid label should not come back as an error: " + ok);
+        for (Endpoint e : ENDPOINTS) {
+            String ok = postCheck(r, wc, e.descriptor(), e.method(), e.accepted());
+            assertFalse(
+                    isError(ok), e.method() + " rejected " + quoted(e.accepted()) + ", which it should accept: " + ok);
+            String bad = postCheck(r, wc, e.descriptor(), e.method(), e.rejected());
+            assertTrue(
+                    isError(bad),
+                    e.method() + " accepted " + quoted(e.rejected()) + ", which it should reject: " + bad);
+        }
+    }
+
+    /**
+     * {@code FormValidation.ok()} renders as an empty {@code <div/>} and an error as
+     * {@code <div class="error">}, both over HTTP 200, so the status line says nothing about the verdict
+     * and the body has to be read.
+     */
+    private static boolean isError(String body) {
+        return body.contains("class=\"error\"");
+    }
+
+    private static String quoted(String value) {
+        return value.isEmpty() ? "the empty string" : "\"" + value + "\"";
     }
 
     /**
