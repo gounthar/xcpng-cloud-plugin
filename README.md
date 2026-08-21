@@ -132,6 +132,13 @@ jenkins:
             sshAuthorizedKey: "ssh-ed25519 AAAA...replace-with-your-public-key you@example"
 ```
 
+**Upgrading from a version with "Trust self-signed certificate":** that option is gone, and there is
+no automatic replacement for it. A cloud saved with it and no fingerprint logs a warning naming the
+cloud at startup and then fails to connect, so provisioning stops until an administrator opens the
+cloud's configuration, presses **Test connection**, and saves the fingerprint it reports. That is
+deliberate rather than a migration oversight: the old setting accepted any certificate from any host,
+and silently carrying that forward would have preserved the exact weakness this replaces.
+
 Leave `certificateFingerprint` empty for a pool whose certificate chains to a CA the controller
 trusts. For a stock pool, set it to that pool's SHA-256 certificate fingerprint, which you can read on
 the host with `openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256`. Colons are

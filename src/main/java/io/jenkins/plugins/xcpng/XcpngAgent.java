@@ -87,7 +87,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * configuration, or renamed, which is the same thing to an agent holding a name.
      *
      * <p>Non-secret by construction, and deliberately the same three values the cloud persists: the pool URL,
-     * the <em>ID</em> of the XAPI credential, and whether to trust a self-signed pool certificate. The
+     * the <em>ID</em> of the XAPI credential, and the pinned certificate fingerprint, if there is one. The
      * credential itself is still resolved from the store at point of use, so nothing secret reaches the node's
      * {@code config.xml}. Null on an agent persisted before this snapshot existed; {@link #_terminate} treats
      * that absence as "no fallback available" rather than normalising it, since there is nothing to normalise
@@ -152,7 +152,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     /**
      * How a client is opened from the {@link #poolUrl} snapshot when the owning cloud is gone. Null in
      * production, where {@link #openClientFromSnapshot()} builds an {@code XapiClient} through
-     * {@link XcpngCloud#openClient(String, String, boolean, String)}; a test injects an in-memory fake and
+     * {@link XcpngCloud#openClient(String, String, String, String)}; a test injects an in-memory fake and
      * asserts the snapshot it was handed. Transient: behaviour, not configuration, and never persisted.
      */
     private transient ConnectionClientFactory connectionClientFactory;
@@ -227,7 +227,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         return credentialsId;
     }
 
-    /** Whether the owning cloud was configured to trust a self-signed pool certificate. */
+    /**
+     * The certificate fingerprint the owning cloud pinned, or null if that cloud verified the pool against
+     * the JVM trust store instead. Part of the connection snapshot, not a live read of the cloud.
+     */
     @CheckForNull
     public String getCertificateFingerprint() {
         return certificateFingerprint;

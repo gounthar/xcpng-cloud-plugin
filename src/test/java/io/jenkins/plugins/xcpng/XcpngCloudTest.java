@@ -105,7 +105,8 @@ class XcpngCloudTest {
 
     /**
      * The agent's connection snapshot follows the same rule one level down: a provisioned node persists the
-     * pool URL, the credential ID and the TLS-trust flag — which is what lets teardown destroy the VM after
+     * pool URL, the credential ID and the pinned certificate fingerprint — which is what lets teardown
+     * destroy the VM after
      * the cloud is deleted or renamed — and never the password behind that ID.
      */
     @Test
@@ -235,8 +236,8 @@ class XcpngCloudTest {
         assertTrue(
                 log.stream()
                         .anyMatch(record -> record.getLevel() == Level.WARNING
-                                && record.getMessage().contains("lab")
-                                && record.getMessage().contains("Trust self-signed certificate")),
+                                && messageOf(record).contains("lab")
+                                && messageOf(record).contains("Trust self-signed certificate")),
                 "the refusal must name the cloud and the removed option: "
                         + log.stream().map(LogRecord::getMessage).toList());
     }
@@ -261,9 +262,19 @@ class XcpngCloudTest {
         });
 
         assertTrue(
-                log.stream().noneMatch(record -> record.getMessage().contains("Trust self-signed certificate")),
+                log.stream().noneMatch(record -> messageOf(record).contains("Trust self-signed certificate")),
                 "a migrated cloud must not be warned about: "
                         + log.stream().map(LogRecord::getMessage).toList());
+    }
+
+    /**
+     * A record's message, never null. {@code LogRecord#getMessage} is nullable, and the handler below keeps
+     * every record the logger emits rather than only ours, so one record with no message would turn a
+     * predicate into an NPE and a real assertion into a spurious failure.
+     */
+    private static String messageOf(LogRecord record) {
+        String message = record.getMessage();
+        return message == null ? "" : message;
     }
 
     /** Collect everything {@link XcpngCloud} logs while {@code body} runs. */

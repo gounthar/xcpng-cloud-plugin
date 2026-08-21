@@ -66,7 +66,7 @@ import org.kohsuke.stapler.verb.POST;
  * Provisions ephemeral build agents on an XCP-ng pool.
  *
  * <p>The plugin's {@code config.xml} holds only non-secrets and a credential ID: the pool URL, the
- * ID of the XAPI username/password credential, whether to trust a self-signed pool certificate, an
+ * ID of the XAPI username/password credential, the pinned certificate fingerprint if the pool needs one, an
  * instance cap, and the agent templates. The secret itself is resolved from the credentials store at
  * point of use and never written here.
  *
