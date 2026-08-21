@@ -1158,7 +1158,9 @@ public class XcpngCloud extends Cloud {
          * is left to {@code ok()} so a fresh form does not nag; a non-blank value goes through the same
          * scheme/host check the connection test applies.
          */
+        @POST
         public FormValidation doCheckPoolUrl(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
