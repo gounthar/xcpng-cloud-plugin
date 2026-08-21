@@ -8,11 +8,13 @@ import hudson.model.Descriptor;
 import hudson.util.FormValidation;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.model.Jenkins;
 import org.jenkinsci.Symbol;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.verb.POST;
 
 /**
  * One kind of agent this cloud can provision: which golden-image template to clone, the labels the
@@ -241,7 +243,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             return Messages.XcpngTemplate_DisplayName();
         }
 
+        @POST
         public FormValidation doCheckTemplateName(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             return value == null || value.isBlank()
                     ? FormValidation.error(Messages.XcpngTemplate_templateName_required())
                     : FormValidation.ok();
@@ -255,17 +259,23 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * silently meant "serve unlabeled builds"; this says so at the form rather than leaving a config
          * that looks configured and provisions nothing.
          */
+        @POST
         public FormValidation doCheckLabelString(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             return value == null || value.isBlank()
                     ? FormValidation.error(Messages.XcpngTemplate_labelString_required())
                     : FormValidation.ok();
         }
 
+        @POST
         public FormValidation doCheckNumCpus(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             return checkPositiveInt(value, Messages.XcpngTemplate_numCpus_label());
         }
 
+        @POST
         public FormValidation doCheckMemoryMb(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             return checkPositiveInt(value, Messages.XcpngTemplate_memoryMb_label());
         }
 
@@ -275,7 +285,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * warn if the target exceeds the cloud's instance cap: warm agents count against {@code
          * maxInstances}, so a larger target can never be filled.
          */
+        @POST
         public FormValidation doCheckMinInstances(@AncestorInPath XcpngCloud cloud, @QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }
@@ -300,7 +312,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * ({@link XcpngTemplate#sshAuthorizedKeyProblem}), so the UI message and the load-time invariant
          * cannot drift apart. Optional field, so blank is fine.
          */
+        @POST
         public FormValidation doCheckSshAuthorizedKey(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
                 return FormValidation.ok();
             }

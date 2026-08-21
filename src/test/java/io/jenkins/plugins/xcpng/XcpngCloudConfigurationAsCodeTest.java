@@ -5,6 +5,7 @@ import static io.jenkins.plugins.casc.misc.Util.toYamlString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -16,6 +17,13 @@ import io.jenkins.plugins.casc.ConfigurationContext;
 import io.jenkins.plugins.casc.ConfiguratorException;
 import io.jenkins.plugins.casc.ConfiguratorRegistry;
 import io.jenkins.plugins.casc.model.CNode;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -41,7 +49,9 @@ class XcpngCloudConfigurationAsCodeTest {
         assertNotNull(cloud, "the xcpng cloud should be created from YAML");
         assertEquals("https://192.168.1.87", cloud.getPoolUrl());
         assertEquals("xcpng-root", cloud.getCredentialsId());
-        assertTrue(cloud.isTrustSelfSigned());
+        assertEquals(
+                "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+                cloud.getCertificateFingerprint());
         assertEquals(3, cloud.getMaxInstances());
         assertEquals(15, cloud.getIdleMinutes());
         assertEquals(1, cloud.getTemplates().size());
@@ -108,6 +118,117 @@ class XcpngCloudConfigurationAsCodeTest {
                         .configure(getClass()
                                 .getResource("configuration-as-code-multiline-sshkey.yaml")
                                 .toExternalForm()));
+    }
+
+    /**
+     * A document written before pinning existed must still apply. Before #143 this raised {@code
+     * UnknownAttributesException}, which rejects the <em>whole</em> configuration document rather than
+     * this one cloud, so a controller upgrading into #141 came up with none of its configuration and an
+     * error about an attribute name. The retired key now binds, is refused, and the cloud fails closed
+     * exactly as an upgraded {@code config.xml} does.
+     */
+    @Test
+    void aLegacyTrustSelfSignedDocumentAppliesAndFailsClosed(JenkinsRule r) throws Exception {
+        List<LogRecord> log = whileCapturingCloudLog(() -> ConfigurationAsCode.get()
+                .configure(getClass()
+                        .getResource("configuration-as-code-legacy-trust.yaml")
+                        .toExternalForm()));
+
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-legacy");
+        assertNotNull(cloud, "the document must apply rather than being rejected wholesale");
+        assertNull(
+                cloud.getCertificateFingerprint(),
+                "the retired option must not be silently converted into a pin it never carried");
+        assertTrue(
+                log.stream()
+                        .anyMatch(record -> record.getLevel() == Level.WARNING
+                                && messageOf(record).contains("xcpng-legacy")
+                                && messageOf(record).contains("Trust self-signed")),
+                "the refusal must name the cloud and the removed option: "
+                        + log.stream().map(LogRecord::getMessage).toList());
+    }
+
+    /**
+     * The other half, and what makes the assertion above discriminate: a document carrying both the
+     * retired key and a real fingerprint has already been migrated, so it keeps the pin and says nothing.
+     */
+    @Test
+    void aHalfMigratedDocumentKeepsItsFingerprintSilently(JenkinsRule r) throws Exception {
+        List<LogRecord> log = whileCapturingCloudLog(() -> ConfigurationAsCode.get()
+                .configure(getClass()
+                        .getResource("configuration-as-code-legacy-trust-migrated.yaml")
+                        .toExternalForm()));
+
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-migrated");
+        assertNotNull(cloud);
+        assertEquals(
+                "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+                cloud.getCertificateFingerprint(),
+                "the fingerprint must win over the retired key");
+        assertTrue(
+                log.stream().noneMatch(record -> messageOf(record).contains("Trust self-signed")),
+                "a migrated cloud must not be warned about: "
+                        + log.stream().map(LogRecord::getMessage).toList());
+    }
+
+    /**
+     * A controller that imported a legacy document must not hand the retired key back out again.
+     *
+     * <p>{@code exportMatchesExpectedYaml} cannot catch this: it starts from a document that never carried
+     * {@code trustSelfSigned}, so the value is already the default and would be omitted however the getter
+     * behaved. Only a cloud that actually imported the old key can tell whether the export path resurrects
+     * it, and an export that did would put a dead setting into configuration that outlives this migration.
+     */
+    @Test
+    void exportOmitsTheRetiredKeyAfterALegacyImport(JenkinsRule r) throws Exception {
+        ConfigurationAsCode.get()
+                .configure(getClass()
+                        .getResource("configuration-as-code-legacy-trust.yaml")
+                        .toExternalForm());
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-legacy");
+        assertNotNull(cloud, "the fixture must really have imported, or this proves nothing");
+
+        String exported = exportedClouds();
+        assertFalse(
+                exported.contains("trustSelfSigned"),
+                "an imported legacy cloud must not export the retired key: " + exported);
+    }
+
+    /** A record's message, never null: {@code LogRecord#getMessage} is nullable and the handler keeps all. */
+    private static String messageOf(LogRecord record) {
+        String message = record.getMessage();
+        return message == null ? "" : message;
+    }
+
+    /** Collect everything {@link XcpngCloud} logs while {@code body} runs. */
+    private static List<LogRecord> whileCapturingCloudLog(ThrowingRunnable body) throws Exception {
+        List<LogRecord> records = Collections.synchronizedList(new ArrayList<>());
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        Logger logger = Logger.getLogger(XcpngCloud.class.getName());
+        logger.addHandler(handler);
+        try {
+            body.run();
+        } finally {
+            logger.removeHandler(handler);
+        }
+        return records;
+    }
+
+    /** A body that may throw, so the capture helper can wrap ordinary test code. */
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
     }
 
     private void configureFromYaml() throws Exception {

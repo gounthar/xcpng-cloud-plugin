@@ -48,22 +48,24 @@ public final class XapiClient implements HypervisorClient {
      * @param poolUrl base URL of the pool, e.g. {@code https://192.168.1.87}
      * @param user XAPI user (a credential the plugin resolves at point of use, never stored here)
      * @param password XAPI password
-     * @param trustSelfSigned accept a self-signed pool certificate. Off by default; a lab pool needs
-     *     it, nothing else should. Turning it on disables both chain and hostname verification.
+     * @param certificateFingerprint SHA-256 fingerprint of the certificate the pool is expected to
+     *     present. Null or blank means ordinary verification against the JVM trust store, which is what
+     *     a pool holding a certificate from a real CA wants; a stock XCP-ng pool is self-signed and needs
+     *     its fingerprint pinned here instead. There is no third option that accepts anything.
      */
     public XapiClient(
-            @NonNull String poolUrl, @NonNull String user, @NonNull String password, boolean trustSelfSigned) {
-        this(new HttpTransport(poolUrl, trustSelfSigned), user, password);
-        if (trustSelfSigned) {
-            LOGGER.warning("TLS verification disabled for " + poolUrl
-                    + " (trustSelfSigned). Traffic is exposed to interception.");
-        }
+            @NonNull String poolUrl,
+            @NonNull String user,
+            @NonNull String password,
+            @CheckForNull String certificateFingerprint) {
+        this(new HttpTransport(poolUrl, certificateFingerprint), user, password);
         // The form validator rejects http, but it is advisory: a JCasC document or a hand-edited
         // config.xml can still persist an http pool URL. Warn here so the cleartext exposure is not
-        // silent, matching the trustSelfSigned warning above.
+        // silent -- and note that no fingerprint can protect a connection that never negotiates TLS.
         if (poolUrl.regionMatches(true, 0, "http://", 0, "http://".length())) {
             LOGGER.warning("Pool URL " + poolUrl + " uses plain http; the XAPI credential and every"
-                    + " session token are sent in cleartext. Use https://.");
+                    + " session token are sent in cleartext, and the pinned certificate is not consulted."
+                    + " Use https://.");
         }
     }
 

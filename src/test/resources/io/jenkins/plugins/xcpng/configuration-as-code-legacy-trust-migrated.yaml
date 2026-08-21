@@ -1,0 +1,14 @@
+# Half-migrated: an administrator added a fingerprint but left the retired key behind. The fingerprint
+# wins and nothing is warned about, which is what makes the warning in the sibling fixture discriminating.
+jenkins:
+  clouds:
+    - xcpng:
+        name: "xcpng-migrated"
+        poolUrl: "https://192.168.1.87"
+        credentialsId: "xcpng-root"
+        trustSelfSigned: true
+        certificateFingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+        maxInstances: 3
+        templates:
+          - templateName: "jenkins-agent-debian13"
+            labelString: "xcpng-linux"
