@@ -133,11 +133,19 @@ jenkins:
 ```
 
 **Upgrading from a version with "Trust self-signed certificate":** that option is gone, and there is
-no automatic replacement for it. A cloud saved with it and no fingerprint logs a warning naming the
-cloud at startup and then fails to connect, so provisioning stops until an administrator opens the
-cloud's configuration, presses **Test connection**, and saves the fingerprint it reports. That is
-deliberate rather than a migration oversight: the old setting accepted any certificate from any host,
-and silently carrying that forward would have preserved the exact weakness this replaces.
+no automatic replacement for it. A cloud carrying it and no fingerprint logs a warning naming the
+cloud at startup and then fails to connect, so provisioning stops until its fingerprint is set. That
+is deliberate rather than a migration oversight: the old setting accepted any certificate from any
+host, and silently carrying that forward would have preserved the exact weakness this replaces.
+
+How to repair it depends on where the cloud is configured, and doing it in the wrong place does not
+stick:
+
+- **Configured through the UI:** open the cloud, press **Test connection**, and save the fingerprint
+  it reports.
+- **Configured as code:** replace `trustSelfSigned` with `certificateFingerprint` in the YAML. The
+  retired key is still accepted so the document keeps loading, but it does nothing, and an edit made
+  through the UI would be overwritten on the next reload.
 
 Leave `certificateFingerprint` empty for a pool whose certificate chains to a CA the controller
 trusts. For a stock pool, set it to that pool's SHA-256 certificate fingerprint, which you can read on

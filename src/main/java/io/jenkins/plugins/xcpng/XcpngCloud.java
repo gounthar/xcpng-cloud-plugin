@@ -115,10 +115,11 @@ public class XcpngCloud extends Cloud {
     private final String certificateFingerprint;
 
     /**
-     * The switch this field replaced, kept only so {@link #readResolve} can recognise a config written
-     * before pinning existed and say so. Never read for a trust decision and never written: a cloud that
-     * arrives with this set and no fingerprint is refused, not quietly downgraded. Not final because it is
-     * no longer a constructor parameter -- XStream is the only thing that ever assigns it.
+     * The switch this field replaced, kept so an old configuration can be recognised and reported rather
+     * than rejected. Never read for a trust decision: a cloud that arrives with this set and no fingerprint
+     * is refused, not quietly downgraded. Written by exactly two things, and the second is the whole reason
+     * this is not simply deleted -- XStream, loading an old {@code config.xml}, and
+     * {@link #setTrustSelfSigned}, binding an old configuration-as-code document.
      *
      * @deprecated superseded by {@link #certificateFingerprint}; present for migration diagnostics only.
      */
@@ -302,14 +303,79 @@ public class XcpngCloud extends Cloud {
         // longer a code path that accepts an unrecognised certificate, so this cannot be honoured; say so
         // at load, loudly and by name, rather than letting the operator discover it as an opaque handshake
         // failure the first time a build queues. The connection now fails closed, which is the point.
-        if (trustSelfSigned && certificateFingerprint == null) {
-            LOGGER.warning("Cloud '" + name + "' was saved with the removed \"Trust self-signed certificate\""
-                    + " option, which accepted any certificate from any host. It has no replacement setting."
-                    + " This cloud will not connect until an administrator opens its configuration, runs Test"
-                    + " connection to read the pool's certificate fingerprint, and saves it in the Certificate"
-                    + " fingerprint field.");
-        }
+        warnIfConfiguredWithTheRemovedTrustOption();
         return this;
+    }
+
+    /**
+     * Present so configuration-as-code can find the retired attribute at all, and for no other purpose.
+     *
+     * <p>JCasC discovers attributes from <em>getters</em> and then resolves a setter for each one:
+     * {@code BaseConfigurator} looks up {@code findGetter}, and skips the property outright when there is
+     * none. A {@code @DataBoundSetter} on its own is therefore invisible to it, which is exactly the state
+     * this fix was first written in, and the document still failed with {@code UnknownAttributesException}.
+     *
+     * <p>It reports {@code false} unconditionally, which is deliberate and is the whole reason it can exist
+     * safely. {@code DataBoundConfigurator} compares each value against a freshly constructed default before
+     * writing it out and omits anything equal to it, so a getter that answered {@code true} for a legacy
+     * cloud would put {@code trustSelfSigned: true} back into every document exported from that controller,
+     * resurrecting a dead key in configuration that outlives this migration. Only the export path reads this
+     * method; the migration logic reads the field directly, so reporting the neutral value costs nothing and
+     * cannot mask a real setting. {@code exportOmitsTheRetiredKeyAfterALegacyImport} is the guard.
+     *
+     * <p>This getter, not the {@code @DataBoundSetter} beside it, is the load-bearing half. Mutation-checked
+     * both ways: removing the annotation from the setter changes nothing, because JCasC pairs a getter with
+     * any conventionally named setter, while renaming this getter puts both migration tests straight back
+     * to {@code UnknownAttributesException}. The annotation is kept as the conventional marker, not because
+     * the binding needs it.
+     *
+     * <p>Deliberately <em>not</em> annotated {@code @Deprecated}, which is counter-intuitive enough to
+     * need saying. JCasC reads that annotation off the setter and marks the attribute deprecated, and
+     * {@code ConfigurationContext} defaults its deprecation policy to {@code reject} rather than
+     * {@code warn}. Marking this pair deprecated therefore turns a document carrying the old key back into
+     * a hard failure, which is the exact behaviour this change exists to remove. Nothing in JCasC overrides
+     * that default, so it is not a test-harness artefact. The annotation is left off both accessors on
+     * purpose; read {@link #getCertificateFingerprint} to find out how this cloud verifies the pool.
+     */
+    public boolean isTrustSelfSigned() {
+        return false;
+    }
+
+    /**
+     * Bind, and refuse, the option {@link #certificateFingerprint} replaced. This is where a
+     * configuration-as-code document carrying the retired key lands.
+     *
+     * <p>Not annotated {@code @Deprecated}, for the reason given on {@link #isTrustSelfSigned}: that
+     * annotation on the setter is exactly what JCasC reads to mark the attribute deprecated, and its
+     * default policy rejects deprecated attributes rather than warning about them. Annotating it would
+     * restore the hard failure this whole change exists to remove.
+     *
+     * <p>The value is recorded and never honoured. Set a {@code certificateFingerprint} instead.
+     */
+    @DataBoundSetter
+    public void setTrustSelfSigned(boolean trustSelfSigned) {
+        this.trustSelfSigned = trustSelfSigned;
+        warnIfConfiguredWithTheRemovedTrustOption();
+    }
+
+    /**
+     * Say, once and by name, that this cloud is configured with an option that no longer does anything.
+     *
+     * <p>Shared by {@link #readResolve} and {@link #setTrustSelfSigned} so the two migration routes cannot
+     * drift in what they tell the operator. The advice covers both, because the fix differs: a UI-managed
+     * cloud is repaired through the form, and a configuration-as-code one has to be repaired in the YAML,
+     * where an edit through the form would be overwritten on the next reload.
+     */
+    private void warnIfConfiguredWithTheRemovedTrustOption() {
+        if (trustSelfSigned && certificateFingerprint == null) {
+            LOGGER.warning("Cloud '" + name + "' is configured with the removed \"Trust self-signed"
+                    + " certificate\" option, which accepted any certificate from any host. It has no"
+                    + " replacement and is ignored. This cloud will not connect until its certificate"
+                    + " fingerprint is set: in the UI, open the cloud and press Test connection to read the"
+                    + " fingerprint the pool presents, then save it in the Certificate fingerprint field;"
+                    + " under configuration-as-code, replace trustSelfSigned with certificateFingerprint in"
+                    + " the YAML.");
+        }
     }
 
     public String getPoolUrl() {
