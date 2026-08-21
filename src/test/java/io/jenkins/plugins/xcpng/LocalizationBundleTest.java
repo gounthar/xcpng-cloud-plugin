@@ -8,7 +8,9 @@ import java.io.Reader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Matcher;
@@ -35,6 +37,39 @@ class LocalizationBundleTest {
     @Test
     void templateViewBundleCoversEveryJellyKey() throws IOException {
         assertBundleCoversView("XcpngTemplate");
+    }
+
+    /**
+     * Every apostrophe in Messages.properties must be doubled, whether or not the value has a placeholder.
+     *
+     * <p>The generated accessor calls {@code holder.format(key)} for every message, so MessageFormat parses
+     * all of them and eats a lone apostrophe: {@code controller's} renders as "controllers". This is not a
+     * theoretical guard. The bundle's own header comment used to state the opposite rule, and the first
+     * placeholderless apostrophe written into the file was silently swallowed in a form message with the
+     * whole suite green. A convention that only lives in a comment gets believed until it costs something;
+     * this makes it fail the build instead.
+     */
+    @Test
+    void everyApostropheInTheMessageBundleIsDoubled() throws IOException {
+        Path bundle = RESOURCES.resolve("Messages.properties");
+        assertTrue(Files.isRegularFile(bundle), "missing " + bundle);
+
+        List<String> offenders = new ArrayList<>();
+        for (String line : Files.readAllLines(bundle, StandardCharsets.UTF_8)) {
+            String trimmed = line.trim();
+            int separator = trimmed.indexOf('=');
+            if (trimmed.isEmpty() || trimmed.startsWith("#") || separator < 0) {
+                continue;
+            }
+            // Remove the legitimate doubled pairs; anything left is a lone apostrophe MessageFormat would eat.
+            if (trimmed.substring(separator + 1).replace("''", "").indexOf('\'') >= 0) {
+                offenders.add(trimmed.substring(0, separator));
+            }
+        }
+        assertTrue(
+                offenders.isEmpty(),
+                "these message values contain a single apostrophe, which " + "MessageFormat swallows; double it: "
+                        + offenders);
     }
 
     private static void assertBundleCoversView(String descriptorDir) throws IOException {

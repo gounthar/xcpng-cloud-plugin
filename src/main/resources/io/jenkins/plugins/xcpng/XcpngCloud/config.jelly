@@ -9,8 +9,8 @@
   <f:entry title="${%Credentials}" field="credentialsId">
     <c:select/>
   </f:entry>
-  <f:entry title="${%Trust self-signed certificate}" field="trustSelfSigned">
-    <f:checkbox/>
+  <f:entry title="${%Certificate fingerprint}" field="certificateFingerprint">
+    <f:textbox/>
   </f:entry>
   <f:entry title="${%Max instances}" field="maxInstances">
     <f:number default="2" clazz="positive-number"/>
@@ -22,5 +22,5 @@
     <f:repeatableHeteroProperty field="templates" hasHeader="true" addCaption="${%Add template}"/>
   </f:entry>
   <f:validateButton title="${%Test connection}" progress="${%Testing...}"
-                    method="testConnection" with="poolUrl,credentialsId,trustSelfSigned"/>
+                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint"/>
 </j:jelly>
