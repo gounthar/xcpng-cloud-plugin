@@ -1,0 +1,13 @@
+# A document written before certificate pinning existed. It must still apply: the retired key binds and
+# is refused, rather than raising UnknownAttributesException and taking the whole document down with it.
+jenkins:
+  clouds:
+    - xcpng:
+        name: "xcpng-legacy"
+        poolUrl: "https://192.168.1.87"
+        credentialsId: "xcpng-root"
+        trustSelfSigned: true
+        maxInstances: 3
+        templates:
+          - templateName: "jenkins-agent-debian13"
+            labelString: "xcpng-linux"
