@@ -2,7 +2,9 @@ package io.jenkins.plugins.xcpng;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.cloudbees.plugins.credentials.CredentialsScope;
@@ -12,7 +14,13 @@ import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.logging.Handler;
+import java.util.logging.Level;
+import java.util.logging.LogRecord;
+import java.util.logging.Logger;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -20,6 +28,14 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 @WithJenkins
 class XcpngCloudTest {
+
+    /**
+     * A syntactically valid pin, used where a test needs the fingerprint to be present rather than
+     * to match anything: against a null the assertions that it reached a snapshot would pass just as
+     * happily on a hardcoded default.
+     */
+    private static final String PINNED_FINGERPRINT =
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
 
     @Test
     void descriptorIsRegistered(JenkinsRule r) {
@@ -33,7 +49,7 @@ class XcpngCloudTest {
                 "xcpng",
                 "https://pool.example.test",
                 "xcpng-root",
-                true,
+                PINNED_FINGERPRINT,
                 3,
                 List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 4, 8192)));
         // A non-default idle timeout so the assertion proves the optional setter survives the form, not
@@ -46,7 +62,7 @@ class XcpngCloudTest {
         assertNotNull(reloaded);
         assertEquals("https://pool.example.test", reloaded.getPoolUrl());
         assertEquals("xcpng-root", reloaded.getCredentialsId());
-        assertTrue(reloaded.isTrustSelfSigned());
+        assertEquals(PINNED_FINGERPRINT, reloaded.getCertificateFingerprint());
         assertEquals(3, reloaded.getMaxInstances());
         assertEquals(20, reloaded.getIdleMinutes());
         assertEquals(1, reloaded.getTemplates().size());
@@ -76,7 +92,7 @@ class XcpngCloudTest {
                 "xcpng",
                 "https://pool.example.test",
                 "xcpng-root",
-                true,
+                PINNED_FINGERPRINT,
                 2,
                 List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048))));
         r.jenkins.save();
@@ -102,8 +118,8 @@ class XcpngCloudTest {
         SystemCredentialsProvider.getInstance().save();
 
         XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
-        XcpngCloud cloud =
-                new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", true, 2, List.of(template));
+        XcpngCloud cloud = new XcpngCloud(
+                "xcpng", "https://pool.example.test", "xcpng-root", PINNED_FINGERPRINT, 2, List.of(template));
         cloud.setClientFactory(c -> new FakeHypervisorClient("jenkins-golden-debian"));
         cloud.setWaitForOnline(false);
         r.jenkins.clouds.add(cloud);
@@ -126,7 +142,10 @@ class XcpngCloudTest {
         XcpngAgent reloaded = (XcpngAgent) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
         assertEquals("https://pool.example.test", reloaded.getPoolUrl());
         assertEquals("xcpng-root", reloaded.getCredentialsId());
-        assertTrue(reloaded.isTrustSelfSigned(), "the TLS-trust flag must survive the round trip");
+        assertEquals(
+                PINNED_FINGERPRINT,
+                reloaded.getCertificateFingerprint(),
+                "the pinned certificate fingerprint must survive the round trip");
     }
 
     /**
@@ -153,7 +172,7 @@ class XcpngCloudTest {
     /** Surrounding whitespace is trimmed on the way in so the persisted value matches what parses. */
     @Test
     void poolUrlIsTrimmedOnConstruction(JenkinsRule r) {
-        XcpngCloud cloud = new XcpngCloud("xcpng", "  https://pool.example.test  ", "id", false, 2, List.of());
+        XcpngCloud cloud = new XcpngCloud("xcpng", "  https://pool.example.test  ", "id", null, 2, List.of());
         assertEquals("https://pool.example.test", cloud.getPoolUrl());
     }
 
@@ -165,24 +184,117 @@ class XcpngCloudTest {
     @Test
     void testConnectionRejectsMalformedUrlBeforeConnecting(JenkinsRule r) {
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
-        FormValidation v = d.doTestConnection("192.168.1.87", "", false);
+        FormValidation v = d.doTestConnection("192.168.1.87", "", null);
         assertEquals(FormValidation.Kind.ERROR, v.kind);
         assertTrue(v.getMessage().contains("http"), v.getMessage());
     }
 
     /**
-     * A successful connection made with TLS verification off is reported as a warning, not a clean OK, so
-     * the operator is told on the form that the link carrying the pool credential was unverified. A
-     * verified connection stays a plain OK. This is the message layer only; it needs no live pool.
+     * Both ways of succeeding are secure, so both report a plain OK: the certificate either chained to a
+     * CA the JVM trusts or matched the pinned fingerprint. The messages still have to differ, because the
+     * operator needs to know which of the two happened -- a pool that silently stopped being pinned and
+     * started being CA-trusted is worth noticing. This is the message layer only; it needs no live pool.
      */
     @Test
-    void testConnectionSuccessWarnsWhenTlsVerificationDisabled(JenkinsRule r) {
-        FormValidation verified = XcpngCloud.DescriptorImpl.connectedResult(false);
-        assertEquals(FormValidation.Kind.OK, verified.kind);
+    void testConnectionReportsWhichWayTheCertificateWasAccepted(JenkinsRule r) {
+        FormValidation caTrusted = XcpngCloud.DescriptorImpl.connectedResult(null);
+        assertEquals(FormValidation.Kind.OK, caTrusted.kind);
 
-        FormValidation unverified = XcpngCloud.DescriptorImpl.connectedResult(true);
-        assertEquals(FormValidation.Kind.WARNING, unverified.kind);
-        assertTrue(unverified.getMessage().contains("verification"), unverified.getMessage());
+        FormValidation pinned = XcpngCloud.DescriptorImpl.connectedResult(PINNED_FINGERPRINT);
+        assertEquals(FormValidation.Kind.OK, pinned.kind);
+        assertTrue(pinned.getMessage().contains("pinned"), pinned.getMessage());
+        assertNotEquals(
+                caTrusted.getMessage(), pinned.getMessage(), "the two ways of succeeding must not read identically");
+    }
+
+    /**
+     * A cloud saved with the removed "Trust self-signed certificate" option has no honourable
+     * interpretation left: that switch accepted any certificate from any host, and no code path does that
+     * any more. It must be reported by name at load, so the operator finds out from a startup warning
+     * rather than from a build that will not schedule.
+     *
+     * <p>This test is also the evidence for a claim the migration rests on and that is easy to get wrong:
+     * that XStream really does populate the retired field from an old document. It is asserted through the
+     * warning, which cannot fire unless the field was read back as true.
+     */
+    @Test
+    void aCloudSavedWithTrustSelfSignedIsRefusedByName(JenkinsRule r) throws Exception {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngCloud>\n"
+                + "  <name>lab</name>\n"
+                + "  <poolUrl>https://pool.example.test</poolUrl>\n"
+                + "  <trustSelfSigned>true</trustSelfSigned>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngCloud>\n";
+
+        List<LogRecord> log = whileCapturingCloudLog(() -> {
+            XcpngCloud cloud = (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+            assertNull(
+                    cloud.getCertificateFingerprint(),
+                    "the retired option must not be silently converted into a pin it never carried");
+        });
+
+        assertTrue(
+                log.stream()
+                        .anyMatch(record -> record.getLevel() == Level.WARNING
+                                && record.getMessage().contains("lab")
+                                && record.getMessage().contains("Trust self-signed certificate")),
+                "the refusal must name the cloud and the removed option: "
+                        + log.stream().map(LogRecord::getMessage).toList());
+    }
+
+    /**
+     * The other half of the migration, and the one that proves the warning discriminates: a cloud that
+     * carries the retired flag <em>and</em> a fingerprint has already been migrated by an administrator,
+     * so it must load quietly and keep its pin.
+     */
+    @Test
+    void aMigratedCloudKeepsItsPinAndSaysNothing(JenkinsRule r) throws Exception {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngCloud>\n"
+                + "  <name>lab</name>\n"
+                + "  <poolUrl>https://pool.example.test</poolUrl>\n"
+                + "  <trustSelfSigned>true</trustSelfSigned>\n"
+                + "  <certificateFingerprint>" + PINNED_FINGERPRINT + "</certificateFingerprint>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngCloud>\n";
+
+        List<LogRecord> log = whileCapturingCloudLog(() -> {
+            XcpngCloud cloud = (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+            assertEquals(PINNED_FINGERPRINT, cloud.getCertificateFingerprint());
+        });
+
+        assertTrue(
+                log.stream().noneMatch(record -> record.getMessage().contains("Trust self-signed certificate")),
+                "a migrated cloud must not be warned about: "
+                        + log.stream().map(LogRecord::getMessage).toList());
+    }
+
+    /** Collect everything {@link XcpngCloud} logs while {@code body} runs. */
+    private static List<LogRecord> whileCapturingCloudLog(ThrowingRunnable body) throws Exception {
+        List<LogRecord> records = Collections.synchronizedList(new ArrayList<>());
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        Logger logger = Logger.getLogger(XcpngCloud.class.getName());
+        logger.addHandler(handler);
+        try {
+            body.run();
+        } finally {
+            logger.removeHandler(handler);
+        }
+        return records;
+    }
+
+    /** A body that may throw, so a capture helper can wrap ordinary test code. */
+    @FunctionalInterface
+    private interface ThrowingRunnable {
+        void run() throws Exception;
     }
 
     /**
@@ -244,7 +356,7 @@ class XcpngCloudTest {
         // What the operator actually gets: one executor, whatever the old config asked for.
         XcpngAgent agent = new XcpngAgent(
                 "xcpng-legacy-1",
-                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 1, List.of()),
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 1, List.of()),
                 "vm/legacy/1",
                 t,
                 10,
@@ -263,7 +375,7 @@ class XcpngCloudTest {
     void aProvisionedAgentOnlyServesMatchingLabels(JenkinsRule r) throws Exception {
         XcpngAgent agent = new XcpngAgent(
                 "xcpng-agent-1",
-                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 1, List.of()),
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 1, List.of()),
                 "vm/xcpng-agent-1/1",
                 new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048),
                 10,
@@ -356,7 +468,7 @@ class XcpngCloudTest {
     @Test
     void minInstancesValidationWarnsWhenAboveCap(JenkinsRule r) {
         XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
-        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 2, List.of());
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 2, List.of());
 
         assertEquals(FormValidation.Kind.OK, d.doCheckMinInstances(cloud, "").kind);
         assertEquals(FormValidation.Kind.OK, d.doCheckMinInstances(cloud, "2").kind, "at the cap is fine");
@@ -378,7 +490,7 @@ class XcpngCloudTest {
      */
     @Test
     void idleMinutesDefaultsWhenUnset(JenkinsRule r) {
-        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", false, 2, List.of());
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", null, 2, List.of());
         assertEquals(10, cloud.getIdleMinutes(), "an unset idle timeout must default to 10, not 0");
     }
 
@@ -387,7 +499,7 @@ class XcpngCloudTest {
      */
     @Test
     void idleMinutesClampsNonPositiveToDefault(JenkinsRule r) {
-        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", false, 2, List.of());
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", null, 2, List.of());
         cloud.setIdleMinutes(0);
         assertEquals(10, cloud.getIdleMinutes(), "zero must clamp to the default, not disable the reap");
         cloud.setIdleMinutes(-5);

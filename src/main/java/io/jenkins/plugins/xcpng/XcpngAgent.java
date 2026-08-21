@@ -99,7 +99,15 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     private final String credentialsId;
 
-    private final boolean trustSelfSigned;
+    /**
+     * The pinned certificate fingerprint from the cloud that provisioned this agent, or null for ordinary
+     * verification. Snapshotted for the same reason as the two fields above: teardown must still reach the
+     * pool when the owning cloud has been deleted or renamed. An agent persisted before this field existed
+     * reloads with null and connects with ordinary verification, which fails closed against a self-signed
+     * pool rather than falling back to trusting it -- there is no longer a setting that could.
+     */
+    @CheckForNull
+    private final String certificateFingerprint;
 
     /**
      * The cloud-stats provisioning activity this agent belongs to. Serialisable and persisted with the
@@ -192,7 +200,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.warm = warm;
         this.poolUrl = cloud.getPoolUrl();
         this.credentialsId = cloud.getCredentialsId();
-        this.trustSelfSigned = cloud.isTrustSelfSigned();
+        this.certificateFingerprint = cloud.getCertificateFingerprint();
     }
 
     /** The VM this agent runs on, as an opaque backend handle. */
@@ -220,8 +228,9 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     }
 
     /** Whether the owning cloud was configured to trust a self-signed pool certificate. */
-    public boolean isTrustSelfSigned() {
-        return trustSelfSigned;
+    @CheckForNull
+    public String getCertificateFingerprint() {
+        return certificateFingerprint;
     }
 
     /** The cloud that provisioned this agent, or null if it has since been removed from the config. */
@@ -381,9 +390,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @NonNull
     private HypervisorClient openClientFromSnapshot() {
         if (connectionClientFactory != null) {
-            return connectionClientFactory.open(poolUrl, credentialsId, trustSelfSigned);
+            return connectionClientFactory.open(poolUrl, credentialsId, certificateFingerprint);
         }
-        return XcpngCloud.openClient(poolUrl, credentialsId, trustSelfSigned, "the removed cloud '" + cloudName + "'");
+        return XcpngCloud.openClient(
+                poolUrl, credentialsId, certificateFingerprint, "the removed cloud '" + cloudName + "'");
     }
 
     /** Test seam: replace how the cloud-gone fallback opens a client with an in-memory fake. */
@@ -407,12 +417,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
          *
          * @param poolUrl the snapshotted pool URL, null on an agent predating the snapshot.
          * @param credentialsId the snapshotted credential ID, resolved against the store by the caller.
-         * @param trustSelfSigned whether the removed cloud was configured to accept a self-signed
-         *     pool certificate.
+         * @param certificateFingerprint the pinned certificate fingerprint the removed cloud used, or
+         *     null for ordinary verification against the JVM trust store.
          */
         @NonNull
         HypervisorClient open(
-                @CheckForNull String poolUrl, @CheckForNull String credentialsId, boolean trustSelfSigned);
+                @CheckForNull String poolUrl,
+                @CheckForNull String credentialsId,
+                @CheckForNull String certificateFingerprint);
     }
 
     @Extension

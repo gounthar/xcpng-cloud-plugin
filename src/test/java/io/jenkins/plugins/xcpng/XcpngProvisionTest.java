@@ -69,7 +69,7 @@ class XcpngProvisionTest {
     /** A cloud whose clients are the given fake, so a test can inspect the recorded call sequence. */
     private static XcpngCloud cloudBackedBy(FakeHypervisorClient fake, int maxInstances) {
         XcpngCloud cloud = new XcpngCloud(
-                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(LINUX_TEMPLATE));
+                "xcpng", "https://pool.example.test", "cred", null, maxInstances, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
         // The fake agents never connect, so skip the online wait; these tests assert planning/capacity,
         // which the production online-wait does not change.
@@ -639,7 +639,7 @@ class XcpngProvisionTest {
     void interruptingAProvisionStillDestroysTheVmAndKeepsTheInterrupt(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud =
-                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, 2, List.of(LINUX_TEMPLATE));
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 2, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
         // Unlike the other tests, keep the production online wait, so the task is still running when the
         // interrupt lands. Once the node is registered the interrupt may land anywhere -- in addNode's tail
@@ -698,7 +698,7 @@ class XcpngProvisionTest {
     /** A cloud backed by the given fake that keeps the production online wait (unlike {@link #cloudBackedBy}). */
     private static XcpngCloud onlineWaitingCloudBackedBy(FakeHypervisorClient fake, int maxInstances) {
         XcpngCloud cloud = new XcpngCloud(
-                "xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(LINUX_TEMPLATE));
+                "xcpng", "https://pool.example.test", "cred", null, maxInstances, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
         return cloud;
     }
@@ -827,7 +827,7 @@ class XcpngProvisionTest {
     /** A cloud over the given warm-pool templates, backed by the given fake. */
     private static XcpngCloud warmCloudOver(FakeHypervisorClient fake, int maxInstances, XcpngTemplate... templates) {
         XcpngCloud cloud =
-                new XcpngCloud("xcpng", "https://pool.example.test", "cred", false, maxInstances, List.of(templates));
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, maxInstances, List.of(templates));
         cloud.setClientFactory(c -> fake);
         cloud.setWaitForOnline(false);
         return cloud;
@@ -1580,7 +1580,7 @@ class XcpngProvisionTest {
                 "xcpng-a",
                 "https://pool.example.test",
                 "cred",
-                false,
+                null,
                 3,
                 List.of(warmTemplate("jenkins-golden-debian", 1)));
         broken.setClientFactory(c -> brokenFake);
@@ -1593,7 +1593,7 @@ class XcpngProvisionTest {
                 "xcpng-b",
                 "https://pool.example.test",
                 "cred",
-                false,
+                null,
                 3,
                 List.of(warmTemplate("jenkins-golden-debian", 1)));
         healthy.setClientFactory(c -> healthyFake);

@@ -41,6 +41,14 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 @WithJenkins
 class XcpngRetentionStrategyTest {
 
+    /**
+     * A syntactically valid pin, used where a test needs the fingerprint to be present rather than
+     * to match anything: against a null the assertions that it reached a snapshot would pass just as
+     * happily on a hardcoded default.
+     */
+    private static final String PINNED_FINGERPRINT =
+            "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
     private static final XcpngTemplate LINUX_TEMPLATE =
             new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
 
@@ -68,12 +76,13 @@ class XcpngRetentionStrategyTest {
     }
 
     /**
-     * As above under a chosen name, for the rename case. {@code trustSelfSigned} is deliberately true rather
-     * than the more obvious false: the cloud-gone tests assert the flag reached the agent's connection
-     * snapshot, and against a false the assertion would pass just as happily on a hardcoded default.
+     * As above under a chosen name, for the rename case. The certificate fingerprint is deliberately set
+     * rather than left null: the cloud-gone tests assert it reached the agent's connection snapshot, and
+     * against a null the assertion would pass just as happily on a hardcoded default.
      */
     private static XcpngCloud cloudBackedBy(JenkinsRule r, FakeHypervisorClient fake, String name) {
-        XcpngCloud cloud = new XcpngCloud(name, POOL_URL, CREDENTIALS_ID, true, 3, List.of(LINUX_TEMPLATE));
+        XcpngCloud cloud =
+                new XcpngCloud(name, POOL_URL, CREDENTIALS_ID, PINNED_FINGERPRINT, 3, List.of(LINUX_TEMPLATE));
         cloud.setClientFactory(c -> fake);
         cloud.setWaitForOnline(false);
         r.jenkins.clouds.add(cloud);
@@ -91,7 +100,7 @@ class XcpngRetentionStrategyTest {
         private final RuntimeException failure;
         private String poolUrl;
         private String credentialsId;
-        private boolean trustSelfSigned;
+        private String certificateFingerprint;
         private int opens;
 
         /** A factory that always answers with {@code client}, for the paths where the fallback succeeds. */
@@ -107,10 +116,10 @@ class XcpngRetentionStrategyTest {
 
         /** Record the snapshot, then answer with the fake or throw, whichever this factory was built for. */
         @Override
-        public HypervisorClient open(String poolUrl, String credentialsId, boolean trustSelfSigned) {
+        public HypervisorClient open(String poolUrl, String credentialsId, String certificateFingerprint) {
             this.poolUrl = poolUrl;
             this.credentialsId = credentialsId;
-            this.trustSelfSigned = trustSelfSigned;
+            this.certificateFingerprint = certificateFingerprint;
             opens++;
             if (failure != null) {
                 throw failure;
@@ -214,7 +223,7 @@ class XcpngRetentionStrategyTest {
     void markUsedClearsTheWarmFlag(JenkinsRule r) throws Exception {
         XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
         ProvisioningActivity.Id id = new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-warm-1");
-        XcpngCloud cloud = new XcpngCloud("xcpng", POOL_URL, CREDENTIALS_ID, true, 1, List.of(template));
+        XcpngCloud cloud = new XcpngCloud("xcpng", POOL_URL, CREDENTIALS_ID, PINNED_FINGERPRINT, 1, List.of(template));
         XcpngAgent spare = new XcpngAgent("xcpng-warm-1", cloud, "vm/xcpng-warm-1/1", template, 10, id, true);
 
         assertTrue(spare.isWarm(), "a spare is warm at birth");
@@ -770,7 +779,10 @@ class XcpngRetentionStrategyTest {
         assertEquals(1, connections.opens, "the fallback must open exactly one client");
         assertEquals(POOL_URL, connections.poolUrl, "the fallback must use the snapshotted pool URL");
         assertEquals(CREDENTIALS_ID, connections.credentialsId, "the fallback must use the snapshotted credential ID");
-        assertTrue(connections.trustSelfSigned, "the fallback must carry the snapshotted TLS-trust setting");
+        assertEquals(
+                PINNED_FINGERPRINT,
+                connections.certificateFingerprint,
+                "the fallback must carry the snapshotted certificate fingerprint");
         assertFalse(r.jenkins.getNodes().contains(agent), "the node must still be removed");
     }
 
@@ -846,7 +858,7 @@ class XcpngRetentionStrategyTest {
         String xml = Jenkins.XSTREAM2.toXML(provisioned);
         String legacyXml = xml.replaceAll("\\s*<poolUrl>[^<]*</poolUrl>", "")
                 .replaceAll("\\s*<credentialsId>[^<]*</credentialsId>", "")
-                .replaceAll("\\s*<trustSelfSigned>[^<]*</trustSelfSigned>", "");
+                .replaceAll("\\s*<certificateFingerprint>[^<]*</certificateFingerprint>", "");
         XcpngAgent legacy = (XcpngAgent) Jenkins.XSTREAM2.fromXML(legacyXml);
         assertNull(legacy.getPoolUrl(), "the fixture must really predate the snapshot, or it proves nothing");
 

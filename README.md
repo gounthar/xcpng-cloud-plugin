@@ -99,8 +99,11 @@ restart, old spare destroyed 10 min 45 s after it reconnected.
 
 1. **Manage Jenkins** then **Clouds**, and add a new **XCP-ng Cloud**.
 2. Set the **Pool URL** (for example `https://192.168.1.87`) and select the XAPI **Credentials**.
-3. Tick **Trust self-signed certificate** only if the pool presents a self-signed certificate. See
-   [Security notes](#security-notes) before enabling it.
+3. Leave **Certificate fingerprint** empty and press **Test connection**. If the pool's certificate is
+   signed by a CA the controller already trusts, it connects and there is nothing more to do. XCP-ng
+   ships a self-signed certificate, so the usual answer is that the result shows you the SHA-256
+   fingerprint the pool presented. Check it against the pool itself, then paste it into the field. See
+   [Security notes](#security-notes).
 4. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
    the shape of the agents cloned from it. At least one label is required, and labels are how builds
    reach these agents: give the jobs you want on XCP-ng a matching label expression.
@@ -118,7 +121,7 @@ jenkins:
         name: "xcpng-lab"
         poolUrl: "https://192.168.1.87"
         credentialsId: "xcpng-root"
-        trustSelfSigned: false
+        certificateFingerprint: ""
         maxInstances: 3
         idleMinutes: 10
         templates:
@@ -129,8 +132,10 @@ jenkins:
             sshAuthorizedKey: "ssh-ed25519 AAAA...replace-with-your-public-key you@example"
 ```
 
-Set `trustSelfSigned: true` only for a lab pool whose self-signed certificate you cannot replace;
-see [Security notes](#security-notes).
+Leave `certificateFingerprint` empty for a pool whose certificate chains to a CA the controller
+trusts. For a stock pool, set it to that pool's SHA-256 certificate fingerprint, which you can read on
+the host with `openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256`. Colons are
+optional and case does not matter. See [Security notes](#security-notes).
 
 The exported configuration never contains the XAPI password; it holds only the credential ID, which
 the controller resolves at the point of use.
@@ -144,7 +149,7 @@ Cloud fields:
 | Name | `name` | Display name for this cloud. |
 | Pool URL | `poolUrl` | Base URL of the XCP-ng pool master, for example `https://192.168.1.87`. Do not embed credentials in the URL. |
 | Credentials | `credentialsId` | ID of the username/password credential used for XAPI login. |
-| Trust self-signed certificate | `trustSelfSigned` | Skip TLS verification against the pool. Off by default. |
+| Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the pool is expected to present, with or without colons. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; a stock XCP-ng pool is self-signed and needs its fingerprint here. Once set, only that exact certificate is accepted. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
 | Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
 | Templates | `templates` | One or more agent templates (see below). |
@@ -194,9 +199,16 @@ table, the Packer workflow and its honest status, and the produced template name
   it in that window lets an attacker impersonate that one agent, not the controller. The optional SSH
   key is seeded the same way and is not scrubbed; because it is a public key, its presence in the VM
   record is not a secret disclosure.
-- **`trustSelfSigned` disables TLS verification** against the pool and exposes the XAPI session to a
-  man-in-the-middle. Use it only on a trusted network against a pool whose certificate you cannot
-  replace, and prefer installing the pool's certificate into the controller's trust store instead.
+- **A pool certificate is either trusted by the JVM or pinned by fingerprint.** There is no setting
+  that accepts an unrecognised certificate, because the first thing sent over that connection is the
+  XAPI credential. Pinning is checked in addition to the ordinary hostname check, not instead of it:
+  a connection succeeds only if the certificate both matches the fingerprint and names the host being
+  dialled. If the pool's certificate is later replaced, connections fail until an administrator
+  confirms the new fingerprint — that failure is the feature, since a replaced certificate is either
+  routine maintenance or an interception and only a human can tell which.
+- **Reading a fingerprint does not trust it.** `Test connection` inspects the certificate an unknown
+  pool presents and then refuses the connection, so the credential is never offered to a host nobody
+  has confirmed. Check the fingerprint it reports against the pool before pasting it in.
 - **Only public SSH keys belong in `sshAuthorizedKey`.** The field seeds a public key into each
   clone; the form rejects anything that looks like a private key. The private half must never reach
   an agent.

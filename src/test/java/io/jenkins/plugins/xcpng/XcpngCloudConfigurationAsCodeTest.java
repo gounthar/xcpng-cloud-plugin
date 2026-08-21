@@ -41,7 +41,9 @@ class XcpngCloudConfigurationAsCodeTest {
         assertNotNull(cloud, "the xcpng cloud should be created from YAML");
         assertEquals("https://192.168.1.87", cloud.getPoolUrl());
         assertEquals("xcpng-root", cloud.getCredentialsId());
-        assertTrue(cloud.isTrustSelfSigned());
+        assertEquals(
+                "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99",
+                cloud.getCertificateFingerprint());
         assertEquals(3, cloud.getMaxInstances());
         assertEquals(15, cloud.getIdleMinutes());
         assertEquals(1, cloud.getTemplates().size());
