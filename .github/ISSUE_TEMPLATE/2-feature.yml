@@ -1,0 +1,46 @@
+---
+name: Feature request
+description: Something the plugin should do and does not
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Several things are missing on purpose. Please read [Not in this
+        version](https://github.com/gounthar/xcpng-cloud-plugin#not-in-this-version) first — if
+        what you want is listed there, say so and describe the case that makes it worth doing now.
+        That is a stronger argument than a fresh request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: >-
+        What are you trying to do, and where does the plugin stop you? Describe the situation
+        rather than the fix you have in mind; the fix is easier to judge with the situation in
+        front of it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like it to do
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: >-
+        Terraform, a static agent, a warm pool sized by hand, something else. Knowing what does not
+        work helps rule out a change that would land in the same place.
+
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Would you like to work on it?
+      options:
+        - label: I would be willing to open a pull request for this

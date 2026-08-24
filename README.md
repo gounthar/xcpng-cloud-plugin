@@ -306,10 +306,12 @@ tests use an in-memory fake of the hypervisor client and recorded XAPI fixtures,
 live pool. To run a local Jenkins with the plugin loaded:
 
 ```sh
-mvn hpi:run -Dhost=0.0.0.0 -Dport=8080
+mvn hpi:run
 ```
 
-Jenkins is then available at `http://localhost:8080/jenkins`.
+Jenkins is then available at `http://localhost:8080/jenkins`. That binds loopback. To exercise
+provisioning you need the controller reachable from the VM, since the agent connects inbound, so
+add `-Dhost=0.0.0.0` — bearing in mind a development Jenkins has no authentication in front of it.
 
 ## Dependency updates
 
@@ -362,6 +364,15 @@ If the plugin is donated to `jenkinsci`, this is replaced by
 `cd.yaml` calling `jenkins-infra/github-reusable-workflows`, which publishes to
 `repo.jenkins-ci.org` and needs organisation secrets. It reads the same labels, so only the
 publishing half changes. The `.mvn/` incrementals wiring that donation requires is already here.
+
+## Contributing
+
+Reports from a pool that does not look like the single-host lab this was written against are the
+most useful thing anyone can send. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the build (JDK 21
+only, spotless enforced), how the tests avoid needing a hypervisor, the design constraints worth
+arguing about before writing code, and what a pull request is expected to say about testing.
+[`SECURITY.md`](SECURITY.md) covers vulnerability reporting and what is already known.
+Participation is governed by the [Jenkins Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## License
 

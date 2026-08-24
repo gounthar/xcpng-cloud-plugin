@@ -1,0 +1,99 @@
+---
+name: Bug report
+description: Something the plugin does that it should not, or fails to do
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        This plugin is a spike, proven against a single-host lab pool. A report from a pool that
+        looks different from that one is genuinely useful, so please say what yours looks like.
+
+
+        Please check [Known
+        limitations](https://github.com/gounthar/xcpng-cloud-plugin#known-limitations) first — what
+        you are seeing may already be written down there.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: >-
+        The steps, and how reliably they produce the failure. "Once, and not since" is a useful
+        answer; please do not round it up to "always".
+    validations:
+      required: true
+
+  - type: input
+    id: plugin-version
+    attributes:
+      label: Plugin version
+      description: The release you installed, or the commit you built from.
+    validations:
+      required: true
+
+  - type: input
+    id: jenkins-version
+    attributes:
+      label: Jenkins version
+      description: From Manage Jenkins → System Information.
+    validations:
+      required: true
+
+  - type: input
+    id: xcpng-version
+    attributes:
+      label: XCP-ng and XAPI version
+      description: >-
+        For example "XCP-ng 8.3.0, XAPI 26.1". `xe host-param-list uuid=<host>` reports both.
+    validations:
+      required: true
+
+  - type: textarea
+    id: pool-shape
+    attributes:
+      label: Pool and storage
+      description: >-
+        How many hosts, and what kind of storage repository — file-backed `ext`, LVM, shared? This
+        matters more than it looks: `VM.clone` is copy-on-write on a file-backed SR and is not on
+        an LVM-backed one.
+    validations:
+      required: true
+
+  - type: textarea
+    id: golden-image
+    attributes:
+      label: Golden image
+      description: >-
+        How the template was built (the Packer template in `image/`, by hand, some other way), the
+        guest OS, the Java version on it, and whether the guest tools are installed. A clone that
+        never reports an IP is usually a guest tools or network configuration problem rather than a
+        plugin one — see the README's Troubleshooting section.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Controller log
+      description: >-
+        The relevant part of the Jenkins controller log, and the agent log from the VM if you could
+        reach it. Please redact credentials, connection secrets, and anything else you would not
+        publish.
+      render: text
+
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else
+      description: >-
+        Whether the VM was left behind, what `xe vm-list` showed, what you have already tried.
