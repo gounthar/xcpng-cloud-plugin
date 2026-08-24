@@ -347,6 +347,92 @@ class XapiClientTest {
                 "a VDI shared by several VBDs must be destroyed exactly once");
     }
 
+    // #145: a teardown that finds the VM already gone has reached its goal state, not failed. Two teardowns
+    // race for the same VM in production (the completion reap and the idle net), and an operator running
+    // `xe vm-destroy` beats both. Before this, HANDLE_INVALID propagated out of here, XcpngAgent._terminate
+    // logged it at SEVERE and called recordLeakedVm, and the warm-pool maintainer then retried that
+    // reference forever against a VM that no longer existed -- a permanent entry pointing at nothing, on a
+    // pool that had actually returned to baseline.
+
+    @Test
+    void destroyWithDisksTreatsAnAlreadyGoneVmAsDestroyed() {
+        ScriptedTransport t = new ScriptedTransport();
+        t.handleInvalidOn = "VM.get_VBDs"; // the record vanished before this teardown could read it
+        t.handleInvalidData = List.of("VM", "OpaqueRef:vm-1");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.destroyWithDisks(new VmRef("OpaqueRef:vm-1")); // must not throw: there is nothing left to leak
+
+        assertFalse(t.methods().contains("VDI.destroy"), "no disk was ever captured, so none can be destroyed");
+    }
+
+    @Test
+    void destroyWithDisksStillReclaimsDisksWhenTheVmVanishesAfterTheyAreCaptured() {
+        ScriptedTransport t = new ScriptedTransport();
+        t.handleInvalidOn = "VM.destroy"; // another teardown won the race between capture and destroy
+        t.handleInvalidData = List.of("VM", "OpaqueRef:vm-1");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.destroyWithDisks(new VmRef("OpaqueRef:vm-1"));
+
+        // VDIs outlive the VM record that referenced them, so swallowing the VM's disappearance must not
+        // skip them. Returning early here would orphan exactly the disks this method exists to reclaim,
+        // and nothing downstream could enumerate them again once the VM record was gone.
+        assertEquals("OpaqueRef:vdi-disk", paramsOf(t, "VDI.destroy").get(1).asText());
+    }
+
+    @Test
+    void destroyWithDisksDoesNotReportAnAlreadyGoneDiskAsLeaked() {
+        ScriptedTransport t = new ScriptedTransport();
+        t.handleInvalidOn = "VDI.destroy"; // whoever destroyed the VM took its disk too
+        t.handleInvalidData = List.of("VDI", "OpaqueRef:vdi-disk");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        // Must not throw "teardown leaked 1 VDI(s)": that is the same false alarm one level down.
+        c.destroyWithDisks(new VmRef("OpaqueRef:vm-1"));
+    }
+
+    @Test
+    void destroyWithDisksStillFailsWhenHandleInvalidNamesSomethingElse() {
+        // The guard matches the reference under teardown, not the code alone. A HANDLE_INVALID about some
+        // other object is a genuine failure, and swallowing it would trade a false leak report for a silent
+        // real one -- strictly worse, because the reaper's whole value is telling the truth about leaks.
+        ScriptedTransport t = new ScriptedTransport();
+        t.handleInvalidOn = "VM.get_VBDs";
+        t.handleInvalidData = List.of("VM", "OpaqueRef:some-other-vm");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> c.destroyWithDisks(new VmRef("OpaqueRef:vm-1")));
+        assertTrue(e.getMessage().contains("HANDLE_INVALID"), e.getMessage());
+    }
+
+    @Test
+    void anErrorEnvelopeCarriesItsCodeAndParamsStructurally() {
+        // The already-gone guard reads these rather than the message text, so that a code quoted inside an
+        // unrelated failure (a task's error info, say) cannot be mistaken for the failure itself.
+        ScriptedTransport t = new ScriptedTransport();
+        t.handleInvalidOn = "VM.get_power_state";
+        t.handleInvalidData = List.of("VM", "OpaqueRef:vm-1");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException e = assertThrows(HypervisorException.class, () -> c.state(new VmRef("OpaqueRef:vm-1")));
+        assertEquals("HANDLE_INVALID", e.getErrorCode());
+        assertEquals(List.of("VM", "OpaqueRef:vm-1"), e.getErrorParams());
+    }
+
+    @Test
+    void aFailureWithNoBackendEnvelopeHasNoErrorCode() {
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(
+                        new VmRef("OpaqueRef:tmpl"), new ProvisionSpec("agent", 2, 2048L, null, "host-3", null)));
+        assertEquals(null, e.getErrorCode(), "our own guards are not a backend error");
+        assertTrue(e.getErrorParams().isEmpty());
+    }
+
     @Test
     void primaryIpIsEmptyWhenHalted() {
         ScriptedTransport t = new ScriptedTransport();
@@ -464,6 +550,16 @@ class XapiClientTest {
         String taskStatus = "success";
         boolean vdiDestroyFails = false;
         boolean hostIsSlave = false;
+
+        /**
+         * Method that answers HANDLE_INVALID, standing in for a handle destroyed out from under this
+         * teardown, and the class/reference pair XAPI puts in the error data. The reference is scripted
+         * rather than assumed so a test can point the error at something other than the object under
+         * teardown, which is what proves the already-gone guard is narrow.
+         */
+        String handleInvalidOn = null;
+
+        List<String> handleInvalidData = List.of();
         boolean extraDisk = false;
         boolean sharedVdi = false;
         Map<String, String> xenstoreData = Map.of();
@@ -502,6 +598,9 @@ class XapiClientTest {
             }
             if (vdiDestroyFails && method.equals("VDI.destroy")) {
                 return envelope(id, null, Map.of("message", "VDI_IN_USE"));
+            }
+            if (method.equals(handleInvalidOn)) {
+                return envelope(id, null, Map.of("message", "HANDLE_INVALID", "data", handleInvalidData));
             }
             // XAPI checks 0 < VCPUs_at_startup <= VCPUs_max on *every* write, against the value being set
             // and whatever the other one currently holds. Modelling it is what makes the sizing tests real:

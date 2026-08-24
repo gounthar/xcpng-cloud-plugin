@@ -54,6 +54,21 @@ class HypervisorClientContractTest {
     }
 
     @Test
+    void destroyingAnAlreadyDestroyedVmIsNotAFailure() {
+        // The seam's rule, which XapiClientTest pins for the XAPI backend against a HANDLE_INVALID envelope
+        // (#145): destroyWithDisks states a goal, so reaching it twice is success. Any backend added beside
+        // XapiClient has to agree, or a teardown racing another one reports a leak that is not there.
+        FakeHypervisorClient client = new FakeHypervisorClient("t");
+        VmRef vm = client.cloneFromTemplate(client.resolveTemplate("t"), spec());
+        client.start(vm);
+
+        client.destroyWithDisks(vm);
+        client.destroyWithDisks(vm); // must not throw
+
+        assertEquals(VmState.UNKNOWN, client.state(vm));
+    }
+
+    @Test
     void ipIsEmptyWithoutGuestToolsAndPresentWhenReported() {
         FakeHypervisorClient noTools = new FakeHypervisorClient("t");
         VmRef vm = noTools.cloneFromTemplate(noTools.resolveTemplate("t"), spec());
