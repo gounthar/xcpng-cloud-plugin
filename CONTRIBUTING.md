@@ -33,8 +33,21 @@ Three things about that command:
   drift fails the whole build rather than a lint step. Run `mvn spotless:apply` before committing
   anything under `src/` or touching `pom.xml`.
 
-`mvn hpi:run -Dhost=0.0.0.0 -Dport=8080` gives you a local Jenkins at
-`http://localhost:8080/jenkins` with the plugin loaded.
+`mvn hpi:run` gives you a local Jenkins at `http://localhost:8080/jenkins` with the plugin loaded.
+It binds loopback and nothing else: the `run` mojo declares `defaultHost` as `localhost` and
+`defaultPort` as `8080`, overridable through the `host` and `port` user properties.
+
+Exercising the provisioning loop needs more than that, and the reason is the launcher. The agent
+connects *inbound*, so a VM on the pool has to reach your controller; against a loopback-bound
+Jenkins the clone boots, never connects, and gets reaped looking exactly like a failure with a real
+cause. Bind every interface for that:
+
+```sh
+mvn hpi:run -Dhost=0.0.0.0 -Dport=8080
+```
+
+A development Jenkins has no authentication in front of it, so that is a trusted network only, for
+as long as the test takes.
 
 ## Tests
 

@@ -306,10 +306,12 @@ tests use an in-memory fake of the hypervisor client and recorded XAPI fixtures,
 live pool. To run a local Jenkins with the plugin loaded:
 
 ```sh
-mvn hpi:run -Dhost=0.0.0.0 -Dport=8080
+mvn hpi:run
 ```
 
-Jenkins is then available at `http://localhost:8080/jenkins`.
+Jenkins is then available at `http://localhost:8080/jenkins`. That binds loopback. To exercise
+provisioning you need the controller reachable from the VM, since the agent connects inbound, so
+add `-Dhost=0.0.0.0` — bearing in mind a development Jenkins has no authentication in front of it.
 
 ## Dependency updates
 
