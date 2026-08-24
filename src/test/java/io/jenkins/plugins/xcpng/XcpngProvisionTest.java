@@ -1373,8 +1373,14 @@ class XcpngProvisionTest {
 
             assertEquals(1, submitted.get(), "a burst of freed slots should collapse into one queued reconcile");
         } finally {
-            gate.countDown();
+            // Drain before releasing the gate, not after. The worker is still parked in gate.await(), so
+            // the queued reconcile is guaranteed to be sitting in the queue and shutdownNow() removes it
+            // without ever running it. Releasing the gate first lets the worker pick that pass up and
+            // provision on the way out, which is the teardown race #140 filed -- and unlike the test
+            // below there is nothing here that needs the pass to have run, so this drops it rather than
+            // waiting for it. countDown() stays as a no-op safety net if shutdownNow() ever misses.
             reconciles.shutdownNow();
+            gate.countDown();
         }
     }
 
@@ -1406,6 +1412,15 @@ class XcpngProvisionTest {
                     }
                 };
         cloud.setReconcileExecutor(reconciles);
+        // The absorbed pass runs a full reconcile once it is unblocked, and this cloud starts empty
+        // against a target of two, so it submits launches. Left on the default executors those are the
+        // static PROVISION_POOL, which no test can await -- so awaiting the reconcile alone would still
+        // leave the launches racing teardown. Same idiom as reconcileAndSettle: put both halves of a
+        // pass on workers this method can wait for.
+        ExecutorService launches = Executors.newSingleThreadExecutor();
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        cloud.setProvisionExecutor(launches);
+        cloud.setReapExecutor(reaps);
         try {
             synchronized (cloud) {
                 // Every trigger from here on finds a pass in flight and blocked, which is the state
@@ -1419,8 +1434,21 @@ class XcpngProvisionTest {
                         submitted.get(),
                         "a pass already in flight must absorb later triggers, not let each queue its own");
             }
+
+            // The absorbed pass is blocked on the cloud monitor and resumes only once the block above
+            // exits, so these awaits cannot move inside it. Without them the pass and its launches
+            // outlive the test method and provision through the cloud-stats path while JenkinsRule is
+            // deleting JENKINS_HOME, failing teardown with DirectoryNotEmptyException (#140).
+            reconciles.shutdown();
+            assertTrue(reconciles.awaitTermination(30, TimeUnit.SECONDS), "the absorbed pass should finish");
+            launches.shutdown();
+            assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the absorbed pass's launches should finish");
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the absorbed pass's drains should finish");
         } finally {
             reconciles.shutdownNow();
+            launches.shutdownNow();
+            reaps.shutdownNow();
         }
     }
 
