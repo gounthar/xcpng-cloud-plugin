@@ -1,0 +1,19 @@
+---
+blank_issues_enabled: true
+contact_links:
+  - name: Read the documentation first
+    url: https://github.com/gounthar/xcpng-cloud-plugin#readme
+    about: >-
+      Configuration, golden image preparation, security notes, known limitations, and the
+      deliberate scope cuts are all in the README.
+  - name: Report a security vulnerability
+    url: https://github.com/gounthar/xcpng-cloud-plugin/security/advisories/new
+    about: Please do not open a public issue for a vulnerability.
+  - name: Jenkins community forum
+    url: https://community.jenkins.io/
+    about: >-
+      For questions about Jenkins itself, agents, or clouds in general, rather than about this
+      plugin.
+  - name: XCP-ng community forum
+    url: https://xcp-ng.org/forum/
+    about: For questions about XCP-ng, XAPI, or Xen Orchestra rather than about this plugin.

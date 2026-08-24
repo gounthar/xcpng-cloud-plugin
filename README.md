@@ -363,6 +363,15 @@ If the plugin is donated to `jenkinsci`, this is replaced by
 `repo.jenkins-ci.org` and needs organisation secrets. It reads the same labels, so only the
 publishing half changes. The `.mvn/` incrementals wiring that donation requires is already here.
 
+## Contributing
+
+Reports from a pool that does not look like the single-host lab this was written against are the
+most useful thing anyone can send. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the build (JDK 21
+only, spotless enforced), how the tests avoid needing a hypervisor, the design constraints worth
+arguing about before writing code, and what a pull request is expected to say about testing.
+[`SECURITY.md`](SECURITY.md) covers vulnerability reporting and what is already known.
+Participation is governed by the [Jenkins Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT. See [`LICENSE`](LICENSE); it is also declared in `pom.xml`.
