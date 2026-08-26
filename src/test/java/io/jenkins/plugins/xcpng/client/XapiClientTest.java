@@ -408,6 +408,70 @@ class XapiClientTest {
     }
 
     @Test
+    void destroyWithDisksTreatsAVmThatVanishesDuringItsShutdownAsDestroyed() {
+        // The other way the race lands. A halted VM fails the very first call, which the tests above cover;
+        // a *running* one is shut down through an async task, and XAPI can accept the Async.VM.hard_shutdown
+        // and then fail the task with HANDLE_INVALID. The exception then comes from the task's error info
+        // rather than from a JSON-RPC error envelope, and it must carry the same code for the guard to read.
+        ScriptedTransport t = new ScriptedTransport();
+        t.powerState = "Running";
+        t.taskStatus = "failure";
+        t.taskErrorInfo = List.of("HANDLE_INVALID", "VM", "OpaqueRef:vm-1");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.destroyWithDisks(new VmRef("OpaqueRef:vm-1")); // must not throw: the VM is gone, which is the goal
+
+        assertTrue(t.methods().contains("Async.VM.hard_shutdown"), "the shutdown task path went unexercised");
+        assertTrue(
+                t.methods().contains("VDI.destroy"), "the disks captured before the shutdown must still be reclaimed");
+    }
+
+    @Test
+    void destroyWithDisksStillFailsWhenAFailedTaskNamesSomethingElse() {
+        // Same narrowness rule on the task path: the guard matches the reference under teardown, so a task
+        // that failed about some other object stays a failure. Without this, a fix for the case above could
+        // swallow every HANDLE_INVALID a task ever reports and nothing would notice.
+        ScriptedTransport t = new ScriptedTransport();
+        t.powerState = "Running";
+        t.taskStatus = "failure";
+        t.taskErrorInfo = List.of("HANDLE_INVALID", "VM", "OpaqueRef:some-other-vm");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> c.destroyWithDisks(new VmRef("OpaqueRef:vm-1")));
+        assertTrue(e.getMessage().contains("HANDLE_INVALID"), e.getMessage());
+    }
+
+    @Test
+    void aFailedTaskCarriesItsCodeAndParamsStructurally() {
+        // XAPI shapes error_info like a synchronous ErrorDescription: the code first, its parameters after.
+        // Asserting the split here is what stops the async path degrading to a message-text match again.
+        ScriptedTransport t = new ScriptedTransport();
+        t.taskStatus = "failure";
+        t.taskErrorInfo = List.of("VM_BAD_POWER_STATE", "OpaqueRef:vm-1", "Halted", "Running");
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException e = assertThrows(HypervisorException.class, () -> c.start(new VmRef("OpaqueRef:vm-1")));
+        assertEquals("VM_BAD_POWER_STATE", e.getErrorCode());
+        assertEquals(List.of("OpaqueRef:vm-1", "Halted", "Running"), e.getErrorParams());
+    }
+
+    @Test
+    void aTaskThatFailsWithNoErrorInfoStillReportsNoCode() {
+        // An empty error_info must not be mined for a code that is not there. Reporting none keeps the
+        // already-gone guard from matching on an accident.
+        ScriptedTransport t = new ScriptedTransport();
+        t.taskStatus = "failure";
+        t.taskErrorInfo = List.of();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException e = assertThrows(HypervisorException.class, () -> c.start(new VmRef("OpaqueRef:vm-1")));
+        assertEquals(null, e.getErrorCode());
+        assertTrue(e.getErrorParams().isEmpty());
+        assertTrue(e.getMessage().contains("failure"), e.getMessage());
+    }
+
+    @Test
     void anErrorEnvelopeCarriesItsCodeAndParamsStructurally() {
         // The already-gone guard reads these rather than the message text, so that a code quoted inside an
         // unrelated failure (a task's error info, say) cannot be mistaken for the failure itself.
@@ -548,6 +612,15 @@ class XapiClientTest {
         int nameMatches = 1;
         String powerState = "Halted";
         String taskStatus = "success";
+
+        /**
+         * What a failed task reports in {@code error_info}. Scriptable because a task is the other way a
+         * teardown learns its object is already gone: XAPI can fail the {@code Async.*} call outright, or
+         * accept it and fail the task. Leaving this fixed at an unrelated code would let a test cover the
+         * first path and quietly claim the second.
+         */
+        List<String> taskErrorInfo = List.of("INTERNAL_ERROR", "boom");
+
         boolean vdiDestroyFails = false;
         boolean hostIsSlave = false;
 
@@ -653,7 +726,7 @@ class XapiClientTest {
                             req.get("params").get(1).asText().contains("clone")
                                     ? "<value>OpaqueRef:1a2b3c4d-5e6f-4a8b-9c0d-1e2f3a4b5c6d</value>"
                                     : "";
-                        case "task.get_error_info" -> List.of("INTERNAL_ERROR", "boom");
+                        case "task.get_error_info" -> taskErrorInfo;
                         case "VM.get_VCPUs_max" -> vcpusMax;
                         case "VM.get_xenstore_data" -> xenstoreData;
                         case "VM.get_other_config" -> otherConfig;

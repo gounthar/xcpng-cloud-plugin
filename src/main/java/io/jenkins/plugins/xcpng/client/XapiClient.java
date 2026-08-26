@@ -113,7 +113,7 @@ public final class XapiClient implements HypervisorClient {
         JsonNode error = payload.get("error");
         if (error != null && !error.isNull()) {
             String message = error.path("message").asText("UNKNOWN");
-            List<String> errorData = errorParams(error.path("data"));
+            List<String> errorData = stringList(error.path("data"));
             if (message.contains("HOST_IS_SLAVE")) {
                 // The pool returns the master's address in the error data. v0 does not auto-redirect
                 // (the lab is a single host), so turn the opaque failure into an actionable one and
@@ -135,12 +135,13 @@ public final class XapiClient implements HypervisorClient {
     }
 
     /**
-     * XAPI's {@code error.data} as a list of strings. It is an array whose shape depends on the code --
-     * {@code HANDLE_INVALID} gives the class and the reference, {@code HOST_IS_SLAVE} the master's address --
-     * so this keeps the elements verbatim and leaves the meaning to whoever branches on the code. Anything
-     * that is not an array (absent, or a bare scalar) yields an empty list rather than a guess.
+     * One of XAPI's error arrays as a list of strings -- a synchronous failure's {@code error.data}, or a failed
+     * task's {@code error_info}. Their shapes depend on the code -- {@code HANDLE_INVALID} gives the class and the
+     * reference, {@code HOST_IS_SLAVE} the master's address -- so this keeps the elements verbatim and leaves the
+     * meaning to whoever branches on the code. Anything that is not an array (absent, or a bare scalar) yields an
+     * empty list rather than a guess.
      */
-    private static List<String> errorParams(JsonNode data) {
+    private static List<String> stringList(JsonNode data) {
         if (data == null || !data.isArray()) {
             return List.of();
         }
@@ -191,7 +192,7 @@ public final class XapiClient implements HypervisorClient {
                     return call("task.get_result", task).asText("");
                 }
                 if ("failure".equals(status) || "cancelled".equals(status)) {
-                    throw new HypervisorException("task " + status + ": " + call("task.get_error_info", task));
+                    throw taskFailure(status, call("task.get_error_info", task));
                 }
                 if (System.nanoTime() > deadline) {
                     throw new HypervisorException("task timeout: " + task);
@@ -205,6 +206,26 @@ public final class XapiClient implements HypervisorClient {
                 // best effort; a leaked task record is harmless
             }
         }
+    }
+
+    /**
+     * Turn a failed task's {@code error_info} into an exception that carries the backend code structurally.
+     *
+     * <p>XAPI reports the cause of a failed task in the same shape it reports a synchronous failure: a string
+     * array holding the code first and its parameters after it. Splitting it here is what lets a caller branch
+     * on the code on the async path too -- {@link #alreadyGone} in particular, which would otherwise see a null
+     * code on every {@code Async.*} failure and rethrow a teardown that had in fact reached its goal state.
+     *
+     * <p>An {@code error_info} that is empty, or not an array at all, carries no code: the exception then keeps
+     * the same text it always had and reports no code, rather than inventing one out of the first token.
+     */
+    private static HypervisorException taskFailure(String status, JsonNode errorInfo) {
+        List<String> parts = stringList(errorInfo);
+        String message = "task " + status + ": " + errorInfo;
+        if (parts.isEmpty()) {
+            return new HypervisorException(message);
+        }
+        return new HypervisorException(message, parts.get(0), parts.subList(1, parts.size()));
     }
 
     /** Await a task that yields an object reference (e.g. VM.clone), extracting the OpaqueRef. */
