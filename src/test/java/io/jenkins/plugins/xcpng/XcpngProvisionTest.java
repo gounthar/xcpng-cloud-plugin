@@ -1848,13 +1848,18 @@ class XcpngProvisionTest {
         r.jenkins.clouds.add(cloud);
         cloud.recordLeakedVm("vm/leaked/1");
 
-        // Recording rather than retrying inline earns its keep only by surviving a controller restart, which is
-        // an XStream round-trip of config.xml. A transient set would come back empty and the VM would leak
-        // undetected past the very restart the durable set exists to bridge.
-        XcpngCloud reloaded =
-                (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(jenkins.model.Jenkins.XSTREAM2.toXML(cloud));
+        // Recording rather than retrying inline earns its keep only if the ref outlives the cloud object that
+        // recorded it. Since #149 that is what this asserts: the set is held by XcpngLeakedVmStore under the
+        // cloud's name, so a second cloud object built for the same name reads it back. It is deliberately no
+        // longer a claim about XStream -- the config a cloud writes carries no leaked-VM element at all, and
+        // the durability that used to rest on it is asserted against the store's own file in
+        // XcpngLeakedVmStoreTest#aRecordedRefSurvivesARestart.
+        String serialized = jenkins.model.Jenkins.XSTREAM2.toXML(cloud);
+        assertFalse(serialized.contains("leakedVmRefs"), "the cloud must not persist the set itself: " + serialized);
+
+        XcpngCloud reloaded = (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(serialized);
         assertTrue(
                 reloaded.leakedVmRefs().contains("vm/leaked/1"),
-                "a recorded leaked VM must survive a config reload: " + reloaded.leakedVmRefs());
+                "a rebuilt cloud of the same name must still see the leaked VM: " + reloaded.leakedVmRefs());
     }
 }

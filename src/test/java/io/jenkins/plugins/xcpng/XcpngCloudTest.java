@@ -533,4 +533,33 @@ class XcpngCloudTest {
         XcpngCloud cloud = (XcpngCloud) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
         assertEquals(10, cloud.getIdleMinutes(), "a missing idleMinutes must restore the default, not stay 0");
     }
+
+    /**
+     * Saving the cloud from its own configuration page must not forget the VMs a teardown failed to destroy.
+     *
+     * <p>This is the half of #149 the issue did not name, and the likelier one in practice: the issue is
+     * written about configuration-as-code, but {@code /manage/cloud/<name>/configure} rebinds the cloud
+     * through the same {@code @DataBoundConstructor} and hands back a different object. Measured on
+     * 2026-08-26 before the fix -- same instance {@code false}, leaked set {@code []} -- so an operator
+     * raising {@code maxInstances} silently dropped every reference the plugin was still holding, and the
+     * only thing left pointing at those VMs was the external reaper.
+     */
+    @Test
+    void aUiSaveOfTheCloudKeepsTheLeakedVmSet(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", null, 2, List.of());
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("OpaqueRef:leaked-1");
+
+        r.submit(r.createWebClient().goTo("manage/cloud/xcpng/configure").getFormByName("config"));
+
+        XcpngCloud saved = (XcpngCloud) r.jenkins.clouds.getByName("xcpng");
+        assertNotNull(saved, "the save must leave a cloud behind");
+        assertNotEquals(
+                System.identityHashCode(cloud),
+                System.identityHashCode(saved),
+                "a UI save is expected to rebuild the cloud; if it stopped doing so this test proves nothing");
+        assertTrue(
+                saved.leakedVmRefs().contains("OpaqueRef:leaked-1"),
+                "a UI save must not forget a VM the plugin failed to destroy: " + saved.leakedVmRefs());
+    }
 }

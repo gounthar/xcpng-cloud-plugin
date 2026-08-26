@@ -33,7 +33,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,7 +40,6 @@ import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -140,19 +138,19 @@ public class XcpngCloud extends Cloud {
     private int idleMinutes = DEFAULT_IDLE_MINUTES;
 
     /**
-     * VM refs the plugin failed to destroy during agent teardown, awaiting another attempt. When
-     * {@link XcpngAgent#_terminate}'s {@code destroyWithDisks} throws, the base class still removes the node,
-     * so this set becomes the last thing referencing that VM; {@link #sweepLeakedVms} reissues the destroy and
-     * {@link XcpngWarmPoolMaintainer} calls it on a schedule. Persisted (not transient, unlike the in-flight
-     * counters below) because the VM outlives the controller process: a leak recorded before a restart must
-     * still be reclaimed after one. Not final: {@link #readResolve} re-creates it for a config predating the
-     * field. A {@link CopyOnWriteArraySet} rather than a locked {@link LinkedHashSet}: a runtime mutation
-     * (a record or a sweep) must not throw {@code ConcurrentModificationException} against XStream iterating
-     * the set during an unrelated {@code Jenkins.save()} on another thread, which no lock of ours could prevent
-     * since XStream never takes it. Its copy-on-write iteration is snapshot-based, so mutations are safe and no
-     * explicit synchronization is needed.
+     * Where a pre-#149 {@code config.xml} kept the leaked-VM set, read on the way in and never written again.
+     *
+     * <p>The set now lives in {@link XcpngLeakedVmStore}, off the cloud object, because a cloud is rebuilt
+     * through its {@code @DataBoundConstructor} on every configuration path but an XStream reload -- both a
+     * configuration-as-code reload and an ordinary UI save of the cloud hand back a fresh object, and any
+     * non-configuration field on it starts empty. That class carries the reasoning.
+     *
+     * <p>This field survives only so that a controller upgrading into #149 does not lose what it had
+     * recorded. It has no initializer, so a cloud built by either constructor leaves it null and XStream
+     * omits it from the config it writes; {@link #readResolve} hands whatever an older config carried to
+     * {@link XcpngLeakedVmStore#deferMigration} and clears it.
      */
-    private Set<String> leakedVmRefs = new CopyOnWriteArraySet<>();
+    private Set<String> leakedVmRefs;
 
     /**
      * How a live client is opened. Null in production, where {@link #openClient()} builds an
@@ -287,10 +285,13 @@ public class XcpngCloud extends Cloud {
         if (reconcileLock == null) {
             reconcileLock = new Object();
         }
-        // A config predating the leaked-VM set deserializes it to null (XStream skips the initializer). Any
-        // refs an older controller persisted are gone, but a live sweep must still have a set to work with.
-        if (leakedVmRefs == null) {
-            leakedVmRefs = new CopyOnWriteArraySet<>();
+        // A pre-#149 config carries the leaked-VM set on the cloud itself. Hand it to the store now, while
+        // this object is still the one holding it: configuration-as-code may replace the cloud before
+        // anything asks it for its leaks, and a migration that waited for that question would never be asked
+        // it. deferMigration touches no Jenkins API, which readResolve cannot do at this point in startup.
+        if (leakedVmRefs != null) {
+            XcpngLeakedVmStore.deferMigration(name, leakedVmRefs);
+            leakedVmRefs = null;
         }
         // Transient boolean: XStream skips the field initializer, so a reloaded cloud would default to
         // false (fast-complete) and over-provision. Restore the production behaviour.
@@ -872,10 +873,9 @@ public class XcpngCloud extends Cloud {
      * restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
      */
     void recordLeakedVm(@NonNull String vmRef) {
-        // add() is atomic on the CopyOnWriteArraySet and returns whether the ref was new, so only a genuine
-        // first record triggers a save, and XStream may iterate the set mid-save without a CME.
-        if (leakedVmRefs.add(vmRef)) {
-            saveQuietly();
+        // The store persists itself, and reports whether the ref was new so a duplicate record is silent.
+        if (XcpngLeakedVmStore.get().record(name, vmRef)) {
+            LOGGER.log(Level.FINE, () -> "Recorded leaked XCP-ng VM " + vmRef + " for cloud " + name);
         }
     }
 
@@ -888,11 +888,11 @@ public class XcpngCloud extends Cloud {
      * carries its own lock.
      */
     void sweepLeakedVms() {
-        if (leakedVmRefs.isEmpty()) {
+        // A snapshot off the store: iterating it cannot throw even if a record lands mid-sweep.
+        List<String> pending = new ArrayList<>(XcpngLeakedVmStore.get().refs(name));
+        if (pending.isEmpty()) {
             return;
         }
-        // A CopyOnWriteArraySet snapshot: iterating it to copy cannot throw even if a record lands mid-sweep.
-        List<String> pending = new ArrayList<>(leakedVmRefs);
         List<String> reclaimed = new ArrayList<>();
         try (HypervisorClient client = openClient()) {
             for (String vmRef : pending) {
@@ -912,28 +912,16 @@ public class XcpngCloud extends Cloud {
             LOGGER.log(Level.FINE, e, () -> "Could not open a client to sweep leaked XCP-ng VMs for cloud " + name);
         } finally {
             // In a finally, not after the try, so a client whose close() throws cannot resurrect a ref whose
-            // destroy already succeeded. removeAll is atomic on the CopyOnWriteArraySet.
-            if (!reclaimed.isEmpty()) {
-                leakedVmRefs.removeAll(reclaimed);
-                saveQuietly();
-            }
+            // destroy already succeeded. The store drops and persists them in one step.
+            XcpngLeakedVmStore.get().drop(name, reclaimed);
         }
     }
 
     /** A snapshot of the VM refs a past teardown could not destroy, for asserting the durable orphan set in tests. */
     @NonNull
     Set<String> leakedVmRefs() {
-        // A defensive copy off the copy-on-write set; the snapshot iteration cannot throw a CME.
-        return new LinkedHashSet<>(leakedVmRefs);
-    }
-
-    /** Persist the cloud after mutating the leaked-VM set, logging rather than throwing if the save fails. */
-    private static void saveQuietly() {
-        try {
-            Jenkins.get().save();
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, e, () -> "Could not persist the XCP-ng cloud's leaked-VM set");
-        }
+        // Already a defensive copy on the way out of the store; the snapshot iteration cannot throw a CME.
+        return XcpngLeakedVmStore.get().refs(name);
     }
 
     /**
