@@ -113,21 +113,43 @@ public final class XapiClient implements HypervisorClient {
         JsonNode error = payload.get("error");
         if (error != null && !error.isNull()) {
             String message = error.path("message").asText("UNKNOWN");
+            List<String> errorData = stringList(error.path("data"));
             if (message.contains("HOST_IS_SLAVE")) {
                 // The pool returns the master's address in the error data. v0 does not auto-redirect
                 // (the lab is a single host), so turn the opaque failure into an actionable one and
                 // point the operator at the master. Auto-redirect is a TODO for a multi-host backend.
-                throw new HypervisorException(method + ": this host is a pool member, not the master."
-                        + " Point the cloud's poolUrl at the pool master at "
-                        + error.path("data").path(0).asText("(address not reported)"));
+                throw new HypervisorException(
+                        method + ": this host is a pool member, not the master."
+                                + " Point the cloud's poolUrl at the pool master at "
+                                + error.path("data").path(0).asText("(address not reported)"),
+                        message,
+                        errorData);
             }
-            throw new HypervisorException(method + ": " + message + " " + error.path("data"));
+            throw new HypervisorException(method + ": " + message + " " + error.path("data"), message, errorData);
         }
         JsonNode result = payload.get("result");
         if (result == null) {
             throw new HypervisorException(method + ": no result in " + payload);
         }
         return result;
+    }
+
+    /**
+     * One of XAPI's error arrays as a list of strings -- a synchronous failure's {@code error.data}, or a failed
+     * task's {@code error_info}. Their shapes depend on the code -- {@code HANDLE_INVALID} gives the class and the
+     * reference, {@code HOST_IS_SLAVE} the master's address -- so this keeps the elements verbatim and leaves the
+     * meaning to whoever branches on the code. Anything that is not an array (absent, or a bare scalar) yields an
+     * empty list rather than a guess.
+     */
+    private static List<String> stringList(JsonNode data) {
+        if (data == null || !data.isArray()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>();
+        for (JsonNode element : data) {
+            out.add(element.asText());
+        }
+        return out;
     }
 
     /** Authenticated call, re-logging in once on a stale session. */
@@ -170,7 +192,7 @@ public final class XapiClient implements HypervisorClient {
                     return call("task.get_result", task).asText("");
                 }
                 if ("failure".equals(status) || "cancelled".equals(status)) {
-                    throw new HypervisorException("task " + status + ": " + call("task.get_error_info", task));
+                    throw taskFailure(status, call("task.get_error_info", task));
                 }
                 if (System.nanoTime() > deadline) {
                     throw new HypervisorException("task timeout: " + task);
@@ -184,6 +206,26 @@ public final class XapiClient implements HypervisorClient {
                 // best effort; a leaked task record is harmless
             }
         }
+    }
+
+    /**
+     * Turn a failed task's {@code error_info} into an exception that carries the backend code structurally.
+     *
+     * <p>XAPI reports the cause of a failed task in the same shape it reports a synchronous failure: a string
+     * array holding the code first and its parameters after it. Splitting it here is what lets a caller branch
+     * on the code on the async path too -- {@link #alreadyGone} in particular, which would otherwise see a null
+     * code on every {@code Async.*} failure and rethrow a teardown that had in fact reached its goal state.
+     *
+     * <p>An {@code error_info} that is empty, or not an array at all, carries no code: the exception then keeps
+     * the same text it always had and reports no code, rather than inventing one out of the first token.
+     */
+    private static HypervisorException taskFailure(String status, JsonNode errorInfo) {
+        List<String> parts = stringList(errorInfo);
+        String message = "task " + status + ": " + errorInfo;
+        if (parts.isEmpty()) {
+            return new HypervisorException(message);
+        }
+        return new HypervisorException(message, parts.get(0), parts.subList(1, parts.size()));
     }
 
     /** Await a task that yields an object reference (e.g. VM.clone), extracting the OpaqueRef. */
@@ -441,27 +483,52 @@ public final class XapiClient implements HypervisorClient {
     @Override
     public void destroyWithDisks(@NonNull VmRef vm) {
         ensureSession();
-        List<String> vdis = diskVdis(vm.value()); // capture before destroy, or the VDIs orphan
-        // Known, accepted hazard: XAPI's power_state can lie. A VM has been observed reading Halted
-        // (domid -1) from XAPI while the domain was still running on dom0, so this guard skips the
-        // hard_shutdown and VM.destroy then takes a live domain's disk. There is no fix from here:
-        // this client speaks only JSON-RPC and the inbound/JNLP design holds no SSH credential, so
-        // it has no second opinion, and asking XAPI to check XAPI inherits the same stale record.
-        // The operator-side safety net is tools/reaper.py --dom0-check, which reads `xl list` off
-        // dom0 before a sweep. See README "Known limitations".
-        if (!"Halted".equals(call("VM.get_power_state", vm.value()).asText(""))) {
-            // Async, for the same reason start and stop are: a synchronous hard_shutdown blocks
-            // server-side until the domain is down, and one crossing the transport's 30s request
-            // timeout would fail this whole teardown as a leak while the shutdown proceeds
-            // regardless. The task deadline bounds the wait instead of the per-request timeout.
-            awaitTask(call("Async.VM.hard_shutdown", vm.value()).asText());
+        // The whole VM half runs under one already-gone guard rather than each call carrying its own,
+        // because every one of them can lose the same race. Two teardowns can reach the same VM (the
+        // completion reap and the idle net both do, see #145), and an operator running `xe vm-destroy`
+        // beats both. XAPI answers HANDLE_INVALID once the record is gone, which reports the goal state
+        // of this method, not a failure: destroying an already-destroyed VM is a success. Letting it
+        // propagate is what made a finished teardown log at SEVERE and record a permanent leaked-VM
+        // entry pointing at nothing, which the warm-pool maintainer then retried forever.
+        List<String> vdis = List.of();
+        try {
+            vdis = diskVdis(vm.value()); // capture before destroy, or the VDIs orphan
+            // Known, accepted hazard: XAPI's power_state can lie. A VM has been observed reading Halted
+            // (domid -1) from XAPI while the domain was still running on dom0, so this guard skips the
+            // hard_shutdown and VM.destroy then takes a live domain's disk. There is no fix from here:
+            // this client speaks only JSON-RPC and the inbound/JNLP design holds no SSH credential, so
+            // it has no second opinion, and asking XAPI to check XAPI inherits the same stale record.
+            // The operator-side safety net is tools/reaper.py --dom0-check, which reads `xl list` off
+            // dom0 before a sweep. See README "Known limitations".
+            if (!"Halted".equals(call("VM.get_power_state", vm.value()).asText(""))) {
+                // Async, for the same reason start and stop are: a synchronous hard_shutdown blocks
+                // server-side until the domain is down, and one crossing the transport's 30s request
+                // timeout would fail this whole teardown as a leak while the shutdown proceeds
+                // regardless. The task deadline bounds the wait instead of the per-request timeout.
+                awaitTask(call("Async.VM.hard_shutdown", vm.value()).asText());
+            }
+            call("VM.destroy", vm.value());
+        } catch (HypervisorException e) {
+            if (!alreadyGone(e, vm.value())) {
+                throw e;
+            }
+            // Whatever was captured before the record vanished is still destroyed below. VDIs outlive the
+            // VM that referenced them, so returning here instead would orphan exactly the disks this
+            // method exists to reclaim. An empty list (the record was already gone on the first call) just
+            // falls through the loop.
+            LOGGER.info(() -> "VM " + vm.value() + " was already gone when teardown reached it; treating that"
+                    + " as destroyed and reclaiming any disks captured first");
         }
-        call("VM.destroy", vm.value());
         List<String> orphaned = new ArrayList<>();
         for (String vdi : vdis) {
             try {
                 call("VDI.destroy", vdi);
             } catch (HypervisorException e) {
+                if (alreadyGone(e, vdi)) {
+                    // Whoever won the race above destroyed this disk too. Counting it as orphaned would
+                    // raise the same false leak this method just stopped raising for the VM.
+                    continue;
+                }
                 // Try every disk even after one fails: giving up halfway orphans the rest.
                 LOGGER.warning("VDI " + vdi + " survived teardown: " + e.getMessage());
                 orphaned.add(vdi);
@@ -472,6 +539,24 @@ public final class XapiClient implements HypervisorClient {
             // knows the teardown was partial, rather than reporting a clean destroy.
             throw new HypervisorException("teardown leaked " + orphaned.size() + " VDI(s): " + orphaned);
         }
+    }
+
+    /**
+     * Whether this failure reports that the given handle is already gone, which is the goal state of a
+     * teardown rather than a failure of one.
+     *
+     * <p>The reference is checked, not just the code: XAPI puts the class and the reference in the error
+     * data ({@code ["VM", "OpaqueRef:..."]}), and a HANDLE_INVALID naming some *other* object during our
+     * teardown is a genuine failure that must keep propagating. That is also why this reads the structured
+     * code rather than the message text, which would match a code quoted inside an unrelated failure.
+     *
+     * <p>Deliberately narrow, and one case it does not cover: if the VM record vanishes midway through
+     * {@link #diskVdis}, XAPI names the VBD rather than the VM, so that fails the teardown instead of
+     * being swallowed. That is the conservative answer -- the disks may genuinely have orphaned and
+     * nothing can enumerate them any more, so reporting it beats reporting a clean destroy.
+     */
+    private static boolean alreadyGone(HypervisorException e, String ref) {
+        return "HANDLE_INVALID".equals(e.getErrorCode()) && e.getErrorParams().contains(ref);
     }
 
     private List<String> diskVdis(String vm) {
