@@ -1,6 +1,5 @@
 package io.jenkins.plugins.xcpng.client;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
@@ -8,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * In-memory {@link HypervisorClient} for testing the Jenkins half without a pool.
@@ -20,7 +20,17 @@ import java.util.Set;
 public final class FakeHypervisorClient implements HypervisorClient {
 
     private final Set<String> knownTemplates;
-    private final List<String> calls = new ArrayList<>();
+    /**
+     * The verb log, on a copy-on-write list rather than an {@code ArrayList}.
+     *
+     * <p>Provisioning runs on whatever thread core is connecting the computer on, so a test asserting on
+     * this log is almost always reading it from a different thread from the one writing it. An
+     * {@code ArrayList} there is a data race: a reader can see a torn list, or throw
+     * {@code ConcurrentModificationException} mid-iteration, and either failure would read as a bug in the
+     * code under test. Writes are rare and reads are frequent, which is what copy-on-write is for.
+     */
+    private final List<String> calls = new CopyOnWriteArrayList<>();
+
     private final Map<String, VmState> states = new HashMap<>();
     private int cloneCounter = 0;
     private boolean pingFails = false;

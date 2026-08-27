@@ -66,6 +66,11 @@ class XcpngLauncherTest {
         fail(message.get());
     }
 
+    /** Whether core is still running this agent's launcher. */
+    private static boolean isConnecting(XcpngAgent agent) {
+        return agent.toComputer() instanceof SlaveComputer computer && computer.isConnecting();
+    }
+
     private static long cloneCount(FakeHypervisorClient fake) {
         return fake.calls().stream()
                 .filter(c -> c.startsWith("cloneFromTemplate:"))
@@ -124,7 +129,11 @@ class XcpngLauncherTest {
         XcpngCloud cloud = cloudBackedBy(r, fake);
         XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
         r.jenkins.addNode(agent);
-        awaitTrue(() -> agent.getVmRef() != null, () -> "the first launch should have cloned a VM");
+        // Both halves matter. The reference is set between the clone and the start, so waiting on it alone
+        // would read the call log while the first launcher was still writing to it.
+        awaitTrue(
+                () -> agent.getVmRef() != null && !isConnecting(agent),
+                () -> "the first launch should have cloned a VM and returned");
         assertEquals(1, cloneCount(fake), "one launch, one clone: " + fake.calls());
         String vmRef = agent.getVmRef();
 

@@ -1162,10 +1162,23 @@ public class XcpngCloud extends Cloud {
      */
     private void pruneReservations(@NonNull Set<String> registered) {
         long now = System.currentTimeMillis();
-        reservations
-                .entrySet()
-                .removeIf(entry ->
-                        registered.contains(entry.getKey()) || entry.getValue().expiresAt() <= now);
+        reservations.entrySet().removeIf(entry -> {
+            if (registered.contains(entry.getKey())) {
+                return true;
+            }
+            if (entry.getValue().expiresAt() > now) {
+                return false;
+            }
+            // Said out loud, because this is the one branch that gives a slot back to a plan that may still
+            // be live. It should not happen: core registers a planned node on its next round, and the
+            // launcher hands the slot over before that node runs anything. If these lines turn up in a log
+            // beside a cloud running over its cap, the deadline is the first thing to look at.
+            LOGGER.log(
+                    Level.INFO,
+                    () -> "Reservation for " + entry.getKey() + " on cloud " + name + " expired after "
+                            + RESERVATION_TTL_MILLIS + " ms without the node being registered; releasing the slot");
+            return true;
+        });
     }
 
     /** Reservations for a template's warm spares, so repeated ticks do not stack duplicate provisions. */
