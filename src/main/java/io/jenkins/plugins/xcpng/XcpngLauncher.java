@@ -20,8 +20,8 @@ import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
  * <p>The clone, the xenstore seed and the start used to run inside {@link XcpngCloud#provision}, on a
  * background thread, and the node was registered there too — an inbound agent cannot dial in to a node
  * Jenkins does not have. Core's {@code NodeProvisioner} then registered the same node a second time when it
- * polled the planned node's completed future, which is the race behind #145 and the reason
- * {@code XcpngNodeListener} exists.
+ * polled the planned node's completed future, which is the race behind #145; it was undone from a
+ * {@code NodeListener} until this class removed the second registration instead.
  *
  * <p>Doing the work here inverts that ordering, following the shape kubernetes-plugin uses: {@code provision}
  * hands back an agent with no VM behind it yet, core registers it exactly once, and the VM is built while
