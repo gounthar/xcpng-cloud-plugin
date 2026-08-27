@@ -694,6 +694,37 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void anAgentAlreadyBootingIsNotProvisionedForASecondTime(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
+        // Keep the online wait so the launcher is still running when provision() is asked again, which is
+        // the state a booting clone is in for about 35 seconds on the lab pool.
+        cloud.setOnlineWait(TimeUnit.SECONDS.toMillis(20), 10L);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent booting = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(booting);
+        awaitTrue(
+                () -> booting.getVmRef() != null && isConnecting(booting),
+                () -> "the launcher should be building this agent's VM");
+
+        try {
+            // Core's own accounting does not cover this window: a PlannedNode counts toward planned
+            // capacity only while its future is pending (NodeProvisioner.java:298), and ours settles inside
+            // provision(), while the connecting term is throttled by an EMA that takes a tick or two to
+            // climb. So core will keep asking. This cloud has the headroom to say yes and must not.
+            assertTrue(
+                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                            .isEmpty(),
+                    "an agent already booting for this template covers the work; provisioning a second one"
+                            + " is the over-provisioning #120 is about");
+            assertEquals(1, cloneCount(fake), "and nothing else may be cloned: " + fake.calls());
+        } finally {
+            booting.terminate();
+        }
+    }
+
+    @Test
     void aPlannedNodeCoreNeverRegistersLeavesNoVmBehind(JenkinsRule r) {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);

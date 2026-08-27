@@ -449,7 +449,23 @@ public class XcpngCloud extends Cloud {
         }
         List<NodeProvisioner.PlannedNode> planned = new ArrayList<>();
         int capacity = availableCapacity();
-        int remaining = excessWorkload;
+        // Subtract what this cloud is already building for this template. Core will not do it for us, and
+        // that is the whole reason this line exists rather than being left to the NodeProvisioner:
+        //
+        //   - Planned capacity counts a PlannedNode only while its future is NOT done
+        //     (NodeProvisioner.java:298, 2.555.3). Ours settles inside provision(), so it is never counted,
+        //     not even for the round that harvests it. The term is 0 from the moment we return.
+        //   - Connecting capacity is min(EMA, snapshot). The snapshot is right immediately, but the EMA
+        //     needs a tick or two of the 10s LoadStatistics clock to climb, and the min throttles the pair
+        //     to the EMA.
+        //
+        // So for roughly one round after a node registers, both of core's terms read about zero while the
+        // agent is demonstrably booting, and a queue whose own EMA has climbed past the threshold gets a
+        // second agent for the same build. Measured on the lab pool on 2026-08-27: one queued build, two
+        // clones, from provisioning rounds ten seconds apart. The old code was covered by accident, because
+        // awaitOnline kept the planned node's future pending and so kept the planned term at 1 for the
+        // whole boot.
+        int remaining = excessWorkload - alreadyBuilding(template);
         // One VM per planned node, and one executor per VM, so each planned node serves exactly one unit of
         // the excess workload. Stop when the workload is met or the instance cap is reached, whichever comes
         // first. Throughput scales by cloning more agents, never by stacking executors onto one: see
@@ -1110,6 +1126,48 @@ public class XcpngCloud extends Cloud {
         // agents would let a concurrent round provision past the cap.
         pruneReservations(registered);
         return Math.max(0, maxInstances - registered.size() - reservations.size());
+    }
+
+    /**
+     * Units of work this cloud has already committed to for a template and has not yet delivered: agents
+     * planned but not registered, and agents registered but still being built by {@link XcpngLauncher}.
+     *
+     * <p>An agent that is online is deliberately not counted. Core sees it, in {@code availableExecutors},
+     * and it can take the build itself; counting it here as well would stop this cloud growing at all.
+     */
+    private int alreadyBuilding(@NonNull XcpngTemplate template) {
+        Set<String> registered = registeredAgentNames();
+        pruneReservations(registered);
+        int building = 0;
+        for (Reservation reservation : reservations.values()) {
+            if (reservation.templateName().equals(template.getTemplateName())) {
+                building++;
+            }
+        }
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                // Read the id once and branch on the local, as reconcileWarmPool does: it is @CheckForNull,
+                // and two calls are two chances for it to be null.
+                ProvisioningActivity.Id id = agent.getId();
+                if (id != null && template.getTemplateName().equals(id.getTemplateName()) && isBeingBuilt(agent)) {
+                    building++;
+                }
+            }
+        }
+        return building;
+    }
+
+    /**
+     * Whether this agent is registered and on its way up: its computer has not been created yet, or its
+     * launcher is still running. An agent whose launch failed is neither, so a failed provision does not
+     * suppress its own replacement.
+     */
+    private static boolean isBeingBuilt(@NonNull XcpngAgent agent) {
+        Computer computer = agent.toComputer();
+        if (computer == null) {
+            return true;
+        }
+        return computer instanceof SlaveComputer slave && slave.isConnecting();
     }
 
     /** Node names of the agents this cloud currently has registered with Jenkins. */
