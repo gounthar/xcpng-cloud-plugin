@@ -2,6 +2,7 @@ package io.jenkins.plugins.xcpng;
 
 import hudson.Extension;
 import hudson.model.Node;
+import hudson.slaves.SlaveComputer;
 import java.io.IOException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -37,12 +38,19 @@ import jenkins.model.NodeListener;
  * accepting work for up to that long. The removal is safe to do inline because
  * {@code Nodes.handleAddedNode} fires this listener after its {@code Queue.runWithLock} section has
  * returned, so nothing here re-enters a lock the add is still holding.
+ *
+ * <p>The {@code setAcceptingTasks(false)} below ships asserted rather than demonstrated. Reddening a test
+ * without it would need {@code removeNode} to fail, and the successful path leaves neither node nor
+ * computer to inspect, so there is nothing a test could observe. It is kept because the reasoning stands
+ * on its own: the re-added computer constructs {@code acceptingTasks} true, and a build scheduled onto it
+ * would lose its VM immediately.
  */
 @Extension
 public class XcpngNodeListener extends NodeListener {
 
     private static final Logger LOGGER = Logger.getLogger(XcpngNodeListener.class.getName());
 
+    /** Drop a re-registered {@link XcpngAgent} whose teardown has already run. */
     @Override
     protected void onCreated(Node node) {
         if (!(node instanceof XcpngAgent agent) || !agent.isTerminated()) {
@@ -54,17 +62,30 @@ public class XcpngNodeListener extends NodeListener {
                         + " was registered again after its teardown had already run, which the node"
                         + " provisioner does when it polls a planned node whose agent has since been"
                         + " reclaimed; removing it rather than leaving a node whose VM is gone");
+        // Refuse work before attempting the removal, not after it succeeds. The re-add gave this agent a
+        // brand new Computer (Nodes.handleAddedNode calls updateNewComputer before firing this listener),
+        // and acceptingTasks constructs true, so between here and the removal the queue is entitled to
+        // schedule a build onto a VM that no longer exists. Doing it first also means the failure path
+        // below leaves the node refusing work rather than advertising itself.
+        if (node.toComputer() instanceof SlaveComputer computer) {
+            computer.setAcceptingTasks(false);
+        }
         try {
             Jenkins.get().removeNode(node);
         } catch (IOException e) {
             // Logged rather than thrown: this runs inside addNode's listener fan-out, and throwing would
-            // only break whatever else that add still has to do. A node left behind here is reclaimed by
-            // the idle net as before, which is the pre-fix behaviour rather than a new failure.
+            // only break whatever else that add still has to do. The node is left for the idle net to
+            // reclaim, as before this class existed, but non-accepting thanks to the call above.
+            //
+            // No retry here, deliberately. This runs on the provisioner's thread inside a listener
+            // callback, and a bounded retry loop in that position would block the add for as long as it
+            // ran. The idle net is the retry, and it is the same one that covers every other teardown
+            // that could not finish.
             LOGGER.log(
                     Level.WARNING,
                     e,
                     () -> "Could not remove re-registered agent " + agent.getNodeName()
-                            + "; it will linger until the idle timeout reclaims it");
+                            + "; it stays registered but refuses work, and the idle timeout reclaims it");
         }
     }
 }
