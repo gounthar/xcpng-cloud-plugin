@@ -150,6 +150,25 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private transient volatile boolean reloaded;
 
     /**
+     * True once this agent's teardown has run, so the node behind it is gone or about to be. Set at the top
+     * of {@link #_terminate}, which every teardown path converges on.
+     *
+     * <p>It exists because a torn-down agent can be registered again by somebody else. {@link
+     * XcpngCloud#launch} adds the node itself, before the wait for the agent to connect, since an inbound
+     * agent cannot dial in to a node Jenkins does not have; core's {@code NodeProvisioner} then adds the
+     * same node a second time when it next polls the planned node's completed future, and it does so
+     * unconditionally, with no check that the node is still registered or still wanted. On a build short
+     * enough that the completion reap removes the node before that poll lands, the second add wins and
+     * Jenkins ends up holding an agent whose VM was destroyed seconds earlier. {@link XcpngNodeListener}
+     * reads this flag to undo exactly that add.
+     *
+     * <p>Transient, and deliberately not persisted: a re-added node is written to disk by {@code addNode},
+     * but an agent restored from that file is already covered by {@link #reloaded}. Volatile because the
+     * reaping thread sets it and the node listener reads it on the provisioner's thread.
+     */
+    private transient volatile boolean terminated;
+
+    /**
      * How a client is opened from the {@link #poolUrl} snapshot when the owning cloud is gone. Null in
      * production, where {@link #openClientFromSnapshot()} builds an {@code XapiClient} through
      * {@link XcpngCloud#openClient(String, String, String, String)}; a test injects an in-memory fake and
@@ -260,6 +279,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         return reloaded;
     }
 
+    /** True once {@link #_terminate} has run for this agent, so any later registration of it is spurious. */
+    public boolean isTerminated() {
+        return terminated;
+    }
+
     /**
      * Mark this spare as used, so it is no longer exempt from idle-reaping and reverts to single-use
      * behaviour. Called when the agent accepts its first build. Idempotent, and a plain field write:
@@ -307,6 +331,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     @Override
     protected void _terminate(TaskListener listener) {
+        // Before anything that can fail or block: the flag says a teardown ran, not that it succeeded, and
+        // XcpngNodeListener needs it set even on the paths below that give up on the VM. The node is being
+        // removed by the base class either way (see the class javadoc on terminated).
+        terminated = true;
         XcpngCloud cloud = getCloud();
         if (cloud == null) {
             terminateWithoutCloud(listener);
