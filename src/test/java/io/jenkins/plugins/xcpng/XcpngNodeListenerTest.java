@@ -47,9 +47,17 @@ class XcpngNodeListenerTest {
         return cloud;
     }
 
+    /**
+     * An agent as the launcher leaves it: built by the cloud and holding a VM reference, without going
+     * through a registration and a real launch. Setting the reference by hand is what keeps that true --
+     * {@link XcpngLauncher} skips the clone when the agent already has one -- so registering this agent
+     * touches the pool for nothing.
+     */
     private static XcpngAgent agent(XcpngCloud cloud, String name) throws Exception {
-        return (XcpngAgent) cloud.provisionNode(
+        XcpngAgent agent = cloud.createAgent(
                 LINUX_TEMPLATE, name, new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", name), false);
+        agent.setVmRef("vm/" + name + "/1");
+        return agent;
     }
 
     /**

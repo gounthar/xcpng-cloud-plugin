@@ -191,9 +191,17 @@ class XcpngRetentionStrategyTest {
         return new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", nodeName);
     }
 
-    /** Provision an agent (warm or on-demand) through the cloud, so it carries a real VM ref and cloud name. */
+    /**
+     * An agent (warm or on-demand) as the launcher leaves it: built by the cloud and holding a VM reference,
+     * without going
+     * through a registration and a real launch. Setting the reference by hand is what keeps that true --
+     * {@link XcpngLauncher} skips the clone when the agent already has one -- so registering this agent
+     * touches the pool for nothing.
+     */
     private static XcpngAgent agent(XcpngCloud cloud, String name, boolean warm) throws Exception {
-        return (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, name, activityId(name), warm);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, name, activityId(name), warm);
+        agent.setVmRef("vm/" + name + "/1");
+        return agent;
     }
 
     private static long destroyCount(FakeHypervisorClient fake) {
@@ -224,7 +232,7 @@ class XcpngRetentionStrategyTest {
         XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
         ProvisioningActivity.Id id = new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-warm-1");
         XcpngCloud cloud = new XcpngCloud("xcpng", POOL_URL, CREDENTIALS_ID, PINNED_FINGERPRINT, 1, List.of(template));
-        XcpngAgent spare = new XcpngAgent("xcpng-warm-1", cloud, "vm/xcpng-warm-1/1", template, 10, id, true);
+        XcpngAgent spare = new XcpngAgent("xcpng-warm-1", cloud, template, 10, id, true);
 
         assertTrue(spare.isWarm(), "a spare is warm at birth");
         spare.markUsed();

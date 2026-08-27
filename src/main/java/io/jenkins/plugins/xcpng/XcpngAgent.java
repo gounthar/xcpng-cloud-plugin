@@ -9,7 +9,6 @@ import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.Cloud;
-import hudson.slaves.JNLPLauncher;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import java.io.IOException;
@@ -79,7 +78,26 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     static final Node.Mode USAGE_MODE = Node.Mode.EXCLUSIVE;
 
     private final String cloudName;
-    private final String vmRef;
+
+    /**
+     * The clone's opaque backend handle, or null while this agent has no VM behind it yet.
+     *
+     * <p>Null is an ordinary state, not a defect: an agent is registered before its VM exists, so that the
+     * inbound agent has a node to dial in to, and {@link XcpngLauncher} clones the VM and sets this field once
+     * core connects the computer. Between those two moments — and forever, for an agent whose launch failed
+     * before the clone — there is genuinely nothing to destroy, which is what {@link #_terminate} keys off.
+     *
+     * <p>Not final, and not transient. It is written once by the launcher and persisted with the node, because
+     * a controller restart in the middle of a build must not lose the handle to the VM that build is running
+     * on. A node persisted with it still null is a node whose VM was never built; {@link #readResolve} raises
+     * {@link #reloaded} for it exactly as for any other, and the retention strategy reclaims it on the first
+     * check, with a teardown that has nothing to do.
+     *
+     * <p>Volatile because the launcher writes it on the connect thread and the retention and teardown threads
+     * read it.
+     */
+    @CheckForNull
+    private volatile String vmRef;
 
     /**
      * Connection parameters copied off the owning cloud at provision time, so this agent can still reach the
@@ -177,8 +195,13 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private transient ConnectionClientFactory connectionClientFactory;
 
     /**
-     * Wrap a freshly cloned, running VM in a single-use inbound agent. Called from
-     * {@link XcpngCloud#provisionNode}, which is the only site that builds one.
+     * Build a single-use inbound agent for a VM that does not exist yet. Called from
+     * {@link XcpngCloud#createAgent}, which is the only site that builds one.
+     *
+     * <p>The VM comes later, from {@link XcpngLauncher}, once Jenkins has registered this node and starts
+     * connecting its computer. That ordering is the whole point: an inbound agent cannot dial in to a node
+     * Jenkins does not have, and having the cloud register the node itself is what let core register it a
+     * second time (see {@link XcpngLauncher}'s class javadoc).
      *
      * @param name the node name, which is also the clone's VM name and the identity its inbound agent
      *     presents to the controller.
@@ -186,8 +209,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      *     snapshot cannot drift from the name it is recorded against; the agent keeps only the name and the
      *     three non-secret connection parameters, never a reference to the cloud itself, which is not
      *     serialised with the node.
-     * @param vmRef the clone's opaque backend handle, destroyed with its disks when the node is removed.
-     * @param template the template this agent was cloned from, which supplies its labels.
+     * @param template the template this agent is cloned from, which supplies its labels and, through the
+     *     launcher this constructor builds, the clone's size and golden image.
      * @param idleMinutes the timeout handed to this agent's {@link XcpngRetentionStrategy}.
      * @param activityId the cloud-stats activity to correlate this agent's phases against. The same
      *     instance the planned node carries, since cloud-stats matches ids per instance.
@@ -197,7 +220,6 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     public XcpngAgent(
             @NonNull String name,
             @NonNull XcpngCloud cloud,
-            @NonNull String vmRef,
             @NonNull XcpngTemplate template,
             int idleMinutes,
             @NonNull ProvisioningActivity.Id activityId,
@@ -210,11 +232,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 EXECUTORS_PER_AGENT,
                 USAGE_MODE,
                 template.getLabelString(),
-                new JNLPLauncher(),
+                new XcpngLauncher(template),
                 new XcpngRetentionStrategy(idleMinutes),
                 Collections.emptyList());
         this.cloudName = cloud.name;
-        this.vmRef = vmRef;
         this.activityId = activityId;
         this.warm = warm;
         this.poolUrl = cloud.getPoolUrl();
@@ -222,10 +243,37 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.certificateFingerprint = cloud.getCertificateFingerprint();
     }
 
-    /** The VM this agent runs on, as an opaque backend handle. */
-    @NonNull
+    /** The VM this agent runs on, as an opaque backend handle, or null while it has none yet. */
+    @CheckForNull
     public String getVmRef() {
         return vmRef;
+    }
+
+    /**
+     * Record the VM this agent runs on, and persist it.
+     *
+     * <p>Called by {@link XcpngLauncher} the moment the clone exists — before the VM is started, deliberately.
+     * Everything after the clone can fail, and the teardown that failure runs can only destroy a handle it can
+     * see, so the window in which a clone exists and no node knows about it is kept to nothing.
+     *
+     * <p>Persisted rather than kept in memory because a controller restart mid-build must not lose the handle
+     * to the VM that build is on. {@link Node#save()} writes this node's own {@code config.xml} and nothing
+     * else; it is a no-op before the node is registered, which is why the launcher is the only caller.
+     */
+    void setVmRef(@CheckForNull String vmRef) {
+        this.vmRef = vmRef;
+        try {
+            save();
+        } catch (IOException e) {
+            // The field is set in memory either way, so this agent still destroys its own VM on teardown. What
+            // is lost is only the record surviving a restart, and the durable leaked-VM set and tools/reaper.py
+            // both find such a VM by its owner marker. Not worth failing a launch over.
+            LOGGER.log(
+                    Level.WARNING,
+                    e,
+                    () -> "Could not persist the VM reference for agent " + getNodeName()
+                            + "; a controller restart before its teardown would leave the VM to the owner-marker sweep");
+        }
     }
 
     /** Name of the cloud that provisioned this agent, used to attribute it against that cloud's cap. */
@@ -335,9 +383,23 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         // XcpngNodeListener needs it set even on the paths below that give up on the VM. The node is being
         // removed by the base class either way (see the class javadoc on terminated).
         terminated = true;
+        // Read the field once. Everything below branches on it, and the launcher writes it from another
+        // thread, so re-reading could take the destroy branch on a reference that has since gone.
+        final String vmRef = this.vmRef;
+        if (vmRef == null) {
+            // No VM was ever built for this node: the launch failed before the clone, or the node was removed
+            // before its computer was ever connected. Distinct from a lost handle, and deliberately said out
+            // loud, because "nothing to destroy" and "something to destroy that we can no longer reach" want
+            // opposite responses from whoever reads this log.
+            LOGGER.log(
+                    Level.FINE,
+                    () -> "Agent " + getNodeName() + " never had a VM behind it; nothing to destroy on teardown");
+            listener.getLogger().println("No XCP-ng VM was ever created for this agent; nothing to destroy.");
+            return;
+        }
         XcpngCloud cloud = getCloud();
         if (cloud == null) {
-            terminateWithoutCloud(listener);
+            terminateWithoutCloud(listener, vmRef);
             return;
         }
         listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
@@ -376,7 +438,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * store, or the pool unreachable. The cloud's durable leaked-VM set cannot stand in for either, since
      * {@link XcpngCloud#recordLeakedVm} lives on the very cloud that no longer exists.
      */
-    private void terminateWithoutCloud(TaskListener listener) {
+    private void terminateWithoutCloud(TaskListener listener, @NonNull String vmRef) {
         if (poolUrl == null) {
             LOGGER.log(
                     Level.SEVERE,

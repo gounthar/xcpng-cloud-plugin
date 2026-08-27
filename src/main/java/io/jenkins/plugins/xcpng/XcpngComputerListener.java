@@ -82,15 +82,24 @@ public class XcpngComputerListener extends ComputerListener {
                             + agent.getNodeName());
             return;
         }
+        String vmRef = agent.getVmRef();
+        if (vmRef == null) {
+            // An agent cannot be online without a VM to be online on, so this is unreachable in practice; it
+            // is here because the reference is nullable now that the launcher, not the constructor, sets it.
+            LOGGER.log(
+                    Level.FINE,
+                    () -> "Agent " + agent.getNodeName() + " reports no VM; nothing to scrub the seed secret from");
+            return;
+        }
         try (HypervisorClient client = cloud.openClient()) {
-            client.clearGuestSecret(new VmRef(agent.getVmRef()));
+            client.clearGuestSecret(new VmRef(vmRef));
             LOGGER.log(Level.FINE, () -> "Scrubbed the seed secret for agent " + agent.getNodeName());
         } catch (RuntimeException e) {
             LOGGER.log(
                     Level.WARNING,
                     e,
-                    () -> "Failed to scrub the seed secret for agent " + agent.getNodeName() + " (VM "
-                            + agent.getVmRef() + "); it remains in the VM record until teardown");
+                    () -> "Failed to scrub the seed secret for agent " + agent.getNodeName() + " (VM " + vmRef
+                            + "); it remains in the VM record until teardown");
         }
     }
 

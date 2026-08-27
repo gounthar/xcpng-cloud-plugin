@@ -12,6 +12,7 @@ import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.TaskListener;
 import hudson.security.ACL;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
@@ -37,15 +38,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
-import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -90,11 +88,19 @@ public class XcpngCloud extends Cloud {
     private static final long ONLINE_POLL_MILLIS = 1000L;
 
     /**
-     * Dedicated pool for provisioning tasks. Each task blocks up to {@link #ONLINE_TIMEOUT_MINUTES}
-     * waiting for its agent to connect, so it runs here rather than on {@code Computer.threadPoolForRemoting}
-     * where long waits would compete with the controller's own remoting work. Cached and daemon-threaded:
-     * it grows to the number of in-flight provisions (bounded per cloud by {@code maxInstances}) and idles
-     * back to zero.
+     * How long a slot stays committed to an agent Jenkins has not registered yet. Generous on purpose: the
+     * normal release is by name against the node list, one provisioning round later, so this deadline only
+     * ever fires for a planned node core dropped without registering it. Expiring a live commitment early is
+     * the failure the reservations exist to prevent; expiring a dead one late costs one delayed provision.
+     */
+    private static final long RESERVATION_TTL_MILLIS = TimeUnit.MINUTES.toMillis(1);
+
+    /**
+     * Dedicated pool for warm-spare registrations. The clone, the start and the online wait moved to
+     * {@link XcpngLauncher}, which core runs on its own remoting pool, so what is left here is short: build
+     * the node and register it. It still runs off the caller's thread, because {@link #reconcileWarmPool}
+     * holds this cloud's monitor while it fills the pool and {@code addNode} takes the queue lock, and
+     * because a maintainer tick must not wait on a registration. Cached and daemon-threaded.
      */
     private static final ExecutorService PROVISION_POOL = Executors.newCachedThreadPool(runnable -> {
         Thread thread = new Thread(runnable, "xcpng-provisioner");
@@ -160,22 +166,21 @@ public class XcpngCloud extends Cloud {
     private transient HypervisorClientFactory clientFactory;
 
     /**
-     * Provisions submitted but not yet registered as {@link XcpngAgent} nodes. Counted against the
-     * instance cap so a burst of concurrent {@link #provision} rounds cannot overshoot {@code
-     * maxInstances} while earlier clones are still booting and have not yet appeared in the node list.
-     * Transient and never persisted; the field initializer covers a fresh instance and {@link
+     * Agents this cloud has committed to but Jenkins has not registered yet, keyed by node name.
+     *
+     * <p>A planned node is now handed back with its future already settled and no VM behind it, so core
+     * registers it on its next provisioning round rather than this cloud registering it on a background
+     * thread. That leaves a window of one round in which the agent counts against nothing: it is not in
+     * {@code Jenkins.getNodes()}, and there is no in-flight task to ask. A concurrent round -- another
+     * label's {@code NodeProvisioner}, or a warm-pool tick -- would plan straight past {@link #maxInstances}
+     * into that window. These reservations close it, and they are why this is a map of node names rather
+     * than the counter it replaced: an entry is dropped when its node turns up registered, which is a name
+     * comparison against the node list and needs no event to fire and nothing to remember to call.
+     *
+     * <p>Transient and never persisted; the field initializer covers a fresh instance and {@link
      * #readResolve} covers a deserialized one (XStream skips both the constructor and field initializers).
      */
-    private transient AtomicInteger inFlight = new AtomicInteger();
-
-    /**
-     * Per-template count of warm-pool provisions submitted but not yet registered as nodes, so a warm
-     * reconcile does not double-provision a template across ticks while its earlier spares are still
-     * booting. This only feeds the per-template deficit; the cloud-wide {@link #inFlight} stays the single
-     * instance-cap counter. Transient; the field initializer covers a fresh instance and {@link
-     * #readResolve} a deserialized one.
-     */
-    private transient ConcurrentHashMap<String, AtomicInteger> warmInFlightByTemplate = new ConcurrentHashMap<>();
+    private transient ConcurrentHashMap<String, Reservation> reservations = new ConcurrentHashMap<>();
 
     /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
@@ -276,11 +281,8 @@ public class XcpngCloud extends Cloud {
         if (idleMinutes <= 0) {
             idleMinutes = DEFAULT_IDLE_MINUTES;
         }
-        if (inFlight == null) {
-            inFlight = new AtomicInteger();
-        }
-        if (warmInFlightByTemplate == null) {
-            warmInFlightByTemplate = new ConcurrentHashMap<>();
+        if (reservations == null) {
+            reservations = new ConcurrentHashMap<>();
         }
         if (reconcileLock == null) {
             reconcileLock = new Object();
@@ -459,158 +461,136 @@ public class XcpngCloud extends Cloud {
             final String displayName = "xcpng-" + template.getTemplateName() + "-"
                     + UUID.randomUUID().toString().substring(0, 8);
             // The cloud-stats activity id for this provisioning. One instance is created here and shared:
-            // the TrackedPlannedNode below and the XcpngAgent built by provisionNode both carry this exact
+            // the TrackedPlannedNode below and the XcpngAgent built by createAgent both carry this exact
             // object. cloud-stats' Id equality is per-instance (a random fingerprint, not the names), so a
             // rebuilt id would never correlate; the phases stay on one activity only by sharing this handle.
             final ProvisioningActivity.Id activityId =
                     new ProvisioningActivity.Id(name, template.getTemplateName(), displayName);
-            // On-demand agents are never warm spares: they are provisioned for queued work. launch()
-            // reserves capacity, clones, starts, registers, and (in production) waits for the agent to
-            // come online before settling the future, so the NodeProvisioner does not over-provision.
-            CompletableFuture<Node> future = launch(template, displayName, activityId, false);
-            if (future == null) {
-                // The pool refused the submit, which it does only while shutting down. The reservation is
-                // already settled inside launch; stop planning further nodes this round.
+            // On-demand agents are never warm spares: they are provisioned for queued work. The node is
+            // handed back with no VM behind it yet; XcpngLauncher builds that when core connects the
+            // computer, which is what keeps the registration in core's hands and out of this cloud's.
+            XcpngAgent agent;
+            try {
+                agent = createAgent(template, displayName, activityId, false);
+            } catch (Descriptor.FormException | IOException e) {
+                // Building the node object is local work with no VM behind it, so this is a
+                // misconfiguration (a label expression the template rejects, most likely) rather than a
+                // pool problem. Nothing was reserved and nothing was cloned; stop planning this round
+                // rather than spinning on the same failure for every unit of the excess workload.
+                LOGGER.log(Level.WARNING, e, () -> "Could not plan agent " + displayName + " for cloud " + name);
                 break;
             }
-            planned.add(new TrackedPlannedNode(activityId, XcpngAgent.EXECUTORS_PER_AGENT, future));
+            // Reserve before handing the planned node out, so a concurrent round sees the commitment even
+            // though the node will not be registered until core polls this future.
+            reserve(displayName, template.getTemplateName(), false);
+            planned.add(new TrackedPlannedNode(
+                    activityId, XcpngAgent.EXECUTORS_PER_AGENT, CompletableFuture.completedFuture(agent)));
             remaining -= XcpngAgent.EXECUTORS_PER_AGENT;
         }
         return planned;
     }
 
     /**
-     * Reserve one unit of capacity, submit the clone, start and node registration on the provisioning
-     * pool, and return the future that settles when the agent is registered (and, for an on-demand agent
-     * in production, online). Shared by {@link #provision}, which wraps the future in a
-     * {@link TrackedPlannedNode}, and by {@link #reconcileWarmPool}, which discards it. Returns null if the
-     * pool rejected the submit, having already settled the reservation. Increments {@link #inFlight}
-     * synchronously, so a caller holding this cloud's monitor sees the reservation before it next snapshots
-     * capacity.
+     * Build the node object for one agent, with no VM behind it. The clone, the seed and the start happen
+     * later, in {@link XcpngLauncher}, once Jenkins has registered this node and starts connecting its
+     * computer.
      *
-     * <p>A warm spare differs from an on-demand agent only here: it is still registered so its inbound
-     * agent can connect, but the maintainer never blocks a tick waiting for it to come online, and the
-     * per-template warm counter is reserved so a later tick does not double-provision it. Because it
-     * bypasses the NodeProvisioner, it also opens its own cloud-stats activity with {@code onStarted} against
-     * {@code activityId} (the on-demand path leaves that to the {@link TrackedPlannedNode}); once the activity
-     * exists, cloud-stats' own computer and node listeners drive it through launch, operation, and teardown, so
-     * the only phase this method must close by hand is a failure before any computer exists, via {@code onFailure}.
+     * <p>Package-visible so a test can build an agent without going through a provisioning round. The
+     * {@code activityId} is the same instance carried by the planned node, stamped onto the agent so
+     * cloud-stats keeps both on one activity.
      */
-    @CheckForNull
-    private CompletableFuture<Node> launch(
+    @NonNull
+    XcpngAgent createAgent(
             @NonNull XcpngTemplate template,
             @NonNull String displayName,
             @NonNull ProvisioningActivity.Id activityId,
-            boolean warm) {
-        inFlight.incrementAndGet();
-        if (warm) {
-            warmInFlight(template.getTemplateName()).incrementAndGet();
+            boolean warm)
+            throws Descriptor.FormException, IOException {
+        // The cloud itself, not just its name: the agent snapshots this cloud's connection parameters so it
+        // can still destroy its VM if the cloud is later deleted or renamed.
+        return new XcpngAgent(displayName, this, template, idleMinutes, activityId, warm);
+    }
+
+    /**
+     * Clone the template, start it, and record the clone on the agent. Called by {@link XcpngLauncher} on the
+     * thread core is connecting the computer on, so this cloud's own client, seed and leaked-VM handling stay
+     * in one place rather than being duplicated into the launcher.
+     *
+     * <p>The reference is stamped onto the agent between the clone and the start, deliberately: everything
+     * after the clone can fail, and a teardown can only destroy a handle it can see.
+     */
+    void provisionVm(@NonNull XcpngAgent agent, @NonNull XcpngTemplate template, @NonNull TaskListener listener)
+            throws Exception {
+        String displayName = agent.getNodeName();
+        try (HypervisorClient client = openClient()) {
+            VmRef templateRef = client.resolveTemplate(template.getTemplateName());
+            ProvisionSpec spec = new ProvisionSpec(
+                    displayName,
+                    template.getNumCpus(),
+                    template.getMemoryBytes(),
+                    null,
+                    null,
+                    null,
+                    seedFor(displayName, template),
+                    // Stamp the owning cloud onto the VM record. The plugin's own teardown is the normal
+                    // path; this is what lets tools/reaper.py find a clone the plugin lost track of, after
+                    // a crash mid-provision or a destroy that threw.
+                    name);
+            listener.getLogger().println("Cloning XCP-ng template " + template.getTemplateName() + " for this agent.");
+            VmRef clone = client.cloneFromTemplate(templateRef, spec);
+            agent.setVmRef(clone.value());
+            client.start(clone);
+            listener.getLogger().println("Started XCP-ng VM " + clone.value() + "; waiting for the agent to connect.");
+            LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
         }
-        // A CompletableFuture, not the raw submit() future, so cancellation is handled: the node
-        // provisioner may cancel a PlannedNode, and if the task never runs (cancelled before start) its
-        // own finally would never release the reservation. Releasing in whenComplete ties the decrement to
-        // the future settling by any path -- success, failure, or cancellation.
-        CompletableFuture<Node> future = new CompletableFuture<>();
-        future.whenComplete((node, throwable) -> {
-            inFlight.decrementAndGet();
-            if (warm) {
-                warmInFlight(template.getTemplateName()).decrementAndGet();
-            }
-        });
+    }
+
+    /**
+     * Register one pre-booted warm spare: reserve a slot, build the node, and add it to Jenkins. The VM
+     * itself is built by {@link XcpngLauncher} when core connects the new computer, exactly as for an
+     * on-demand agent -- {@code AbstractCIBase.updateComputer} calls {@code retentionStrategy.start} on a
+     * freshly added node, and {@code CloudRetentionStrategy.start} is an unguarded {@code connect}.
+     *
+     * <p>Returns false if the pool rejected the submit, which it does only while shutting down, having
+     * already released the reservation; the caller stops filling for this tick.
+     *
+     * <p>A warm spare bypasses the {@code NodeProvisioner} altogether, so nothing files its cloud-stats
+     * activity for it. This opens one by hand with {@code onStarted} before the node is added, so an activity
+     * exists by the time the spare connects or is drained -- otherwise cloud-stats' own online and deletion
+     * listeners call {@code getActivityFor} on an untracked node and throw. Only a failure <em>before</em> the
+     * node is registered is closed here, with {@code onFailure}: past that point a computer exists, and
+     * cloud-stats' listeners (and {@link XcpngLauncher}, for a failed launch) carry the activity the rest of
+     * the way.
+     */
+    private boolean launchWarmSpare(
+            @NonNull XcpngTemplate template, @NonNull String displayName, @NonNull ProvisioningActivity.Id activityId) {
+        reserve(displayName, template.getTemplateName(), true);
         try {
-            Future<?> task = provisionExecutor().submit(() -> {
-                if (future.isCancelled()) {
-                    return;
-                }
-                Node node = null;
+            provisionExecutor().submit(() -> {
                 try {
-                    // A warm spare is added straight to the pool and never passes through the
-                    // NodeProvisioner, which is what files an on-demand TrackedPlannedNode's cloud-stats
-                    // activity. Register it here against the agent's own activityId, before the clone starts,
-                    // so an activity exists by the time the spare connects or is drained -- otherwise
-                    // cloud-stats' online and deletion listeners call getActivityFor on an untracked node and
-                    // throw IllegalStateException. The on-demand path leaves this to the NodeProvisioner.
-                    if (warm) {
-                        CloudStatistics.ProvisioningListener.get().onStarted(activityId);
-                    }
-                    node = provisionNode(template, displayName, activityId, warm);
-                    // Register the node so its inbound agent can dial in -- both warm spares and on-demand
-                    // agents need this. Only an on-demand agent in production then blocks until it is online,
-                    // which keeps its PlannedNode pending and stops the NodeProvisioner counting it as
-                    // delivered capacity while it is still booting; a warm spare is fire-and-forget so the
-                    // maintainer tick never blocks on a boot.
-                    Jenkins.get().addNode(node);
-                    if (waitForOnline && !warm) {
-                        awaitOnline(node, displayName, future);
-                    }
-                    if (!future.complete(node) && node instanceof XcpngAgent agent) {
-                        // The planned node was cancelled while this VM was being built, so it will never be
-                        // used. Tear it down rather than leak it on the pool.
+                    CloudStatistics.ProvisioningListener.get().onStarted(activityId);
+                    XcpngAgent spare = createAgent(template, displayName, activityId, true);
+                    Jenkins.get().addNode(spare);
+                } catch (Exception e) {
+                    // Nothing was cloned -- the VM is the launcher's job and the launcher never ran -- so
+                    // there is no VM to clean up here, only the reservation and the open activity.
+                    release(displayName);
+                    try {
+                        CloudStatistics.ProvisioningListener.get().onFailure(activityId, e);
+                    } catch (RuntimeException statsFailure) {
                         LOGGER.log(
                                 Level.WARNING,
-                                () -> "Provision of " + displayName
-                                        + " completed after cancellation; terminating the orphaned agent");
-                        terminateQuietly(agent, displayName);
+                                statsFailure,
+                                () -> "Could not record the failed provision of " + displayName + " in cloud-stats");
                     }
-                } catch (Throwable t) {
-                    // Capture the interrupt and clear the flag for the duration of the cleanup below.
-                    // terminateQuietly ends in a blocking HTTP call, which throws immediately on a thread
-                    // whose interrupt flag is already set -- so restoring the flag first would guarantee the
-                    // destroy fails in exactly the case the cleanup exists for (an awaitOnline sleep
-                    // interrupted during executor shutdown), leaking the VM and its disks. The flag is
-                    // restored below, once the destroy has had its chance to run.
-                    // Thread.interrupted() first, and never behind the instanceof: it is the call that
-                    // clears the flag, so short-circuiting past it would leave a thread interrupted after
-                    // the InterruptedException was thrown (a racing shutdownNow) still interrupted here,
-                    // which is the very failure this guards against.
-                    boolean interrupted = Thread.interrupted() || t instanceof InterruptedException;
-                    // If the VM was built and registered but never came online (timeout, or a failure after
-                    // clone), tear it down so a failed provision leaks neither a VM nor a half-added offline
-                    // node.
-                    if (node instanceof XcpngAgent agent) {
-                        terminateQuietly(agent, displayName);
-                    }
-                    // The activity was opened with onStarted above. A failure here means no computer was ever
-                    // launched, so cloud-stats' own onLaunchFailure/onDeleted listeners never fire and the
-                    // activity would hang in PROVISIONING forever. Close it as failed by hand; the on-demand
-                    // path lets the NodeProvisioner record the failure through its PlannedNode instead. Guard
-                    // it: this monitoring call sits before completeExceptionally, so letting it throw would skip
-                    // the future completion and leak the inFlight/warmInFlight reservation whenComplete releases,
-                    // wedging capacity over a stats hiccup.
-                    if (warm) {
-                        try {
-                            CloudStatistics.ProvisioningListener.get().onFailure(activityId, t);
-                        } catch (RuntimeException statsFailure) {
-                            LOGGER.log(
-                                    Level.WARNING,
-                                    statsFailure,
-                                    () -> "Could not record the failed provision of " + displayName
-                                            + " in cloud-stats");
-                        }
-                    }
-                    future.completeExceptionally(t);
-                    // Restore the interrupt so higher-level shutdown/cancellation logic still sees it,
-                    // rather than swallowing it into the future's exceptional completion.
-                    if (interrupted) {
-                        Thread.currentThread().interrupt();
-                    }
+                    LOGGER.log(Level.WARNING, e, () -> "Could not register warm spare " + displayName);
                 }
             });
-            // Propagate a cancellation of the planned node to the task, but without interrupting it: a
-            // not-yet-started task is prevented from running, and a running one is left to finish so its
-            // cleanup (provisionNode's post-clone destroy, or the orphan guard above) runs on a thread with
-            // no interrupt flag set. Interrupting mid-run could leave the flag set and make the blocking
-            // destroyWithDisks call fail, leaking the very VM the cleanup exists to remove.
-            future.whenComplete((node, throwable) -> {
-                if (throwable instanceof CancellationException) {
-                    task.cancel(false);
-                }
-            });
-            return future;
+            return true;
         } catch (RejectedExecutionException e) {
+            release(displayName);
             LOGGER.log(Level.WARNING, e, () -> "Could not schedule provision of " + displayName);
-            future.completeExceptionally(e);
-            return null;
+            return false;
         }
     }
 
@@ -634,12 +614,12 @@ public class XcpngCloud extends Cloud {
         for (XcpngTemplate template : templates) {
             configuredTemplates.add(template.getTemplateName());
         }
-        int active = 0;
+        Set<String> registered = new HashSet<>();
         Map<String, List<XcpngAgent>> warmByTemplate = new HashMap<>();
         List<XcpngAgent> orphanedSpares = new ArrayList<>();
         for (Node node : Jenkins.get().getNodes()) {
             if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
-                active++;
+                registered.add(agent.getNodeName());
                 if (agent.isWarm()) {
                     ProvisioningActivity.Id id = agent.getId();
                     if (id != null) {
@@ -658,11 +638,12 @@ public class XcpngCloud extends Cloud {
             }
         }
         // The same headroom formula as availableCapacity(), fed from the pass above and decremented
-        // locally as launches are submitted (launch() reserves inFlight too, but the local counter saves
+        // locally as launches are submitted (launchWarmSpare reserves too, but the local counter saves
         // re-reading it and keeps the two in step within this tick). Keep the formulas aligned. Spares
         // drained later in this tick still count as active here: their teardown is asynchronous, so they
         // are not headroom yet, and letting the next tick see the freed capacity is the honest reading.
-        int capacity = Math.max(0, maxInstances - active - inFlight.get());
+        pruneReservations(registered);
+        int capacity = Math.max(0, maxInstances - registered.size() - reservations.size());
         for (XcpngTemplate template : templates) {
             int target = warmTarget(template);
             if (target <= 0) {
@@ -672,14 +653,14 @@ public class XcpngCloud extends Cloud {
             // ticks do not stack duplicate provisions for the same template.
             int deficit = target
                     - warmCount(warmByTemplate, template.getTemplateName())
-                    - warmInFlight(template.getTemplateName()).get();
+                    - warmReserved(template.getTemplateName());
             int toLaunch = Math.min(deficit, capacity);
             for (int i = 0; i < toLaunch; i++) {
                 final String displayName = "xcpng-" + template.getTemplateName() + "-"
                         + UUID.randomUUID().toString().substring(0, 8);
                 final ProvisioningActivity.Id activityId =
                         new ProvisioningActivity.Id(name, template.getTemplateName(), displayName);
-                if (launch(template, displayName, activityId, true) == null) {
+                if (!launchWarmSpare(template, displayName, activityId)) {
                     // Pool shutting down; no point trying this or any later template this tick.
                     return;
                 }
@@ -866,10 +847,10 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Record a VM the plugin failed to destroy, so it is reclaimed later rather than leaked. Called on both
-     * {@code destroyWithDisks} failure paths: {@link XcpngAgent#_terminate}, where the base class is about to
-     * remove the node, and the cleanup destroy in {@link #provisionNode}, where the clone never became an agent
-     * at all. Either way this set becomes the last reference to the VM. Persisted at once so the ref survives a
+     * Record a VM the plugin failed to destroy, so it is reclaimed later rather than leaked. Called from the
+     * one {@code destroyWithDisks} failure path there now is, {@link XcpngAgent#_terminate}, which every
+     * teardown converges on -- including the one {@link XcpngLauncher} runs when a launch fails after the
+     * clone. This set then holds the last reference to the VM. Persisted at once so the ref survives a
      * restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
      */
     void recordLeakedVm(@NonNull String vmRef) {
@@ -968,15 +949,19 @@ public class XcpngCloud extends Cloud {
         this.reconcileExecutor = reconcileExecutor;
     }
 
-    /** Test seam: reservations taken but not yet settled, for asserting the cap accounting. */
+    /** Test seam: slots committed to agents Jenkins has not registered yet, for asserting the cap accounting. */
     int inFlightCount() {
-        return inFlight.get();
+        Set<String> registered = registeredAgentNames();
+        pruneReservations(registered);
+        return reservations.size();
     }
 
     /**
      * Test seam: with a fake client the provisioned agents never connect, so the online wait would block
-     * for the whole timeout. Turning it off makes the planned-node future complete as soon as the VM is
-     * "cloned", which is what the capacity/planning tests assert against.
+     * for the whole timeout. Turning it off makes {@link XcpngLauncher} return as soon as the VM is
+     * "cloned", which is what the capacity/planning tests assert against. Core then reports the launch as
+     * failed, because no channel ever appeared, and leaves the node registered and offline -- which is what
+     * those tests want to look at.
      */
     void setWaitForOnline(boolean waitForOnline) {
         this.waitForOnline = waitForOnline;
@@ -992,110 +977,28 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Block until the provisioned node's computer connects, or fail after {@link #onlineTimeoutMillis}
-     * (the production {@link #ONLINE_TIMEOUT_MINUTES} unless a test shrank it). Returns early without error
-     * if the planned node is cancelled while waiting: the caller's cancellation path then tears the VM down.
-     * An instance method, not static, because the timeout and poll interval are injectable seams.
+     * Block until the agent's computer connects, or fail after {@link #onlineTimeoutMillis} (the production
+     * {@link #ONLINE_TIMEOUT_MINUTES} unless a test shrank it). Called by {@link XcpngLauncher}, which turns
+     * the failure into a failed launch and tears the VM down.
+     *
+     * <p>Still lives on the cloud rather than the launcher, for one reason: the timeout and poll interval are
+     * injectable seams, and every test that drives a provisioning round needs them. Waiting in the launcher
+     * is what keeps {@code SlaveComputer.isConnecting()} true for the whole boot window, which is how core's
+     * own {@code connectingExecutors} accounting sees a booting agent.
+     *
+     * <p>Returns immediately when {@link #waitForOnline} is off, which is a test seam and nothing else.
      */
-    private void awaitOnline(@NonNull Node node, @NonNull String displayName, @NonNull Future<?> future)
-            throws InterruptedException {
+    void awaitOnline(@NonNull SlaveComputer computer, @NonNull String displayName) throws InterruptedException {
+        if (!waitForOnline) {
+            return;
+        }
         long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(onlineTimeoutMillis);
-        // Re-fetch the computer each pass and treat a null one as "not online yet": returning early on a
-        // transiently-null Computer would complete the future without the agent connected, reintroducing
-        // the over-provisioning this wait exists to prevent.
-        while (true) {
-            Computer computer = node.toComputer();
-            if (computer != null && computer.isOnline()) {
-                return;
-            }
-            if (future.isCancelled()) {
-                return;
-            }
+        while (!computer.isOnline()) {
             if (System.nanoTime() > deadlineNanos) {
                 throw new IllegalStateException(
                         "agent " + displayName + " did not come online within " + onlineTimeoutMillis + " ms");
             }
             Thread.sleep(onlinePollMillis);
-        }
-    }
-
-    private static void terminateQuietly(@NonNull XcpngAgent agent, @NonNull String displayName) {
-        try {
-            agent.terminate();
-        } catch (Exception e) {
-            LOGGER.log(Level.WARNING, e, () -> "Failed to terminate agent " + displayName);
-        }
-    }
-
-    /**
-     * Clone the template, start it, and wrap the running VM in a single-use inbound agent. Called on a
-     * background thread by {@link #provision}; the returned {@link Node} is added to Jenkins by the
-     * node provisioner once this future completes. Package-visible so a test can drive it against a
-     * fake client and assert the clone/start call sequence. The {@code activityId} is the same instance
-     * carried by the planned node, stamped onto the agent so cloud-stats keeps both on one activity.
-     */
-    Node provisionNode(
-            @NonNull XcpngTemplate template, @NonNull String displayName, @NonNull ProvisioningActivity.Id activityId)
-            throws Exception {
-        return provisionNode(template, displayName, activityId, false);
-    }
-
-    /**
-     * As {@link #provisionNode(XcpngTemplate, String, ProvisioningActivity.Id)}, but {@code warm} marks the
-     * agent as a warm-pool spare so the retention strategy keeps it hot until it runs its first build.
-     */
-    Node provisionNode(
-            @NonNull XcpngTemplate template,
-            @NonNull String displayName,
-            @NonNull ProvisioningActivity.Id activityId,
-            boolean warm)
-            throws Exception {
-        try (HypervisorClient client = openClient()) {
-            VmRef templateRef = client.resolveTemplate(template.getTemplateName());
-            ProvisionSpec spec = new ProvisionSpec(
-                    displayName,
-                    template.getNumCpus(),
-                    template.getMemoryBytes(),
-                    null,
-                    null,
-                    null,
-                    seedFor(displayName, template),
-                    // Stamp the owning cloud onto the VM record. The plugin's own teardown is the normal
-                    // path; this is what lets tools/reaper.py find a clone the plugin lost track of, after
-                    // a crash mid-provision or a destroy that threw.
-                    name);
-            VmRef clone = client.cloneFromTemplate(templateRef, spec);
-            try {
-                client.start(clone);
-                // The cloud itself, not just its name: the agent snapshots this cloud's connection
-                // parameters so it can still destroy its VM if the cloud is later deleted or renamed.
-                XcpngAgent agent =
-                        new XcpngAgent(displayName, this, clone.value(), template, idleMinutes, activityId, warm);
-                LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
-                return agent;
-            } catch (Exception e) {
-                // The clone exists but never became a usable agent. Destroy it so a failed provision does
-                // not leak a VM and its disks: the reaper iterates VMs by agent, so a clone attached to no
-                // agent is invisible to it and would leak indefinitely.
-                LOGGER.log(
-                        Level.WARNING,
-                        e,
-                        () -> "Provision of " + displayName + " failed after clone; destroying VM " + clone.value());
-                try {
-                    client.destroyWithDisks(clone);
-                } catch (RuntimeException cleanup) {
-                    // The cleanup destroy usually fails for the same reason the provision did: the pool went
-                    // unreachable mid-operation. Record the ref so the durable sweep retries it, exactly as a
-                    // failed teardown does. Without this the clone is invisible to Jenkins the moment this
-                    // method throws, and only tools/reaper.py could ever find it again.
-                    recordLeakedVm(clone.value());
-                    LOGGER.log(
-                            Level.WARNING,
-                            cleanup,
-                            () -> "Could not clean up VM " + clone.value() + " after a failed provision");
-                }
-                throw e;
-            }
         }
     }
 
@@ -1202,22 +1105,85 @@ public class XcpngCloud extends Cloud {
      * Filtered by cloud name so one XCP-ng cloud does not throttle another that shares the controller.
      */
     private int availableCapacity() {
-        int active = 0;
-        for (Node node : Jenkins.get().getNodes()) {
-            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
-                active++;
-            }
-        }
-        // Subtract in-flight provisions too: they will become nodes but have not yet, so counting only
-        // registered agents would let a concurrent round provision past the cap.
-        return Math.max(0, maxInstances - active - inFlight.get());
+        Set<String> registered = registeredAgentNames();
+        // Subtract reservations too: they will become nodes but have not yet, so counting only registered
+        // agents would let a concurrent round provision past the cap.
+        pruneReservations(registered);
+        return Math.max(0, maxInstances - registered.size() - reservations.size());
     }
 
-    /** The warm in-flight counter for a template, created on first use. */
+    /** Node names of the agents this cloud currently has registered with Jenkins. */
     @NonNull
-    private AtomicInteger warmInFlight(@NonNull String templateName) {
-        return warmInFlightByTemplate.computeIfAbsent(templateName, k -> new AtomicInteger());
+    private Set<String> registeredAgentNames() {
+        Set<String> registered = new HashSet<>();
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                registered.add(agent.getNodeName());
+            }
+        }
+        return registered;
     }
+
+    /**
+     * Hand a reservation over to the node it was taken for. Called by {@link XcpngLauncher} the moment it
+     * runs, which is the first point at which the node is certainly registered -- a computer exists for it,
+     * and nothing but a registered node has one. From here the node itself is what {@link #availableCapacity}
+     * counts, so holding the reservation any longer would count the agent twice.
+     *
+     * <p>A capacity read would drop it too, by name against the node list, but only if one happened while the
+     * node was still there. A launch that fails tears the node down within seconds, so without this the
+     * reservation would outlive its node and wedge a slot until its deadline.
+     */
+    void noteRegistered(@NonNull String nodeName) {
+        release(nodeName);
+    }
+
+    /** Commit a slot to an agent that does not exist as a node yet. */
+    private void reserve(@NonNull String nodeName, @NonNull String templateName, boolean warm) {
+        reservations.put(
+                nodeName, new Reservation(templateName, warm, System.currentTimeMillis() + RESERVATION_TTL_MILLIS));
+    }
+
+    /** Give a slot back, for a commitment that will never become a node. */
+    private void release(@NonNull String nodeName) {
+        reservations.remove(nodeName);
+    }
+
+    /**
+     * Drop reservations that have done their job, or that never will.
+     *
+     * <p>The first case is the normal one and needs no event: once the node is in {@code registered} it is
+     * counted as an agent, and leaving the reservation would count it twice.
+     *
+     * <p>The deadline is the backstop for the second case -- a planned node core dropped without ever
+     * registering it, which no callback tells us about. It is set far longer than the round or two a
+     * registration takes, because expiring a live commitment early is the failure this whole mechanism
+     * exists to prevent, while expiring a dead one late costs one delayed provision.
+     */
+    private void pruneReservations(@NonNull Set<String> registered) {
+        long now = System.currentTimeMillis();
+        reservations
+                .entrySet()
+                .removeIf(entry ->
+                        registered.contains(entry.getKey()) || entry.getValue().expiresAt() <= now);
+    }
+
+    /** Reservations for a template's warm spares, so repeated ticks do not stack duplicate provisions. */
+    private int warmReserved(@NonNull String templateName) {
+        int count = 0;
+        for (Reservation reservation : reservations.values()) {
+            if (reservation.warm() && reservation.templateName().equals(templateName)) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * One committed-but-unregistered agent: which template it is for, whether it is a warm spare, and when
+     * this cloud stops believing in it.
+     */
+    private record Reservation(String templateName, boolean warm, long expiresAt) {}
 
     /**
      * How {@link #openClient()} obtains a client. Production leaves this null and builds an
