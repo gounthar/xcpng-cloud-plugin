@@ -4,6 +4,7 @@ import static io.jenkins.plugins.casc.misc.Util.getJenkinsRoot;
 import static io.jenkins.plugins.casc.misc.Util.toYamlString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -20,6 +21,7 @@ import io.jenkins.plugins.casc.model.CNode;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -192,6 +194,65 @@ class XcpngCloudConfigurationAsCodeTest {
         assertFalse(
                 exported.contains("trustSelfSigned"),
                 "an imported legacy cloud must not export the retired key: " + exported);
+    }
+
+    /**
+     * A configuration-as-code reload must not forget the VMs a teardown failed to destroy (#149).
+     *
+     * <p>JCasC rebuilds {@code jenkins.clouds} from the document through the
+     * {@code @DataBoundConstructor}, so every field that is not configuration comes back at its initial
+     * value. The leaked-VM set used to be such a field, and a reload therefore dropped the last reference to
+     * a VM nothing else was going to retry. It now lives in {@link XcpngLeakedVmStore}, keyed by cloud name,
+     * which is what a rebuilt cloud carries across.
+     */
+    @Test
+    void aJcascReloadKeepsTheLeakedVmSet(JenkinsRule r) throws Exception {
+        configureFromYaml();
+        XcpngCloud before = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(before, "the fixture must really have imported, or this proves nothing");
+        before.recordLeakedVm("OpaqueRef:leaked-vm-1");
+
+        configureFromYaml();
+
+        XcpngCloud after = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(after, "the reload must leave a cloud behind");
+        assertNotEquals(
+                System.identityHashCode(before),
+                System.identityHashCode(after),
+                "a reload is expected to rebuild the cloud; if it stopped doing so this test proves nothing");
+        assertEquals(
+                Set.of("OpaqueRef:leaked-vm-1"),
+                after.leakedVmRefs(),
+                "a JCasC reload must not forget a VM the plugin failed to destroy");
+    }
+
+    /**
+     * The leaked-VM set must never appear in the exported YAML.
+     *
+     * <p>Round-tripping it through the document would fix #149 the wrong way round: a reference to a VM that
+     * failed to die is runtime state, and JCasC's contract is that the YAML is what an operator wrote. The
+     * store is a plain {@code Saveable} rather than a {@code GlobalConfiguration} precisely so no configurator
+     * picks it up, and that is only true until someone changes its base class -- which is what this catches.
+     */
+    @Test
+    void theLeakedVmStoreIsNotExportedToYaml(JenkinsRule r) throws Exception {
+        configureFromYaml();
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(cloud);
+        cloud.recordLeakedVm("OpaqueRef:leaked-vm-1");
+        assertFalse(cloud.leakedVmRefs().isEmpty(), "the leak must be recorded, or the assertions below are vacuous");
+
+        String clouds = exportedClouds();
+        assertFalse(
+                clouds.contains("OpaqueRef:leaked-vm-1"), "runtime state must not reach the cloud export: " + clouds);
+        assertFalse(clouds.contains("leakedVm"), "the cloud must not export a leaked-VM key at all: " + clouds);
+
+        ConfigurationContext context = new ConfigurationContext(ConfiguratorRegistry.get());
+        String root = toYamlString(getJenkinsRoot(context));
+        assertFalse(root.contains("OpaqueRef:leaked-vm-1"), "runtime state must not reach any part of the export");
+        assertFalse(
+                root.toLowerCase(java.util.Locale.ROOT).contains("xcpngleakedvmstore"),
+                "the store must not be a configuration-as-code root element");
     }
 
     /** A record's message, never null: {@code LogRecord#getMessage} is nullable and the handler keeps all. */
