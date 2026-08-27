@@ -31,7 +31,17 @@ public final class FakeHypervisorClient implements HypervisorClient {
      */
     private final List<String> calls = new CopyOnWriteArrayList<>();
 
+    /**
+     * The rest of the mutable state, guarded by this object's monitor.
+     *
+     * <p>Two launcher threads can be in {@code cloneFromTemplate} at once, because a warm pool registers
+     * its spares together and core connects each on its own thread. Unguarded, {@code ++cloneCounter} can
+     * hand both clones the same VM reference and concurrent {@code HashMap} writes can corrupt the map, so
+     * every method that touches these is synchronized. {@link #calls} stays copy-on-write on top of that,
+     * for the different reason given above: a caller iterates the list it is handed outside this monitor.
+     */
     private final Map<String, VmState> states = new HashMap<>();
+
     private int cloneCounter = 0;
     private boolean pingFails = false;
     private boolean startFails = false;
@@ -44,19 +54,19 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     /** Make {@link #ping()} throw, to test the failure path of a connection check. */
-    public FakeHypervisorClient failPing() {
+    public synchronized FakeHypervisorClient failPing() {
         this.pingFails = true;
         return this;
     }
 
     /** Have a started VM report this IP, to stand in for guest tools writing an address. */
-    public FakeHypervisorClient reportIpOnStart(String ip) {
+    public synchronized FakeHypervisorClient reportIpOnStart(String ip) {
         this.assignIpOnStart = ip;
         return this;
     }
 
     /** Make {@link #start} throw after the clone exists, to test failed-provision cleanup. */
-    public FakeHypervisorClient failStart() {
+    public synchronized FakeHypervisorClient failStart() {
         this.startFails = true;
         return this;
     }
@@ -65,7 +75,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
      * Make {@link #destroyWithDisks} throw <em>after</em> recording the attempt, to test a teardown whose
      * destroy fails: the caller must still complete (remove the node, log) rather than leave it half-removed.
      */
-    public FakeHypervisorClient failDestroy() {
+    public synchronized FakeHypervisorClient failDestroy() {
         this.destroyFails = true;
         return this;
     }
@@ -74,7 +84,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
      * Stop {@link #destroyWithDisks} throwing, so a later call succeeds. Models a pool that was briefly
      * unreachable during a teardown recovering by the time the leaked-VM sweep retries the destroy.
      */
-    public FakeHypervisorClient recoverDestroy() {
+    public synchronized FakeHypervisorClient recoverDestroy() {
         this.destroyFails = false;
         return this;
     }
@@ -97,12 +107,12 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     /** The spec passed to the most recent {@link #cloneFromTemplate}, to assert the seed it carried. */
-    public ProvisionSpec lastSpec() {
+    public synchronized ProvisionSpec lastSpec() {
         return lastSpec;
     }
 
     @Override
-    public VmRef resolveTemplate(String name) {
+    public synchronized VmRef resolveTemplate(String name) {
         checkNotInterrupted("resolveTemplate");
         calls.add("resolveTemplate:" + name);
         if (!knownTemplates.contains(name)) {
@@ -112,7 +122,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
-    public VmRef cloneFromTemplate(VmRef template, ProvisionSpec spec) {
+    public synchronized VmRef cloneFromTemplate(VmRef template, ProvisionSpec spec) {
         checkNotInterrupted("cloneFromTemplate");
         this.lastSpec = spec;
         VmRef clone = new VmRef("vm/" + spec.name() + "/" + (++cloneCounter));
@@ -122,7 +132,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
-    public void start(VmRef vm) {
+    public synchronized void start(VmRef vm) {
         checkNotInterrupted("start");
         calls.add("start:" + vm.value());
         if (startFails) {
@@ -132,13 +142,13 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
-    public void clearGuestSecret(VmRef vm) {
+    public synchronized void clearGuestSecret(VmRef vm) {
         checkNotInterrupted("clearGuestSecret");
         calls.add("clearGuestSecret:" + vm.value());
     }
 
     @Override
-    public Optional<String> primaryIpAddress(VmRef vm) {
+    public synchronized Optional<String> primaryIpAddress(VmRef vm) {
         if (assignIpOnStart != null && states.get(vm.value()) == VmState.RUNNING) {
             return Optional.of(assignIpOnStart);
         }
@@ -146,19 +156,19 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
-    public VmState state(VmRef vm) {
+    public synchronized VmState state(VmRef vm) {
         return states.getOrDefault(vm.value(), VmState.UNKNOWN);
     }
 
     @Override
-    public void stop(VmRef vm) {
+    public synchronized void stop(VmRef vm) {
         checkNotInterrupted("stop");
         calls.add("stop:" + vm.value());
         states.put(vm.value(), VmState.HALTED);
     }
 
     @Override
-    public void destroyWithDisks(VmRef vm) {
+    public synchronized void destroyWithDisks(VmRef vm) {
         checkNotInterrupted("destroyWithDisks");
         calls.add("destroyWithDisks:" + vm.value());
         if (destroyFails) {
@@ -168,7 +178,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
-    public void ping() {
+    public synchronized void ping() {
         checkNotInterrupted("ping");
         calls.add("ping");
         if (pingFails) {

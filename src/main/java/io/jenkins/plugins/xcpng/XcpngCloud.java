@@ -1202,8 +1202,27 @@ public class XcpngCloud extends Cloud {
                 nodeName, new Reservation(templateName, warm, System.currentTimeMillis() + RESERVATION_TTL_MILLIS));
     }
 
-    /** Give a slot back, for a commitment that will never become a node. */
-    private void release(@NonNull String nodeName) {
+    /**
+     * Give a slot back: to the node it was taken for, or because the commitment will never become one.
+     *
+     * <p>Synchronized on the cloud monitor, which is the same monitor {@link #provision} and
+     * {@link #reconcileWarmPool} hold for a whole pass, and that is the point rather than habit. A pass
+     * reads the registered node list and the reservations at two different instants. Without this, a
+     * release landing between those two reads makes an agent invisible to both: the node list was
+     * snapshotted before it registered, and its reservation is gone by the time the reservations are
+     * counted. The pass then plans one more agent than the cap allows.
+     *
+     * <p>Taking the monitor here rules that out rather than narrowing it. A release cannot happen while a
+     * pass is running, so either the pass sees the reservation, or the release already happened, which means
+     * the node was registered before the pass started and is therefore in its snapshot. Registration
+     * strictly precedes the launcher that calls {@link #noteRegistered}, which is what makes that second
+     * branch hold.
+     *
+     * <p>No new lock order: this takes the cloud monitor and nothing else, and the launcher calls it before
+     * it holds anything. The warm-launch failure path already calls it from inside a pass, and Java monitors
+     * are re-entrant.
+     */
+    private synchronized void release(@NonNull String nodeName) {
         reservations.remove(nodeName);
     }
 
