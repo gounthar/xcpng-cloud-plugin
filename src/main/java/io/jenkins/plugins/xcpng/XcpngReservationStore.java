@@ -9,6 +9,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -41,6 +43,17 @@ import java.util.logging.Logger;
  * therefore orphans its entries. Unlike the leaked-VM store that needs no backstop: an orphaned
  * reservation belongs to no live cloud, so no capacity formula reads it, and it is dropped by its own
  * deadline the next time anything prunes that key.
+ *
+ * <p>Holding the map here is not on its own enough to keep a cap, which is why this class also owns a lock
+ * per cloud name (#162). A capacity pass reads the registered node list and the reservation count at two
+ * different instants, and {@link XcpngCloud#release} takes the cloud's own monitor so that no release can
+ * land between them. That argument covers one cloud object. During a reload two objects are live under one
+ * name with <em>different</em> monitors, so the old object's in-flight launcher can release between the
+ * replacement's two reads: the agent is in neither term -- not in the snapshot, because it had not
+ * registered when the snapshot was taken, and not in the count, because its reservation has just gone --
+ * and the replacement plans one agent past {@link XcpngCloud#getMaxInstances()}. The lock is keyed by name
+ * rather than held on the cloud precisely because the name is the one thing the pair shares. See
+ * {@link #computeUnderCapacityLock} for what may run inside it.
  */
 @Extension
 public class XcpngReservationStore {
@@ -58,9 +71,59 @@ public class XcpngReservationStore {
      */
     private final ConcurrentMap<String, ConcurrentMap<String, Reservation>> byCloud = new ConcurrentHashMap<>();
 
+    /**
+     * Cloud name to the lock that serialises capacity decisions taken under that name.
+     *
+     * <p>One entry per name ever used, never removed. A renamed or deleted cloud leaves a bare lock behind,
+     * which costs a few dozen bytes and is bounded by the number of distinct cloud names an operator has
+     * configured; removing entries would race a thread that is about to take the lock it just found, for no
+     * saving worth the reasoning.
+     */
+    private final ConcurrentMap<String, ReentrantLock> capacityLocks = new ConcurrentHashMap<>();
+
     /** The singleton. Never call this before extensions are augmented; every caller is a runtime path. */
     static XcpngReservationStore get() {
         return ExtensionList.lookupSingleton(XcpngReservationStore.class);
+    }
+
+    /**
+     * Run {@code body} with every other capacity decision for this cloud name held off, and hand back what it
+     * returns.
+     *
+     * <p>What belongs inside: the whole snapshot-count-reserve sequence of a provisioning or warm-pool pass,
+     * and the release that hands a slot back. What must stay outside: anything that takes another lock. The
+     * lock this takes is a leaf -- nothing held inside it acquires anything else -- and the cloud monitor is
+     * the only lock ever held on the way in, so the order across the plugin is cloud monitor then this, and
+     * there is no cycle to argue about. The warm-pool drain is left outside for that reason: it takes
+     * {@link XcpngRetentionStrategy}'s monitor, and it decides a surplus rather than a cap, so it has no
+     * reason to be in here.
+     *
+     * <p>Reentrant, because a pass already holding it calls back through {@link XcpngCloud#release} on the
+     * warm-launch rejection path.
+     *
+     * <p>A cloud with no name has nothing to key a lock by and nothing to coordinate with -- {@link #reserve}
+     * refuses to record anything for it -- so the body runs unguarded rather than serialising every nameless
+     * cloud on one lock.
+     */
+    <T> T computeUnderCapacityLock(String cloudName, @NonNull Supplier<T> body) {
+        if (cloudName == null) {
+            return body.get();
+        }
+        ReentrantLock lock = capacityLocks.computeIfAbsent(cloudName, key -> new ReentrantLock());
+        lock.lock();
+        try {
+            return body.get();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** {@link #computeUnderCapacityLock} for a body with nothing to return. */
+    void runUnderCapacityLock(String cloudName, @NonNull Runnable body) {
+        computeUnderCapacityLock(cloudName, () -> {
+            body.run();
+            return null;
+        });
     }
 
     /** Commit a slot to an agent that does not exist as a node yet. */

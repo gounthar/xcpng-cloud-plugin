@@ -10,13 +10,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
+import edu.umd.cs.findbugs.annotations.NonNull;
+import hudson.model.Descriptor;
+import hudson.model.Label;
+import hudson.slaves.Cloud;
+import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -36,6 +48,74 @@ class XcpngCloudTest {
      */
     private static final String PINNED_FINGERPRINT =
             "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99";
+
+    /**
+     * A capacity decision must stay atomic from the read to the reservation it takes against it (#162).
+     *
+     * <p>This is the property the fix is actually for, and the one the two barrier tests in
+     * {@link XcpngCloudConfigurationAsCodeTest} cannot reach. Those pin that a pass and a release each take
+     * the name-keyed capacity lock; neither notices if the pass takes it once per helper and drops it in
+     * between, which leaves the whole bug intact -- a release from another cloud object sharing the name
+     * lands in the gap, and the agent counts against neither the node list nor the reservations. Measured:
+     * removing only the wrapper around the pass, and leaving the lock inside {@code availableCapacity} and
+     * {@code alreadyBuilding}, keeps both of those tests green.
+     *
+     * <p>The seam is {@code createAgent}, which is already package-visible and already runs in exactly the
+     * window under test: after the capacity read, before the reservation. No production hook was added for
+     * this. What the override does is ask, from another thread, for the same lock a second cloud object
+     * under this name would want. Under the fix that thread waits; under the bug it walks straight in.
+     */
+    @Test
+    void aCapacityDecisionStaysAtomicFromTheReadToTheReservation(JenkinsRule r) throws Exception {
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
+        ExecutorService pool = Executors.newCachedThreadPool();
+        AtomicBoolean probed = new AtomicBoolean();
+        AtomicBoolean excluded = new AtomicBoolean();
+        try {
+            XcpngCloud cloud =
+                    new XcpngCloud(
+                            "xcpng",
+                            "https://pool.example.test",
+                            "xcpng-root",
+                            PINNED_FINGERPRINT,
+                            2,
+                            List.of(template)) {
+                        @Override
+                        XcpngAgent createAgent(
+                                @NonNull XcpngTemplate t,
+                                @NonNull String displayName,
+                                @NonNull ProvisioningActivity.Id activityId,
+                                boolean warm)
+                                throws Descriptor.FormException, java.io.IOException {
+                            probed.set(true);
+                            Future<?> contender = pool.submit(
+                                    () -> XcpngReservationStore.get().runUnderCapacityLock("xcpng", () -> {}));
+                            try {
+                                contender.get(2, TimeUnit.SECONDS);
+                            } catch (TimeoutException e) {
+                                excluded.set(true);
+                            } catch (Exception e) {
+                                throw new IllegalStateException(e);
+                            }
+                            return super.createAgent(t, displayName, activityId, warm);
+                        }
+                    };
+            // Deliberately not added to jenkins.clouds: an anonymous subclass capturing this test's locals is
+            // not serializable, and nothing on the path under test reads the cloud back off the controller.
+
+            Collection<NodeProvisioner.PlannedNode> planned =
+                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
+
+            assertEquals(1, planned.size(), "the cloud must plan an agent, or the seam below never ran");
+            assertTrue(probed.get(), "the seam must have run inside the pass, or this test asserts nothing");
+            assertTrue(
+                    excluded.get(),
+                    "the capacity lock must stay held from the read through the reservation, or another cloud "
+                            + "object sharing this name can free a slot inside the window");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 
     @Test
     void descriptorIsRegistered(JenkinsRule r) {
