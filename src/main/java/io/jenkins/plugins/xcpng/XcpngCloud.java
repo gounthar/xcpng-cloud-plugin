@@ -39,7 +39,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
@@ -166,23 +165,6 @@ public class XcpngCloud extends Cloud {
     private transient HypervisorClientFactory clientFactory;
 
     /**
-     * Agents this cloud has committed to but Jenkins has not registered yet, keyed by node name.
-     *
-     * <p>A planned node is now handed back with its future already settled and no VM behind it, so core
-     * registers it on its next provisioning round rather than this cloud registering it on a background
-     * thread. That leaves a window of one round in which the agent counts against nothing: it is not in
-     * {@code Jenkins.getNodes()}, and there is no in-flight task to ask. A concurrent round -- another
-     * label's {@code NodeProvisioner}, or a warm-pool tick -- would plan straight past {@link #maxInstances}
-     * into that window. These reservations close it, and they are why this is a map of node names rather
-     * than the counter it replaced: an entry is dropped when its node turns up registered, which is a name
-     * comparison against the node list and needs no event to fire and nothing to remember to call.
-     *
-     * <p>Transient and never persisted; the field initializer covers a fresh instance and {@link
-     * #readResolve} covers a deserialized one (XStream skips both the constructor and field initializers).
-     */
-    private transient ConcurrentHashMap<String, Reservation> reservations = new ConcurrentHashMap<>();
-
-    /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
      * back to the dedicated {@link #PROVISION_POOL}; a test injects a controllable one. Transient:
      * behaviour, never persisted to {@code config.xml}.
@@ -280,9 +262,6 @@ public class XcpngCloud extends Cloud {
         // non-positive value would disable the idle safety net, so restore the default.
         if (idleMinutes <= 0) {
             idleMinutes = DEFAULT_IDLE_MINUTES;
-        }
-        if (reservations == null) {
-            reservations = new ConcurrentHashMap<>();
         }
         if (reconcileLock == null) {
             reconcileLock = new Object();
@@ -659,7 +638,9 @@ public class XcpngCloud extends Cloud {
         // drained later in this tick still count as active here: their teardown is asynchronous, so they
         // are not headroom yet, and letting the next tick see the freed capacity is the honest reading.
         pruneReservations(registered);
-        int capacity = Math.max(0, maxInstances - registered.size() - reservations.size());
+        int capacity = Math.max(
+                0,
+                maxInstances - registered.size() - XcpngReservationStore.get().count(name));
         for (XcpngTemplate template : templates) {
             int target = warmTarget(template);
             if (target <= 0) {
@@ -969,7 +950,7 @@ public class XcpngCloud extends Cloud {
     int inFlightCount() {
         Set<String> registered = registeredAgentNames();
         pruneReservations(registered);
-        return reservations.size();
+        return XcpngReservationStore.get().count(name);
     }
 
     /**
@@ -1136,7 +1117,9 @@ public class XcpngCloud extends Cloud {
         // Subtract reservations too: they will become nodes but have not yet, so counting only registered
         // agents would let a concurrent round provision past the cap.
         pruneReservations(registered);
-        return Math.max(0, maxInstances - registered.size() - reservations.size());
+        return Math.max(
+                0,
+                maxInstances - registered.size() - XcpngReservationStore.get().count(name));
     }
 
     /**
@@ -1149,12 +1132,7 @@ public class XcpngCloud extends Cloud {
     private int alreadyBuilding(@NonNull XcpngTemplate template) {
         Set<String> registered = registeredAgentNames();
         pruneReservations(registered);
-        int building = 0;
-        for (Reservation reservation : reservations.values()) {
-            if (reservation.templateName().equals(template.getTemplateName())) {
-                building++;
-            }
-        }
+        int building = XcpngReservationStore.get().countForTemplate(name, template.getTemplateName());
         for (Node node : Jenkins.get().getNodes()) {
             if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
                 // Read the id once and branch on the local, as reconcileWarmPool does: it is @CheckForNull,
@@ -1207,10 +1185,26 @@ public class XcpngCloud extends Cloud {
         release(nodeName);
     }
 
-    /** Commit a slot to an agent that does not exist as a node yet. */
+    /**
+     * Commit a slot to an agent that does not exist as a node yet, keyed by the name it will register under.
+     *
+     * <p>A planned node is handed back with its future already settled and no VM behind it, so core
+     * registers it on its next provisioning round rather than this cloud registering it on a background
+     * thread. That leaves a window of one round in which the agent counts against nothing: it is not in
+     * {@code Jenkins.getNodes()}, and there is no in-flight task to ask. A concurrent round -- another
+     * label's {@code NodeProvisioner}, or a warm-pool tick -- would plan straight past {@link #maxInstances}
+     * into that window. These reservations close it, and they are why this is keyed by node name rather
+     * than the counter it replaced: an entry is dropped when its node turns up registered, which is a name
+     * comparison against the node list and needs no event to fire and nothing to remember to call.
+     *
+     * <p>The map lives in {@link XcpngReservationStore}, off this object, for the same reason the leaked-VM
+     * set does: applying configuration rebuilds the cloud, and a reservation held on it would be forgotten
+     * mid-flight, freeing a slot that is not free (#160). Never persisted -- unlike the leaked-VM set, a
+     * reservation is worthless after a restart, which is why that is a separate store.
+     */
     private void reserve(@NonNull String nodeName, @NonNull String templateName, boolean warm) {
-        reservations.put(
-                nodeName, new Reservation(templateName, warm, System.currentTimeMillis() + RESERVATION_TTL_MILLIS));
+        XcpngReservationStore.get()
+                .reserve(name, nodeName, templateName, warm, System.currentTimeMillis() + RESERVATION_TTL_MILLIS);
     }
 
     /**
@@ -1234,7 +1228,7 @@ public class XcpngCloud extends Cloud {
      * are re-entrant.
      */
     private synchronized void release(@NonNull String nodeName) {
-        reservations.remove(nodeName);
+        XcpngReservationStore.get().release(name, nodeName);
     }
 
     /**
@@ -1249,42 +1243,23 @@ public class XcpngCloud extends Cloud {
      * exists to prevent, while expiring a dead one late costs one delayed provision.
      */
     private void pruneReservations(@NonNull Set<String> registered) {
-        long now = System.currentTimeMillis();
-        reservations.entrySet().removeIf(entry -> {
-            if (registered.contains(entry.getKey())) {
-                return true;
-            }
-            if (entry.getValue().expiresAt() > now) {
-                return false;
-            }
-            // Said out loud, because this is the one branch that gives a slot back to a plan that may still
-            // be live. It should not happen: core registers a planned node on its next round, and the
-            // launcher hands the slot over before that node runs anything. If these lines turn up in a log
-            // beside a cloud running over its cap, the deadline is the first thing to look at.
+        List<String> expired = XcpngReservationStore.get().prune(name, registered, System.currentTimeMillis());
+        // Said out loud, because this is the one branch that gives a slot back to a plan that may still be
+        // live. It should not happen: core registers a planned node on its next round, and the launcher
+        // hands the slot over before that node runs anything. If these lines turn up in a log beside a
+        // cloud running over its cap, the deadline is the first thing to look at.
+        for (String nodeName : expired) {
             LOGGER.log(
                     Level.INFO,
-                    () -> "Reservation for " + entry.getKey() + " on cloud " + name + " expired after "
+                    () -> "Reservation for " + nodeName + " on cloud " + name + " expired after "
                             + RESERVATION_TTL_MILLIS + " ms without the node being registered; releasing the slot");
-            return true;
-        });
+        }
     }
 
     /** Reservations for a template's warm spares, so repeated ticks do not stack duplicate provisions. */
     private int warmReserved(@NonNull String templateName) {
-        int count = 0;
-        for (Reservation reservation : reservations.values()) {
-            if (reservation.warm() && reservation.templateName().equals(templateName)) {
-                count++;
-            }
-        }
-        return count;
+        return XcpngReservationStore.get().countWarmForTemplate(name, templateName);
     }
-
-    /**
-     * One committed-but-unregistered agent: which template it is for, whether it is a warm spare, and when
-     * this cloud stops believing in it.
-     */
-    private record Reservation(String templateName, boolean warm, long expiresAt) {}
 
     /**
      * How {@link #openClient()} obtains a client. Production leaves this null and builds an
