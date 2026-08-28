@@ -18,6 +18,7 @@ import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -170,6 +171,60 @@ class XcpngLauncherTest {
         assertTrue(fake.calls().isEmpty(), "a launch with no cloud must not reach a pool: " + fake.calls());
         assertNull(agent.getVmRef(), "and must not claim to have built anything");
         assertNotNull(r.jenkins.getNode("xcpng-agent-1"), "the node stays for the idle net to reclaim");
+    }
+
+    /**
+     * A launch whose node is removed under it stops, rather than waiting out the online timeout for an agent
+     * that no longer exists.
+     *
+     * <p>Not hypothetical, and not a case anyone designed: a controller restart reloads an agent that was
+     * mid-boot, core connects its computer again, and the retention strategy reclaims it seconds later
+     * because {@code readResolve} marked it reloaded. On the lab the launcher then sat in the wait for the
+     * full five minutes and reported a launch failure for an agent whose teardown had already run.
+     */
+    @Test
+    void aLaunchWhoseNodeIsRemovedStopsInsteadOfWaitingOutTheTimeout(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud =
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 2, List.of(LINUX_TEMPLATE));
+        cloud.setClientFactory(c -> fake);
+        // A timeout far longer than this test may take, so finishing early can only mean the removal was
+        // noticed. Waiting it out would fail the test by timing out instead.
+        cloud.setOnlineWait(TimeUnit.MINUTES.toMillis(10), 10L);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+        awaitTrue(() -> agent.getVmRef() != null, () -> "the launcher should have cloned a VM");
+        SlaveComputer computer = assertInstanceOf(SlaveComputer.class, agent.toComputer());
+
+        CountDownLatch done = new CountDownLatch(1);
+        Thread launching = new Thread(
+                () -> {
+                    try {
+                        assertInstanceOf(XcpngLauncher.class, agent.getLauncher())
+                                .launch(computer, TaskListener.NULL);
+                    } catch (RuntimeException expected) {
+                        // Removing the node fails the launch, which is the point.
+                    } finally {
+                        done.countDown();
+                    }
+                },
+                "launch-under-test");
+        launching.start();
+        try {
+            awaitTrue(
+                    () -> launching.getState() == Thread.State.TIMED_WAITING,
+                    () -> "the launcher should be parked in the online wait, was " + launching.getState());
+
+            r.jenkins.removeNode(agent);
+
+            assertTrue(
+                    done.await(30, TimeUnit.SECONDS),
+                    "the launch must give up when its node goes, not wait out the ten-minute timeout");
+        } finally {
+            launching.interrupt();
+        }
     }
 
     /** A launcher is only ever attached to an {@link XcpngAgent}; anything else is a configuration error. */

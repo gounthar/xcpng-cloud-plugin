@@ -1010,6 +1010,17 @@ public class XcpngCloud extends Cloud {
         }
         long deadlineNanos = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(onlineTimeoutMillis);
         while (!computer.isOnline()) {
+            // Stop if the node has been removed under us, rather than waiting out the whole timeout for an
+            // agent that no longer exists. This is not hypothetical: a controller restart reloads an agent
+            // that was mid-boot, core connects its computer again, and XcpngRetentionStrategy reclaims it
+            // seconds later because readResolve marked it reloaded. Measured on the lab on 2026-08-28 --
+            // reclaimed at 07:11:48, and without this the launcher sat in this loop until 07:16:45, holding
+            // a remoting thread for five minutes and then reporting a launch failure for an agent whose
+            // teardown had already run.
+            if (computer.getNode() == null) {
+                throw new IllegalStateException(
+                        "agent " + displayName + " was removed while its VM was still starting");
+            }
             if (System.nanoTime() > deadlineNanos) {
                 throw new IllegalStateException(
                         "agent " + displayName + " did not come online within " + onlineTimeoutMillis + " ms");

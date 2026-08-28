@@ -10,6 +10,7 @@ import hudson.slaves.JNLPLauncher;
 import hudson.slaves.SlaveComputer;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.model.Jenkins;
 import org.jenkinsci.plugins.cloudstats.CloudStatistics;
 import org.jenkinsci.plugins.cloudstats.PhaseExecutionAttachment;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
@@ -139,6 +140,19 @@ public class XcpngLauncher extends JNLPLauncher {
      */
     private static void terminateQuietly(
             @NonNull XcpngAgent agent, @NonNull TaskListener listener, @NonNull Throwable cause) {
+        if (Jenkins.get().getNode(agent.getNodeName()) != agent) {
+            // The node is already gone, so its teardown has already run: this is the reloaded-agent case,
+            // where a controller restart reconnects an agent that XcpngRetentionStrategy then reclaims
+            // underneath the launcher. Terminating again would issue a second destroy for a VM that is
+            // already destroyed, and recording a failure would fire against a closed activity. Neither is
+            // an error worth a WARNING, so this says what happened at FINE and stops.
+            LOGGER.log(
+                    Level.FINE,
+                    cause,
+                    () -> "Launch of agent " + agent.getNodeName()
+                            + " ended after its node had already been removed; nothing left to tear down");
+            return;
+        }
         LOGGER.log(
                 Level.WARNING,
                 cause,
