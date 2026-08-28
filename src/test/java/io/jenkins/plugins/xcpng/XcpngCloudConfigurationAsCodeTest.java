@@ -13,12 +13,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import com.cloudbees.plugins.credentials.impl.UsernamePasswordCredentialsImpl;
+import hudson.model.Label;
+import hudson.slaves.Cloud;
+import hudson.slaves.NodeProvisioner;
 import io.jenkins.plugins.casc.ConfigurationAsCode;
 import io.jenkins.plugins.casc.ConfigurationContext;
 import io.jenkins.plugins.casc.ConfiguratorException;
 import io.jenkins.plugins.casc.ConfiguratorRegistry;
 import io.jenkins.plugins.casc.model.CNode;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
@@ -224,6 +228,48 @@ class XcpngCloudConfigurationAsCodeTest {
                 Set.of("OpaqueRef:leaked-vm-1"),
                 after.leakedVmRefs(),
                 "a JCasC reload must not forget a VM the plugin failed to destroy");
+    }
+
+    /**
+     * A configuration-as-code reload must not free a slot the cloud has already committed (#160).
+     *
+     * <p>The sibling of {@link #aJcascReloadKeepsTheLeakedVmSet}, and the same shape: runtime state on an
+     * object that a reload rebuilds. A reservation covers the round in which a planned node is in neither
+     * {@code Jenkins.getNodes()} nor any in-flight count, and both capacity formulas subtract it, so losing
+     * one to a reload lets the next pass plan past {@code maxInstances}.
+     *
+     * <p>Asserted by node name rather than by {@code inFlightCount()} on purpose. The fixture's template
+     * carries {@code minInstances: 1}, so a warm-pool tick landing mid-test would take a reservation of its
+     * own and make a count assertion pass whether or not the committed slot survived.
+     */
+    @Test
+    void aJcascReloadKeepsReservations(JenkinsRule r) throws Exception {
+        configureFromYaml();
+        XcpngCloud before = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(before, "the fixture must really have imported, or this proves nothing");
+
+        // provision() opens no client: it builds the node object and reserves the slot, and XcpngLauncher
+        // does the cloning later, when core connects the computer. So a reservation can be taken here
+        // without a pool to talk to. The node is never registered, so nothing releases it.
+        Collection<NodeProvisioner.PlannedNode> planned =
+                before.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
+        assertEquals(1, planned.size(), "the cloud must plan an agent for its own label");
+        String nodeName = planned.iterator().next().displayName;
+        assertTrue(
+                XcpngReservationStore.get().holds("xcpng-lab", nodeName),
+                "the plan must hold a reservation, or the reload below has nothing to lose");
+
+        configureFromYaml();
+
+        XcpngCloud after = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(after, "the reload must leave a cloud behind");
+        assertNotEquals(
+                System.identityHashCode(before),
+                System.identityHashCode(after),
+                "a reload is expected to rebuild the cloud; if it stopped doing so this test proves nothing");
+        assertTrue(
+                XcpngReservationStore.get().holds("xcpng-lab", nodeName),
+                "a reload must not give back a slot the cloud had already committed to " + nodeName);
     }
 
     /**

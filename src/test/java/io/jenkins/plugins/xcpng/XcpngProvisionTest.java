@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -691,6 +692,46 @@ class XcpngProvisionTest {
                 cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
                         .isEmpty(),
                 "and the cloud must be able to plan a replacement straight away");
+    }
+
+    /**
+     * Applying configuration must not free a slot this cloud has already committed (#160).
+     *
+     * <p>Every configuration path but an XStream reload rebuilds the cloud through its
+     * {@code @DataBoundConstructor}: configuration-as-code on reload, and the web UI on a save at
+     * {@code /manage/cloud/<name>/configure}. The reservations used to be a transient map on that object,
+     * so a rebuild landing inside the reservation window handed back an empty one, and both capacity
+     * formulas then counted a committed slot as free. The next pass planned straight past
+     * {@code maxInstances}.
+     *
+     * <p>The cap is what this asserts, rather than the count, because the count is the mechanism and the
+     * cap is the promise. Mutation-checked: putting the map back on the cloud makes the second pass plan a
+     * second agent against a cloud whose only slot is taken.
+     */
+    @Test
+    void aRebuiltCloudKeepsTheReservationsOfTheOneItReplaced(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud before = cloudBackedBy(fake, 1);
+        r.jenkins.clouds.add(before);
+
+        // Take the cloud's only slot and leave it taken: the planned node is never registered, so nothing
+        // releases the reservation by the ordinary route and it is still live when the cloud is replaced.
+        Collection<NodeProvisioner.PlannedNode> planned =
+                before.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
+        assertEquals(1, planned.size(), "the first pass must plan an agent, or the rest of this proves nothing");
+        assertEquals(1, before.inFlightCount(), "and it must hold the cloud's only slot");
+
+        // What applying configuration does: same name, same settings, a different object.
+        XcpngCloud after = cloudBackedBy(fake, 1);
+        r.jenkins.clouds.remove(before);
+        r.jenkins.clouds.add(after);
+        assertNotSame(before, after, "the replacement must really be a different object, or this tests nothing");
+
+        assertEquals(1, after.inFlightCount(), "the rebuilt cloud must still count the slot its predecessor committed");
+        assertTrue(
+                after.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                        .isEmpty(),
+                "a cloud rebuilt inside the reservation window must not plan past maxInstances");
     }
 
     @Test
