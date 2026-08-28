@@ -420,12 +420,28 @@ public class XcpngCloud extends Cloud {
 
     // Synchronized so two concurrent provisioning rounds cannot both snapshot the same capacity before
     // either reserves against it; without that lock each could plan up to the cap and overshoot.
+    //
+    // That monitor is this object's, and during a reload there are two of them under one cloud name, so it
+    // is not enough on its own: the decision itself runs under the name-keyed lock in XcpngReservationStore
+    // (#162), which the replacement cloud and the old cloud's in-flight launchers all share.
     @Override
     public synchronized Collection<NodeProvisioner.PlannedNode> provision(CloudState state, int excessWorkload) {
         XcpngTemplate template = templateFor(state.getLabel());
         if (template == null) {
             return List.of();
         }
+        return XcpngReservationStore.get().computeUnderCapacityLock(name, () -> plan(template, excessWorkload));
+    }
+
+    /**
+     * Decide how many agents to plan for one template and reserve a slot for each.
+     *
+     * <p>Split out of {@link #provision} so the whole sequence -- the capacity read, the already-building
+     * subtraction and the reservations taken against them -- runs inside one hold of the name-keyed capacity
+     * lock. Every read here is of state another cloud object sharing this name can change.
+     */
+    @NonNull
+    private Collection<NodeProvisioner.PlannedNode> plan(@NonNull XcpngTemplate template, int excessWorkload) {
         List<NodeProvisioner.PlannedNode> planned = new ArrayList<>();
         int capacity = availableCapacity();
         // Subtract what this cloud is already building for this template. Core will not do it for us, and
@@ -602,16 +618,64 @@ public class XcpngCloud extends Cloud {
      * its surplus running until each spare happened to pick up a build.
      */
     synchronized void reconcileWarmPool() {
+        // Filled by the pass below, read by the drain after it: the spares this cloud holds per template, and
+        // the ones whose template the administrator has removed.
+        Map<String, List<XcpngAgent>> warmByTemplate = new HashMap<>();
+        List<XcpngAgent> orphanedSpares = new ArrayList<>();
+        // The fill runs under the name-keyed capacity lock and the drain does not, which is the whole reason
+        // the two halves are split (#162). The fill reads the node list and the reservation count at two
+        // instants and then reserves against the result, so it must not have a release from another cloud
+        // object sharing this name land inside it. The drain decides a surplus rather than a cap, and it
+        // takes XcpngRetentionStrategy's monitor -- keeping it outside is what leaves the capacity lock a
+        // leaf, with nothing acquired while it is held.
+        if (!XcpngReservationStore.get()
+                .computeUnderCapacityLock(name, () -> fillWarmPool(warmByTemplate, orphanedSpares))) {
+            // Pool shutting down; the drain would only queue teardowns nothing will run.
+            return;
+        }
+        // Drain after the fill, in the same tick and still under this cloud's monitor, but outside the
+        // capacity lock. A template sitting at its target has no deficit and no surplus, so it is untouched
+        // by both halves.
+        for (XcpngTemplate template : templates) {
+            List<XcpngAgent> spares = warmByTemplate.get(template.getTemplateName());
+            if (spares == null) {
+                continue;
+            }
+            int surplus = spares.size() - warmTarget(template);
+            for (XcpngAgent spare : spares) {
+                if (surplus <= 0) {
+                    break;
+                }
+                if (drainSpare(spare)) {
+                    surplus--;
+                }
+            }
+        }
+        for (XcpngAgent spare : orphanedSpares) {
+            drainSpare(spare);
+        }
+    }
+
+    /**
+     * Bring each template up to its warm-spare target, and bucket the spares this cloud already holds so the
+     * drain can read them.
+     *
+     * <p>Runs under the capacity lock, called only from {@link #reconcileWarmPool}. Returns false when the
+     * provisioning pool is shutting down, which is the one condition worth abandoning the whole tick for.
+     *
+     * @param warmByTemplate filled with this cloud's unused spares, keyed by template name
+     * @param orphanedSpares filled with spares whose template is no longer configured
+     */
+    private boolean fillWarmPool(
+            @NonNull Map<String, List<XcpngAgent>> warmByTemplate, @NonNull List<XcpngAgent> orphanedSpares) {
         // One pass over the node list feeds both halves: count this cloud's agents (for the cap) and bucket
         // its unused warm spares by template, rather than rescanning the list per template. The spares
-        // themselves are collected, not just counted, because the drain below needs the agents to reap.
+        // themselves are collected, not just counted, because the drain needs the agents to reap.
         Set<String> configuredTemplates = new HashSet<>();
         for (XcpngTemplate template : templates) {
             configuredTemplates.add(template.getTemplateName());
         }
         Set<String> registered = new HashSet<>();
-        Map<String, List<XcpngAgent>> warmByTemplate = new HashMap<>();
-        List<XcpngAgent> orphanedSpares = new ArrayList<>();
         for (Node node : Jenkins.get().getNodes()) {
             if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
                 registered.add(agent.getNodeName());
@@ -659,31 +723,12 @@ public class XcpngCloud extends Cloud {
                         new ProvisioningActivity.Id(name, template.getTemplateName(), displayName);
                 if (!launchWarmSpare(template, displayName, activityId)) {
                     // Pool shutting down; no point trying this or any later template this tick.
-                    return;
+                    return false;
                 }
                 capacity--;
             }
         }
-        // Drain after the fill, in the same tick and under the same monitor. A template sitting at its
-        // target has no deficit and no surplus, so it is untouched by both halves.
-        for (XcpngTemplate template : templates) {
-            List<XcpngAgent> spares = warmByTemplate.get(template.getTemplateName());
-            if (spares == null) {
-                continue;
-            }
-            int surplus = spares.size() - warmTarget(template);
-            for (XcpngAgent spare : spares) {
-                if (surplus <= 0) {
-                    break;
-                }
-                if (drainSpare(spare)) {
-                    surplus--;
-                }
-            }
-        }
-        for (XcpngAgent spare : orphanedSpares) {
-            drainSpare(spare);
-        }
+        return true;
     }
 
     /**
@@ -1113,13 +1158,21 @@ public class XcpngCloud extends Cloud {
      * Filtered by cloud name so one XCP-ng cloud does not throttle another that shares the controller.
      */
     private int availableCapacity() {
-        Set<String> registered = registeredAgentNames();
-        // Subtract reservations too: they will become nodes but have not yet, so counting only registered
-        // agents would let a concurrent round provision past the cap.
-        pruneReservations(registered);
-        return Math.max(
-                0,
-                maxInstances - registered.size() - XcpngReservationStore.get().count(name));
+        // Under the name-keyed lock, not just this cloud's monitor: the node list and the reservation count
+        // are read at two different instants, and a release from another cloud object sharing this name
+        // landing between them makes an agent invisible to both terms (#162). Reentrant, so a pass that
+        // already holds it -- every caller inside plan() and reconcileWarmPool() does -- costs nothing here.
+        return XcpngReservationStore.get().computeUnderCapacityLock(name, () -> {
+            Set<String> registered = registeredAgentNames();
+            // Subtract reservations too: they will become nodes but have not yet, so counting only registered
+            // agents would let a concurrent round provision past the cap.
+            pruneReservations(registered);
+            return Math.max(
+                    0,
+                    maxInstances
+                            - registered.size()
+                            - XcpngReservationStore.get().count(name));
+        });
     }
 
     /**
@@ -1130,20 +1183,24 @@ public class XcpngCloud extends Cloud {
      * and it can take the build itself; counting it here as well would stop this cloud growing at all.
      */
     private int alreadyBuilding(@NonNull XcpngTemplate template) {
-        Set<String> registered = registeredAgentNames();
-        pruneReservations(registered);
-        int building = XcpngReservationStore.get().countForTemplate(name, template.getTemplateName());
-        for (Node node : Jenkins.get().getNodes()) {
-            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
-                // Read the id once and branch on the local, as reconcileWarmPool does: it is @CheckForNull,
-                // and two calls are two chances for it to be null.
-                ProvisioningActivity.Id id = agent.getId();
-                if (id != null && template.getTemplateName().equals(id.getTemplateName()) && isBeingBuilt(agent)) {
-                    building++;
+        // Same reason as availableCapacity(): reservations and the node list are two reads of state a cloud
+        // object sharing this name can change between them (#162).
+        return XcpngReservationStore.get().computeUnderCapacityLock(name, () -> {
+            Set<String> registered = registeredAgentNames();
+            pruneReservations(registered);
+            int building = XcpngReservationStore.get().countForTemplate(name, template.getTemplateName());
+            for (Node node : Jenkins.get().getNodes()) {
+                if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                    // Read the id once and branch on the local, as reconcileWarmPool does: it is
+                    // @CheckForNull, and two calls are two chances for it to be null.
+                    ProvisioningActivity.Id id = agent.getId();
+                    if (id != null && template.getTemplateName().equals(id.getTemplateName()) && isBeingBuilt(agent)) {
+                        building++;
+                    }
                 }
             }
-        }
-        return building;
+            return building;
+        });
     }
 
     /**
@@ -1223,12 +1280,19 @@ public class XcpngCloud extends Cloud {
      * strictly precedes the launcher that calls {@link #noteRegistered}, which is what makes that second
      * branch hold.
      *
-     * <p>No new lock order: this takes the cloud monitor and nothing else, and the launcher calls it before
-     * it holds anything. The warm-launch failure path already calls it from inside a pass, and Java monitors
-     * are re-entrant.
+     * <p>The monitor alone only covers one cloud object, and a reload leaves two live under one name with
+     * different monitors, so an in-flight launcher belonging to the old one could still release between the
+     * replacement's two reads (#162). The name-keyed lock in {@link XcpngReservationStore} is what the pair
+     * shares, and taking it here is the other half of taking it around those reads.
+     *
+     * <p>No new lock order: cloud monitor then capacity lock, which is the order every pass takes them in,
+     * and the capacity lock acquires nothing further. The launcher calls this holding neither. The
+     * warm-launch failure path already calls it from inside a pass; Java monitors are re-entrant and so is
+     * that lock.
      */
     private synchronized void release(@NonNull String nodeName) {
-        XcpngReservationStore.get().release(name, nodeName);
+        XcpngReservationStore.get()
+                .runUnderCapacityLock(name, () -> XcpngReservationStore.get().release(name, nodeName));
     }
 
     /**

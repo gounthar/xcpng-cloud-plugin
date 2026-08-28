@@ -26,6 +26,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -270,6 +276,132 @@ class XcpngCloudConfigurationAsCodeTest {
         assertTrue(
                 XcpngReservationStore.get().holds("xcpng-lab", nodeName),
                 "a reload must not give back a slot the cloud had already committed to " + nodeName);
+    }
+
+    /**
+     * A release belonging to one cloud object must not land inside a capacity decision taken under the same
+     * cloud name by another one (#162).
+     *
+     * <p>The remainder left by #161. Holding the reservations off the cloud stops a reload forgetting them,
+     * but a capacity pass still reads the registered node list and the reservation count at two different
+     * instants, and what keeps a release out from between those two reads is the cloud's own monitor. A
+     * reload leaves the old object and its replacement live under one name with <em>different</em> monitors,
+     * so the old one's in-flight launcher can release inside the replacement's pass: the agent is in neither
+     * term, and the replacement plans one past {@code maxInstances}.
+     *
+     * <p>Asserted from both sides on purpose. That the release does not complete while the lock is held is
+     * half of it; that it completes as soon as the lock is dropped is the other half, and without it a
+     * release thread that had simply not started yet would look exactly like one that was correctly
+     * excluded. Same family as the probe that was too polite to fail.
+     */
+    @Test
+    void aReleaseCannotLandInsideACapacityPassHeldUnderTheSameName(JenkinsRule r) throws Exception {
+        configureFromYaml();
+        XcpngCloud before = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(before, "the fixture must really have imported, or this proves nothing");
+
+        // As in aJcascReloadKeepsReservations: provision() opens no client, so a reservation can be taken
+        // with no pool to talk to, and the node is never registered so nothing releases it on its own.
+        Collection<NodeProvisioner.PlannedNode> planned =
+                before.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
+        assertEquals(1, planned.size(), "the cloud must plan an agent for its own label");
+        String nodeName = planned.iterator().next().displayName;
+        assertTrue(
+                XcpngReservationStore.get().holds("xcpng-lab", nodeName),
+                "the plan must hold a reservation, or there is nothing for the release below to take away");
+
+        configureFromYaml();
+
+        XcpngCloud after = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(after, "the reload must leave a cloud behind");
+        assertNotEquals(
+                System.identityHashCode(before),
+                System.identityHashCode(after),
+                "a reload is expected to rebuild the cloud; if it stopped doing so this test proves nothing");
+
+        ExecutorService pool = Executors.newCachedThreadPool();
+        Future<?> release;
+        try {
+            // The lock a pass on `after` holds. Taken through the store rather than by running a pass,
+            // because there is no seam inside provision() to pause at.
+            try (HeldCapacityLock held = new HeldCapacityLock(pool, "xcpng-lab")) {
+                release = pool.submit(() -> before.noteRegistered(nodeName));
+                assertThrows(
+                        TimeoutException.class,
+                        () -> release.get(2, TimeUnit.SECONDS),
+                        "a release from the old cloud object must wait for a capacity decision under its name");
+                assertTrue(
+                        XcpngReservationStore.get().holds("xcpng-lab", nodeName),
+                        "the slot must still be committed while the decision that counts it is being taken");
+            }
+            release.get(30, TimeUnit.SECONDS);
+        } finally {
+            pool.shutdownNow();
+        }
+        assertFalse(
+                XcpngReservationStore.get().holds("xcpng-lab", nodeName),
+                "the release must go through once the lock is dropped, or it was never blocked on it");
+    }
+
+    /**
+     * The mirror: a provisioning pass must wait for a capacity lock already held under its cloud name.
+     *
+     * <p>Without this the release side could hold the lock diligently against nobody. Both halves have to
+     * take it for either to be worth anything, and a mutation dropping it from {@code provision} would leave
+     * {@link #aReleaseCannotLandInsideACapacityPassHeldUnderTheSameName} green.
+     */
+    @Test
+    void aProvisioningPassWaitsForACapacityLockHeldUnderItsName(JenkinsRule r) throws Exception {
+        configureFromYaml();
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-lab");
+        assertNotNull(cloud, "the fixture must really have imported, or this proves nothing");
+
+        ExecutorService pool = Executors.newCachedThreadPool();
+        Future<Collection<NodeProvisioner.PlannedNode>> pass;
+        try {
+            try (HeldCapacityLock held = new HeldCapacityLock(pool, "xcpng-lab")) {
+                pass = pool.submit(() -> cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1));
+                assertThrows(
+                        TimeoutException.class,
+                        () -> pass.get(2, TimeUnit.SECONDS),
+                        "provision must not read capacity while another holder of this name is deciding");
+            }
+            assertNotNull(pass.get(30, TimeUnit.SECONDS), "the pass must finish once the lock is dropped");
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    /**
+     * Holds a cloud name's capacity lock on a pool thread until it is closed, which is what a provisioning
+     * or warm-pool pass on some other cloud object does for the length of its decision.
+     */
+    private static final class HeldCapacityLock implements AutoCloseable {
+
+        private final CountDownLatch drop = new CountDownLatch(1);
+        private final Future<?> holder;
+
+        HeldCapacityLock(ExecutorService pool, String cloudName) throws InterruptedException {
+            CountDownLatch taken = new CountDownLatch(1);
+            holder = pool.submit(() -> XcpngReservationStore.get().runUnderCapacityLock(cloudName, () -> {
+                taken.countDown();
+                try {
+                    if (!drop.await(30, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("the test never dropped the capacity lock");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(e);
+                }
+            }));
+            assertTrue(taken.await(30, TimeUnit.SECONDS), "the holder must really take the lock");
+        }
+
+        @Override
+        public void close() throws Exception {
+            drop.countDown();
+            holder.get(30, TimeUnit.SECONDS);
+        }
     }
 
     /**
