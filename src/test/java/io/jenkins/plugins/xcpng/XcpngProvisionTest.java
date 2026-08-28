@@ -734,6 +734,114 @@ class XcpngProvisionTest {
                 "a cloud rebuilt inside the reservation window must not plan past maxInstances");
     }
 
+    /**
+     * An expired reservation stops counting against {@code maxInstances}, and a live one does not (#159).
+     *
+     * <p>The cap is what this asserts rather than the map, for the reason the sibling test above gives: the
+     * count is the mechanism and the cap is the promise. The deadline's own three branches are covered at
+     * the store in {@link XcpngReservationStoreTest}; what is here is the property an operator would
+     * notice, which is that the cloud provisions again once a dropped plan's slot has timed out and not one
+     * pass before.
+     *
+     * <p>The two halves are one test because either alone passes against a broken cap. Seeding only the
+     * expired reservation would pass against a {@code prune} that dropped every unregistered reservation,
+     * which is the mutation that plans past the cap; seeding only the live one would pass against a
+     * {@code prune} that dropped nothing at all and wedged the slot forever, which is the bug the deadline
+     * exists for.
+     *
+     * <p>No clock seam and no waiting: the reservation is seeded through the store with the deadline it is
+     * to be judged against, which is the same call {@code XcpngCloud.reserve} makes.
+     */
+    @Test
+    void anExpiredReservationStopsHoldingASlotAndALiveOneKeepsIt(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 1);
+        r.jenkins.clouds.add(cloud);
+
+        // A plan core dropped without ever registering it: nothing will release this by the ordinary route,
+        // so the deadline is the only thing that can. Still inside its window here.
+        XcpngReservationStore.get()
+                .reserve(
+                        "xcpng",
+                        "xcpng-jenkins-golden-debian-deadplan",
+                        "jenkins-golden-debian",
+                        false,
+                        System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(10));
+
+        assertEquals(1, cloud.inFlightCount(), "a live commitment must still be held");
+        assertTrue(
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                        .isEmpty(),
+                "a cloud whose only slot is committed must not plan past maxInstances");
+
+        // The same reservation, now past its deadline. Re-seeding is what a clock that has moved on would
+        // leave behind, and it keeps the test free of a seam that would exist only for it.
+        XcpngReservationStore.get()
+                .reserve(
+                        "xcpng",
+                        "xcpng-jenkins-golden-debian-deadplan",
+                        "jenkins-golden-debian",
+                        false,
+                        System.currentTimeMillis() - 1);
+
+        assertEquals(0, cloud.inFlightCount(), "an expired commitment must stop counting against the cap");
+        assertEquals(
+                1,
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                        .size(),
+                "and the slot it wedged must be provisionable again");
+    }
+
+    /**
+     * The expiry says so in the log, which is the whole reason it returns the names rather than dropping
+     * them quietly (#159).
+     *
+     * <p>This is the one branch that can hand a slot back to a plan that is still alive, so a cloud found
+     * running over its cap is meant to be diagnosable from these lines. A refactor that kept the drop and
+     * lost the line would leave that case silent, and no other test would notice.
+     */
+    @Test
+    void anExpiredReservationSaysSoInTheLog(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 1);
+        r.jenkins.clouds.add(cloud);
+        XcpngReservationStore.get()
+                .reserve(
+                        "xcpng",
+                        "xcpng-jenkins-golden-debian-deadplan",
+                        "jenkins-golden-debian",
+                        false,
+                        System.currentTimeMillis() - 1);
+
+        List<LogRecord> records = new ArrayList<>();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                records.add(record);
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        Logger logger = Logger.getLogger(XcpngCloud.class.getName());
+        logger.addHandler(handler);
+        try {
+            assertEquals(0, cloud.inFlightCount(), "the expiry must have fired, or there is nothing to log");
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertTrue(
+                records.stream()
+                        .anyMatch(record -> record.getLevel() == Level.INFO
+                                && String.valueOf(record.getMessage()).contains("xcpng-jenkins-golden-debian-deadplan")
+                                && String.valueOf(record.getMessage()).contains("expired")),
+                "an expiry must name the node it released the slot for, at INFO");
+    }
+
     @Test
     void anAgentAlreadyBootingIsNotProvisionedForASecondTime(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
