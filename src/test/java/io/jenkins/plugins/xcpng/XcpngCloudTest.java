@@ -125,7 +125,7 @@ class XcpngCloudTest {
         cloud.setWaitForOnline(false);
         r.jenkins.clouds.add(cloud);
 
-        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(
+        XcpngAgent agent = cloud.createAgent(
                 template,
                 "xcpng-agent-1",
                 new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-agent-1"),
@@ -368,7 +368,6 @@ class XcpngCloudTest {
         XcpngAgent agent = new XcpngAgent(
                 "xcpng-legacy-1",
                 new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 1, List.of()),
-                "vm/legacy/1",
                 t,
                 10,
                 new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-legacy-1"),
@@ -387,7 +386,6 @@ class XcpngCloudTest {
         XcpngAgent agent = new XcpngAgent(
                 "xcpng-agent-1",
                 new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 1, List.of()),
-                "vm/xcpng-agent-1/1",
                 new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048),
                 10,
                 new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-agent-1"),

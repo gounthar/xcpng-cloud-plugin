@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 import hudson.ExtensionList;
 import hudson.model.Computer;
@@ -20,9 +21,9 @@ import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
+import hudson.slaves.SlaveComputer;
 import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
-import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collection;
@@ -30,7 +31,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -38,7 +38,8 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
@@ -82,15 +83,65 @@ class XcpngProvisionTest {
         return new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", nodeName);
     }
 
+    /**
+     * Provision one agent the way the plugin now does: build the node, register it, and let core connect its
+     * computer, which is what runs {@link XcpngLauncher} and clones the VM.
+     *
+     * <p>The wait is not politeness. The clone used to happen on the caller's thread inside {@code
+     * provisionNode}; it now happens on core's remoting pool, so a test that read the fake's call log
+     * straight after {@code addNode} would be reading it while the launcher was still writing to it.
+     */
+    private static XcpngAgent provisioned(JenkinsRule r, XcpngCloud cloud, XcpngTemplate template, String name)
+            throws Exception {
+        return provisioned(r, cloud, template, name, false);
+    }
+
+    /** As {@link #provisioned(JenkinsRule, XcpngCloud, XcpngTemplate, String)}, for a warm spare. */
+    private static XcpngAgent provisioned(
+            JenkinsRule r, XcpngCloud cloud, XcpngTemplate template, String name, boolean warm) throws Exception {
+        XcpngAgent agent = cloud.createAgent(template, name, activityId(name), warm);
+        r.jenkins.addNode(agent);
+        awaitLaunched(agent);
+        return agent;
+    }
+
+    /** Wait until the launcher has cloned this agent's VM and returned. */
+    private static void awaitLaunched(XcpngAgent agent) throws InterruptedException {
+        awaitTrue(
+                () -> agent.getVmRef() != null && !isConnecting(agent),
+                () -> "the launcher never finished provisioning a VM for " + agent.getNodeName());
+    }
+
+    /** Whether core is still running this agent's launcher. */
+    private static boolean isConnecting(XcpngAgent agent) {
+        return agent.toComputer() instanceof SlaveComputer computer && computer.isConnecting();
+    }
+
+    /** Poll a condition the launcher satisfies on another thread, and fail with {@code message} if it never does. */
+    private static void awaitTrue(BooleanSupplier condition, Supplier<String> message) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 30_000;
+        while (System.currentTimeMillis() < deadline) {
+            if (condition.getAsBoolean()) {
+                return;
+            }
+            Thread.sleep(10);
+        }
+        fail(message.get());
+    }
+
+    /** Wait until the fake has recorded a call, so an assertion does not race the launcher's thread. */
+    private static void awaitCall(FakeHypervisorClient fake, String call) throws InterruptedException {
+        awaitTrue(() -> fake.calls().contains(call), () -> "the fake never recorded " + call + ": " + fake.calls());
+    }
+
     @Test
     void provisionClonesStartsAndWrapsTheVmInAnAgent(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        Node node = cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
 
-        XcpngAgent agent = assertInstanceOf(XcpngAgent.class, node);
         assertEquals("vm/xcpng-agent-1/1", agent.getVmRef());
         assertFalse(agent.isWarm(), "an on-demand agent is used from birth, never a warm spare");
         assertEquals(
@@ -111,7 +162,7 @@ class XcpngProvisionTest {
         // whatever the harness happens to set (and never degrading to null == null).
         JenkinsLocationConfiguration.get().setUrl("https://controller.example.test/");
 
-        cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
 
         Map<String, String> seed = fake.lastSpec().guestData();
         // The guest reads these three keys to dial back in as an inbound agent: the controller URL, the
@@ -130,7 +181,7 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
 
         // The recovery contract: every clone carries the owning cloud's name on its VM record, so a VM the
         // plugin lost track of (a controller that died mid-provision, a destroy that threw) is still findable
@@ -302,7 +353,7 @@ class XcpngProvisionTest {
         String pubkey = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleKeyForTest operator@host";
         keyed.setSshAuthorizedKey(pubkey);
 
-        cloud.provisionNode(keyed, "xcpng-agent-1", activityId("xcpng-agent-1"));
+        provisioned(r, cloud, keyed, "xcpng-agent-1");
 
         assertEquals(pubkey, fake.lastSpec().guestData().get("ssh_authorized_key"));
     }
@@ -313,9 +364,7 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        XcpngAgent agent =
-                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
-        r.jenkins.addNode(agent);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
         agent.terminate();
 
         assertTrue(
@@ -329,22 +378,22 @@ class XcpngProvisionTest {
     }
 
     @Test
-    void aCloneThatFailsToStartIsDestroyedNotLeaked(JenkinsRule r) {
+    void aCloneThatFailsToStartIsDestroyedNotLeaked(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        // Narrowed to the client's own exception (not any Exception): the clone succeeds and only the
-        // start throws, so a broader assertion could pass on an unrelated failure and hide a regression.
-        HypervisorException thrown = assertThrows(
-                HypervisorException.class,
-                () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1")));
-        assertTrue(
-                thrown.getMessage().contains("start failed"),
-                "the surfaced failure must be the start failure: " + thrown.getMessage());
-        assertTrue(
-                fake.calls().contains("destroyWithDisks:vm/xcpng-agent-1/1"),
-                "a clone that fails to start must be destroyed, not leaked: " + fake.calls());
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+
+        // The clone succeeds and the start throws, so the launcher fails with a VM already on the pool. That
+        // VM must not survive the failed launch, and neither must the node it was being built for: a node
+        // left registered holds a slot against maxInstances until the idle net reclaims it.
+        awaitCall(fake, "destroyWithDisks:vm/xcpng-agent-1/1");
+        awaitTrue(() -> r.jenkins.getNodes().isEmpty(), () -> "a failed launch must not leave its node registered");
+        awaitTrue(
+                () -> cloud.inFlightCount() == 0,
+                () -> "a failed launch must release its reservation, not wedge the cap");
     }
 
     @Test
@@ -429,7 +478,7 @@ class XcpngProvisionTest {
         // The exact id the planned node would carry. cloud-stats' id equality is per-instance (a random
         // fingerprint), so correlation works only if the agent holds this same object, not a rebuilt one.
         ProvisioningActivity.Id id = activityId("xcpng-agent-1");
-        XcpngAgent agent = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", id);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", id, false);
         assertSame(id, agent.getId(), "the agent must carry the very id instance it was provisioned with");
 
         r.jenkins.addNode(agent);
@@ -444,9 +493,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
-        XcpngAgent agent =
-                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
-        r.jenkins.addNode(agent);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
         Computer computer = agent.toComputer();
 
         // The fake agent never really connects, so drive the connect hook directly: onOnline is what fires
@@ -472,9 +519,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
-        XcpngAgent agent =
-                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-2", activityId("xcpng-agent-2"));
-        r.jenkins.addNode(agent);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-2");
         Computer computer = agent.toComputer();
 
         // A single worker, occupied by a task that will not return until the gate opens: whatever onOnline
@@ -518,9 +563,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
-        XcpngAgent agent =
-                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-3", activityId("xcpng-agent-3"));
-        r.jenkins.addNode(agent);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-3");
         Computer computer = agent.toComputer();
 
         // An already-shut-down executor is what the remoting pool becomes while Jenkins is going down, and
@@ -565,135 +608,142 @@ class XcpngProvisionTest {
     }
 
     @Test
-    void aRejectedProvisionSubmitReleasesItsReservation(JenkinsRule r) {
-        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+    void aRejectedWarmLaunchReleasesItsReservation(JenkinsRule r) {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2, 2);
         r.jenkins.clouds.add(cloud);
-        // A shut-down executor rejects every submit, standing in for the remoting pool during shutdown.
+        // A shut-down executor rejects every submit, standing in for the pool during shutdown. Only the warm
+        // path submits anything now: an on-demand provision builds the node inline and hands it to core.
         ExecutorService dead = Executors.newSingleThreadExecutor();
         dead.shutdownNow();
         cloud.setProvisionExecutor(dead);
 
-        Collection<NodeProvisioner.PlannedNode> planned =
-                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
+        cloud.reconcileWarmPool();
 
-        assertTrue(planned.isEmpty(), "a rejected submit plans nothing");
+        assertTrue(r.jenkins.getNodes().isEmpty(), "a rejected submit registers nothing");
         assertEquals(0, cloud.inFlightCount(), "the reservation must be released when the submit is rejected");
     }
 
     @Test
-    void inFlightReservationsHoldTheCapAcrossRounds(JenkinsRule r) throws Exception {
+    void reservationsHoldTheCapUntilCoreRegistersThePlannedNodes(JenkinsRule r) throws Exception {
         XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
         r.jenkins.clouds.add(cloud);
-        // One worker thread, blocked on a gate, so the provisioning tasks queue and their reservations
-        // stay outstanding while we inspect the cap. A second round must see no free capacity.
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        CountDownLatch gate = new CountDownLatch(1);
-        exec.submit(() -> {
-            gate.await();
-            return null;
-        });
-        cloud.setProvisionExecutor(exec);
-        try {
-            Collection<NodeProvisioner.PlannedNode> first =
-                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
-            Collection<NodeProvisioner.PlannedNode> second =
-                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
 
-            assertEquals(2, first.size());
-            assertEquals(0, second.size(), "the cap must hold while earlier reservations are outstanding");
-            assertEquals(2, cloud.inFlightCount());
-        } finally {
-            gate.countDown();
-            exec.shutdownNow();
+        // This is the window the reservations exist for. A planned node is handed back with its future
+        // already settled and no VM behind it, and core does not register it until its next round, so
+        // between the two there is nothing in the node list for a second round to count. Without the
+        // reservation this second round plans two more agents and the cloud runs at twice its cap.
+        Collection<NodeProvisioner.PlannedNode> first =
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
+        Collection<NodeProvisioner.PlannedNode> second =
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5);
+
+        assertEquals(2, first.size());
+        assertEquals(0, second.size(), "the cap must hold while earlier reservations are outstanding");
+        assertEquals(2, cloud.inFlightCount());
+
+        // Core registers what it planned, which is where the slot changes hands: the node itself now counts
+        // against the cap, so holding the reservation any longer would count the same agent twice.
+        for (NodeProvisioner.PlannedNode planned : first) {
+            r.jenkins.addNode(planned.future.get(30, TimeUnit.SECONDS));
         }
+
+        awaitTrue(
+                () -> cloud.inFlightCount() == 0,
+                () -> "a registered node must take over its own reservation, not double-count with it");
+        assertEquals(
+                2, r.jenkins.getNodes().size(), "the cloud is at its cap, now on registered nodes rather than plans");
+        assertTrue(
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .isEmpty(),
+                "the cap must still hold once the reservations have been handed over");
     }
 
     @Test
-    void cancellingAPlannedNodeReleasesItsReservation(JenkinsRule r) throws Exception {
-        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+    void aFailedLaunchGivesItsReservationBackAtOnce(JenkinsRule r) throws Exception {
+        // failStart() gets the launcher as far as a running clone and then throws, so the node is registered
+        // and torn down again within seconds. That is the case the explicit handover exists for: the ordinary
+        // release is a name comparison against the node list, and by the time anything reads the cap this
+        // node is gone from it, so the slot would sit reserved until its deadline with nothing to show for it.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
+        XcpngCloud cloud = cloudBackedBy(fake, 1);
         r.jenkins.clouds.add(cloud);
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        CountDownLatch gate = new CountDownLatch(1);
-        exec.submit(() -> {
-            gate.await();
-            return null;
-        });
-        cloud.setProvisionExecutor(exec);
-        try {
-            Collection<NodeProvisioner.PlannedNode> planned =
-                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1);
-            assertEquals(1, planned.size());
-            assertEquals(1, cloud.inFlightCount());
 
-            // The node provisioner can cancel a planned node; that must not strand the reservation.
-            planned.iterator().next().future.cancel(true);
+        NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                .iterator()
+                .next();
+        assertEquals(1, cloud.inFlightCount(), "the plan holds the cloud's only slot");
 
-            assertEquals(0, cloud.inFlightCount(), "cancelling a planned node must release its reservation");
-        } finally {
-            gate.countDown();
-            exec.shutdownNow();
-        }
+        // Core registering what it planned, which is the moment the launcher runs and the slot changes hands.
+        r.jenkins.addNode(planned.future.get(30, TimeUnit.SECONDS));
+
+        // Wait on the node list, not on the count. Reading the count is itself what drops a reservation whose
+        // node has turned up registered, so a poll that ran during the launch would release this slot by the
+        // ordinary route and the handover would never be under test at all -- which is exactly what an earlier
+        // version of this test did, and it stayed green with the handover deleted.
+        awaitTrue(
+                () -> r.jenkins.getNodes().isEmpty(),
+                () -> "the failed launch should have torn its own node down: " + r.jenkins.getNodes());
+        assertEquals(
+                0,
+                cloud.inFlightCount(),
+                "a launch that failed must hand its slot back rather than hold it to the deadline");
+        assertFalse(
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                        .isEmpty(),
+                "and the cloud must be able to plan a replacement straight away");
     }
 
     @Test
-    void interruptingAProvisionStillDestroysTheVmAndKeepsTheInterrupt(JenkinsRule r) throws Exception {
+    void anAgentAlreadyBootingIsNotProvisionedForASecondTime(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
-        XcpngCloud cloud =
-                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 2, List.of(LINUX_TEMPLATE));
-        cloud.setClientFactory(c -> fake);
-        // Unlike the other tests, keep the production online wait, so the task is still running when the
-        // interrupt lands. Once the node is registered the interrupt may land anywhere -- in addNode's tail
-        // or in awaitOnline's sleep -- and every one of those must still destroy the VM, so the assertions
-        // below hold regardless of where it hits rather than depending on one landing spot.
+        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
+        // Keep the online wait so the launcher is still running when provision() is asked again, which is
+        // the state a booting clone is in for about 35 seconds on the lab pool.
+        cloud.setOnlineWait(TimeUnit.SECONDS.toMillis(20), 10L);
         r.jenkins.clouds.add(cloud);
 
-        // afterExecute runs on the worker right after the task body, so it observes the interrupt flag the
-        // task left behind -- the only vantage point from which "restored on the way out" is assertable.
-        AtomicReference<Thread> worker = new AtomicReference<>();
-        AtomicBoolean interruptSurvived = new AtomicBoolean();
-        CountDownLatch taskDone = new CountDownLatch(1);
-        ThreadPoolExecutor exec =
-                new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(), runnable -> {
-                    Thread t = new Thread(runnable, "provision-under-test");
-                    worker.set(t);
-                    return t;
-                }) {
-                    @Override
-                    protected void afterExecute(Runnable runnable, Throwable thrown) {
-                        interruptSurvived.set(Thread.currentThread().isInterrupted());
-                        taskDone.countDown();
-                    }
-                };
-        cloud.setProvisionExecutor(exec);
+        XcpngAgent booting = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(booting);
+        awaitTrue(
+                () -> booting.getVmRef() != null && isConnecting(booting),
+                () -> "the launcher should be building this agent's VM");
+
         try {
-            NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
-                    .iterator()
-                    .next();
-
-            // Interrupt only once the node is registered, which puts the task past the clone/start calls:
-            // interrupting earlier would fail the clone instead, leaving no VM to clean up and testing a
-            // different path. Spin rather than sleep between checks, so the interrupt lands as close to
-            // addNode as possible -- that window, not awaitOnline's sleep, is where the flag can still be
-            // set when the exception surfaces, and it is the case a coarser poll would rarely sample.
-            long deadline = System.currentTimeMillis() + 30_000;
-            while (r.jenkins.getNodes().isEmpty() && System.currentTimeMillis() < deadline) {
-                Thread.onSpinWait();
-            }
-            assertFalse(r.jenkins.getNodes().isEmpty(), "the provision should have registered its node");
-            worker.get().interrupt();
-
-            assertTrue(taskDone.await(30, TimeUnit.SECONDS), "the interrupted provision should finish");
-            assertThrows(Exception.class, () -> planned.future.get(30, TimeUnit.SECONDS));
+            // Core's own accounting does not cover this window: a PlannedNode counts toward planned
+            // capacity only while its future is pending (NodeProvisioner.java:298), and ours settles inside
+            // provision(), while the connecting term is throttled by an EMA that takes a tick or two to
+            // climb. So core will keep asking. This cloud has the headroom to say yes and must not.
             assertTrue(
-                    fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
-                    "an interrupted provision must still destroy its VM rather than leak it: " + fake.calls());
-            assertTrue(interruptSurvived.get(), "the interrupt must be restored once the cleanup has run");
+                    cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                            .isEmpty(),
+                    "an agent already booting for this template covers the work; provisioning a second one"
+                            + " is the over-provisioning #120 is about");
+            assertEquals(1, cloneCount(fake), "and nothing else may be cloned: " + fake.calls());
         } finally {
-            exec.shutdownNow();
+            booting.terminate();
         }
     }
 
-    // ---- The async launch() path: timeout, cancellation mid-boot, failure through launch ----
+    @Test
+    void aPlannedNodeCoreNeverRegistersLeavesNoVmBehind(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        // Cancelling a planned node used to be a teardown problem: the VM was built on a background thread
+        // as soon as the node was planned, so a cancel mid-boot left a running clone nobody would ever use.
+        // Nothing is cloned until core connects the computer now, so a plan core drops costs a name and
+        // nothing else. This is the invariant that replaced that teardown path, not a restatement of it.
+        NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
+                .iterator()
+                .next();
+        planned.future.cancel(true);
+
+        assertTrue(fake.calls().isEmpty(), "planning a node must not touch the pool: " + fake.calls());
+        assertTrue(r.jenkins.getNodes().isEmpty(), "a plan core never registered leaves no node either");
+    }
+
+    // ---- The launcher path: timeout, interruption, failure after the clone ----
 
     /** A cloud backed by the given fake that keeps the production online wait (unlike {@link #cloudBackedBy}). */
     private static XcpngCloud onlineWaitingCloudBackedBy(FakeHypervisorClient fake, int maxInstances) {
@@ -704,114 +754,72 @@ class XcpngProvisionTest {
     }
 
     @Test
-    void aProvisionThatNeverComesOnlineTimesOutAndDestroysTheVm(JenkinsRule r) {
+    void aLaunchThatNeverComesOnlineTimesOutAndDestroysTheVm(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
-        // The fake agent never connects, so keep the production online wait but shrink it: the task gives
-        // up in ~100ms instead of five minutes and takes the timeout-and-teardown path the production
+        // The fake agent never connects, so keep the production online wait but shrink it: the launcher
+        // gives up in ~100ms instead of five minutes and takes the timeout-and-teardown path the production
         // constants would make untestable.
         cloud.setOnlineWait(100L, 10L);
         r.jenkins.clouds.add(cloud);
 
-        NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
-                .iterator()
-                .next();
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
 
         // A clone that boots but never connects must not keep its VM: the timeout has to tear it down, or
         // the VM (and its disks) leak on the pool for the controller's whole lifetime.
-        ExecutionException thrown =
-                assertThrows(ExecutionException.class, () -> planned.future.get(30, TimeUnit.SECONDS));
-        assertInstanceOf(
-                IllegalStateException.class,
-                thrown.getCause(),
-                "the online timeout should surface as an IllegalStateException: " + thrown.getCause());
-        assertTrue(
-                fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
-                "an agent that never comes online must have its VM destroyed on timeout: " + fake.calls());
+        awaitCall(fake, "destroyWithDisks:vm/xcpng-agent-1/1");
+        awaitTrue(
+                () -> r.jenkins.getNodes().isEmpty(),
+                () -> "an agent that never came online must not stay registered either");
     }
 
     @Test
-    void aPlannedNodeCancelledAfterRegistrationTearsDownTheOrphan(JenkinsRule r) throws Exception {
+    void anInterruptedLaunchStillDestroysTheVmAndKeepsTheInterrupt(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
-        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
-        // Keep the online wait so the task is still looping in awaitOnline when the cancel lands; a generous
-        // timeout so the test never races the deadline, a small poll so the cancel is noticed promptly. This
-        // reaches the "completed after cancellation" branch that the existing cancel-before-start test cannot.
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
+
+        // Put the online wait back and run the launcher again against the agent it already built. That is the
+        // reconnect branch, and it parks in exactly the wait an interrupt lands in during a shutdown: the
+        // clone and the start are behind us, so what is under test is what the interrupt does, not where it
+        // happens to hit.
+        cloud.setWaitForOnline(true);
         cloud.setOnlineWait(TimeUnit.MINUTES.toMillis(5), 10L);
-        // A controllable executor so the orphan teardown can be awaited: fake.calls() is a live view, not a
-        // snapshot, so the call log must not be read while the worker thread is still appending to it.
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        cloud.setProvisionExecutor(exec);
-        r.jenkins.clouds.add(cloud);
+        SlaveComputer computer = assertInstanceOf(SlaveComputer.class, agent.toComputer());
+        XcpngLauncher launcher = assertInstanceOf(XcpngLauncher.class, agent.getLauncher());
+
+        AtomicBoolean interruptSurvived = new AtomicBoolean();
+        CountDownLatch done = new CountDownLatch(1);
+        Thread launching = new Thread(
+                () -> {
+                    try {
+                        launcher.launch(computer, TaskListener.NULL);
+                    } catch (RuntimeException expected) {
+                        // The interrupted launch fails, which is the point; the assertions are below.
+                    } finally {
+                        // Read on the way out, which is the only vantage point from which "restored after the
+                        // teardown ran" is assertable at all.
+                        interruptSurvived.set(Thread.currentThread().isInterrupted());
+                        done.countDown();
+                    }
+                },
+                "launch-under-test");
+        launching.start();
         try {
-            NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
-                    .iterator()
-                    .next();
+            awaitTrue(
+                    () -> launching.getState() == Thread.State.TIMED_WAITING,
+                    () -> "the launcher should be parked in the online wait, was " + launching.getState());
+            launching.interrupt();
 
-            // Cancel only once the task has registered the node, so the cancel lands after registration rather
-            // than before the task starts (which the existing test covers and which never reaches this branch).
-            long deadline = System.currentTimeMillis() + 30_000;
-            while (r.jenkins.getNodes().isEmpty() && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
-            assertFalse(r.jenkins.getNodes().isEmpty(), "the provision should have registered its node");
-            XcpngAgent orphan =
-                    assertInstanceOf(XcpngAgent.class, r.jenkins.getNodes().get(0));
-            String vmRef = orphan.getVmRef();
-
-            planned.future.cancel(false);
-
-            // awaitOnline returns on the cancel, complete(node) then returns false, and the task tears the
-            // orphan down before it finishes; await that completion so the call log is settled before reading.
-            exec.shutdown();
-            assertTrue(exec.awaitTermination(30, TimeUnit.SECONDS), "the cancelled provision's task should finish");
-
-            // A cancelled-mid-boot VM must not be left running on the pool.
+            assertTrue(done.await(30, TimeUnit.SECONDS), "the interrupted launch should finish");
             assertTrue(
-                    fake.calls().contains("destroyWithDisks:" + vmRef),
-                    "a node cancelled after registration must have its orphaned VM destroyed: " + fake.calls());
+                    fake.calls().contains("destroyWithDisks:" + "vm/xcpng-agent-1/1"),
+                    "an interrupted launch must still destroy its VM rather than leak it: " + fake.calls());
+            assertTrue(interruptSurvived.get(), "the interrupt must be restored once the cleanup has run");
         } finally {
-            exec.shutdownNow();
-        }
-    }
-
-    @Test
-    void aProvisionThatFailsThroughLaunchReleasesItsReservation(JenkinsRule r) throws Exception {
-        // failStart() makes the clone succeed and the start throw, so the failure surfaces through the async
-        // launch() task rather than the direct provisionNode() call the existing failure test uses.
-        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
-        XcpngCloud cloud = onlineWaitingCloudBackedBy(fake, 2);
-        // The start throws before any online wait, so the wait setting is irrelevant here; a real single-thread
-        // executor runs the task so provision() returns before it completes and the future is awaited below.
-        ExecutorService exec = Executors.newSingleThreadExecutor();
-        cloud.setProvisionExecutor(exec);
-        r.jenkins.clouds.add(cloud);
-        try {
-            NodeProvisioner.PlannedNode planned = cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 1)
-                    .iterator()
-                    .next();
-
-            ExecutionException thrown =
-                    assertThrows(ExecutionException.class, () -> planned.future.get(30, TimeUnit.SECONDS));
-            assertInstanceOf(
-                    HypervisorException.class,
-                    thrown.getCause(),
-                    "the start failure should surface as the client's own exception: " + thrown.getCause());
-            assertTrue(
-                    fake.calls().stream().anyMatch(c -> c.startsWith("destroyWithDisks:")),
-                    "a clone that fails after start must be destroyed, not leaked: " + fake.calls());
-
-            // The whenComplete decrement runs off the completing thread, so spin briefly for it. If it broke on
-            // the exceptional path, every failed provision would permanently shrink availableCapacity() and
-            // eventually wedge the cloud at zero capacity with no VMs running.
-            long deadline = System.currentTimeMillis() + 30_000;
-            while (cloud.inFlightCount() != 0 && System.currentTimeMillis() < deadline) {
-                Thread.sleep(10);
-            }
-            assertEquals(
-                    0, cloud.inFlightCount(), "a failed provision must release its reservation, not wedge the cap");
-        } finally {
-            exec.shutdownNow();
+            launching.interrupt();
         }
     }
 
@@ -840,8 +848,12 @@ class XcpngProvisionTest {
 
     /**
      * Reconcile the warm pool with both halves on controllable workers, then wait for the launches to
-     * register and the drains to tear down, so the node list and the fake's call log are settled by the
-     * time the caller asserts on them.
+     * register, the VMs behind them to be built, and the drains to tear down, so the node list and the fake's
+     * call log are settled by the time the caller asserts on them.
+     *
+     * <p>The third of those is new and is not covered by draining the executors. Registering a spare is all
+     * the warm path does now; the clone happens afterwards, on the remoting thread core connects the new
+     * computer on, so an executor that has finished proves nothing about the pool having been touched.
      */
     private static void reconcileAndSettle(XcpngCloud cloud) throws InterruptedException {
         ExecutorService launches = Executors.newSingleThreadExecutor();
@@ -851,8 +863,25 @@ class XcpngProvisionTest {
         cloud.reconcileWarmPool();
         launches.shutdown();
         assertTrue(launches.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool launches should finish");
+        awaitLaunchers();
         reaps.shutdown();
         assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "the warm-pool drains should finish");
+        awaitLaunchers();
+    }
+
+    /** Wait until no registered agent is still having its VM built by {@link XcpngLauncher}. */
+    private static void awaitLaunchers() throws InterruptedException {
+        awaitTrue(
+                () -> {
+                    for (Node node : Jenkins.get().getNodes()) {
+                        if (node instanceof XcpngAgent agent && (agent.getVmRef() == null || isConnecting(agent))) {
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                () -> "the launchers never finished building the registered agents' VMs: "
+                        + Jenkins.get().getNodes());
     }
 
     private static long destroyCount(FakeHypervisorClient fake) {
@@ -874,7 +903,10 @@ class XcpngProvisionTest {
      * a spare by the reconcile while still counting against the cap.
      */
     private static XcpngAgent reloadedSpare(XcpngCloud cloud, String displayName) throws Exception {
-        XcpngAgent spare = (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, displayName, activityId(displayName), true);
+        XcpngAgent spare = cloud.createAgent(LINUX_TEMPLATE, displayName, activityId(displayName), true);
+        // The VM the launcher would have built. Set by hand because this agent is never registered: it is
+        // round-tripped through XStream and its copy is what the test registers.
+        spare.setVmRef("vm/" + displayName + "/1");
         XcpngAgent reloaded = (XcpngAgent) Jenkins.XSTREAM2.fromXML(Jenkins.XSTREAM2.toXML(spare));
         assertTrue(reloaded.isReloaded(), "the round trip must produce the post-restart state this test is about");
         assertFalse(reloaded.isWarm(), "a reloaded agent is indistinguishable from a spent one, so it is not warm");
@@ -895,6 +927,9 @@ class XcpngProvisionTest {
     void warmPoolFillsToMinInstances(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = warmCloudBackedBy(fake, 3, 2);
+        // Registered, because the launcher resolves the owning cloud by name to build the VM: an
+        // unregistered cloud is one an agent cannot be provisioned against.
+        r.jenkins.clouds.add(cloud);
 
         reconcileAndSettle(cloud);
 
@@ -911,6 +946,9 @@ class XcpngProvisionTest {
     void warmPoolIsClampedByTheCap(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = warmCloudBackedBy(fake, 2, 5); // wants five, cap of two
+        // Registered, because the launcher resolves the owning cloud by name to build the VM: an
+        // unregistered cloud is one an agent cannot be provisioned against.
+        r.jenkins.clouds.add(cloud);
 
         reconcileAndSettle(cloud);
 
@@ -920,6 +958,7 @@ class XcpngProvisionTest {
     @Test
     void warmReconcileIsIdempotentAcrossTicks(JenkinsRule r) throws Exception {
         XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3, 2);
+        r.jenkins.clouds.add(cloud);
         // One worker blocked on a gate, so the first tick's launches queue with their reservations
         // outstanding and never register. A second tick must see the deficit already covered and add nothing.
         ExecutorService exec = Executors.newSingleThreadExecutor();
@@ -1263,10 +1302,9 @@ class XcpngProvisionTest {
 
         reapAndSettle(cloud, computer);
 
-        assertEquals(
-                clonesBefore + 1,
-                cloneCount(fake),
-                "the freed slot must be refilled by the teardown, not by a later tick: " + fake.calls());
+        awaitTrue(
+                () -> cloneCount(fake) == clonesBefore + 1,
+                () -> "the freed slot must be refilled by the teardown, not by a later tick: " + fake.calls());
         assertEquals(1, warmNodeCount(r), "the pool should be back at its target");
     }
 
@@ -1294,10 +1332,9 @@ class XcpngProvisionTest {
 
         reapAndSettle(cloud, computer);
 
-        assertEquals(
-                clonesBefore + 1,
-                cloneCount(fake),
-                "the used spare's replacement must be cloned on its teardown: " + fake.calls());
+        awaitTrue(
+                () -> cloneCount(fake) == clonesBefore + 1,
+                () -> "the used spare's replacement must be cloned on its teardown: " + fake.calls());
         assertEquals(1, warmNodeCount(r), "the pool should be back at its target");
     }
 
@@ -1466,9 +1503,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = warmCloudBackedBy(fake, 2, 0);
         r.jenkins.clouds.add(cloud);
-        XcpngAgent agent =
-                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-used-1", activityId("xcpng-used-1"), false);
-        r.jenkins.addNode(agent);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-used-1");
         AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, agent.getComputer());
         long clonesBefore = cloneCount(fake);
 
@@ -1782,9 +1817,7 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
-        XcpngAgent agent =
-                (XcpngAgent) cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"));
-        r.jenkins.addNode(agent);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
 
         // The teardown's destroy fails: the node is still removed, but the VM ref is recorded rather than lost.
         agent.terminate();
@@ -1801,21 +1834,21 @@ class XcpngProvisionTest {
     }
 
     @Test
-    void aFailedProvisionCleanupIsRecordedThenReclaimedOnTheNextSweep(JenkinsRule r) {
+    void aFailedProvisionCleanupIsRecordedThenReclaimedOnTheNextSweep(JenkinsRule r) throws Exception {
         // Both failures at once, which is the realistic pairing: the pool goes unreachable, so the start throws
-        // and the cleanup destroy that follows throws on the same blip. The clone exists on the pool and no
-        // agent was ever built around it, so this set is the only thing that can still name it.
+        // and the teardown that follows throws on the same blip. The clone exists on the pool and the node it
+        // belonged to is removed, so this set is the only thing that can still name it.
         FakeHypervisorClient fake =
                 new FakeHypervisorClient("jenkins-golden-debian").failStart().failDestroy();
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
 
-        assertThrows(
-                HypervisorException.class,
-                () -> cloud.provisionNode(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1")));
-        assertTrue(
-                cloud.leakedVmRefs().contains("vm/xcpng-agent-1/1"),
-                "a cleanup destroy that failed must record the clone as leaked: " + cloud.leakedVmRefs());
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+
+        awaitTrue(
+                () -> cloud.leakedVmRefs().contains("vm/xcpng-agent-1/1"),
+                () -> "a teardown destroy that failed must record the clone as leaked: " + cloud.leakedVmRefs());
 
         // The pool recovers; the sweep reclaims it with no operator and no external reaper involved.
         fake.recoverDestroy();
