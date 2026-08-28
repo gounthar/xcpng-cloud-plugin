@@ -44,6 +44,8 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     private int cloneCounter = 0;
     private boolean pingFails = false;
+    private int pingSuccessesBeforeFailing = -1;
+    private boolean resolveFailsAtTransport = false;
     private boolean startFails = false;
     private boolean destroyFails = false;
     private String assignIpOnStart = null;
@@ -56,6 +58,26 @@ public final class FakeHypervisorClient implements HypervisorClient {
     /** Make {@link #ping()} throw, to test the failure path of a connection check. */
     public synchronized FakeHypervisorClient failPing() {
         this.pingFails = true;
+        return this;
+    }
+
+    /**
+     * Let {@link #ping()} succeed {@code successes} times and throw after that, so a caller that pings,
+     * does something, and pings again can be given a pool that disappears between the two.
+     */
+    public synchronized FakeHypervisorClient failPingAfter(int successes) {
+        this.pingSuccessesBeforeFailing = successes;
+        return this;
+    }
+
+    /**
+     * Make {@link #resolveTemplate} fail the way a dropped connection does rather than the way an absent
+     * name does, whatever templates this fake knows. The two are indistinguishable from the exception --
+     * both are a {@link HypervisorException} with a null error code -- which is exactly why a caller has
+     * to tell them apart some other way.
+     */
+    public synchronized FakeHypervisorClient failResolveAtTransport() {
+        this.resolveFailsAtTransport = true;
         return this;
     }
 
@@ -115,6 +137,9 @@ public final class FakeHypervisorClient implements HypervisorClient {
     public synchronized VmRef resolveTemplate(String name) {
         checkNotInterrupted("resolveTemplate");
         calls.add("resolveTemplate:" + name);
+        if (resolveFailsAtTransport) {
+            throw new HypervisorException("VM.get_by_name_label: transport error: connection reset");
+        }
         if (!knownTemplates.contains(name)) {
             throw new HypervisorException("no template named '" + name + "'");
         }
@@ -181,6 +206,13 @@ public final class FakeHypervisorClient implements HypervisorClient {
     public synchronized void ping() {
         checkNotInterrupted("ping");
         calls.add("ping");
+        if (pingSuccessesBeforeFailing >= 0) {
+            if (pingSuccessesBeforeFailing == 0) {
+                throw new HypervisorException("ping: transport error: connection reset");
+            }
+            pingSuccessesBeforeFailing--;
+            return;
+        }
         if (pingFails) {
             throw new HypervisorException("cannot reach pool");
         }

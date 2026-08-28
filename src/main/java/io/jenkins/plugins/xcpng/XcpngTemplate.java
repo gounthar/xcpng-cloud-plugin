@@ -340,8 +340,19 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                     client.resolveTemplate(name);
                     return FormValidation.ok();
                 } catch (RuntimeException e) {
-                    // The client's own message names the case — absent, not a template, or ambiguous —
-                    // and is more specific than anything reconstructed here would be.
+                    // A successful ping does not stay true. The pool can drop between the two calls, and the
+                    // exception cannot say which happened: an absent name and a dead connection are both a
+                    // HypervisorException with a null error code (XapiClient.raw builds the transport one that
+                    // way, resolveTemplate builds the not-found one that way), so there is nothing on it to
+                    // branch on. Ask the pool again instead. If it still answers, it answered about the name.
+                    try {
+                        client.ping();
+                    } catch (RuntimeException poolWentAway) {
+                        LOGGER.log(Level.FINE, e, () -> "Lost " + url + " while checking a template name");
+                        return FormValidation.ok();
+                    }
+                    // The client's own message names the case (absent, not a template, or ambiguous) and is
+                    // more specific than anything reconstructed here would be.
                     String detail = e.getMessage();
                     return detail == null || detail.isBlank()
                             ? FormValidation.error(Messages.XcpngTemplate_templateName_unresolvedNoDetail(name))

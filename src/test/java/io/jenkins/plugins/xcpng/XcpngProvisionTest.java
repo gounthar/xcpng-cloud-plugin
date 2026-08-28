@@ -2183,4 +2183,43 @@ class XcpngProvisionTest {
                 Set.of(declared.group(1).trim().split("\\s+")),
                 "the check must depend on exactly the cloud's three connection fields, one level up");
     }
+
+    /**
+     * A pool that dies between the ping and the lookup must not be reported as a bad template name.
+     *
+     * <p>The ping proves the pool was reachable a moment ago, not that it still is, and the exception
+     * cannot settle it: {@code XapiClient} builds a transport failure and a not-found the same way, a
+     * {@code HypervisorException} with a null error code, so there is nothing on it to branch on. The
+     * check asks the pool a second time instead. Raised by review on #165; without the second ping the
+     * operator is told "this name does not resolve to a template on it" followed by a connection error,
+     * which is the precise misattribution the ping exists to prevent.
+     */
+    @Test
+    void aPoolThatDropsMidCheckIsNotReportedAsABadName(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        // Reachable for the first ping, gone by the lookup, and still gone when asked again.
+        FakeHypervisorClient dropping = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName())
+                .failPingAfter(1)
+                .failResolveAtTransport();
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> dropping);
+
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                "a connection lost mid-check must not be reported as an unresolvable name");
+        assertEquals(
+                2,
+                dropping.calls().stream().filter(c -> c.equals("ping")).count(),
+                "the pool must be asked a second time before the name is condemned: " + dropping.calls());
+
+        // The other half of the same branch: the lookup fails but the pool is still there, so the pool
+        // really did answer about the name and the error stands.
+        FakeHypervisorClient healthy =
+                new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failResolveAtTransport();
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> healthy);
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                "a pool that is still answering has answered about the name");
+    }
 }
