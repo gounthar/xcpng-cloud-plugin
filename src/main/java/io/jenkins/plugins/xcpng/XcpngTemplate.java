@@ -305,8 +305,10 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * password and a missing credential are all Test connection's story to tell, and reporting them
          * under this field would blame the template name for a problem it did not cause — and would put a
          * red error on a half-filled form, which is the state every form starts in. The discriminator is
-         * {@code ping()}: once it has succeeded the pool is reachable and the credential works, so anything
-         * {@code resolveTemplate} says after that is about the name.
+         * {@code ping()}, asked twice: once before the lookup, to establish that the pool is reachable and
+         * the credential works, and again after a failed lookup, because a successful ping does not stay
+         * true — the pool can drop between the two calls, and the exception cannot say which happened. The
+         * error stands only when the pool answered that second ping as well.
          */
         private FormValidation resolveAgainstPool(
                 @NonNull String name,
