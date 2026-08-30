@@ -30,6 +30,7 @@ import java.util.Calendar;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.AbstractExecutorService;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -2043,5 +2044,182 @@ class XcpngProvisionTest {
         assertTrue(
                 reloaded.leakedVmRefs().contains("vm/leaked/1"),
                 "a rebuilt cloud of the same name must still see the leaked VM: " + reloaded.leakedVmRefs());
+    }
+
+    /**
+     * #157's form-time half: when the form is carrying the pool's connection detail, a template name is
+     * resolved against the pool, so a typo is named on the configuration page instead of failing a
+     * provision on every provisioning round for as long as a build waits.
+     *
+     * <p>The three outcomes are asserted separately because they have different causes and only one of
+     * them is an error. A resolvable name is OK; a name the pool does not have is an ERROR carrying the
+     * client's own message, which distinguishes absent from ambiguous; and a pool that cannot be reached
+     * at all is OK, because that is Test connection's story and not this field's.
+     */
+    @Test
+    void aTemplateNameIsResolvedAgainstThePoolWhenTheFormCanReachIt(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName());
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> fake);
+
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                "a template the pool has must pass");
+
+        FormValidation missing =
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null);
+        assertEquals(FormValidation.Kind.ERROR, missing.kind, "a template the pool does not have must be named here");
+        assertTrue(
+                missing.getMessage().contains("no-such-golden-image"),
+                "the error must name the template that did not resolve: " + missing.getMessage());
+    }
+
+    /**
+     * Every way of not reaching the pool leaves the field OK, and — the half that matters — never asks it
+     * anything. A half-filled form is the state every form starts in, so a red error there would fire on a
+     * page nobody has finished typing into, and a blank pool URL is not evidence about the template name.
+     *
+     * <p>Asserted on the fake's call log rather than only on the verdict: an implementation that opened a
+     * session, failed, and swallowed it would produce the same OK while still logging in on every keystroke
+     * of a form that has no pool configured yet.
+     */
+    @Test
+    void anIncompleteConnectionLeavesTheNameUncheckedRatherThanRejected(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName());
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> fake);
+
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName("anything", null, null, null).kind,
+                "no pool URL means nothing to check against");
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName("anything", "   ", "cred", null).kind,
+                "a blank pool URL means nothing to check against");
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName("anything", "192.168.1.87", "cred", null).kind,
+                "a malformed pool URL is doCheckPoolUrl's to report, not this field's");
+        assertEquals(List.of(), fake.calls(), "an unusable connection must not open a session at all");
+
+        // And the name is still required, whatever the connection looks like.
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckTemplateName("  ", null, null, null).kind);
+    }
+
+    /**
+     * A reachable URL whose pool does not answer leaves the field OK. {@code ping()} is the discriminator
+     * the check rests on: until it succeeds, nothing {@code resolveTemplate} says can be attributed to the
+     * name, so the check must not reach it. Without the ping the same failure would render as "this
+     * template does not exist" on a pool that was merely unreachable.
+     */
+    @Test
+    void anUnreachablePoolDoesNotBlameTheTemplateName(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failPing();
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> fake);
+
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null).kind,
+                "a pool that never answered cannot condemn a template name");
+        assertFalse(
+                fake.calls().stream().anyMatch(c -> c.startsWith("resolveTemplate")),
+                "the name must not be resolved before ping has succeeded: " + fake.calls());
+
+        // A probe that cannot even open a session is the same case, and must not throw out of the form.
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> {
+            throw new IllegalStateException("No XAPI credentials configured for the template name check.");
+        });
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "", null).kind,
+                "a missing credential is Test connection's to report, not this field's");
+    }
+
+    /**
+     * The rendered form must actually wire the three connection fields into this check, and must reach the
+     * enclosing cloud to do it.
+     *
+     * <p>Asserted against a real rendered page rather than by reading the annotations back, because the
+     * annotations being present is not the claim. The claim is that {@code ../} resolves to the cloud from
+     * inside a template, and templates are rendered through a {@code repeatableHeteroProperty} — one wrong
+     * level and core silently logs "Unable to find nearby ../poolUrl" in the browser console, sends the
+     * check without those values, and the validator quietly stops resolving anything. Every outcome of
+     * that failure is an OK, which is exactly what a working check returns on a form with no pool, so
+     * nothing else in this suite would notice.
+     */
+    @Test
+    void theTemplateNameCheckReachesTheCloudsConnectionFields(JenkinsRule r) throws Exception {
+        r.jenkins.clouds.add(
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 2, List.of(LINUX_TEMPLATE)));
+
+        String form = r.createWebClient()
+                .goTo("manage/cloud/xcpng/configure")
+                .getFormByName("config")
+                .asXml();
+
+        // Anchor on the input itself. Searching for the bare field name finds the help link first, and a
+        // fixed-size window around that would drift the moment the surrounding markup changes.
+        int name = form.indexOf("name=\"_.templateName\"");
+        assertTrue(name >= 0, "the template name field must be on the cloud's configuration page");
+        int start = form.lastIndexOf("<input", name);
+        int end = form.indexOf("/>", name);
+        assertTrue(start >= 0 && end > start, "could not isolate the template name input from: " + form);
+        String field = form.substring(start, end + 2);
+
+        // asXml() lowercases attribute names, so match the markup as rendered rather than as written in
+        // the taglib. Attribute values keep their case, which is why the ../ dependencies below do not.
+        java.util.regex.Matcher declared =
+                java.util.regex.Pattern.compile("checkdependson=\"([^\"]*)\"").matcher(field);
+        assertTrue(declared.find(), "the template name field must send its dependencies with the check: " + field);
+
+        // Compared as whole tokens, never with contains(): "../../poolUrl" contains "../poolUrl", so a
+        // substring assertion would pass at every depth and pin nothing. The level is the whole claim —
+        // one ../ reaches the cloud, two overshoot it — so the tokens have to match exactly.
+        assertEquals(
+                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint"),
+                Set.of(declared.group(1).trim().split("\\s+")),
+                "the check must depend on exactly the cloud's three connection fields, one level up");
+    }
+
+    /**
+     * A pool that dies between the ping and the lookup must not be reported as a bad template name.
+     *
+     * <p>The ping proves the pool was reachable a moment ago, not that it still is, and the exception
+     * cannot settle it: {@code XapiClient} builds a transport failure and a not-found the same way, a
+     * {@code HypervisorException} with a null error code, so there is nothing on it to branch on. The
+     * check asks the pool a second time instead. Raised by review on #165; without the second ping the
+     * operator is told "this name does not resolve to a template on it" followed by a connection error,
+     * which is the precise misattribution the ping exists to prevent.
+     */
+    @Test
+    void aPoolThatDropsMidCheckIsNotReportedAsABadName(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        // Reachable for the first ping, gone by the lookup, and still gone when asked again.
+        FakeHypervisorClient dropping = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName())
+                .failPingAfter(1)
+                .failResolveAtTransport();
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> dropping);
+
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                "a connection lost mid-check must not be reported as an unresolvable name");
+        assertEquals(
+                2,
+                dropping.calls().stream().filter(c -> c.equals("ping")).count(),
+                "the pool must be asked a second time before the name is condemned: " + dropping.calls());
+
+        // The other half of the same branch: the lookup fails but the pool is still there, so the pool
+        // really did answer about the name and the error stands.
+        FakeHypervisorClient healthy =
+                new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failResolveAtTransport();
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> healthy);
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                "a pool that is still answering has answered about the name");
     }
 }

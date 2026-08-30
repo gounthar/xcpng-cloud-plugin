@@ -3,9 +3,11 @@ package io.jenkins.plugins.xcpng;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.RelativePath;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
 import hudson.util.FormValidation;
+import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -243,12 +245,130 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             return Messages.XcpngTemplate_DisplayName();
         }
 
+        /**
+         * How the template-name check opens a pool session. Production builds an {@code XapiClient} from
+         * the connection fields the form is carrying; a test injects a fake through {@link #setPoolProbe}.
+         * An instance field rather than a static one because the descriptor is a singleton per Jenkins and
+         * {@code JenkinsRule} builds a fresh Jenkins per test, so nothing leaks between tests.
+         */
+        @FunctionalInterface
+        interface PoolProbe {
+            @NonNull
+            HypervisorClient open(
+                    @CheckForNull String poolUrl,
+                    @CheckForNull String credentialsId,
+                    @CheckForNull String certificateFingerprint);
+        }
+
+        private PoolProbe poolProbe = (poolUrl, credentialsId, certificateFingerprint) ->
+                XcpngCloud.openClient(poolUrl, credentialsId, certificateFingerprint, "the template name check");
+
+        /** Test seam: resolve template names against an in-memory fake instead of a real pool. */
+        void setPoolProbe(@NonNull PoolProbe poolProbe) {
+            this.poolProbe = poolProbe;
+        }
+
+        /**
+         * The name is required, and — when the form is carrying enough of the enclosing cloud's connection
+         * detail to ask — it is also resolved against the pool, so a typo is named here rather than in the
+         * build queue. Without this the only symptom is #157: a template naming an image the pool does not
+         * have fails a provision on every provisioning round, once per round, for as long as a build waits,
+         * with no message clearer than the first one.
+         *
+         * <p>The connection fields come from the enclosing cloud through {@link RelativePath}, not from a
+         * saved {@code XcpngCloud}, because the operator may be typing them right now and the value being
+         * checked has to be the one they can see. Core infers {@code checkDependsOn} from this signature,
+         * so editing any of the three re-runs the check as well.
+         *
+         * <p>This does not remove the runtime case — a golden image can be deleted after the cloud is
+         * saved, and #157's retry-forever half is still open — it moves the common case to where it is
+         * cheap. The validator fires on page load, on this field's own change, and on a change to any of
+         * the three it depends on, so the cost is roughly a Test connection rather than one per keystroke.
+         */
         @POST
-        public FormValidation doCheckTemplateName(@QueryParameter String value) {
+        public FormValidation doCheckTemplateName(
+                @QueryParameter String value,
+                @RelativePath("..") @QueryParameter String poolUrl,
+                @RelativePath("..") @QueryParameter String credentialsId,
+                @RelativePath("..") @QueryParameter String certificateFingerprint) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
-            return value == null || value.isBlank()
-                    ? FormValidation.error(Messages.XcpngTemplate_templateName_required())
-                    : FormValidation.ok();
+            if (value == null || value.isBlank()) {
+                return FormValidation.error(Messages.XcpngTemplate_templateName_required());
+            }
+            return resolveAgainstPool(value.trim(), poolUrl, credentialsId, certificateFingerprint);
+        }
+
+        /**
+         * Ask the pool whether {@code name} resolves, and say so only when the pool actually answered.
+         *
+         * <p>Every way of failing to reach the pool returns {@code ok()}: an unreachable host, a wrong
+         * password and a missing credential are all Test connection's story to tell, and reporting them
+         * under this field would blame the template name for a problem it did not cause — and would put a
+         * red error on a half-filled form, which is the state every form starts in. The discriminator is
+         * {@code ping()}, asked twice: once before the lookup, to establish that the pool is reachable and
+         * the credential works, and again after a failed lookup, because a successful ping does not stay
+         * true — the pool can drop between the two calls, and the exception cannot say which happened. The
+         * error stands only when the pool answered that second ping as well.
+         */
+        private FormValidation resolveAgainstPool(
+                @NonNull String name,
+                @CheckForNull String poolUrl,
+                @CheckForNull String credentialsId,
+                @CheckForNull String certificateFingerprint) {
+            if (poolUrl == null || poolUrl.isBlank()) {
+                return FormValidation.ok();
+            }
+            String url = poolUrl.trim();
+            if (XcpngCloud.DescriptorImpl.validatePoolUrlFormat(url).kind != FormValidation.Kind.OK) {
+                // doCheckPoolUrl is already saying what is wrong with it; do not say it twice, and do
+                // not hand a malformed URL to the client.
+                return FormValidation.ok();
+            }
+            HypervisorClient client;
+            try {
+                client = poolProbe.open(url, credentialsId, certificateFingerprint);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.FINE, e, () -> "Could not open a session to " + url + " to check a template name");
+                return FormValidation.ok();
+            }
+            try {
+                try {
+                    client.ping();
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.FINE, e, () -> "Could not reach " + url + " to check a template name");
+                    return FormValidation.ok();
+                }
+                try {
+                    client.resolveTemplate(name);
+                    return FormValidation.ok();
+                } catch (RuntimeException e) {
+                    // A successful ping does not stay true. The pool can drop between the two calls, and the
+                    // exception cannot say which happened: an absent name and a dead connection are both a
+                    // HypervisorException with a null error code (XapiClient.raw builds the transport one that
+                    // way, resolveTemplate builds the not-found one that way), so there is nothing on it to
+                    // branch on. Ask the pool again instead. If it still answers, it answered about the name.
+                    try {
+                        client.ping();
+                    } catch (RuntimeException poolWentAway) {
+                        LOGGER.log(Level.FINE, e, () -> "Lost " + url + " while checking a template name");
+                        return FormValidation.ok();
+                    }
+                    // The client's own message names the case (absent, not a template, or ambiguous) and is
+                    // more specific than anything reconstructed here would be.
+                    String detail = e.getMessage();
+                    return detail == null || detail.isBlank()
+                            ? FormValidation.error(Messages.XcpngTemplate_templateName_unresolvedNoDetail(name))
+                            : FormValidation.error(Messages.XcpngTemplate_templateName_unresolved(detail));
+                }
+            } finally {
+                // Closed by hand rather than with try-with-resources: a close() that threw would replace
+                // the error just computed and the check would silently pass.
+                try {
+                    client.close();
+                } catch (RuntimeException e) {
+                    LOGGER.log(Level.FINE, e, () -> "Releasing the session used to check a template name failed");
+                }
+            }
         }
 
         /**

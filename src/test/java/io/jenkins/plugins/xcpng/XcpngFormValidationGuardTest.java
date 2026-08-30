@@ -62,7 +62,9 @@ class XcpngFormValidationGuardTest {
         XcpngTemplate.DescriptorImpl tpl = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
         return List.of(
                 new NamedCheck("doCheckPoolUrl", () -> cloud.doCheckPoolUrl("https://pool.example.test")),
-                new NamedCheck("doCheckTemplateName", () -> tpl.doCheckTemplateName("jenkins-agent-debian13")),
+                new NamedCheck(
+                        "doCheckTemplateName",
+                        () -> tpl.doCheckTemplateName("jenkins-agent-debian13", null, null, null)),
                 new NamedCheck("doCheckLabelString", () -> tpl.doCheckLabelString("xcpng-linux")),
                 new NamedCheck("doCheckNumCpus", () -> tpl.doCheckNumCpus("2")),
                 new NamedCheck("doCheckMemoryMb", () -> tpl.doCheckMemoryMb("2048")),
