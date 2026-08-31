@@ -72,6 +72,11 @@ class XcpngTemplateBackoffTest {
         AtomicLong clock = new AtomicLong();
         XcpngTemplateBackoff backoff = onClock(clock);
 
+        // The loop below proves nothing if it never runs, and a retune of FREE_FAILURES to 0 would do
+        // exactly that while leaving this test green. Assert the denominator before trusting the zero.
+        assertTrue(
+                XcpngTemplateBackoff.FREE_FAILURES > 0,
+                "this test only means something while there is a free allowance to spend");
         for (int failure = 1; failure <= XcpngTemplateBackoff.FREE_FAILURES; failure++) {
             assertNotNull(backoff.noteFailure(CLOUD, TEMPLATE));
             assertTrue(
@@ -102,12 +107,14 @@ class XcpngTemplateBackoffTest {
         AtomicLong clock = new AtomicLong();
         onClock(clock);
 
+        assertTrue(XcpngTemplateBackoff.FREE_FAILURES > 0, "there must be a free allowance to check");
         for (int free = 1; free <= XcpngTemplateBackoff.FREE_FAILURES; free++) {
             assertEquals(0L, XcpngTemplateBackoff.delayAfter(free), "failure " + free + " should cost nothing");
         }
 
         long previous = 0L;
         boolean reachedTheCap = false;
+        int increases = 0;
         for (int failures = XcpngTemplateBackoff.FREE_FAILURES + 1;
                 failures <= XcpngTemplateBackoff.FREE_FAILURES + 12;
                 failures++) {
@@ -119,10 +126,16 @@ class XcpngTemplateBackoffTest {
                 reachedTheCap = true;
             } else {
                 assertTrue(delay > previous, "failure " + failures + " did not wait longer than failure " + previous);
+                increases++;
             }
             previous = delay;
         }
         assertTrue(reachedTheCap, "the schedule should reach its cap within a dozen failures");
+        // Without this the else branch above is an unreachable escape hatch waiting to happen: lower
+        // MAX_DELAY_MILLIS to the base and the very first delay is already the cap, so "waits longer each
+        // time" is never asserted and this test passes having checked only the clamp. A branch that reads
+        // as covering a case must be shown to have covered one.
+        assertTrue(increases > 0, "the doubling was never exercised; only the cap was");
         assertEquals(
                 XcpngTemplateBackoff.MAX_DELAY_MILLIS,
                 XcpngTemplateBackoff.delayAfter(Integer.MAX_VALUE),
