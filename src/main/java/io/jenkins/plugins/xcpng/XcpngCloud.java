@@ -1282,11 +1282,15 @@ public class XcpngCloud extends Cloud {
         // line says the same thing whatever clock the store is on.
         long waitSeconds =
                 TimeUnit.MILLISECONDS.toSeconds(XcpngTemplateBackoff.delayAfter(backoff.consecutiveFailures()));
+        // Inside the free allowance the wait is zero, and saying "not provisioning for it for 0s" would be
+        // both wrong and alarming: nothing is being held, and the next round provisions as normal.
+        String held = waitSeconds == 0
+                ? "; still within its free allowance, so the next round will try again"
+                : "; not provisioning for it for " + waitSeconds + "s";
         LOGGER.log(
                 Level.INFO,
-                () -> "Template " + templateName + " on cloud " + name + " has failed "
-                        + backoff.consecutiveFailures() + " launch(es) in a row; not provisioning for it for "
-                        + waitSeconds + "s");
+                () -> "Template " + templateName + " on cloud " + name + " has failed " + backoff.consecutiveFailures()
+                        + " launch(es) in a row" + held);
     }
 
     /**

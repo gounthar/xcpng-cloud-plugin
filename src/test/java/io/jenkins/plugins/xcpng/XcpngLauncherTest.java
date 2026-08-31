@@ -9,6 +9,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+import hudson.ExtensionList;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.TaskListener;
@@ -222,6 +223,15 @@ class XcpngLauncherTest {
             assertTrue(
                     done.await(30, TimeUnit.SECONDS),
                     "the launch must give up when its node goes, not wait out the ten-minute timeout");
+
+            // And it must not hold that against the template. Removing a node is a cancellation, not a
+            // verdict on the golden image: a controller restart reloads mid-boot agents and the retention
+            // strategy reclaims them, so counting these would withhold a healthy template from provisioning
+            // after a few restarts, which is the opposite of what the backoff is for (#157).
+            assertNull(
+                    ExtensionList.lookupSingleton(XcpngTemplateBackoff.class)
+                            .backoffFor("xcpng", LINUX_TEMPLATE.getTemplateName()),
+                    "a node removed under the launcher must not be recorded as a template failure");
         } finally {
             launching.interrupt();
         }

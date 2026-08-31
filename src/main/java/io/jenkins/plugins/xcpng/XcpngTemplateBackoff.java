@@ -1,6 +1,5 @@
 package io.jenkins.plugins.xcpng;
 
-import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.ExtensionList;
 import java.util.concurrent.ConcurrentHashMap;
@@ -91,7 +90,7 @@ public class XcpngTemplateBackoff {
      * Clock for the deadline math. Null in production, where {@link #now()} reads the system clock; a test
      * injects a fixed one so it can step over a delay without sleeping through it.
      */
-    private LongSupplier clock;
+    private volatile LongSupplier clock;
 
     /** The singleton. Never call this before extensions are augmented; every caller is a runtime path. */
     static XcpngTemplateBackoff get() {
@@ -111,11 +110,14 @@ public class XcpngTemplateBackoff {
      * again. Returning an empty collection from {@code provision} has the same effect on that round and is
      * cached by nothing.
      *
-     * <p>A cloud with no name -- possible from a hand-edited {@code config.xml} -- has nothing to key by,
-     * so it is always ready. That is the behaviour this class exists to improve on rather than a cap being
-     * silently lost, so it is documented rather than warned about.
+     * <p>A cloud or template with no name -- both reachable from a hand-edited {@code config.xml}, since
+     * neither constructor rejects one -- has nothing to key by, so it is always ready and records nothing.
+     * The alternative is worse than the missing backoff: {@code ConcurrentHashMap} throws on a null key, so
+     * an unnamed template would take an NPE out of {@code provision} and into core's {@code NodeProvisioner}
+     * on every round. Losing a backoff degrades to the behaviour this class exists to improve on; losing the
+     * provisioning round does not.
      */
-    boolean isReady(String cloudName, @NonNull String templateName) {
+    boolean isReady(String cloudName, String templateName) {
         Backoff backoff = backoffFor(cloudName, templateName);
         return backoff == null || backoff.readyAt() <= now();
     }
@@ -126,8 +128,8 @@ public class XcpngTemplateBackoff {
      *
      * <p>Returns null for a cloud with no name, which records nothing.
      */
-    Backoff noteFailure(String cloudName, @NonNull String templateName) {
-        if (cloudName == null) {
+    Backoff noteFailure(String cloudName, String templateName) {
+        if (unkeyable(cloudName, templateName)) {
             return null;
         }
         long now = now();
@@ -147,8 +149,8 @@ public class XcpngTemplateBackoff {
      * The next provision fails and re-enters the backoff one attempt later, which is a cheaper trade than
      * threading the distinction through the launcher.
      */
-    void noteSuccess(String cloudName, @NonNull String templateName) {
-        ConcurrentMap<String, Backoff> forCloud = cloudName == null ? null : byCloud.get(cloudName);
+    void noteSuccess(String cloudName, String templateName) {
+        ConcurrentMap<String, Backoff> forCloud = unkeyable(cloudName, templateName) ? null : byCloud.get(cloudName);
         if (forCloud != null) {
             forCloud.remove(templateName);
         }
@@ -164,9 +166,14 @@ public class XcpngTemplateBackoff {
     }
 
     /** This template's current backoff, or null if it is not in one. */
-    Backoff backoffFor(String cloudName, @NonNull String templateName) {
-        ConcurrentMap<String, Backoff> forCloud = cloudName == null ? null : byCloud.get(cloudName);
+    Backoff backoffFor(String cloudName, String templateName) {
+        ConcurrentMap<String, Backoff> forCloud = unkeyable(cloudName, templateName) ? null : byCloud.get(cloudName);
         return forCloud == null ? null : forCloud.get(templateName);
+    }
+
+    /** Whether this pair can be used as a map key at all. Either half missing means neither is usable. */
+    private static boolean unkeyable(String cloudName, String templateName) {
+        return cloudName == null || templateName == null;
     }
 
     /** The current instant in millis, from the injected clock in tests or the system clock in production. */
