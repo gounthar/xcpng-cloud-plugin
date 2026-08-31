@@ -111,6 +111,7 @@ public class XcpngLauncher extends JNLPLauncher {
                                 + " is already running for this agent; waiting for it to connect.");
             }
             cloud.awaitOnline(computer, displayName);
+            cloud.noteLaunchSucceeded(template.getTemplateName());
         } catch (InterruptedException e) {
             // Shutdown, or the computer being disconnected under us. Tear the VM down on the way out for the
             // same reason as any other failure, then restore the flag so core's own shutdown still sees it.
@@ -121,6 +122,11 @@ public class XcpngLauncher extends JNLPLauncher {
             Thread.currentThread().interrupt();
             throw asLaunchFailure(displayName, e);
         } catch (Exception e) {
+            // Held against the template, so a golden image the pool does not have stops being retried on
+            // every provisioning round (#157). Deliberately not done for the interrupt above: that says the
+            // controller changed its mind -- a shutdown, or the computer disconnected under us -- and says
+            // nothing about whether this template can be cloned.
+            cloud.noteLaunchFailed(template.getTemplateName());
             terminateQuietly(agent, listener, e);
             throw asLaunchFailure(displayName, e);
         }
