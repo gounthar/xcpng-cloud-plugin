@@ -430,6 +430,13 @@ public class XcpngCloud extends Cloud {
         if (template == null) {
             return List.of();
         }
+        // A template whose launches keep failing is left alone for a spell rather than retried on every
+        // round for as long as a build sits in the queue (#157). Checked here rather than in canProvision,
+        // which Label caches: see XcpngTemplateBackoff.isReady. Outside the capacity lock because this
+        // decides not to take a slot at all, and the backoff store acquires nothing of its own.
+        if (!XcpngTemplateBackoff.get().isReady(name, template.getTemplateName())) {
+            return List.of();
+        }
         return XcpngReservationStore.get().computeUnderCapacityLock(name, () -> plan(template, excessWorkload));
     }
 
@@ -708,6 +715,12 @@ public class XcpngCloud extends Cloud {
         for (XcpngTemplate template : templates) {
             int target = warmTarget(template);
             if (target <= 0) {
+                continue;
+            }
+            // A warm pool refills on a timer with nothing queued, so a template that cannot resolve
+            // produces the same endless stream of failures here as on the on-demand path, and with nobody
+            // waiting on a build to notice it. Same backoff, read the same way (#157).
+            if (!XcpngTemplateBackoff.get().isReady(name, template.getTemplateName())) {
                 continue;
             }
             // Deficit against both the spares already registered and those still booting, so repeated
@@ -1240,6 +1253,44 @@ public class XcpngCloud extends Cloud {
      */
     void noteRegistered(@NonNull String nodeName) {
         release(nodeName);
+    }
+
+    /**
+     * Record that an agent for this template launched, clearing any backoff the template had earned.
+     * Called by {@link XcpngLauncher} once its agent is online.
+     */
+    void noteLaunchSucceeded(@NonNull String templateName) {
+        XcpngTemplateBackoff.get().noteSuccess(name, templateName);
+    }
+
+    /**
+     * Record that an agent for this template failed to launch, and say how long the next attempt is being
+     * held off for.
+     *
+     * <p>Said out loud, at INFO, because the silence is otherwise the confusing part: after this the cloud
+     * simply plans nothing for a template an operator can see configured against a queued build, and the
+     * only other trace is the launch WARNING that has already been printed. One line per failure is still
+     * far less than the fourteen this backoff exists to stop, and it names the number an operator needs --
+     * how long until the fixed template is tried again.
+     */
+    void noteLaunchFailed(@NonNull String templateName) {
+        XcpngTemplateBackoff.Backoff backoff = XcpngTemplateBackoff.get().noteFailure(name, templateName);
+        if (backoff == null) {
+            return;
+        }
+        // The delay is recomputed from the failure count rather than read back off the deadline, so this
+        // line says the same thing whatever clock the store is on.
+        long waitSeconds =
+                TimeUnit.MILLISECONDS.toSeconds(XcpngTemplateBackoff.delayAfter(backoff.consecutiveFailures()));
+        // Inside the free allowance the wait is zero, and saying "not provisioning for it for 0s" would be
+        // both wrong and alarming: nothing is being held, and the next round provisions as normal.
+        String held = waitSeconds == 0
+                ? "; still within its free allowance, so the next round will try again"
+                : "; not provisioning for it for " + waitSeconds + "s";
+        LOGGER.log(
+                Level.INFO,
+                () -> "Template " + templateName + " on cloud " + name + " has failed " + backoff.consecutiveFailures()
+                        + " launch(es) in a row" + held);
     }
 
     /**

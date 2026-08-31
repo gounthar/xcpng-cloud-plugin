@@ -40,6 +40,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.logging.Handler;
@@ -2221,5 +2222,108 @@ class XcpngProvisionTest {
                 FormValidation.Kind.ERROR,
                 d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
                 "a pool that is still answering has answered about the name");
+    }
+
+    /**
+     * A template the pool cannot resolve is not retried on every provisioning round for as long as a build
+     * sits in the queue (#157).
+     *
+     * <p>What is asserted is the repetition rather than the failure. Every individual attempt was already
+     * correct -- the node is torn down, the reservation comes back, nothing is left on the pool -- and the
+     * part that was wrong is that there were fourteen of them in four minutes on the lab, one every twenty
+     * seconds, stopping only when the operator cancelled the build.
+     *
+     * <p>{@code failStart()} rather than #157's own unresolvable name, and the reason is core's rather than
+     * ours: {@code Nodes.addNode} creates and launches the computer <em>before</em> it persists the node's
+     * {@code config.xml}, so a launch that fails as fast as {@code resolveTemplate} does removes the node
+     * directory while that write is still in flight and {@code addNode} itself throws
+     * {@code NoSuchFileException}. Every other failed-launch test here uses {@code failStart} for the same
+     * reason. The cause makes no difference to what is under test: the hold is taken on any failed launch,
+     * and {@code resolveTemplate} throwing is covered where it happens, in the client's own tests.
+     *
+     * <p>The last assertion is the one that says this is a backoff rather than a gate. Nothing tells the
+     * plugin that a template has been fixed, so the hold has to end on its own clock; a version that
+     * latched would pass every line above and leave the cloud dead until someone re-saved it.
+     */
+    @Test
+    void aTemplateThatCannotResolveIsNotRetriedOnEveryProvisioningRound(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        AtomicLong clock = new AtomicLong(TimeUnit.DAYS.toMillis(1));
+        XcpngTemplateBackoff backoff = XcpngTemplateBackoff.get();
+        backoff.setClock(clock::get);
+
+        Cloud.CloudState queued = new Cloud.CloudState(Label.get("xcpng-linux"), 0);
+
+        // Spend the free allowance first. Those attempts are free on purpose (see
+        // XcpngTemplateBackoff.FREE_FAILURES and aFailedLaunchGivesItsReservationBackAtOnce), so a hold
+        // only exists from the attempt after them, and that attempt is the real launch below.
+        for (int failure = 1; failure <= XcpngTemplateBackoff.FREE_FAILURES; failure++) {
+            backoff.noteFailure("xcpng", LINUX_TEMPLATE.getTemplateName());
+        }
+        Collection<NodeProvisioner.PlannedNode> control = cloud.provision(queued, 1);
+        assertFalse(control.isEmpty(), "a template inside its free allowance must still be planned for");
+        // Hand that round's slot straight back. A reservation for a node nothing ever registers is
+        // subtracted from every later round by alreadyBuilding(), so leaving it would make the assertion
+        // below read empty for the cap rather than for the hold -- and it would then pass against a
+        // backoff that was never consulted at all. Found by deleting the gate and watching it stay green.
+        control.forEach(node -> cloud.noteRegistered(node.displayName));
+
+        // Register one agent the way core registers a planned node, and let its launcher fail against the
+        // pool. Waiting on the recorded failure rather than on the node disappearing: the teardown removes
+        // the node either way, so the node list cannot tell a held template from an unheld one.
+        r.jenkins.addNode(cloud.createAgent(LINUX_TEMPLATE, "xcpng-failing", activityId("xcpng-failing"), false));
+        awaitTrue(
+                () -> !backoff.isReady("xcpng", LINUX_TEMPLATE.getTemplateName()),
+                () -> "the failed launch was never held against the template: " + fake.calls());
+        // Settle the teardown before reading provision(). The hold is recorded before the node is removed,
+        // so a round taken in between reads empty because alreadyBuilding() has already absorbed the whole
+        // excess workload -- which passes this test with the hold deleted. Found by doing exactly that.
+        awaitTrue(
+                () -> r.jenkins.getNodes().isEmpty(),
+                () -> "the failed launch should have torn its own node down: " + r.jenkins.getNodes());
+
+        assertTrue(
+                cloud.provision(queued, 1).isEmpty(),
+                "a template past its free allowance must not be planned again on the very next round");
+
+        clock.set(clock.get() + XcpngTemplateBackoff.delayAfter(XcpngTemplateBackoff.FREE_FAILURES + 1));
+        assertFalse(
+                cloud.provision(queued, 1).isEmpty(),
+                "the hold must expire on its own: nothing tells the plugin that a template was fixed");
+    }
+
+    /**
+     * The warm-pool fill consults the same hold, so a template that cannot be launched does not refill on
+     * every tick with nobody waiting on a build to notice.
+     *
+     * <p>The fake is deliberately <em>healthy</em>. A fake that also refused to clone would make this test
+     * pass against a fill that ignored the backoff completely, since nothing would ever register either
+     * way; with a pool that would happily hand over a spare, the only thing that can keep the node list
+     * empty is the hold itself.
+     */
+    @Test
+    void aHeldTemplateIsSkippedByTheWarmPoolFillUntilItsDeadline(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = warmCloudBackedBy(fake, 2, 1);
+        r.jenkins.clouds.add(cloud);
+        AtomicLong clock = new AtomicLong(TimeUnit.DAYS.toMillis(1));
+        XcpngTemplateBackoff backoff = XcpngTemplateBackoff.get();
+        backoff.setClock(clock::get);
+
+        XcpngTemplateBackoff.Backoff held = null;
+        for (int failure = 1; failure <= XcpngTemplateBackoff.FREE_FAILURES + 1; failure++) {
+            held = backoff.noteFailure("xcpng", "jenkins-golden-debian");
+        }
+        assertNotNull(held);
+        assertFalse(backoff.isReady("xcpng", "jenkins-golden-debian"), "the template should be held by now");
+
+        reconcileAndSettle(cloud);
+        assertTrue(r.jenkins.getNodes().isEmpty(), "a held template must not be refilled: " + fake.calls());
+
+        clock.set(held.readyAt());
+        reconcileAndSettle(cloud);
+        assertEquals(1, r.jenkins.getNodes().size(), "the spare should arrive once the hold expires");
     }
 }
