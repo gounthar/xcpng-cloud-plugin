@@ -1,0 +1,31 @@
+<?jelly escape-by-default='true'?>
+
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
+
+    <f:entry title="${%Description}" field="description">
+        <f:textarea />
+    </f:entry>
+
+    <f:entry title="${%Number of executors}" field="numExecutors">
+        <f:textbox />
+    </f:entry>
+
+    <f:entry title="${%Remote FS root}" field="remoteFS">
+        <f:textbox />
+    </f:entry>
+
+    <f:entry title="${%Labels}" field="labelString">
+        <f:textbox />
+    </f:entry>
+
+    <f:entry title="${%Usage}">
+        <f:slave-mode field="mode" />
+    </f:entry>
+
+    <f:section title="${%Node Properties}">
+        <f:descriptorList
+            descriptors="${nodePropertiesDescriptors}"
+            instances="${nodeProperties}" />
+    </f:section>
+
+</j:jelly>
