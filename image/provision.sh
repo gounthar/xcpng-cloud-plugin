@@ -491,7 +491,12 @@ NETPLAN
 # an anchor added only there leaves an image where curl succeeds against the
 # controller and the agent still cannot connect — a failure that gives no hint
 # where to look.
-EXTRA_CA_DIR="${EXTRA_CA_DIR:-/tmp/ca-certificates}"
+# Fixed, not taken from the environment. The Packer file provisioner uploads to a
+# path this script does not get to choose, so an override bought nothing, and it
+# is read below by an rm -rf running as root: EXTRA_CA_DIR=/etc would have taken
+# /etc with it. readonly rather than a plain assignment so a later edit that
+# reintroduces the override has to do so deliberately.
+readonly EXTRA_CA_DIR=/tmp/ca-certificates
 
 # Everything the Packer file provisioner uploaded is removed again, whatever
 # happened. /tmp is a plain directory on the root disk here, not a tmpfs -- the
@@ -500,8 +505,13 @@ EXTRA_CA_DIR="${EXTRA_CA_DIR:-/tmp/ca-certificates}"
 # puts a PKCS#12 in this directory by mistake, which the docs warn is the easy
 # mistake to make, would otherwise ship its private key on every agent.
 discard_extra_ca_dir() {
-    [ -n "$EXTRA_CA_DIR" ] && [ -d "$EXTRA_CA_DIR" ] || return 0
-    rm -rf -- "$EXTRA_CA_DIR"
+    [ -d "$EXTRA_CA_DIR" ] || return 0
+    # Belt and braces against a future edit to the constant above: this only ever
+    # deletes below /tmp, whatever it is pointed at.
+    case "$EXTRA_CA_DIR" in
+        /tmp/?*) rm -rf -- "$EXTRA_CA_DIR" ;;
+        *) log "refusing to remove ${EXTRA_CA_DIR}: not under /tmp" ;;
+    esac
 }
 
 install_extra_ca_certificates() {
