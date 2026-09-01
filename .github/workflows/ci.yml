@@ -131,6 +131,100 @@ jobs:
           SKIP_CLEANUP: '1'
         run: bash image/provision.sh
 
+      # The trust-anchor directory is operator input that ends up baked into the template and then
+      # into every clone the plugin makes from it, so the cases below are the ones verified by hand
+      # in a container during review of #180, kept here so they stay verified. Two things matter:
+      # nothing unrecognised is installed, and the upload never survives provisioning. It must not
+      # survive: provision.sh masks tmp.mount, so /tmp is a plain directory on the root disk and a
+      # PKCS#12 left there would ship its private key on every agent.
+      - name: Operator CA, a valid anchor reaches both trust stores
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/ci-root.crt -subj '/CN=CI Root'
+          fp="$(openssl x509 -in /tmp/ca-certificates/ci-root.crt -noout -fingerprint -sha256 | cut -d= -f2)"
+          bash image/provision.sh
+          test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
+          test -f /usr/local/share/ca-certificates/ci-root.crt
+          # By fingerprint, not by alias: update-ca-certificates regenerates the Adoptium truststore
+          # from the system store under a name of its own making, so ci-root.crt lands as "ciroot".
+          keytool -list -cacerts -storepass changeit 2>/dev/null | grep -qF "$fp" \
+            || { echo "::error::the anchor is not in the Java truststore"; exit 1; }
+
+      - name: Operator CA, an empty directory is not an error
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          # What the file provisioner uploads from a stock checkout.
+          mkdir -p /tmp/ca-certificates && : > /tmp/ca-certificates/.gitkeep
+          # Not piped into grep: that would hand provision.sh a SIGPIPE and hide its exit status.
+          bash image/provision.sh > /tmp/provision.out
+          grep -q 'no operator CA certificates supplied' /tmp/provision.out
+          test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
+
+      # EXTRA_CA_DIR is a readonly constant precisely so this cannot happen: it is read by an rm -rf
+      # running as root, and taking it from the environment made EXTRA_CA_DIR=/etc delete /etc.
+      - name: Operator CA, EXTRA_CA_DIR from the environment is ignored
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+          EXTRA_CA_DIR: /etc
+        run: |
+          before="$(find /etc -maxdepth 1 | wc -l)"
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/env-root.crt -subj '/CN=Env Root'
+          bash image/provision.sh
+          after="$(find /etc -maxdepth 1 | wc -l)"
+          test "$after" -ge "$before" || { echo "::error::/etc lost entries: $before -> $after"; exit 1; }
+          test -f /etc/passwd || { echo "::error::/etc was emptied"; exit 1; }
+          test ! -e /tmp/ca-certificates || { echo "::error::the real upload directory was not cleaned"; exit 1; }
+
+      - name: Operator CA, anything unrecognised fails the build and leaves nothing behind
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          rc=0
+          # The fixture is already in place; $1 labels it, $2 is the message provision.sh owes us.
+          refuses() {
+            if bash image/provision.sh >/tmp/provision.out 2>&1; then
+              echo "::error::$1: provision.sh succeeded and must not have"; rc=1
+            elif ! grep -qF "$2" /tmp/provision.out; then
+              echo "::error::$1: expected \"$2\", got: $(tail -1 /tmp/provision.out)"; rc=1
+            elif [ -e /tmp/ca-certificates ]; then
+              echo "::error::$1: the upload directory survived the failure"; rc=1
+            else
+              echo "ok, refused: $1"
+            fi
+            rm -rf /tmp/ca-certificates
+          }
+          newca() { openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null -out "$1" -subj "/CN=$2"; }
+
+          mkdir -p /tmp/ca-certificates; openssl genrsa -out /tmp/ca-certificates/leaked.pem 2048
+          refuses "a private key" "contains a private key"
+
+          mkdir -p /tmp/ca-certificates; echo not-a-certificate > /tmp/ca-certificates/notes.txt
+          refuses "a file that is neither .crt nor .pem" "but it is not empty"
+
+          mkdir -p /tmp/ca-certificates; echo not-a-certificate > /tmp/ca-certificates/bogus.crt
+          refuses "a .crt that is not a certificate" "is not a PEM certificate"
+
+          mkdir -p /tmp/ca-certificates; newca /tmp/b1.crt One; newca /tmp/b2.crt Two
+          cat /tmp/b1.crt /tmp/b2.crt > /tmp/ca-certificates/bundle.crt
+          refuses "a concatenated chain" "holds 2 certificates"
+
+          # Both globs feed one loop, so these are one alias twice: without a guard the system store
+          # keeps one certificate and the Java store the other, and the build goes green.
+          mkdir -p /tmp/ca-certificates; newca /tmp/ca-certificates/vates.crt One; newca /tmp/ca-certificates/vates.pem Two
+          refuses "two files giving one alias" "both give alias vates"
+
+          exit $rc
+
   packer:
     name: packer validate
     runs-on: ubuntu-latest
