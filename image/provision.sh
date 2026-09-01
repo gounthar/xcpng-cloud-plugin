@@ -548,9 +548,21 @@ install_extra_ca_certificates() {
     command -v update-ca-certificates >/dev/null 2>&1 \
         || die "update-ca-certificates not found. Install it with: apt-get install -y ca-certificates"
 
-    local cert alias count
+    local cert alias count seen=" "
     for cert in "${certs[@]}"; do
         alias="$(basename "$cert")"; alias="${alias%.*}"
+
+        # Both globs above feed this one loop, so foo.crt and foo.pem arrive as the
+        # same alias twice and the second one wins in the system store while the
+        # first one stays in the Java store, which the keytool branch below reports
+        # as already present. Measured with two distinct CAs named vates.crt and
+        # vates.pem: the system store ends up holding one of them, the Java store
+        # the other, and the build is green. The stores disagreeing is the failure
+        # this function's header exists to prevent.
+        case "$seen" in
+            *" ${alias} "*) die "$cert and an earlier file both give alias ${alias}; rename one" ;;
+        esac
+        seen="${seen}${alias} "
 
         openssl x509 -in "$cert" -noout >/dev/null 2>&1 \
             || die "$cert is not a PEM certificate"
