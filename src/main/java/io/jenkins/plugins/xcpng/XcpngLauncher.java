@@ -1,7 +1,6 @@
 package io.jenkins.plugins.xcpng;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import hudson.Extension;
 import hudson.model.Descriptor;
 import hudson.model.Node;
 import hudson.model.TaskListener;
@@ -111,17 +110,37 @@ public class XcpngLauncher extends JNLPLauncher {
                                 + " is already running for this agent; waiting for it to connect.");
             }
             cloud.awaitOnline(computer, displayName);
+            cloud.noteLaunchSucceeded(template.getTemplateName());
         } catch (InterruptedException e) {
             // Shutdown, or the computer being disconnected under us. Tear the VM down on the way out for the
             // same reason as any other failure, then restore the flag so core's own shutdown still sees it.
             // Restored after the teardown, not before: the teardown ends in a blocking HTTP call, which
             // throws immediately on a thread whose interrupt flag is already set, and that would leak the
             // very VM the teardown exists to remove.
-            terminateQuietly(agent, listener, e);
+            terminateQuietly(agent, listener, e, alreadyRemoved(agent));
             Thread.currentThread().interrupt();
             throw asLaunchFailure(displayName, e);
         } catch (Exception e) {
-            terminateQuietly(agent, listener, e);
+            // Decided before the teardown, because the teardown is what removes the node this asks about.
+            boolean cancelled = alreadyRemoved(agent);
+            // Teardown first, bookkeeping second. The teardown is the half that must not be skipped: it is
+            // the only thing that destroys a VM, and anything that threw while recording a backoff -- an
+            // extension lookup during shutdown, say -- would otherwise leak the running clone.
+            terminateQuietly(agent, listener, e, cancelled);
+            if (!cancelled) {
+                // Held against the template, so a golden image the pool does not have stops being retried on
+                // every provisioning round (#157).
+                //
+                // Not held when the node was removed under the launcher, which is a cancellation rather than
+                // a verdict on the template: a controller restart reloads a mid-boot agent, the retention
+                // strategy reclaims it, and awaitOnline throws because computer.getNode() has gone. Counting
+                // those would withhold a perfectly healthy template after a few restarts. Same condition
+                // recordFailure already uses, for the same reason.
+                //
+                // Nor for the interrupt above: that says the controller changed its mind -- a shutdown, or
+                // the computer disconnected under us -- and says nothing about whether this template clones.
+                cloud.noteLaunchFailed(template.getTemplateName());
+            }
             throw asLaunchFailure(displayName, e);
         }
     }
@@ -139,8 +158,11 @@ public class XcpngLauncher extends JNLPLauncher {
      * the original failure, which is the one worth reporting.
      */
     private static void terminateQuietly(
-            @NonNull XcpngAgent agent, @NonNull TaskListener listener, @NonNull Throwable cause) {
-        if (Jenkins.get().getNode(agent.getNodeName()) != agent) {
+            @NonNull XcpngAgent agent,
+            @NonNull TaskListener listener,
+            @NonNull Throwable cause,
+            boolean alreadyRemoved) {
+        if (alreadyRemoved) {
             // The node is already gone, so its teardown has already run: this is the reloaded-agent case,
             // where a controller restart reconnects an agent that XcpngRetentionStrategy then reclaims
             // underneath the launcher. Terminating again would issue a second destroy for a VM that is
@@ -173,6 +195,18 @@ public class XcpngLauncher extends JNLPLauncher {
                     .println(
                             "Could not tear down " + agent.getNodeName() + " after a failed launch: " + e.getMessage());
         }
+    }
+
+    /**
+     * Whether this agent's node has already been removed, so a failure reaching the launcher is a
+     * cancellation rather than a verdict on the pool or the template.
+     *
+     * <p>Read once per failure and passed down, rather than evaluated at each place that needs it: the
+     * teardown itself removes the node, so a second read after it would answer a different question and the
+     * two decisions would disagree.
+     */
+    private static boolean alreadyRemoved(@NonNull XcpngAgent agent) {
+        return Jenkins.get().getNode(agent.getNodeName()) != agent;
     }
 
     /**
@@ -223,17 +257,46 @@ public class XcpngLauncher extends JNLPLauncher {
     }
 
     /**
-     * Present because every {@code Describable} needs one: {@code AbstractDescribableImpl.getDescriptor} calls
-     * {@code getDescriptorOrDie}, so a launcher without a descriptor throws an {@code AssertionError} the first
-     * time any view renders the node it is attached to — including the ordinary agent configuration page.
+     * The descriptor, handed out directly rather than looked up, so that it exists without being offered.
      *
-     * <p>It carries no {@code config.jelly} and this class has no {@code @DataBoundConstructor}, so the entry it
-     * adds to the New Node launch-method dropdown cannot be bound into an agent. That is a deliberate trade: an
-     * inert dropdown entry is a cosmetic wart, and the alternative is a page that dies on an agent this plugin
-     * provisioned.
+     * <p>{@code AbstractDescribableImpl.getDescriptor} resolves a descriptor through
+     * {@code Jenkins.getDescriptorOrDie}, which throws an {@code AssertionError} when there is none registered.
+     * Every view that renders a node hits that, including the ordinary agent configuration page, so an agent
+     * this plugin provisioned needs a descriptor to exist. Registering one as an {@code @Extension} is the
+     * usual way to arrange that, and it also puts an entry in the New Node launch-method dropdown, where
+     * picking it can only fail: this class has no {@code @DataBoundConstructor} and no {@code config.jelly}, so
+     * there is nothing for the form to bind, and a launcher built that way would have no template and no cloud
+     * behind it.
+     *
+     * <p>Overriding {@link #getDescriptor()} answers the first need without the second. Nothing enumerates a
+     * descriptor that was never registered, so the dropdown no longer offers it (#158), while the agent
+     * configuration page resolves one here and renders. kubernetes-plugin does the same thing for the same
+     * reason, and says so in a comment on its own descriptor: <em>"Only there to avoid throwing unnecessary
+     * exceptions. KubernetesLauncher is never instantiated via UI."</em>
      */
-    @Extension
-    public static class DescriptorImpl extends Descriptor<ComputerLauncher> {
+    @NonNull
+    @Override
+    public Descriptor<ComputerLauncher> getDescriptor() {
+        return DESCRIPTOR;
+    }
+
+    /**
+     * Built once, at class initialisation, rather than per call.
+     *
+     * <p>Safe there because {@code Descriptor}'s no-argument constructor touches no Jenkins singleton: it reads
+     * the enclosing class to infer what it describes and checks the type parameter against it, and nothing
+     * else. Held as one instance because a descriptor is conventionally a singleton, and handing out a fresh
+     * one on each call would hand two callers objects that compare unequal.
+     */
+    private static final DescriptorImpl DESCRIPTOR = new DescriptorImpl();
+
+    /**
+     * Deliberately not an {@code @Extension}, and deliberately still nested: {@code Descriptor}'s no-argument
+     * constructor infers what it describes from {@code getClass().getEnclosingClass()} and fails an assertion
+     * when that is null, so moving this to the top level would need the {@code Descriptor(Class)} constructor
+     * instead.
+     */
+    private static class DescriptorImpl extends Descriptor<ComputerLauncher> {
 
         @NonNull
         @Override

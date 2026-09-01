@@ -9,9 +9,6 @@ __pycache__/
 
 # Never commit: secrets, and local working context.
 .env
-CLAUDE.md
-CONTEXT.md
-CONTEXT-*.md
 *.credentials.json
 *.pem
 golden_key*

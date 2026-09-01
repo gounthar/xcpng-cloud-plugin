@@ -179,7 +179,16 @@ public final class CertificateFingerprint {
         return of(leaf);
     }
 
-    /** An SSL context whose trust manager records the server's leaf certificate and then refuses it. */
+    /**
+     * An SSL context whose trust manager records the server's leaf certificate and then refuses it.
+     *
+     * <p>The scan flags every {@code SSLContext#init}, because that call is how TLS verification is
+     * normally switched off; it does not read the trust manager it is handed. This one does the
+     * opposite of weakening anything. The manager below accepts nothing at all: it records the leaf
+     * and then throws unconditionally, so no handshake it takes part in can ever complete. Suppressed
+     * rather than dismissed through the API so the reasoning sits beside the code. See #142.
+     */
+    @SuppressWarnings("lgtm[jenkins/unsafe-calls]") // Records the certificate, then refuses it. Accepts nothing.
     private static SSLContext recordingContext(AtomicReference<X509Certificate> sink) throws IOException {
         X509TrustManager recorder = new X509TrustManager() {
             @Override

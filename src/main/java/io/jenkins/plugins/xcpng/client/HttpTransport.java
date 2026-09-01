@@ -78,7 +78,14 @@ final class HttpTransport implements JsonRpcTransport {
      * CN=192.168.1.87} with {@code IP Address:192.168.1.87} -- so a pool reached at the address its
      * certificate names satisfies both. A pool reached under some other name needs a certificate that
      * says so, which is a fair thing to require and was already required before this change.
+     *
+     * <p>The scan flags every {@code SSLContext#init}, because that call is how TLS verification is
+     * normally switched off; it does not read the trust manager it is handed. This one narrows trust
+     * rather than widening it: {@link PinnedTrustManager} accepts a single certificate where the JVM
+     * default accepts every public CA, and hostname verification still applies on top. Suppressed
+     * rather than dismissed through the API so the reasoning sits beside the code. See #142.
      */
+    @SuppressWarnings("lgtm[jenkins/unsafe-calls]") // Pins one certificate; strictly narrower than the JVM default.
     private static HttpClient pinnedClient(String fingerprint) {
         SSLContext ctx;
         try {
