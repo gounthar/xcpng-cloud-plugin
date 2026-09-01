@@ -73,7 +73,7 @@ jobs:
 
       # Pinned. Dependabot's github-actions ecosystem keeps this one current.
       - name: Install Updatecli
-        uses: updatecli/updatecli-action@v3.4.0
+        uses: updatecli/updatecli-action@v3.6.0
 
       - name: Diff
         run: |
