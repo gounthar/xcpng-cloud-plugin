@@ -142,6 +142,7 @@ jobs:
           SKIP_GUEST_TOOLS: '1'
           SKIP_CLEANUP: '1'
         run: |
+          apt-get install -y -qq openssl
           mkdir -p /tmp/ca-certificates
           openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
             -out /tmp/ca-certificates/ci-root.crt -subj '/CN=CI Root'
