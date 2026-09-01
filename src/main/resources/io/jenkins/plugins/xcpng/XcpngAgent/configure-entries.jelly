@@ -1,31 +1,37 @@
 <?jelly escape-by-default='true'?>
+<!--
+  The node configuration form for an agent this cloud provisioned.
 
+  Core's Computer/configure.jelly includes this by name, and there is no such view on Slave or
+  AbstractCloudSlave, so without it the include fails: the response is already committed by then, so
+  the page returns 200 and simply stops mid-render with no form on it (#179).
+
+  What is deliberately absent matters as much as what is here.
+
+  No launcher selector and no retention-strategy selector. Both are the cloud's to decide, neither is
+  an operator's to change on a VM that is destroyed when it goes idle, and DumbSlave's version of this
+  file builds its launcher dropdown from ${computerLauncherDescriptors}, the list #158 took this
+  plugin's launcher out of, so including it would offer a control whose current value is missing.
+
+  No numExecutors and no remoteFS either, which is where this departs from kubernetes-plugin's
+  otherwise identical view. Both are fixed on this agent: see XcpngAgent.EXECUTORS_PER_AGENT, pinned
+  to 1 in #23 because the reap fires on build completion and a second executor would have its VM
+  destroyed under it, and XcpngAgent.REMOTE_FS, which the golden image is built around. Rendering
+  them as editable inputs invites a misconfiguration whose symptom is an unexplained channel loss.
+-->
 <j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
 
-    <f:entry title="${%Description}" field="description">
-        <f:textarea />
-    </f:entry>
+  <f:entry title="${%Description}" field="nodeDescription">
+    <f:textbox />
+  </f:entry>
 
-    <f:entry title="${%Number of executors}" field="numExecutors">
-        <f:textbox />
-    </f:entry>
+  <f:entry title="${%Labels}" field="labelString">
+    <f:textbox />
+  </f:entry>
 
-    <f:entry title="${%Remote FS root}" field="remoteFS">
-        <f:textbox />
-    </f:entry>
+  <f:slave-mode name="mode" node="${it}" />
 
-    <f:entry title="${%Labels}" field="labelString">
-        <f:textbox />
-    </f:entry>
-
-    <f:entry title="${%Usage}">
-        <f:slave-mode field="mode" />
-    </f:entry>
-
-    <f:section title="${%Node Properties}">
-        <f:descriptorList
-            descriptors="${nodePropertiesDescriptors}"
-            instances="${nodeProperties}" />
-    </f:section>
+  <f:descriptorList title="${%Node Properties}" field="nodeProperties"
+                    descriptors="${h.getNodePropertyDescriptors(descriptor.clazz)}" />
 
 </j:jelly>
