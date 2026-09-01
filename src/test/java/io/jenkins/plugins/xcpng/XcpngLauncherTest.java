@@ -5,15 +5,19 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import hudson.ExtensionList;
+import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.TaskListener;
 import hudson.slaves.Cloud;
+import hudson.slaves.ComputerLauncher;
+import hudson.slaves.DumbSlave;
 import hudson.slaves.JNLPLauncher;
 import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
@@ -247,5 +251,52 @@ class XcpngLauncherTest {
                 IllegalStateException.class,
                 () -> new XcpngLauncher(LINUX_TEMPLATE).launch(computer, TaskListener.NULL),
                 "a launcher with no XCP-ng agent behind it has nothing to provision");
+    }
+
+    /**
+     * The New Node form must not offer this launcher (#158).
+     *
+     * <p>Asked the way the form itself asks. {@code DumbSlave.DescriptorImpl.computerLauncherDescriptors} is
+     * what {@code config.jelly} iterates to build the launch-method dropdown, so a descriptor absent from that
+     * list is absent from the dropdown. Picking it there could only fail: this launcher has no
+     * {@code @DataBoundConstructor} for the form to bind, and one built that way would carry no template and
+     * no cloud.
+     */
+    @Test
+    void theNewNodeFormDoesNotOfferThisLauncher(JenkinsRule r) {
+        List<String> offered =
+                r.jenkins.getDescriptorByType(DumbSlave.DescriptorImpl.class).computerLauncherDescriptors(null).stream()
+                        .map(d -> d.clazz.getName())
+                        .toList();
+
+        assertFalse(
+                offered.contains(XcpngLauncher.class.getName()),
+                () -> "the New Node launch-method dropdown must not offer a launcher it cannot bind, but got "
+                        + offered);
+    }
+
+    /**
+     * And it must still have a descriptor, which is the half that stops the fix being "delete it".
+     *
+     * <p>{@code AbstractDescribableImpl.getDescriptor} goes through {@code Jenkins.getDescriptorOrDie}, so a
+     * launcher with no descriptor throws an {@code AssertionError} the first time a view renders the node it
+     * is attached to, the agent configuration page included. Hiding it from the dropdown must not cost that.
+     */
+    @Test
+    void anAgentStillResolvesItsLauncherDescriptor(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = cloudBackedBy(r, new FakeHypervisorClient());
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+
+        Descriptor<ComputerLauncher> descriptor = agent.getLauncher().getDescriptor();
+
+        assertNotNull(descriptor, "an agent must be able to resolve its launcher's descriptor");
+        assertEquals(
+                XcpngLauncher.class,
+                descriptor.clazz,
+                "the descriptor an agent resolves must be the one describing its own launcher");
+        assertSame(
+                descriptor,
+                agent.getLauncher().getDescriptor(),
+                "a descriptor is a singleton; two lookups must not hand back objects that compare unequal");
     }
 }
