@@ -1,7 +1,6 @@
 package io.jenkins.plugins.xcpng;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
-import hudson.Extension;
 import hudson.model.Descriptor;
 import hudson.model.Node;
 import hudson.model.TaskListener;
@@ -258,17 +257,46 @@ public class XcpngLauncher extends JNLPLauncher {
     }
 
     /**
-     * Present because every {@code Describable} needs one: {@code AbstractDescribableImpl.getDescriptor} calls
-     * {@code getDescriptorOrDie}, so a launcher without a descriptor throws an {@code AssertionError} the first
-     * time any view renders the node it is attached to — including the ordinary agent configuration page.
+     * The descriptor, handed out directly rather than looked up, so that it exists without being offered.
      *
-     * <p>It carries no {@code config.jelly} and this class has no {@code @DataBoundConstructor}, so the entry it
-     * adds to the New Node launch-method dropdown cannot be bound into an agent. That is a deliberate trade: an
-     * inert dropdown entry is a cosmetic wart, and the alternative is a page that dies on an agent this plugin
-     * provisioned.
+     * <p>{@code AbstractDescribableImpl.getDescriptor} resolves a descriptor through
+     * {@code Jenkins.getDescriptorOrDie}, which throws an {@code AssertionError} when there is none registered.
+     * Every view that renders a node hits that, including the ordinary agent configuration page, so an agent
+     * this plugin provisioned needs a descriptor to exist. Registering one as an {@code @Extension} is the
+     * usual way to arrange that, and it also puts an entry in the New Node launch-method dropdown, where
+     * picking it can only fail: this class has no {@code @DataBoundConstructor} and no {@code config.jelly}, so
+     * there is nothing for the form to bind, and a launcher built that way would have no template and no cloud
+     * behind it.
+     *
+     * <p>Overriding {@link #getDescriptor()} answers the first need without the second. Nothing enumerates a
+     * descriptor that was never registered, so the dropdown no longer offers it (#158), while the agent
+     * configuration page resolves one here and renders. kubernetes-plugin does the same thing for the same
+     * reason, and says so in a comment on its own descriptor: <em>"Only there to avoid throwing unnecessary
+     * exceptions. KubernetesLauncher is never instantiated via UI."</em>
      */
-    @Extension
-    public static class DescriptorImpl extends Descriptor<ComputerLauncher> {
+    @NonNull
+    @Override
+    public Descriptor<ComputerLauncher> getDescriptor() {
+        return DESCRIPTOR;
+    }
+
+    /**
+     * Built once, at class initialisation, rather than per call.
+     *
+     * <p>Safe there because {@code Descriptor}'s no-argument constructor touches no Jenkins singleton: it reads
+     * the enclosing class to infer what it describes and checks the type parameter against it, and nothing
+     * else. Held as one instance because a descriptor is conventionally a singleton, and handing out a fresh
+     * one on each call would hand two callers objects that compare unequal.
+     */
+    private static final DescriptorImpl DESCRIPTOR = new DescriptorImpl();
+
+    /**
+     * Deliberately not an {@code @Extension}, and deliberately still nested: {@code Descriptor}'s no-argument
+     * constructor infers what it describes from {@code getClass().getEnclosingClass()} and fails an assertion
+     * when that is null, so moving this to the top level would need the {@code Descriptor(Class)} constructor
+     * instead.
+     */
+    private static class DescriptorImpl extends Descriptor<ComputerLauncher> {
 
         @NonNull
         @Override
