@@ -493,35 +493,76 @@ NETPLAN
 # where to look.
 EXTRA_CA_DIR="${EXTRA_CA_DIR:-/tmp/ca-certificates}"
 
+# Everything the Packer file provisioner uploaded is removed again, whatever
+# happened. /tmp is a plain directory on the root disk here, not a tmpfs -- the
+# tmp.mount mask a hundred lines above sees to that -- so anything left behind
+# is baked into the template and into every clone made from it. An operator who
+# puts a PKCS#12 in this directory by mistake, which the docs warn is the easy
+# mistake to make, would otherwise ship its private key on every agent.
+discard_extra_ca_dir() {
+    [ -n "$EXTRA_CA_DIR" ] && [ -d "$EXTRA_CA_DIR" ] || return 0
+    rm -rf -- "$EXTRA_CA_DIR"
+}
+
 install_extra_ca_certificates() {
     [ -d "$EXTRA_CA_DIR" ] || { log "no operator CA directory, skipping"; return 0; }
+    # Removed on every exit from here on, including the failure paths below, each
+    # of which calls die and would otherwise leave the upload on disk.
+    trap discard_extra_ca_dir EXIT
+
+    # Scan every regular file, not only the ones that will be installed. A key in
+    # a file this function skips is still a key sitting in the image.
+    local f
+    while IFS= read -r -d '' f; do
+        if grep -q 'PRIVATE KEY' "$f"; then
+            die "$(basename "$f") contains a private key; only certificates belong in ${EXTRA_CA_DIR}"
+        fi
+    done < <(find "$EXTRA_CA_DIR" -type f -print0)
 
     shopt -s nullglob
-    local certs=("$EXTRA_CA_DIR"/*.crt)
+    local certs=("$EXTRA_CA_DIR"/*.crt "$EXTRA_CA_DIR"/*.pem)
+    local everything=("$EXTRA_CA_DIR"/*)
     shopt -u nullglob
     if [ "${#certs[@]}" -eq 0 ]; then
+        # Silence here is what the whole feature exists to avoid. A file that was
+        # dropped in and not installed means the operator believes the image has
+        # an anchor it does not have, and they find out when an agent will not
+        # connect and nothing says why.
+        [ "${#everything[@]}" -eq 0 ] || die "no .crt or .pem certificates in ${EXTRA_CA_DIR}, but it is not empty: $(basename -a "${everything[@]}" | tr '\n' ' ')"
         log "no operator CA certificates supplied"
         return 0
     fi
 
-    local cert alias added=0
-    for cert in "${certs[@]}"; do
-        alias="$(basename "$cert" .crt)"
+    command -v openssl >/dev/null 2>&1 || die "openssl not found, needed to validate ${EXTRA_CA_DIR}"
+    command -v keytool >/dev/null 2>&1 || die "keytool not found; install_java must run before this"
+    command -v update-ca-certificates >/dev/null 2>&1 \
+        || die "update-ca-certificates not found. Install it with: apt-get install -y ca-certificates"
 
-        # Reject anything carrying a private key: this directory is for trust
-        # anchors, and a key here would be baked into every clone of the image.
-        if grep -q 'PRIVATE KEY' "$cert"; then
-            die "$cert contains a private key; only certificates belong here"
-        fi
+    local cert alias count
+    for cert in "${certs[@]}"; do
+        alias="$(basename "$cert")"; alias="${alias%.*}"
+
         openssl x509 -in "$cert" -noout >/dev/null 2>&1 \
             || die "$cert is not a PEM certificate"
 
+        # A concatenated chain is a common export format and neither consumer
+        # handles one: keytool imports the first certificate and drops the rest
+        # without an error, and update-ca-certificates(8) says outright that
+        # there should be one certificate per file. Measured: two CAs in one file
+        # gives a keystore with one entry. Refuse rather than half-install.
+        count="$(grep -c 'BEGIN CERTIFICATE' "$cert" || true)"
+        [ "$count" -eq 1 ] \
+            || die "$cert holds $count certificates; split the chain into one file per certificate"
+
         log "installing trust anchor ${alias} into the system store"
         install -m 0644 "$cert" "/usr/local/share/ca-certificates/${alias}.crt"
-        added=1
 
-        if keytool -list -cacerts -storepass changeit -alias "$alias" \
-             >/dev/null 2>&1; then
+        # Left as the author wrote it. Comparing the alias's contents looks like the
+        # obvious hardening here, and it is not: update-ca-certificates below
+        # regenerates the Adoptium truststore from the system store and discards
+        # whatever keytool put in it, alias and all. See the issue linked from the
+        # review before changing this.
+        if keytool -list -cacerts -storepass changeit -alias "$alias" >/dev/null 2>&1; then
             log "trust anchor ${alias} already in the Java truststore"
         else
             log "installing trust anchor ${alias} into the Java truststore"
@@ -531,7 +572,7 @@ install_extra_ca_certificates() {
         fi
     done
 
-    [ "$added" -eq 1 ] && update-ca-certificates
+    update-ca-certificates
     return 0
 }
 

@@ -106,9 +106,9 @@ variable "iso_name" {
       against one fails with VDI_IO_ERROR.
 
       NOTE: this does not stop the builder from destroying the ISO VDI at cleanup,
-      despite what the builder's PreserveVdi flag suggests. Measured on XCP-ng 8.3
-      against a shared NFS ISO SR: the file is removed on both the success and the
-      failure path. See <lien vers ton issue>.
+      despite what the builder's PreserveVdi flag suggests. Reported measured on
+      XCP-ng 8.3 against a shared NFS ISO SR: the file is removed on both the
+      success and the failure path. Not yet reproduced here, and not yet filed.
     EOT
 }
 
