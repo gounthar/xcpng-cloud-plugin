@@ -159,8 +159,8 @@ whatever name you choose is the one the cloud's template field has to match.
    `image/provision.sh` as root inside the VM. It installs Temurin 21 from Adoptium, installs
    `xe-guest-utilities` from the CD and `xenstore-utils` for the guest xenstore client, bakes the
    `jenkins-agent` and `jenkins-agent-ssh-seed` systemd units that read the per-clone data from
-   xenstore, installs any PEM certificate found in that directory into both the system and Java
-   trust stores, resets cloud-init and the machine identity, and drops a
+   xenstore, installs any certificate found in that directory into both the system and Java trust
+   stores and then removes the directory, resets cloud-init and the machine identity, and drops a
    `/var/lib/golden-image-ready` marker.
 5. Shut the VM down.
 6. Make it a **template**: `xe vm-param-set uuid=<uuid> is-a-template=true`.
@@ -193,8 +193,16 @@ image/ca-certificates/
   your-internal-root.crt
 ```
 
-The filename becomes the alias in the Java truststore, so pick one you will recognise later. The
-directory is gitignored: a root certificate is not a secret, but it is infrastructure detail, and
+The extension has to be `.crt` or `.pem`, and the filename is the name the system store keeps the
+anchor under, so pick one you will recognise later. **One certificate per file**, and one file per
+name: a concatenated chain is refused, and so are `vates.crt` and `vates.pem` side by side, since
+both give the alias `vates` and one of the two would be lost.
+
+The directory is removed from the image once the anchors are installed. `/tmp` on this image is a
+directory on the root disk rather than a tmpfs, as the table above explains, so anything left in it
+is captured in the template and readable on every clone made from it.
+
+The directory is gitignored: a root certificate is not a secret, but it is infrastructure detail, and
 publishing it to a public repository cannot be undone.
 
 ### Both stores, and why the second one is the whole point
@@ -216,22 +224,32 @@ anchor by hand instead of through this directory, do both stores.
 
 ### What is refused
 
-`provision.sh` fails the build, naming the file, if one of them contains a private key or is not a
-PEM certificate. Exporting a PKCS#12 bundle rather than the certificate is the easy mistake, and it
-is the one carrying the key — which would otherwise be baked into every clone of the image. Same
-posture as the MAC-pinned netplan stanza above: refuse at build time rather than ship an image that
-fails later for a reason nothing explains.
+`provision.sh` fails the build, naming the file, on anything it cannot account for: a private key in
+any file in the directory, a `.crt` or `.pem` that is not a certificate, several certificates
+concatenated into one, a directory that holds files but none it can install, or two names that give
+one alias. Exporting a PKCS#12 rather than the certificate is the easy mistake, and it is the one
+carrying the key — which would otherwise be baked into every clone of the image. A file that is
+simply skipped is treated as a failure too: an operator who believes the image has an anchor it does
+not have finds out when an agent will not connect and nothing says why. Same posture as the
+MAC-pinned netplan stanza above: refuse at build time rather than ship an image that fails later for
+a reason nothing explains.
 
 ### Verifying inside the built VM
 
 ```sh
 openssl verify -CApath /etc/ssl/certs \
   /usr/local/share/ca-certificates/your-internal-root.crt
-keytool -list -cacerts -storepass changeit -alias your-internal-root
+fp=$(openssl x509 -in /usr/local/share/ca-certificates/your-internal-root.crt \
+       -noout -fingerprint -sha256 | cut -d= -f2)
+keytool -list -cacerts -storepass changeit | grep -F "$fp"
 curl -sS -o /dev/null -w '%{http_code}\n' https://your-controller/login
 ```
 
-The third is the only one that proves the chain end to end: no `-k`, and a 200.
+By fingerprint and not by alias: `update-ca-certificates` regenerates the Adoptium truststore from
+the system store under a name of its own making, discarding what `keytool` wrote. Measured on trixie
+with `temurin-21-jre`, `your-internal-root.crt` comes back as alias `yourinternalroot`.
+
+The last is the only one that proves the chain end to end: no `-k`, and a 200.
 
 ### Renewal
 
