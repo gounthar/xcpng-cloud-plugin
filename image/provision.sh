@@ -529,19 +529,25 @@ install_extra_ca_certificates() {
         fi
     done < <(find "$EXTRA_CA_DIR" -type f -print0)
 
-    shopt -s nullglob
-    local certs=("$EXTRA_CA_DIR"/*.crt "$EXTRA_CA_DIR"/*.pem)
-    local everything=("$EXTRA_CA_DIR"/*)
-    shopt -u nullglob
     if [ "${#certs[@]}" -eq 0 ]; then
         # Silence here is what the whole feature exists to avoid. A file that was
         # dropped in and not installed means the operator believes the image has
         # an anchor it does not have, and they find out when an agent will not
         # connect and nothing says why.
-        [ "${#everything[@]}" -eq 0 ] || die "no .crt or .pem certificates in ${EXTRA_CA_DIR}, but it is not empty: $(basename -a "${everything[@]}" | tr '\n' ' ')"
+        [ "${#everything[@]}" -eq 0 ] || die "no .crt or .pem certificates in ${EXTRA_CA_DIR}, but it is not empty: $(basename -a \"${everything[@]}\" | tr '\n' ' ')"
         log "no operator CA certificates supplied"
         return 0
     fi
+
+    local unrecognised=()
+    local entry
+    for entry in "${everything[@]}"; do
+        case "$entry" in
+            *.crt|*.pem) ;;
+            *) unrecognised+=("$entry") ;;
+        esac
+    done
+    [ "${#unrecognised[@]}" -eq 0 ] || die "unrecognised entries in ${EXTRA_CA_DIR}: $(basename -a \"${unrecognised[@]}\" | tr '\n' ' ')"
 
     command -v openssl >/dev/null 2>&1 || die "openssl not found, needed to validate ${EXTRA_CA_DIR}"
     command -v keytool >/dev/null 2>&1 || die "keytool not found; install_java must run before this"
