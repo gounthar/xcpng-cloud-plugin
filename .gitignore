@@ -17,3 +17,7 @@ CONTEXT-*.md
 golden_key*
 packer_cache/
 packer-jenkins-agent/
+
+# Operator trust anchors are local to a build, never upstream.
+image/ca-certificates/*
+!image/ca-certificates/.gitkeep

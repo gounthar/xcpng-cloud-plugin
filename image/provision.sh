@@ -484,12 +484,66 @@ NETPLAN
     fi
 }
 
+# Operator-supplied trust anchors, uploaded by the Packer file provisioner.
+# Empty on a stock build, in which case this returns without touching anything.
+#
+# Installed into BOTH stores on purpose. Java does not read the system store, so
+# an anchor added only there leaves an image where curl succeeds against the
+# controller and the agent still cannot connect — a failure that gives no hint
+# where to look.
+EXTRA_CA_DIR="${EXTRA_CA_DIR:-/tmp/ca-certificates}"
+
+install_extra_ca_certificates() {
+    [ -d "$EXTRA_CA_DIR" ] || { log "no operator CA directory, skipping"; return 0; }
+
+    shopt -s nullglob
+    local certs=("$EXTRA_CA_DIR"/*.crt)
+    shopt -u nullglob
+    if [ "${#certs[@]}" -eq 0 ]; then
+        log "no operator CA certificates supplied"
+        return 0
+    fi
+
+    local cert alias added=0
+    for cert in "${certs[@]}"; do
+        alias="$(basename "$cert" .crt)"
+
+        # Reject anything carrying a private key: this directory is for trust
+        # anchors, and a key here would be baked into every clone of the image.
+        if grep -q 'PRIVATE KEY' "$cert"; then
+            die "$cert contains a private key; only certificates belong here"
+        fi
+        openssl x509 -in "$cert" -noout >/dev/null 2>&1 \
+            || die "$cert is not a PEM certificate"
+
+        log "installing trust anchor ${alias} into the system store"
+        install -m 0644 "$cert" "/usr/local/share/ca-certificates/${alias}.crt"
+        added=1
+
+        if keytool -list -cacerts -storepass changeit -alias "$alias" \
+             >/dev/null 2>&1; then
+            log "trust anchor ${alias} already in the Java truststore"
+        else
+            log "installing trust anchor ${alias} into the Java truststore"
+            keytool -importcert -noprompt -trustcacerts \
+                -alias "$alias" -file "$cert" \
+                -cacerts -storepass changeit
+        fi
+    done
+
+    [ "$added" -eq 1 ] && update-ca-certificates
+    return 0
+}
+
+
 main() {
     require_root
     require_deps
 
     install_java
     verify_java
+
+    install_extra_ca_certificates
 
     if [ "${SKIP_GUEST_TOOLS:-0}" = "1" ]; then
         log "skipping guest tools and xenstore client (SKIP_GUEST_TOOLS=1)"
