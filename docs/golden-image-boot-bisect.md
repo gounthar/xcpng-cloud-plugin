@@ -21,7 +21,7 @@ Two controlled experiments on real hardware. Every test VM was destroyed by ref 
 
 The automated Tier-2 bootstrap (`VDI.create` + `import_raw_vdi` + clone the shipped template + assemble)
 imports a Debian cloud disk fine but the VM never boots to a kernel: it reaches `Running`, burns
-~7 CPU-seconds, `ttyS0` stays empty, and its MAC never enters the bridge. The end-of-day CONTEXT.md
+~7 CPU-seconds, `ttyS0` stays empty, and its MAC never enters the bridge. The end-of-day
 hypothesis was **UEFI NVRAM**: that a fresh VM has no default varstore, so the plan was to learn how
 to initialise one.
 
