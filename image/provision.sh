@@ -520,6 +520,19 @@ install_extra_ca_certificates() {
     # of which calls die and would otherwise leave the upload on disk.
     trap discard_extra_ca_dir EXIT
 
+    # Collect entries under EXTRA_CA_DIR (excluding the placeholder .gitkeep) so the empty-directory
+    # case is a true no-op.
+    local -a everything=()
+    local -a certs=()
+    local entry
+    while IFS= read -r -d '' entry; do
+        everything+=("$entry")
+        [ -f "$entry" ] || continue
+        case "$entry" in
+            *.crt|*.pem) certs+=("$entry") ;;
+        esac
+    done < <(find "$EXTRA_CA_DIR" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -print0)
+
     # Scan every regular file, not only the ones that will be installed. A key in
     # a file this function skips is still a key sitting in the image.
     local f
@@ -534,7 +547,7 @@ install_extra_ca_certificates() {
         # dropped in and not installed means the operator believes the image has
         # an anchor it does not have, and they find out when an agent will not
         # connect and nothing says why.
-        [ "${#everything[@]}" -eq 0 ] || die "no .crt or .pem certificates in ${EXTRA_CA_DIR}, but it is not empty: $(basename -a \"${everything[@]}\" | tr '\n' ' ')"
+        [ "${#everything[@]}" -eq 0 ] || die "no .crt or .pem certificates in ${EXTRA_CA_DIR}, but it is not empty: $(basename -a "${everything[@]}" | tr '\n' ' ')"
         log "no operator CA certificates supplied"
         return 0
     fi
