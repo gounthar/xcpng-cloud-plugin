@@ -9,9 +9,11 @@ import hudson.model.Node;
 import hudson.slaves.EnvironmentVariablesNodeProperty;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.List;
+import org.htmlunit.html.DomElement;
 import org.htmlunit.html.HtmlForm;
 import org.htmlunit.html.HtmlInput;
 import org.htmlunit.html.HtmlPage;
+import org.htmlunit.html.HtmlSelect;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -192,19 +194,48 @@ class XcpngAgentReconfigureTest {
      * nothing else. Until Save worked there was no other way in. Making it work opened one, so this closes
      * it at the same layer: the mode is re-asserted rather than read, and the run that added this test
      * against the unfixed code failed here with {@code NORMAL}, which is what makes it worth keeping.
+     *
+     * <p>Deliberately indifferent to whether the page still renders a Usage control. The first version of
+     * this test reached for {@code getSelectByName("mode")}, which pinned the presence of the selector
+     * rather than the behaviour, and broke #186 when it removed the control this very invariant makes
+     * pointless. What is being asserted is that a submitted mode does not reach the node, and that has to
+     * hold whether the value arrives from a rendered selector or from a POST that never saw the page.
      */
     @Test
     void aSubmittedUsageModeIsIgnored(JenkinsRule r) throws Exception {
         registeredAgent(r);
 
         HtmlForm form = configForm(r, AGENT_NAME);
-        form.getSelectByName("mode").getOptionByValue("NORMAL").setSelected(true);
+        putMode(form, "NORMAL");
         r.submit(form);
 
         assertEquals(
                 XcpngAgent.USAGE_MODE,
                 nodeInJenkins(r).getMode(),
                 "NORMAL would make every unlabeled build eligible for a single-use VM");
+    }
+
+    /**
+     * Put {@code mode} on the form and submit it, through the Usage selector when the view offers one and
+     * as an injected field when it does not.
+     *
+     * <p>Never both: two fields of the same name would leave the submitted JSON ambiguous, and the point of
+     * the test is to know exactly what was posted. The injected path is not a lesser substitute either, it
+     * is the threat model written down. {@code readonly} and an absent control both constrain a browser and
+     * neither constrains a client that simply posts the field.
+     */
+    @SuppressWarnings("SameParameterValue")
+    private static void putMode(HtmlForm form, String mode) {
+        HtmlSelect selector = form.getSelectsByName("mode").stream().findFirst().orElse(null);
+        if (selector != null) {
+            selector.getOptionByValue(mode).setSelected(true);
+            return;
+        }
+        DomElement injected = ((HtmlPage) form.getPage()).createElement("input");
+        injected.setAttribute("type", "hidden");
+        injected.setAttribute("name", "mode");
+        injected.setAttribute("value", mode);
+        form.appendChild(injected);
     }
 
     /**
