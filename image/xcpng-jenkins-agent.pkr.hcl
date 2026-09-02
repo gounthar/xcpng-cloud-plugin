@@ -93,10 +93,30 @@ variable "preseed_url" {
   default     = ""
 }
 
+variable "iso_name" {
+  type        = string
+  default     = ""
+  description = <<-EOT
+      Name of an ISO VDI already present in sr_iso_name. Set it and the builder
+      uses that VDI in place: no download, no upload. Leave empty to have the ISO
+      fetched from iso_url and uploaded, which is the behaviour without this.
+
+      Useful where uploading is not possible: an SR of type `iso` is populated by
+      dropping the file on the share and running `xe sr-scan`, and import_raw_vdi
+      against one fails with VDI_IO_ERROR.
+
+      NOTE: this does not stop the builder from destroying the ISO VDI at cleanup,
+      despite what the builder's PreserveVdi flag suggests. Reported measured on
+      XCP-ng 8.3 against a shared NFS ISO SR: the file is removed on both the
+      success and the failure path. Not yet reproduced here, and not yet filed.
+    EOT
+}
+
 source "xenserver-iso" "jenkins-agent" {
   iso_url = "https://cdimage.debian.org/cdimage/archive/${var.debian_version}/amd64/iso-cd/debian-${var.debian_version}-amd64-netinst.iso"
   // From that directory's SHA256SUMS. Never hand-written.
   iso_checksum = "sha256:0b813535dd76f2ea96eff908c65e8521512c92a0631fd41c95756ffd7d4896dc"
+  iso_name     = var.iso_name
 
   remote_host     = var.remote_host
   remote_username = var.remote_username
@@ -155,6 +175,15 @@ source "xenserver-iso" "jenkins-agent" {
 
 build {
   sources = ["source.xenserver-iso.jenkins-agent"]
+
+  # Operator trust anchors. The directory is committed empty; anything dropped
+  # into it before a build is installed by provision.sh. Uploading the
+  # directory rather than a variable means no path juggling and no default
+  # that has to point somewhere.
+  provisioner "file" {
+    source      = "image/ca-certificates"
+    destination = "/tmp"
+  }
 
   // Everything durable about the image. Exercised by CI on every push, in a debian:13 container.
   provisioner "shell" {
