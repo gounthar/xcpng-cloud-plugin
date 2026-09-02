@@ -21,17 +21,31 @@
 -->
 <j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
 
+<<<<<<< HEAD
   <f:entry title="${%Description}" field="nodeDescription">
     <f:textbox />
   </f:entry>
-
-  <f:entry title="${%Labels}" field="labelString">
-    <f:textbox />
-  </f:entry>
-
+  
   <f:slave-mode name="mode" node="${it}" />
 
   <f:descriptorList title="${%Node Properties}" field="nodeProperties"
                     descriptors="${h.getNodePropertyDescriptors(descriptor.clazz)}" />
 
 </j:jelly>
+=======
+    <f:entry title="${%Description}" field="nodeDescription">
+        <f:textarea />
+    </f:entry>
+
+    <f:entry title="${%Usage}">
+        <f:slave-mode name="mode" node="${it}" />
+    </f:entry>
+
+    <f:section title="${%Node Properties}">
+        <f:descriptorList
+            descriptors="${nodePropertiesDescriptors}"
+            instances="${nodeProperties}" />
+    </f:section>
+
+</j:jelly>
+>>>>>>> 2b1333c (Fix XcpngAgent configuration fields)
