@@ -18,7 +18,12 @@ on:
   pull_request_target:
     types: [closed]
 
+# Both, following actions/first-interaction, which declares the same pair for the same job. The
+# endpoint is /issues/{n}/comments even when the subject is a pull request, and the docs do not say
+# plainly which of the two covers that case. Getting it wrong fails the comment silently, on a
+# first-time contributor's merge, which is the one moment this exists for.
 permissions:
+  issues: write
   pull-requests: write
 
 jobs:
@@ -54,7 +59,9 @@ jobs:
             }
 
             core.info(`First merged pull request for ${author}; commenting on #${number}.`);
-            const goodFirstIssue = `${context.payload.repository.html_url}/labels/good%20first%20issue`;
+            const repoUrl = context.payload.repository.html_url;
+            const goodFirstIssue = `${repoUrl}/labels/good%20first%20issue`;
+            const contributing = `${repoUrl}/blob/main/CONTRIBUTING.md`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -63,8 +70,8 @@ jobs:
                 `Thanks @${author} — that is your first change merged here, and it is in.`,
                 '',
                 `If you want another, the [\`good first issue\`](${goodFirstIssue}) label is where the`,
-                'small, self-contained ones live, and [`CONTRIBUTING.md`](../blob/main/CONTRIBUTING.md)',
-                'has the build and test commands. Asking on an issue before you write any code is',
+                `small, self-contained ones live, and [\`CONTRIBUTING.md\`](${contributing}) has the`,
+                'build and test commands. Asking on an issue before you write any code is',
                 'welcome, and usually saves you a round of review.',
               ].join('\n'),
             });
