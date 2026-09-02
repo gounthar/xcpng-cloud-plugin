@@ -29,13 +29,32 @@ categories:
     when:
       labels:
         - documentation
+  # `java` is deliberately absent from this list, and putting it back reintroduces a
+  # published defect. Release Drafter files a pull request under *every* category it
+  # matches -- the `break` in categorize-pull-requests.ts fires only when a category sets
+  # `exclusive` -- and every Java code change here carries `java` plus `bug` or
+  # `enhancement`. Nine entries in the 0.3.0 draft therefore rendered twice, under Bug
+  # fixes or Features and again here. The other three labels say what kind of change it
+  # is; `java` says what it touched, which is true of nearly every pull request. See #177.
   - title: Build, CI, and dependencies
     when:
       labels:
         - build
         - dependencies
         - github_actions
-        - java
+
+  # The catch-all. A `changelog` category with a title and no `when:` parses to `when: []`
+  # (config/parse-categories.ts), which is exactly what categorize-pull-requests.ts looks
+  # for when it picks `uncategorizedCategoryIndex`. Without it an unlabelled pull request
+  # goes to the uncategorized list, which generate-changelog.ts pushes *before* the loop
+  # over categories -- so it renders above every heading with nothing above it, and reads
+  # as a truncated changelog. Three entries did that in the 0.3.0 draft. See #177.
+  #
+  # It cannot move the version. A changelog category's `semver-increment` defaults to
+  # patch and contributes only for pull requests that reach it, and the trailing
+  # version-resolver below already falls back to patch, so the Math.max in
+  # resolve-version-increment.ts is a no-op here.
+  - title: Other changes
 
   - type: 'pre-exclude'
     when:
