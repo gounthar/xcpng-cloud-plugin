@@ -240,6 +240,10 @@ class XcpngAgentReconfigureTest {
      * <p>Posting the field is not a lesser substitute for driving the control. It is the threat model
      * written down: neither {@code readonly} nor an absent control constrains a client that simply posts.
      *
+     * <p>The field is a plain input rather than a hidden one, and the type is beside the point: what has to
+     * be true is that HtmlUnit treats it as a control it will submit. It does, measured —
+     * {@code form.getInputsByName("mode")} finds exactly this one field carrying the value.
+     *
      * <p>That the injected field really is submitted is established by mutation rather than by assumption.
      * With {@code reconfigure} changed to bind the mode from the form, this test fails with
      * <em>expected EXCLUSIVE but was NORMAL</em>, which can only happen if the value reached the submitted
@@ -256,8 +260,12 @@ class XcpngAgentReconfigureTest {
         // submitted JSON ambiguous, and knowing exactly what was posted is the entire point.
         form.getSelectsByName("mode").forEach(DomNode::remove);
 
+        // A plain input, on purpose, and this is the second thing that must not be tidied. Setting the
+        // type on a detached element does nothing: HtmlUnit swaps the backing class when an input changes
+        // type, and with no parent there is nothing to swap, so the attribute is dropped and the element
+        // stays an HtmlTextInput. The setAttribute("type", "hidden") that used to sit here read as if the
+        // field were hidden and did not make it so.
         DomElement injected = ((HtmlPage) form.getPage()).createElement("input");
-        injected.setAttribute("type", "hidden");
         injected.setAttribute("name", "mode");
         injected.setAttribute("value", mode);
         form.appendChild(injected);
