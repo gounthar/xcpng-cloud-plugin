@@ -229,13 +229,21 @@ class XcpngAgentReconfigureTest {
     }
 
     /**
-     * Put {@code mode} on the form and submit it, through the Usage selector when the view offers one and
-     * as an injected field when it does not.
+     * Put {@code mode} on the form as a posted field, dropping the Usage selector first if the view still
+     * renders one.
      *
-     * <p>Never both: two fields of the same name would leave the submitted JSON ambiguous, and the point of
-     * the test is to know exactly what was posted. The injected path is not a lesser substitute either, it
-     * is the threat model written down. {@code readonly} and an absent control both constrain a browser and
-     * neither constrains a client that simply posts the field.
+     * <p>Always this way round, never branching on whether the control is there. Branching left the injected
+     * half unexercised on a tree that still has the selector, which is exactly the half that has to keep
+     * working when the control goes. Removing rather than reusing also keeps it to a single field of that
+     * name; two would leave the submitted JSON ambiguous, and knowing what was posted is the whole point.
+     *
+     * <p>Posting the field is not a lesser substitute for driving the control. It is the threat model
+     * written down: neither {@code readonly} nor an absent control constrains a client that simply posts.
+     *
+     * <p>That the injected field really is submitted is established by mutation rather than by assumption.
+     * With {@code reconfigure} changed to bind the mode from the form, this test fails with
+     * <em>expected EXCLUSIVE but was NORMAL</em>, which can only happen if the value reached the submitted
+     * JSON.
      */
     @SuppressWarnings("SameParameterValue")
     private static void putMode(HtmlForm form, String mode) {
