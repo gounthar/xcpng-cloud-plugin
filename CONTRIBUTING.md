@@ -88,6 +88,20 @@ plausible-sounding descriptions in prose is how that kind of thing survives revi
 
 - Branch off `main`; never commit to it directly. `type/short-description`, matching the commit
   type: `feat/`, `fix/`, `docs/`, `refactor/`, `build/`, `ci/`, `test/`, `chore/`.
+- **Do not open a pull request from your fork's own `main`.** It is reviewable and it will
+  merge, so this is a request rather than a rule, and the cost falls on you rather than on us:
+  while the pull request is open your default branch is pinned to it, so you cannot start
+  anything else from a clean base without disturbing the review, and a maintainer pushing a
+  fixup writes to your `main`. Moving an existing one is three commands and the pull request
+  follows the push:
+
+  ```console
+  $ git switch -c fix/short-description
+  $ git branch -f main origin/main
+  $ git push -u origin fix/short-description
+  ```
+
+  Then change the head branch with the *Edit* button beside the pull request title.
 - [Conventional commits](https://www.conventionalcommits.org/): `type(scope): imperative summary`,
   subject under 72 characters. Put the reasoning in the body — why, and which alternatives you
   rejected. The pull request gets read once; `git log` and `git blame` get read for years.
