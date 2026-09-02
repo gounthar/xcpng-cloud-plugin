@@ -13,39 +13,21 @@
   file builds its launcher dropdown from ${computerLauncherDescriptors}, the list #158 took this
   plugin's launcher out of, so including it would offer a control whose current value is missing.
 
-  No numExecutors and no remoteFS either, which is where this departs from kubernetes-plugin's
-  otherwise identical view. Both are fixed on this agent: see XcpngAgent.EXECUTORS_PER_AGENT, pinned
-  to 1 in #23 because the reap fires on build completion and a second executor would have its VM
-  destroyed under it, and XcpngAgent.REMOTE_FS, which the golden image is built around. Rendering
-  them as editable inputs invites a misconfiguration whose symptom is an unexplained channel loss.
+  No numExecutors and no remoteFS either. Both are fixed on this agent by design.
 -->
 <j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
 
-<<<<<<< HEAD
   <f:entry title="${%Description}" field="nodeDescription">
+    <f:textarea />
+  </f:entry>
+
+  <f:entry title="${%Labels}" field="labelString">
     <f:textbox />
   </f:entry>
-  
+
   <f:slave-mode name="mode" node="${it}" />
 
   <f:descriptorList title="${%Node Properties}" field="nodeProperties"
                     descriptors="${h.getNodePropertyDescriptors(descriptor.clazz)}" />
 
 </j:jelly>
-=======
-    <f:entry title="${%Description}" field="nodeDescription">
-        <f:textarea />
-    </f:entry>
-
-    <f:entry title="${%Usage}">
-        <f:slave-mode name="mode" node="${it}" />
-    </f:entry>
-
-    <f:section title="${%Node Properties}">
-        <f:descriptorList
-            descriptors="${nodePropertiesDescriptors}"
-            instances="${nodeProperties}" />
-    </f:section>
-
-</j:jelly>
->>>>>>> 2b1333c (Fix XcpngAgent configuration fields)
