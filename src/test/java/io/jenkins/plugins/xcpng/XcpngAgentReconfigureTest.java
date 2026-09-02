@@ -10,10 +10,10 @@ import hudson.slaves.EnvironmentVariablesNodeProperty;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.List;
 import org.htmlunit.html.DomElement;
+import org.htmlunit.html.DomNode;
 import org.htmlunit.html.HtmlForm;
 import org.htmlunit.html.HtmlInput;
 import org.htmlunit.html.HtmlPage;
-import org.htmlunit.html.HtmlSelect;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -207,11 +207,24 @@ class XcpngAgentReconfigureTest {
 
         HtmlForm form = configForm(r, AGENT_NAME);
         putMode(form, "NORMAL");
+
+        // The payload really carries NORMAL. Without this the test could pass because nothing was
+        // submitted at all, which is how the executor-count test in #187 turned out to pin nothing.
+        List<String> modeFields = form.getElementsByAttribute("input", "name", "mode").stream()
+                .map(e -> e.getAttribute("value"))
+                .toList();
+        assertEquals(List.of("NORMAL"), modeFields, "exactly one mode field, carrying NORMAL");
+
+        // A positive control in the same submit: something the form IS allowed to change must change,
+        // or an unchanged mode proves only that the submit never happened.
+        form.getTextAreaByName("_.nodeDescription").setText("mode probe");
         r.submit(form);
 
+        XcpngAgent after = nodeInJenkins(r);
+        assertEquals("mode probe", after.getNodeDescription(), "the submit has to have taken effect");
         assertEquals(
                 XcpngAgent.USAGE_MODE,
-                nodeInJenkins(r).getMode(),
+                after.getMode(),
                 "NORMAL would make every unlabeled build eligible for a single-use VM");
     }
 
@@ -226,11 +239,15 @@ class XcpngAgentReconfigureTest {
      */
     @SuppressWarnings("SameParameterValue")
     private static void putMode(HtmlForm form, String mode) {
-        HtmlSelect selector = form.getSelectsByName("mode").stream().findFirst().orElse(null);
-        if (selector != null) {
-            selector.getOptionByValue(mode).setSelected(true);
-            return;
-        }
+        // Drop the rendered control if the view still has one, then post the field directly. One path,
+        // so it is exercised on every run rather than only on whichever tree the test happens to meet:
+        // branching on the selector left the injected half dead on a tree that still renders it, which
+        // is the half that has to keep working when #186 removes the control.
+        //
+        // Removing rather than reusing also keeps it to a single field of that name. Two would leave the
+        // submitted JSON ambiguous, and knowing exactly what was posted is the entire point.
+        form.getSelectsByName("mode").forEach(DomNode::remove);
+
         DomElement injected = ((HtmlPage) form.getPage()).createElement("input");
         injected.setAttribute("type", "hidden");
         injected.setAttribute("name", "mode");
