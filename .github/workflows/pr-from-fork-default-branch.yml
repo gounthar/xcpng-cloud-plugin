@@ -21,7 +21,10 @@ on:
   pull_request_target:
     types: [opened]
 
+# Both, matching actions/first-interaction and the first-merge greeting: the comment goes through
+# /issues/{n}/comments even for a pull request, and too few permissions fails it silently.
 permissions:
+  issues: write
   pull-requests: write
 
 jobs:
@@ -43,6 +46,8 @@ jobs:
             }
 
             const suggested = 'fix/short-description';
+            const contributing =
+              `${context.payload.repository.html_url}/blob/main/CONTRIBUTING.md#branches-commits-and-pull-requests`;
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -65,7 +70,7 @@ jobs:
                 '',
                 'Then change the head branch on this pull request with the *Edit* button beside its title.',
                 '',
-                '[`CONTRIBUTING.md`](../blob/main/CONTRIBUTING.md#branches-commits-and-pull-requests) has the',
-                'branch naming we use. Thanks for the contribution.',
+                `[\`CONTRIBUTING.md\`](${contributing}) has the branch naming we use.`,
+                'Thanks for the contribution.',
               ].join('\n'),
             });
