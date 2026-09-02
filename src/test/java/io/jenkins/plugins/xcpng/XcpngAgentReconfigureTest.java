@@ -86,10 +86,7 @@ class XcpngAgentReconfigureTest {
     private static HtmlForm configForm(JenkinsRule r, String agentName) throws Exception {
         JenkinsRule.WebClient wc = r.createWebClient();
         wc.getOptions().setTimeout(PAGE_TIMEOUT_MILLIS);
-        long started = System.currentTimeMillis();
-        HtmlPage page = wc.goTo("computer/" + agentName + "/configure");
-        System.out.println("configure page loaded in " + (System.currentTimeMillis() - started) + " ms");
-        return page.getFormByName("config");
+        return wc.goTo("computer/" + agentName + "/configure").getFormByName("config");
     }
 
     private static XcpngAgent nodeInJenkins(JenkinsRule r) {
@@ -182,6 +179,32 @@ class XcpngAgentReconfigureTest {
                 XcpngAgent.EXECUTORS_PER_AGENT,
                 nodeInJenkins(r).getNumExecutors(),
                 "the form is a request, not an authority");
+    }
+
+    /**
+     * A submitted usage mode does not reach the node either, for the same reason as the executor count and
+     * with more teeth. {@link XcpngAgent#USAGE_MODE} is {@code EXCLUSIVE} because {@code NORMAL} means "use
+     * this node as much as possible", which makes any unlabeled build eligible for a single-use VM: it takes
+     * a warm spare held for a label, and the VM is destroyed when that build finishes, so the labeled build
+     * the pool exists for then waits for a cold clone.
+     *
+     * <p>{@code readResolve} already re-asserts the mode on reload, which covers a controller restart and
+     * nothing else. Until Save worked there was no other way in. Making it work opened one, so this closes
+     * it at the same layer: the mode is re-asserted rather than read, and the run that added this test
+     * against the unfixed code failed here with {@code NORMAL}, which is what makes it worth keeping.
+     */
+    @Test
+    void aSubmittedUsageModeIsIgnored(JenkinsRule r) throws Exception {
+        registeredAgent(r);
+
+        HtmlForm form = configForm(r, AGENT_NAME);
+        form.getSelectByName("mode").getOptionByValue("NORMAL").setSelected(true);
+        r.submit(form);
+
+        assertEquals(
+                XcpngAgent.USAGE_MODE,
+                nodeInJenkins(r).getMode(),
+                "NORMAL would make every unlabeled build eligible for a single-use VM");
     }
 
     /**

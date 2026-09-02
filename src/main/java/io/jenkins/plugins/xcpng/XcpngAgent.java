@@ -359,10 +359,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * disks would run until an operator noticed them by hand. A 500 on Save is a much smaller bug than
      * a leaked VM, which is why this is not a matter of getting the constructor annotated.
      *
-     * <p>So the four editable fields are applied to this instance and this instance is returned. The
-     * executor count is re-asserted afterwards rather than read back, because a submitted form is a
-     * request and not an authority: {@code readonly} on an input keeps an operator from changing the
-     * value in a browser, and says nothing about what an arbitrary POST may carry.
+     * <p>So the three genuinely editable fields are applied to this instance and this instance is
+     * returned. The executor count and the usage mode are re-asserted afterwards rather than read back,
+     * because a submitted form is a request and not an authority: {@code readonly} on an input keeps an
+     * operator from changing a value in a browser, and says nothing about what an arbitrary POST carries.
      *
      * <p>{@code numExecutors} still has to be <em>on</em> the form even though nothing here reads it.
      * {@code Computer.doConfigSubmit} reads it out of the submitted JSON before it ever calls this
@@ -376,13 +376,6 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         }
 
         setNodeDescription(form.optString("nodeDescription", getNodeDescription()));
-
-        String submittedMode = form.optString("mode", getMode().name());
-        try {
-            setMode(Mode.valueOf(submittedMode));
-        } catch (IllegalArgumentException e) {
-            throw new Descriptor.FormException("Unknown usage mode: " + submittedMode, "mode");
-        }
 
         // An absent nodeProperties key means the form carried no properties, which is how core reads it
         // too: its rebuild binds the field from the same JSON and leaves an unbound list empty. Passing
@@ -398,8 +391,19 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
             throw new Descriptor.FormException(e, "labelString");
         }
 
-        // Not read from the form. #23 pins this at one because a second executor would have the VM
-        // destroyed under it the moment the first build finished.
+        // Neither of the next two is read from the form, for the same reason and with the same ordering
+        // requirement: they come after the assignments above, so a future blanket bind cannot beat them.
+        //
+        // The mode is the one with teeth. NORMAL means "use this node as much as possible", which makes any
+        // unlabeled build eligible for a single-use VM: it takes a warm spare held for a label, and the VM is
+        // destroyed when that build finishes, so the labeled build the pool exists for waits for a cold clone
+        // instead. readResolve already re-asserts USAGE_MODE, but that covers a controller restart and
+        // nothing else. Binding the submitted value here would have made the invariant editable at runtime,
+        // which it was not before, because Save did not work at all.
+        setMode(USAGE_MODE);
+
+        // #23 pins this at one because a second executor would have the VM destroyed under it the moment the
+        // first build finished.
         //
         // Deliberately kept even though nothing above binds numExecutors, which makes this a no-op as the
         // method stands -- deleting it was measured against XcpngAgentReconfigureTest and changed no result.
