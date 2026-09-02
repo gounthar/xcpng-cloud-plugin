@@ -9,6 +9,7 @@ import hudson.model.TaskListener;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.Cloud;
+import hudson.slaves.NodeProperty;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import java.io.IOException;
@@ -16,8 +17,10 @@ import java.util.Collections;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import net.sf.json.JSONObject;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.jenkinsci.plugins.cloudstats.TrackedItem;
+import org.kohsuke.stapler.StaplerRequest2;
 
 /**
  * An ephemeral inbound agent backed by one cloned XCP-ng VM.
@@ -340,6 +343,73 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         reloaded = true;
         setMode(USAGE_MODE);
         return super.readResolve();
+    }
+
+    /**
+     * Apply an operator's edits to this node, instead of rebuilding the node from the submitted form.
+     *
+     * <p>The inherited implementation ends in {@code getDescriptor().newInstance(req, form)}, which
+     * constructs a fresh node out of the form fields alone and hands it to {@code Nodes.replaceNode},
+     * which discards the old one. That cannot work here, and the failure would be silent rather than
+     * loud. Everything this agent needs in order to find and destroy its VM — {@link #cloudName},
+     * {@link #vmRef}, {@link #activityId} and the three connection parameters — is final, is absent
+     * from the form, and is not derivable from it. The replacement node would come back with a null
+     * VM reference, so the only record of which clone belongs to this node would go into the bin with
+     * the node it was replacing: {@link #_terminate} would find nothing to destroy, and the VM and its
+     * disks would run until an operator noticed them by hand. A 500 on Save is a much smaller bug than
+     * a leaked VM, which is why this is not a matter of getting the constructor annotated.
+     *
+     * <p>So the four editable fields are applied to this instance and this instance is returned. The
+     * executor count is re-asserted afterwards rather than read back, because a submitted form is a
+     * request and not an authority: {@code readonly} on an input keeps an operator from changing the
+     * value in a browser, and says nothing about what an arbitrary POST may carry.
+     *
+     * <p>{@code numExecutors} still has to be <em>on</em> the form even though nothing here reads it.
+     * {@code Computer.doConfigSubmit} reads it out of the submitted JSON before it ever calls this
+     * method, and reads it with {@code getString}, which throws on an absent key rather than returning
+     * null — so a form without the field fails with a stack trace two frames above this one (#185).
+     */
+    @Override
+    public Node reconfigure(@NonNull StaplerRequest2 req, JSONObject form) throws Descriptor.FormException {
+        if (form == null) {
+            return null;
+        }
+
+        setNodeDescription(form.optString("nodeDescription", getNodeDescription()));
+
+        String submittedMode = form.optString("mode", getMode().name());
+        try {
+            setMode(Mode.valueOf(submittedMode));
+        } catch (IllegalArgumentException e) {
+            throw new Descriptor.FormException("Unknown usage mode: " + submittedMode, "mode");
+        }
+
+        // An absent nodeProperties key means the form carried no properties, which is how core reads it
+        // too: its rebuild binds the field from the same JSON and leaves an unbound list empty. Passing
+        // an empty object rather than null keeps that behaviour and keeps rebuild off a null reference.
+        JSONObject properties = form.optJSONObject("nodeProperties");
+        try {
+            setLabelString(form.optString("labelString", getLabelString()));
+            getNodeProperties().rebuild(req, properties == null ? new JSONObject() : properties, NodeProperty.all());
+        } catch (IOException e) {
+            // Both of these persist as they go, so an IOException here is the node's own config.xml
+            // failing to write. Surfacing it on the field keeps the operator on the form with a message
+            // rather than dropping them on a stack trace.
+            throw new Descriptor.FormException(e, "labelString");
+        }
+
+        // Not read from the form. #23 pins this at one because a second executor would have the VM
+        // destroyed under it the moment the first build finished.
+        //
+        // Deliberately kept even though nothing above binds numExecutors, which makes this a no-op as the
+        // method stands -- deleting it was measured against XcpngAgentReconfigureTest and changed no result.
+        // It is here for the refactor that replaces the assignments above with a blanket
+        // req.bindJSON(this, form): that binds every setter Slave exposes, numExecutors among them, and the
+        // submitted form does carry whatever a caller chose to put there. Position matters more than the
+        // call -- it has to stay after the field assignments, not before them.
+        setNumExecutors(EXECUTORS_PER_AGENT);
+
+        return this;
     }
 
     @Override
