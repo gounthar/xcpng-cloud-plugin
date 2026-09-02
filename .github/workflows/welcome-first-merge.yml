@@ -1,0 +1,70 @@
+---
+# Thank a contributor the first time one of their pull requests is merged here.
+#
+# The trigger is the merge, not the open. A greeting on `opened` costs a newcomer a notification
+# before anyone has looked at their work, and says nothing they did not already know. A note on the
+# merge lands when there is something to thank them for, and it is the moment they are most likely
+# to come back.
+#
+# `pull_request_target` rather than `pull_request` because the token on a fork's `pull_request` run
+# is read-only, so the comment would silently never post. The usual danger of `pull_request_target`
+# is that it runs with a writable token in the base repo's context while checking out the fork's
+# code; this job checks out nothing and runs no code from the pull request, so that danger is not
+# present. Keep it that way: never add `actions/checkout` here.
+
+name: welcome first merge
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  thank:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment when this is the author's first merged pull request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+            const number = context.payload.pull_request.number;
+
+            if (context.payload.pull_request.user.type === 'Bot') {
+              core.info(`${author} is a bot; nothing to say.`);
+              return;
+            }
+
+            // Ask for this author's merged pull requests and discard the one that just merged,
+            // rather than comparing a count against 1. The search index lags a merge by seconds to
+            // minutes, so the pull request that triggered this run may or may not be in the answer
+            // yet, and a count is a different number in each case. Anything OTHER than this one is
+            // proof they have been here before, and that older record is indexed either way.
+            const { data } = await github.rest.search.issuesAndPullRequests({
+              q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${author}`,
+              per_page: 100,
+            });
+            const earlier = data.items.filter((item) => item.number !== number);
+            if (earlier.length > 0) {
+              core.info(`${author} has ${earlier.length} earlier merged pull request(s); not a first.`);
+              return;
+            }
+
+            core.info(`First merged pull request for ${author}; commenting on #${number}.`);
+            const goodFirstIssue = `${context.payload.repository.html_url}/labels/good%20first%20issue`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: number,
+              body: [
+                `Thanks @${author} — that is your first change merged here, and it is in.`,
+                '',
+                `If you want another, the [\`good first issue\`](${goodFirstIssue}) label is where the`,
+                'small, self-contained ones live, and [`CONTRIBUTING.md`](../blob/main/CONTRIBUTING.md)',
+                'has the build and test commands. Asking on an issue before you write any code is',
+                'welcome, and usually saves you a round of review.',
+              ].join('\n'),
+            });
