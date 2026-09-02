@@ -88,11 +88,11 @@ plausible-sounding descriptions in prose is how that kind of thing survives revi
 
 - Branch off `main`; never commit to it directly. `type/short-description`, matching the commit
   type: `feat/`, `fix/`, `docs/`, `refactor/`, `build/`, `ci/`, `test/`, `chore/`.
-- **Do not open a pull request from your fork's own `main`.** It is reviewable and it will
-  merge, so this is a request rather than a rule, and the cost falls on you rather than on us:
-  while the pull request is open your default branch is pinned to it, so you cannot start
-  anything else from a clean base without disturbing the review, and a maintainer pushing a
-  fixup writes to your `main`. Moving an existing one is three commands and the pull request
+- **Do not open a pull request from your fork's default branch** (usually `main`). It is
+  reviewable and it will merge, so this is a request rather than a rule, and the cost falls on
+  you rather than on us: while the pull request is open that branch is pinned to it, so you
+  cannot start anything else from a clean base without disturbing the review, and a maintainer
+  pushing a fixup writes to it. Moving an existing one is two commands and the pull request
   follows the push:
 
   ```console
