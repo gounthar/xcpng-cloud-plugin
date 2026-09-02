@@ -487,10 +487,20 @@ NETPLAN
 # Operator-supplied trust anchors, uploaded by the Packer file provisioner.
 # Empty on a stock build, in which case this returns without touching anything.
 #
-# Installed into BOTH stores on purpose. Java does not read the system store, so
-# an anchor added only there leaves an image where curl succeeds against the
-# controller and the agent still cannot connect — a failure that gives no hint
-# where to look.
+# Both stores have to end up holding the anchor. Java does not read the system
+# store, so an anchor that reaches only there leaves an image where curl succeeds
+# against the controller and the agent still cannot connect — a failure that
+# gives no hint where to look.
+#
+# Only the system store is written here. The Java side is populated by
+# update-ca-certificates(8), through the hook /etc/ca-certificates/update.d/adoptium-cacerts
+# that adoptium-ca-certificates ships and install_java pulls in with Temurin. That
+# hook regenerates the Adoptium truststore from the system store under an alias of
+# its own making. This function used to import each anchor with keytool as well,
+# and the hook discarded it a few lines later, so that import was doing nothing.
+# Because the route is somebody else's hook rather than a call of ours, whether it
+# worked is verified at the end rather than assumed. See #181.
+#
 # Fixed, not taken from the environment. The Packer file provisioner uploads to a
 # path this script does not get to choose, so an override bought nothing, and it
 # is read below by an rm -rf running as root: EXTRA_CA_DIR=/etc would have taken
@@ -567,7 +577,7 @@ install_extra_ca_certificates() {
     command -v update-ca-certificates >/dev/null 2>&1 \
         || die "update-ca-certificates not found. Install it with: apt-get install -y ca-certificates"
 
-    local cert alias count seen=" "
+    local cert alias count fingerprint seen=" "
     for cert in "${certs[@]}"; do
         alias="$(basename "$cert")"; alias="${alias%.*}"
 
@@ -597,23 +607,27 @@ install_extra_ca_certificates() {
 
         log "installing trust anchor ${alias} into the system store"
         install -m 0644 "$cert" "/usr/local/share/ca-certificates/${alias}.crt"
-
-        # Left as the author wrote it. Comparing the alias's contents looks like the
-        # obvious hardening here, and it is not: update-ca-certificates below
-        # regenerates the Adoptium truststore from the system store and discards
-        # whatever keytool put in it, alias and all. See the issue linked from the
-        # review before changing this.
-        if keytool -list -cacerts -storepass changeit -alias "$alias" >/dev/null 2>&1; then
-            log "trust anchor ${alias} already in the Java truststore"
-        else
-            log "installing trust anchor ${alias} into the Java truststore"
-            keytool -importcert -noprompt -trustcacerts \
-                -alias "$alias" -file "$cert" \
-                -cacerts -storepass changeit
-        fi
     done
 
     update-ca-certificates
+
+    # Match on the SHA-256 fingerprint rather than the alias. The hook names the
+    # entry itself -- ci-root.crt lands as `ciroot` -- so the alias is not ours to
+    # predict, and an alias that happens to exist proves nothing about which
+    # certificate sits under it.
+    for cert in "${certs[@]}"; do
+        alias="$(basename "$cert")"; alias="${alias%.*}"
+        fingerprint="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | cut -d= -f2)"
+        if keytool -list -cacerts -storepass changeit 2>/dev/null | grep -qF "$fingerprint"; then
+            log "trust anchor ${alias} reached the Java truststore"
+        else
+            # Reached if install_java stops installing Temurin from packages.adoptium.net,
+            # or that package drops the hook. Failing the build here is the point: the
+            # alternative is a green build producing an image whose agents cannot connect,
+            # which is the silence this whole function exists to prevent.
+            die "${alias} did not reach the Java truststore; update-ca-certificates ran, but the Adoptium hook did not place it"
+        fi
+    done
     return 0
 }
 
