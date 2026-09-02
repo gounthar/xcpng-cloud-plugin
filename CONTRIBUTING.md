@@ -97,11 +97,13 @@ plausible-sounding descriptions in prose is how that kind of thing survives revi
 
   ```console
   $ git switch -c fix/short-description
-  $ git branch -f main origin/main
   $ git push -u origin fix/short-description
   ```
 
-  Then change the head branch with the *Edit* button beside the pull request title.
+  Then change the head branch with the *Edit* button beside the pull request title. Tidying your
+  fork's default branch afterwards is optional and separate: it needs a remote pointing at this
+  repository and a force push over your own fork, so it is worth doing deliberately rather than as
+  part of moving a pull request.
 - [Conventional commits](https://www.conventionalcommits.org/): `type(scope): imperative summary`,
   subject under 72 characters. Put the reasoning in the body — why, and which alternatives you
   rejected. The pull request gets read once; `git log` and `git blame` get read for years.
