@@ -9,6 +9,8 @@ import hudson.model.Node;
 import hudson.slaves.EnvironmentVariablesNodeProperty;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.List;
+import org.htmlunit.html.DomElement;
+import org.htmlunit.html.DomNode;
 import org.htmlunit.html.HtmlForm;
 import org.htmlunit.html.HtmlInput;
 import org.htmlunit.html.HtmlPage;
@@ -192,19 +194,73 @@ class XcpngAgentReconfigureTest {
      * nothing else. Until Save worked there was no other way in. Making it work opened one, so this closes
      * it at the same layer: the mode is re-asserted rather than read, and the run that added this test
      * against the unfixed code failed here with {@code NORMAL}, which is what makes it worth keeping.
+     *
+     * <p>Deliberately indifferent to whether the page still renders a Usage control. The first version of
+     * this test reached for {@code getSelectByName("mode")}, which pinned the presence of the selector
+     * rather than the behaviour, and broke #186 when it removed the control this very invariant makes
+     * pointless. What is being asserted is that a submitted mode does not reach the node, and that has to
+     * hold whether the value arrives from a rendered selector or from a POST that never saw the page.
      */
     @Test
     void aSubmittedUsageModeIsIgnored(JenkinsRule r) throws Exception {
         registeredAgent(r);
 
         HtmlForm form = configForm(r, AGENT_NAME);
-        form.getSelectByName("mode").getOptionByValue("NORMAL").setSelected(true);
+        putMode(form, "NORMAL");
+
+        // The payload really carries NORMAL. Without this the test could pass because nothing was
+        // submitted at all, which is how the executor-count test in #187 turned out to pin nothing.
+        List<String> modeFields = form.getElementsByAttribute("input", "name", "mode").stream()
+                .map(e -> e.getAttribute("value"))
+                .toList();
+        assertEquals(List.of("NORMAL"), modeFields, "exactly one mode field, carrying NORMAL");
+
+        // A positive control in the same submit: something the form IS allowed to change must change,
+        // or an unchanged mode proves only that the submit never happened.
+        form.getTextAreaByName("_.nodeDescription").setText("mode probe");
         r.submit(form);
 
+        XcpngAgent after = nodeInJenkins(r);
+        assertEquals("mode probe", after.getNodeDescription(), "the submit has to have taken effect");
         assertEquals(
                 XcpngAgent.USAGE_MODE,
-                nodeInJenkins(r).getMode(),
+                after.getMode(),
                 "NORMAL would make every unlabeled build eligible for a single-use VM");
+    }
+
+    /**
+     * Put {@code mode} on the form as a posted field, dropping the Usage selector first if the view still
+     * renders one.
+     *
+     * <p>Always this way round, never branching on whether the control is there. Branching left the injected
+     * half unexercised on a tree that still has the selector, which is exactly the half that has to keep
+     * working when the control goes. Removing rather than reusing also keeps it to a single field of that
+     * name; two would leave the submitted JSON ambiguous, and knowing what was posted is the whole point.
+     *
+     * <p>Posting the field is not a lesser substitute for driving the control. It is the threat model
+     * written down: neither {@code readonly} nor an absent control constrains a client that simply posts.
+     *
+     * <p>That the injected field really is submitted is established by mutation rather than by assumption.
+     * With {@code reconfigure} changed to bind the mode from the form, this test fails with
+     * <em>expected EXCLUSIVE but was NORMAL</em>, which can only happen if the value reached the submitted
+     * JSON.
+     */
+    @SuppressWarnings("SameParameterValue")
+    private static void putMode(HtmlForm form, String mode) {
+        // Drop the rendered control if the view still has one, then post the field directly. One path,
+        // so it is exercised on every run rather than only on whichever tree the test happens to meet:
+        // branching on the selector left the injected half dead on a tree that still renders it, which
+        // is the half that has to keep working when #186 removes the control.
+        //
+        // Removing rather than reusing also keeps it to a single field of that name. Two would leave the
+        // submitted JSON ambiguous, and knowing exactly what was posted is the entire point.
+        form.getSelectsByName("mode").forEach(DomNode::remove);
+
+        DomElement injected = ((HtmlPage) form.getPage()).createElement("input");
+        injected.setAttribute("type", "hidden");
+        injected.setAttribute("name", "mode");
+        injected.setAttribute("value", mode);
+        form.appendChild(injected);
     }
 
     /**
