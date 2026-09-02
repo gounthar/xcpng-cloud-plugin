@@ -43,18 +43,34 @@ jobs:
               return;
             }
 
-            // Ask for this author's merged pull requests and discard the one that just merged,
-            // rather than comparing a count against 1. The search index lags a merge by seconds to
-            // minutes, so the pull request that triggered this run may or may not be in the answer
-            // yet, and a count is a different number in each case. Anything OTHER than this one is
-            // proof they have been here before, and that older record is indexed either way.
-            const { data } = await github.rest.search.issuesAndPullRequests({
-              q: `repo:${context.repo.owner}/${context.repo.repo} is:pr is:merged author:${author}`,
+            // Read the repository's own list of closed pull requests, NOT the search API.
+            //
+            // Search was the first attempt and it is wrong here. Its index lags a merge by seconds to
+            // minutes, and discarding the triggering pull request only covers that one record. Two pull
+            // requests from the same new author merged inside the lag window would each find nothing
+            // indexed, so both runs would post a first-merge greeting and the contributor would be
+            // thanked twice for their first contribution. The pulls list is repository state rather than
+            // a view over it, so it is correct the instant the merge lands.
+            //
+            // Paginated with an early exit: a returning contributor is usually found on the first page,
+            // and only a genuine first-timer walks the whole list. That is the expensive case and it is
+            // the one worth being certain about.
+            let earlier = null;
+            for await (const page of github.paginate.iterator(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'closed',
               per_page: 100,
-            });
-            const earlier = data.items.filter((item) => item.number !== number);
-            if (earlier.length > 0) {
-              core.info(`${author} has ${earlier.length} earlier merged pull request(s); not a first.`);
+              sort: 'updated',
+              direction: 'desc',
+            })) {
+              earlier = page.data.find(
+                (pr) => pr.number !== number && pr.merged_at && pr.user && pr.user.login === author,
+              );
+              if (earlier) break;
+            }
+            if (earlier) {
+              core.info(`${author} already had #${earlier.number} merged; not a first.`);
               return;
             }
 
