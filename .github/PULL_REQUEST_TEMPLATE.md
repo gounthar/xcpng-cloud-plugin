@@ -19,7 +19,7 @@
 
 ### Checklist
 
-- [ ] Branched off `main`, not committing to it directly
+- [ ] Opened from a branch, not from your fork's default branch (see CONTRIBUTING.md for why, and how to move it)
 - [ ] The title reads as the changelog entry it will become, and the pull request is labelled
 - [ ] `mvn spotless:apply` run, if this touches `src/` or `pom.xml`
 - [ ] `mvn -B -ntp verify` passes locally
