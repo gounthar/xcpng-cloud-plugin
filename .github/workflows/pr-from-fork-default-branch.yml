@@ -40,7 +40,21 @@ jobs:
             const branch = head.ref;
             const defaultBranch = head.repo.default_branch;
 
+            // A ref name is attacker-controlled and git permits more than it looks. check-ref-format
+            // rules out space, ~ ^ : ? * [ \ and control characters, and says nothing about backticks,
+            // brackets or @ signs. So a fork can legitimately push a branch whose name closes the inline
+            // code span below and continues in Markdown, in a comment this repository's own token posts:
+            // an @mention that notifies people, or a [link](...) pointing anywhere.
+            //
+            // Whitelist rather than strip, because the blacklist is the thing that turned out to be
+            // incomplete. Everything outside a normal ref alphabet becomes a question mark, which keeps
+            // ordinary names untouched and makes a hostile one visibly odd instead of active.
+            const md = (s) => String(s).replace(/[^\w./-]/g, '?');
+            const safeBranch = md(branch);
+
             if (branch !== defaultBranch) {
+              // Raw here on purpose: a workflow log is plain text, so there is nothing to inject into,
+              // and the unaltered name is what a maintainer would want to see when reading the run.
               core.info(`Head branch ${branch} is not the fork's default (${defaultBranch}); nothing to say.`);
               return;
             }
@@ -53,12 +67,12 @@ jobs:
               repo: context.repo.repo,
               issue_number: context.payload.pull_request.number,
               body: [
-                `This one comes from \`${branch}\`, which is your fork's default branch. It is fine to`,
+                `This one comes from \`${safeBranch}\`, which is your fork's default branch. It is fine to`,
                 'review and it will merge as it is. This is a note for next time, not something to fix.',
                 '',
                 'The cost is yours rather than ours: while this is open, that branch is pinned to this',
                 'change, so starting anything else from a clean base means disturbing this pull request,',
-                `and a maintainer pushing a fixup writes to your \`${branch}\`.`,
+                `and a maintainer pushing a fixup writes to your \`${safeBranch}\`.`,
                 '',
                 'Moving it onto a branch is two commands, and the pull request follows the push:',
                 '',
@@ -69,7 +83,7 @@ jobs:
                 '',
                 'Then change the head branch on this pull request with the *Edit* button beside its title.',
                 '',
-                `Tidying \`${branch}\` on your fork afterwards is optional and separate: your \`origin\` is`,
+                `Tidying \`${safeBranch}\` on your fork afterwards is optional and separate: your \`origin\` is`,
                 'your fork, so it already has these commits, and putting it back needs a remote pointing at',
                 'this repository and a force push over your own branch. Worth doing deliberately, not as',
                 'part of moving a pull request.',
