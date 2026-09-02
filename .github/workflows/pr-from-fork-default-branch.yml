@@ -3,9 +3,9 @@
 #
 # It is deliberately advisory. Nothing here fails, nothing here blocks a merge, and the pull request
 # is still perfectly reviewable: #182 arrived this way and was merged. What it costs the contributor
-# is their own `main` for the length of the review — they cannot start anything else from a clean
-# base without disturbing the pull request, and a maintainer pushing a fixup writes to their default
-# branch. That is worth one comment and is not worth a red X on somebody's first contribution.
+# is their own default branch for the length of the review: they cannot start anything else from a
+# clean base without disturbing the pull request, and a maintainer pushing a fixup writes to it.
+# That is worth one comment and is not worth a red X on somebody's first contribution.
 #
 # `pull_request_target` rather than `pull_request` because the token on a fork's `pull_request` run
 # is read-only, so the comment would silently never post. This job checks out nothing and runs no
@@ -54,11 +54,11 @@ jobs:
               issue_number: context.payload.pull_request.number,
               body: [
                 `This one comes from \`${branch}\`, which is your fork's default branch. It is fine to`,
-                'review and it will merge as it is — this is a note for next time, not something to fix.',
+                'review and it will merge as it is. This is a note for next time, not something to fix.',
                 '',
-                'The cost is yours rather than ours: while this is open, your fork\'s default branch is',
-                'pinned to this change, so starting anything else from a clean base means disturbing this',
-                'pull request, and a maintainer pushing a fixup writes to your `main`.',
+                'The cost is yours rather than ours: while this is open, that branch is pinned to this',
+                'change, so starting anything else from a clean base means disturbing this pull request,',
+                `and a maintainer pushing a fixup writes to your \`${branch}\`.`,
                 '',
                 'Moving it onto a branch is two commands, and the pull request follows the push:',
                 '',
