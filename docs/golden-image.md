@@ -149,16 +149,40 @@ and develops alongside their Terraform provider. That is the ecosystem sentence 
 builds the image, Terraform builds the static fleet, and this plugin scales agents to a build queue,
 which is the one thing neither of the others can do.
 
+**Nothing in this path involves Xen Orchestra or XOA.** The builder speaks XAPI straight to
+`remote_host`. Its only Xen dependency is `github.com/terra-farm/go-xen-api-client`, and no Xen
+Orchestra module appears at all, which you can check against your own copy of the plugin rather than
+taking it from here:
+
+```sh
+go version -m ~/.config/packer/plugins/github.com/vatesfr/xenserver/packer-plugin-xenserver_v0.11.4_* \
+  | grep -iE 'xen|orchestra'
+```
+
+It should print the `mod` line for `packer-builder-xenserver` and one `dep` line for
+`terra-farm/go-xen-api-client`, and no third line. The `xen` half of that pattern is the point:
+grepping for `orchestra` alone prints nothing and exits 1 whether the dependency is genuinely
+absent or the path was wrong and the command never read a binary, so it cannot tell you which
+happened. The `xen` matches are the proof that the command found something to look at.
+
+So a pool with no XO on it is not missing a component, and there is nothing in XO to open up for a
+build. Worth stating because it is not deducible from the outside: a reader who assumed an XO
+component performs the preseed fetch went looking for what to unblock in it.
+
 ```sh
 export PKR_VAR_remote_host=192.168.1.87
 export PKR_VAR_remote_username=root
 export PKR_VAR_remote_password=...        # never commit this
 
-# Where debian-installer fetches the preseed. Leave this unset only if the pool can reach the
-# machine running Packer on the port Packer picks. It cannot under WSL2's default NAT, which passes
-# outbound and blocks inbound, and the failure is a silent hang rather than a connection error
-# (see item 3 below). Serve image/http/preseed.cfg from any host on the pool's LAN and point at it:
-#     python3 -m http.server 8000    # in image/http/, on a pool-reachable host
+# Where debian-installer fetches the preseed. The fetch is made by the installer running inside the
+# VM being built, so the machine that has to reach the HTTP server is that VM. Not dom0, not XAPI.
+#
+# On a build host sitting on the pool's VM network with no NAT in between, leave this unset and use
+# Packer's own server. Set it when the installer VM cannot reach that host, which is what WSL2's
+# default NAT does: it passes outbound and blocks inbound, and it fails as a silent hang rather than
+# a connection error (see item 3 below). Then serve image/http/preseed.cfg anywhere the installer VM
+# can reach:
+#     python3 -m http.server 8000    # in image/http/, on a host the installer VM can reach
 export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
 
 # Use an ISO VDI already present in sr_iso_name instead of uploading one. Needed
@@ -218,23 +242,31 @@ And the builder accepts a fifth value, `xva_compressed`, that appears in
 neither its documentation nor its own validation error — read from its source at `v0.11.4`
 (`builder/xenserver/common/common_config.go:208`), not tried here.
 
-> **Status (updated 2026-08-12): `packer build` completes, but NOT unattended.** It stops once, at
-> item 4 below, and needs a single Return on the VM console to continue:
-> `python3 tools/vnc_console.py 127.0.0.1 5901 --key 0xff0d`. Measured on a run that was otherwise
-> hands-off: 17m09s end to end, template registered and exported. Tracked as
-> [#110](https://github.com/gounthar/xcpng-cloud-plugin/issues/110).
+> **Status (updated 2026-09-03): `packer build` runs unattended and registers the template.**
+> No keystroke, twice: **8m31s** on 2026-08-12, producing `jenkins-agent-debian13-v5`, and **11m12s**
+> on 2026-09-03. The second run reached the export step unattended and then failed writing its XVA to
+> a full drive, taking the template with it, which is the hazard described just above rather than an
+> installer problem.
 >
-> An earlier version of this block said the build completes full stop. It produced
-> `jenkins-agent-debian13-v3` on the lab pool (the `-v3` is a `PKR_VAR_template_name` override, so
-> the run sat beside the two existing templates instead of replacing them), the plugin cloned that
-> template, the agent connected, and a build ran and passed on it. Before today it had never produced
-> an image at all, despite this section having called it the recommended path since it was written.
+> The dates on this block are load-bearing, because it has been wrong in both directions. It first
+> said the build completes full stop while the build was still stopping at item 4. It then said the
+> build needs a Return on the console, and stayed up for three weeks after
+> [#114](https://github.com/gounthar/xcpng-cloud-plugin/pull/114) removed that stop on 2026-08-12.
 >
-> **What that run does and does not establish.** It is one build, on one pool, on Debian 13, with the
-> preseed served from a LAN host via `preseed_url`. Untested: Packer's own built-in HTTP server from
-> a build host the pool can reach, any other pool or Debian version, and the no-netplan branch in
-> `provision.sh`, which CI cannot enter because it runs with `SKIP_CLEANUP`. The five fixes below are
-> each verified against the failure they address; none of them is verified as portable.
+> **The images it has produced have carried an agent through a build.** `-v3` on 2026-08-12 midday
+> (`packer build`, the plugin cloned it, the agent connected, build #2 passed), `-v5` that night
+> (build #4 passed on a clone, destroyed, SR back to baseline), and `-v5` again in the 0.3.0 release
+> verification, where the happy path, the capacity cap and the warm pool each cloned it. The `-v3`
+> and `-v5` names are `PKR_VAR_template_name` overrides, so each run sat beside the existing
+> templates rather than replacing them.
+>
+> **What these runs do and do not establish.** One pool, one Debian version. Untested: Packer's own
+> built-in HTTP server from a build host the installer VM can reach, any other pool or Debian
+> version, and the no-netplan branch in `provision.sh`, which CI cannot enter because it runs with
+> `SKIP_CLEANUP`. The newest of these images was built on 2026-08-12, so nothing built since
+> [#180](https://github.com/gounthar/xcpng-cloud-plugin/pull/180) has run a build either
+> ([#202](https://github.com/gounthar/xcpng-cloud-plugin/issues/202)). The five fixes below are each
+> verified against the failure they address; none is verified as portable.
 >
 > Five separate things were wrong, and none of them was visible in the Packer log, which prints
 > `Wait for VM's IP to become known to us` and then nothing in every one of these cases. All are
@@ -244,18 +276,25 @@ neither its documentation nor its own validation error — read from its source 
 >    read as menu shortcuts and selected the accessible/speech-synthesis entry, which waits forever
 >    on `Press enter to continue anyway.`
 > 2. The kernel parameters were typed with no boot label, so `auto=true` was offered as a label.
-> 3. Packer serves the preseed from the machine running Packer, which is unreachable from the pool
->    behind WSL2's default NAT. The `preseed_url` variable now lets you serve it anywhere the pool
+> 3. Packer serves the preseed from the machine running Packer, which the installer VM cannot reach
+>    behind WSL2's default NAT. The `preseed_url` variable now lets you serve it anywhere that VM
 >    can reach. **The July note about WSL2 NAT was right about this**, and an earlier version of this
 >    block wrongly dismissed it; what that note got wrong was only its claim that the boot command
->    had been validated, since no kernel argument was arriving at all.
+>    had been validated, since no kernel argument was arriving at all. Note the machine that has to
+>    reach the server is the VM being built, not dom0 and not XAPI: on this single-host lab they are
+>    the same network, and on a pool with a separate management network they are not.
 > 4. apt-setup stopped on `An attempt to configure apt to install additional packages from the media
->    failed`, a blocking dialog in an otherwise unattended install. **STILL NOT FIXED, tracked as
->    [#110](https://github.com/gounthar/xcpng-cloud-plugin/issues/110). The build needs one Return on
->    the console to get past it.** It was fixed wrongly the first time and read as fixed only because
->    the run after it went green. The preseed answers `apt-setup/cdrom/set-failed`, a boolean reading
->    "Scan extra installation media?"; what blocks is `apt-setup/cdrom/failed`, an *error* template
->    titled "apt configuration problem". One word apart, near-identical body text.
+>    failed`, a blocking dialog in an otherwise unattended install. **Fixed in
+>    [#114](https://github.com/gounthar/xcpng-cloud-plugin/pull/114) by seeding
+>    `d-i cdrom-detect/hybrid boolean true`**, which leaves the netinst mounted where it already is
+>    and stops apt mounting CD drives at all, so apt-cdrom never enumerates the second one and never
+>    fails. Three seeded answers were tried before that and none worked, two of them costing a build
+>    each. The preseed had been answering `apt-setup/cdrom/set-failed`, a boolean reading "Scan extra
+>    installation media?", while what blocks is `apt-setup/cdrom/failed`, an *error* template titled
+>    "apt configuration problem": one word apart, near-identical body text. Seeding that one as
+>    `note` and then as `error` changed nothing either, and **why a seen flag does not suppress its
+>    `db_input critical` is still unexplained**, so a seed that works is not ruled out. The comment
+>    in `image/http/preseed.cfg` carries the detail.
 >
 >    Root cause, from the installed system's `/var/log/installer/syslog`: `apt-cdrom` adds the
 >    netinst fine, then *"Repeat this process for the rest of the CDs in your set"* and moves to the
@@ -505,17 +544,16 @@ that is out of v0 scope.
   network config. This is what the plugin does at provision time anyway.
 - **From-scratch `import_raw_vdi`** with a seed carrying a DHCP network config and a unique
   `instance-id`. Ordinary once the network config is right; the import itself is proven.
-- **Packer** (`image/xcpng-jenkins-agent.pkr.hcl`, installer path). `packer build` was run against the
-  pool: ISO auto-upload to `local-iso`, VM create, and the VNC `boot_command` all work; it blocked only
-  on the preseed HTTP fetch when packer ran behind WSL2 NAT. Run packer from a pool-reachable host (a
-  golden clone is ideal). Installer-made disks carry a persisted network config, so no clone-time
-  cloud-init-network step is needed.
+- **Packer** (`image/xcpng-jenkins-agent.pkr.hcl`, installer path). This is the recommended path and
+  it runs unattended; see the section above. The one environment question is where the installer VM
+  fetches the preseed from, which is what `preseed_url` answers. Installer-made disks carry a
+  persisted network config, so no clone-time cloud-init-network step is needed.
 - **The Xen Orchestra backend.** XO does import + VM-create + cloud-init injection + boot as first-class
   operations, the cleanest home for an automated bootstrap if one is built.
 
 Bottom line: `import_raw_vdi` works and the VMs boot. A from-scratch bootstrap needs a correct
 cloud-init network config, which is ordinary. Clone golden for the simplest reliable path; use Packer
-(from a pool-reachable host) or XO for a from-scratch build.
+or XO for a from-scratch build.
 
 Methodological note, earned expensively: this section was rewritten after a day of misdiagnosis that
 never once looked at the VM console. For a "won't boot" VM on this stack, **capture the screen first**

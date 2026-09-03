@@ -6,15 +6,15 @@
 // the static fleet, and this plugin does the one thing neither can, which is watch a build queue
 // and scale to it.
 //
-// STATUS. `packer validate` passes and CI runs it on every push. `packer build` HAS now been run
-// against the lab pool: the builder uploaded the netinst ISO, created the VM, connected VNC, and
-// drove the Debian installer via boot_command (the installer kernel loaded). It then blocked at the
-// preseed HTTP fetch, an environment wall, not a template one: packer serves the preseed on the
-// host running it, unreachable from the pool when that host is behind WSL2 NAT. Run `packer build`
-// from a pool-reachable host (WSL2 mirrored networking, a netsh portproxy, or a golden-image clone
-// as the builder). Everything durable about the image lives in image/provision.sh, which CI executes
-// on every push inside a debian:13 container. docs/golden-image.md has the full write-up and the
-// manual path, which was performed by hand and does work.
+// STATUS. `packer validate` passes and CI runs it on every push. `packer build` runs unattended
+// against the lab pool and registers the template: 8m31s on 2026-08-12 and 11m12s on 2026-09-03, no
+// keystroke either time. (The second run then failed writing its XVA to a full drive and took the
+// template with it, which is #195 and is why `format` defaults to "none" below. It reached the
+// export step unattended.) Both served the preseed from a LAN host via preseed_url; Packer's own HTTP server is
+// still unexercised from a build host the installer VM can reach.
+//
+// Everything durable about the image lives in image/provision.sh, which CI executes on every push
+// inside a debian:13 container. docs/golden-image.md has the full write-up and the manual path.
 //
 //   export PKR_VAR_remote_host=192.168.1.87
 //   export PKR_VAR_remote_username=root
@@ -75,21 +75,32 @@ variable "debian_version" {
   default = "13.4.0"
 }
 
-// Where the installer fetches the preseed from. Empty means "use Packer's own HTTP server", which is
-// right whenever the machine running Packer is reachable from the pool on the LAN.
+// Where the installer fetches the preseed from.
 //
-// It is not reachable when Packer runs behind NAT, which includes WSL2 in its default mode. Packer
-// still starts its server and still advertises an address, so nothing looks wrong: the installer
-// boots, tries to fetch, cannot, and stalls on a screen that says nothing. The build then sits until
-// ssh_wait_timeout with a log that only ever says "Wait for VM's IP to become known to us".
+// WHO FETCHES IT, because the answer decides everything below: debian-installer, running inside the
+// VM this build is creating, from the `url=` that boot_command types at the isolinux prompt. So what
+// has to reach the HTTP server is the installer VM's network. Not dom0's, and not XAPI's. On this
+// single-host lab those are one network and the distinction never shows; on a pool whose management
+// network is separate from its VM network they are different questions with different answers.
 //
-// Measured on this lab from dom0: Packer advertised 192.168.1.145:8000 while its server was bound
-// inside WSL at 172.18.157.37:8000, and neither address answered from the pool.
+// Empty means "use Packer's own built-in server", bound on the machine running Packer. That is the
+// simplest correct answer on a build host sitting on the pool's VM network with nothing in between,
+// and it is worth trying first there. No build here has confirmed it: the runs that left it empty
+// were behind WSL2's NAT, and every run since has set the variable.
 //
-// Set this to a URL the pool can reach and serve image/http/preseed.cfg there yourself.
+// It is the wrong answer when Packer sits behind NAT, WSL2 in its default mode being the case this
+// project keeps hitting. Packer still starts its server and still advertises an address, so nothing
+// looks wrong: the installer boots, tries to fetch, cannot, and stalls on a screen that says
+// nothing. The build then sits until ssh_wait_timeout with a log that only ever says "Wait for VM's
+// IP to become known to us". Measured here: Packer advertised 192.168.1.145:8000 while its server
+// was bound inside WSL at 172.18.157.37:8000, and neither address answered. That probe was run from
+// dom0 rather than from a VM, which on this lab is the same network; on a segmented pool it would be
+// the wrong test, for the reason above.
+//
+// Then set this to a URL the installer VM can reach, and serve image/http/preseed.cfg there.
 variable "preseed_url" {
   type        = string
-  description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server (needs LAN reachability)."
+  description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server, which the installer VM must be able to reach."
   default     = ""
 }
 
