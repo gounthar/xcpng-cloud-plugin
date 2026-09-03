@@ -94,7 +94,7 @@ variable "preseed_url" {
 }
 
 // What the build leaves on the machine running Packer, on top of the template it registers on the
-// pool. "none" leaves nothing.
+// pool. "none" writes no artifact; it still creates output_directory, see below.
 //
 // The builder's export step runs LAST, after the VM has already been turned into a template
 // (builder/xenserver/iso/builder.go orders StepSetVmToTemplate before StepExport), and it halts the

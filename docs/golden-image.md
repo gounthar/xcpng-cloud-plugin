@@ -60,10 +60,15 @@ export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
 # the share, run `xe sr-scan`, then name it here.
 export PKR_VAR_iso_name=debian-13.4.0-amd64-netinst.iso
 
-# Optional. The build writes no local artifact by default, because the template on the pool is the
-# deliverable. Set these two only if you want a portable file as well, and read the warning below
-# first — an export that cannot be written takes the template down with it.
+# Optional, and independent of each other.
+#
+# format decides whether a portable file is written at all. It defaults to none, because the
+# template on the pool is the deliverable. Set it only after reading the warning below: an export
+# that cannot be written takes the template down with it.
 #     export PKR_VAR_format=xva                       # or xva_compressed, vdi_raw, vdi_vhd, none
+#
+# output_directory is worth setting even at format=none, because the builder creates the directory
+# either way. Point it out of the checkout and no empty packer-jenkins-agent/ appears there.
 #     export PKR_VAR_output_directory=/var/tmp/jenkins-image
 
 # RE-COPY preseed.cfg TO THAT HOST BEFORE EVERY BUILD. What the installer reads is a copy, and
@@ -85,8 +90,8 @@ whatever name you choose is the one the cloud's template field has to match.
 
 ### The build writes no local artifact, and that is deliberate
 
-`format` defaults to `none`, so a build registers the template and leaves nothing on the machine that
-ran Packer. Set `PKR_VAR_format=xva` if you want a portable file, and know what you are buying: an
+`format` defaults to `none`, so a build registers the template and leaves no local artifact behind.
+Set `PKR_VAR_format=xva` if you want a portable file, and know what you are buying: an
 XVA is roughly the size of the image, it lands in `PKR_VAR_output_directory` (default
 `packer-jenkins-agent`, relative to the working directory, which is this checkout), and **an export
 that cannot be written destroys the template the build just registered.**
@@ -100,9 +105,10 @@ drive holding the checkout, and exited 1 with no template on the pool. The pool 
 clean — same free space, same VDI count, no orphans — so nothing leaked. What was lost was a good
 image. [#195](https://github.com/gounthar/xcpng-cloud-plugin/issues/195)
 
-Two smaller things worth knowing before you set it. The builder creates `output_directory` whether or
-not it writes into it, so an empty directory at `format = none` is expected rather than a sign
-something went wrong. And the builder accepts a fifth value, `xva_compressed`, that appears in
+Two smaller things worth knowing. The builder creates `output_directory` whether or not it writes
+into it, so an empty directory at `format = none` is expected rather than a sign something went
+wrong; set `PKR_VAR_output_directory` somewhere outside the checkout if you would rather not see it.
+And the builder accepts a fifth value, `xva_compressed`, that appears in
 neither its documentation nor its own validation error — read from its source at `v0.11.4`
 (`builder/xenserver/common/common_config.go:208`), not tried here.
 
