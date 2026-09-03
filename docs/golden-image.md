@@ -80,10 +80,13 @@ the host holding the disk; every line of it was run on the lab pool:
 # The disk to read. Take it from the template's VBDs, not from a guess.
 vdi=00000000-0000-0000-0000-000000000000
 
-# This host's control domain. `xe vm-list is-control-domain=true` returns one per host in the
-# pool, comma-separated, and vbd-create takes exactly one, so it is the wrong source on any
-# pool with more than one host. Note the parameter is control-domain-uuid; `control-domain`
-# does not exist and fails with "Missing parameter".
+# This host's control domain. The obvious source is the wrong one:
+# `xe vm-list is-control-domain=true params=uuid --minimal` returns one control domain per host
+# in the pool, comma-separated, while vbd-create takes exactly one, so it breaks on any pool
+# with more than one host. Without `--minimal` that command prints a formatted record listing
+# rather than a comma-separated value, so neither form is a drop-in here. Note the parameter
+# below is control-domain-uuid; `control-domain` does not exist and fails with
+# "Missing parameter".
 host=$(awk -F"'" '/^INSTALLATION_UUID/{print $2}' /etc/xensource-inventory)
 dom0=$(xe host-param-get uuid="$host" param-name=control-domain-uuid)
 
