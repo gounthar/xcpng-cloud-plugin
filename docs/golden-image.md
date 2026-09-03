@@ -207,10 +207,10 @@ publishing it to a public repository cannot be undone.
 
 ### Both stores, and why the second one is the whole point
 
-| store | read by |
-|---|---|
-| `/usr/local/share/ca-certificates` + `update-ca-certificates` | `curl`, `git`, `apt` |
-| the Java truststore, via `keytool -cacerts` | the agent |
+| store | read by | written by |
+|---|---|---|
+| `/usr/local/share/ca-certificates` + `update-ca-certificates` | `curl`, `git`, `apt` | `provision.sh`, directly |
+| the Java truststore, read with `keytool -cacerts` | the agent | the `update-ca-certificates` hook, below |
 
 Java does not read the system store. An image with the anchor in the system store only produces a VM
 where
@@ -222,12 +222,21 @@ curl -sS -o /dev/null -w '%{http_code}\n' https://your-controller/login   # 200
 succeeds and the agent still fails to connect, which points nowhere near the cause. If you install an
 anchor by hand instead of through this directory, do both stores.
 
+`provision.sh` writes only the system store. The Java side is filled in by
+`/etc/ca-certificates/update.d/adoptium-cacerts`, a hook shipped by `adoptium-ca-certificates`, which
+Temurin pulls in: `update-ca-certificates` runs it, and it regenerates the Adoptium truststore from
+the system store under an alias of its own choosing. So the second row of that table is somebody
+else's package doing the work, and it would stop happening silently if the image ever moved off
+Temurin from `packages.adoptium.net`. `provision.sh` therefore checks, by fingerprint, that each
+anchor actually arrived in the Java truststore, and fails the build naming the file if it did not.
+
 ### What is refused
 
 `provision.sh` fails the build, naming the file, on anything it cannot account for: a private key in
 any file in the directory, a `.crt` or `.pem` that is not a certificate, several certificates
-concatenated into one, a directory that holds files but none it can install, or two names that give
-one alias. Exporting a PKCS#12 rather than the certificate is the easy mistake, and it is the one
+concatenated into one, a directory that holds files but none it can install, two names that give one
+alias, or an anchor that does not turn up in the Java truststore once `update-ca-certificates` has
+run. Exporting a PKCS#12 rather than the certificate is the easy mistake, and it is the one
 carrying the key — which would otherwise be baked into every clone of the image. A file that is
 simply skipped is treated as a failure too: an operator who believes the image has an anchor it does
 not have finds out when an agent will not connect and nothing says why. Same posture as the

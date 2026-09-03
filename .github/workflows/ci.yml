@@ -226,6 +226,72 @@ jobs:
 
           exit $rc
 
+      # The Java truststore is filled in by /etc/ca-certificates/update.d/adoptium-cacerts, a hook
+      # this repository does not own: adoptium-ca-certificates ships it and Temurin pulls it in. So
+      # provision.sh verifies the anchor arrived rather than assuming it, and a check that has never
+      # been seen to fail is not yet a check. Removing the hook reproduces the drift it guards
+      # against -- install_java moving off packages.adoptium.net, or that package dropping the hook.
+      #
+      # Deliberately last in the job: it leaves the container without the hook.
+      - name: Operator CA, an anchor that misses the Java truststore fails the build
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          test -f /etc/ca-certificates/update.d/adoptium-cacerts \
+            || { echo "::error::no Adoptium hook to remove; this case would prove nothing"; exit 1; }
+          rm -f /etc/ca-certificates/update.d/adoptium-cacerts
+
+          # A fresh CA, not the one an earlier step already installed. Reusing that name would leave
+          # its fingerprint in the truststore from the previous run, and the case would pass with the
+          # hook gone -- agreeing with itself instead of testing anything.
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/drift-root.crt -subj '/CN=Drift Root'
+          fp="$(openssl x509 -in /tmp/ca-certificates/drift-root.crt -noout -fingerprint -sha256 | cut -d= -f2)"
+          if keytool -list -cacerts -storepass changeit 2>/dev/null | grep -qF "$fp"; then
+            echo "::error::the fixture is already in the truststore; this case would pass for the wrong reason"
+            exit 1
+          fi
+
+          if bash image/provision.sh > /tmp/provision.out 2>&1; then
+            echo "::error::provision.sh went green with the anchor missing from the Java truststore"
+            exit 1
+          fi
+          grep -qF 'did not reach the Java truststore' /tmp/provision.out \
+            || { echo "::error::failed for another reason: $(tail -1 /tmp/provision.out)"; exit 1; }
+          test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
+
+      # The fingerprint check reads keytool's exit status, not just whether the fingerprint turned
+      # up, so that an unreadable keystore is reported as an unreadable keystore. Testing only for
+      # the fingerprint would call every anchor missing, which is the wrong fault stated
+      # confidently. Corrupting the store is the cheapest way to reach that branch.
+      #
+      # After the step above, so it inherits a container whose hook is already gone.
+      - name: Operator CA, an unreadable truststore says so rather than blaming the anchor
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          cacerts="$(readlink -f "$(dirname "$(readlink -f "$(command -v keytool)")")/../lib/security/cacerts")"
+          test -f "$cacerts" || { echo "::error::no cacerts at $cacerts"; exit 1; }
+          cp "$cacerts" /tmp/cacerts.bak
+          echo "not a keystore" > "$cacerts"
+
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/broken-store.crt -subj '/CN=Broken Store'
+          rc=0
+          if bash image/provision.sh > /tmp/provision.out 2>&1; then
+            echo "::error::provision.sh went green against a corrupt truststore"; rc=1
+          elif ! grep -qF 'cannot read the Java truststore' /tmp/provision.out; then
+            echo "::error::wrong diagnosis: $(tail -1 /tmp/provision.out)"; rc=1
+          elif [ -e /tmp/ca-certificates ]; then
+            echo "::error::the upload directory survived"; rc=1
+          fi
+          cp /tmp/cacerts.bak "$cacerts"
+          exit $rc
+
   packer:
     name: packer validate
     runs-on: ubuntu-latest
