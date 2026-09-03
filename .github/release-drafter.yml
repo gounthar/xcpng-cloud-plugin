@@ -66,18 +66,27 @@ categories:
   # unlabelled pull request still lands somewhere sensible instead of silently deciding the
   # version for us. Dropping it does not break the parse -- it stops resolving a version at
   # all for an unlabelled pull request, and that surfaces only when a release is cut.
-  # Where two entries match, the highest increment wins.
+  # Where two entries match, the highest increment wins: `getHighestPriority` in
+  # resolve-version-increment.ts takes a Math.max over every matching entry, so a single
+  # pull request carrying the right label decides the version for the whole release.
+  #
+  # `major` and `minor` are deliberately absent from the label lists below, and putting
+  # either back reintroduces a defect that reaches the published tag. dependabot labels its
+  # own pull requests with the *dependency's* semver bump, unprompted -- nothing here or in
+  # any workflow asks it to. #173 (actions/setup-java 5.6.0 to 6.0.0) arrived carrying
+  # `major`, which is true of the Action and says nothing about this plugin, and the draft
+  # release duly renamed itself 1.0.0. `breaking` covers the case these entries are for, and
+  # it is ours alone. A dependabot pull request now falls through to the patch entry via
+  # `dependencies` / `github_actions`, which is what a dependency bump should do. See #198.
   - type: 'version-resolver'
     semver-increment: major
     when:
       labels:
-        - major
         - breaking
   - type: 'version-resolver'
     semver-increment: minor
     when:
       labels:
-        - minor
         - enhancement
   - type: 'version-resolver'
     semver-increment: patch
