@@ -159,6 +159,12 @@ go version -m ~/.config/packer/plugins/github.com/vatesfr/xenserver/packer-plugi
   | grep -iE 'xen|orchestra'
 ```
 
+It should print the `mod` line for `packer-builder-xenserver` and one `dep` line for
+`terra-farm/go-xen-api-client`, and no third line. The `xen` half of that pattern is the point:
+grepping for `orchestra` alone prints nothing and exits 1 whether the dependency is genuinely
+absent or the path was wrong and the command never read a binary, so it cannot tell you which
+happened. The `xen` matches are the proof that the command found something to look at.
+
 So a pool with no XO on it is not missing a component, and there is nothing in XO to open up for a
 build. Worth stating because it is not deducible from the outside: a reader who assumed an XO
 component performs the preseed fetch went looking for what to unblock in it.
