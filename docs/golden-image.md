@@ -91,9 +91,12 @@ dom0=$(xe host-param-get uuid="$host" param-name=control-domain-uuid)
 vbd=$(xe vbd-create vm-uuid="$dom0" vdi-uuid="$vdi" device=autodetect mode=RO type=Disk)
 xe vbd-plug uuid="$vbd"
 
-# Ask the VBD where it landed rather than assuming /dev/tda. The answer is a
-# /dev/sm/backend/<sr>/<vdi> path, and kpartx names its maps after that basename, so the
-# partition node is /dev/mapper/<vdi>1 and never /dev/mapper/tda1.
+# Ask the VBD where it landed rather than assuming a device name. What this returns depends on
+# the VBD: on a dom0 VBD on this pool it is a `sm/backend/<sr>/<vdi>` path, measured twice, so
+# the node is /dev/sm/backend/... and the maps below come out as <vdi>1; on a guest VBD it is an
+# ordinary name like xvda. Either way kpartx derives its map names from the basename, which is
+# why the mount line reads it back with basename instead of naming a node. If in doubt, use the
+# `add map` lines kpartx prints rather than predicting them.
 dev="/dev/$(xe vbd-param-get uuid="$vbd" param-name=device)"
 kpartx -av "$dev"
 mkdir -p /mnt/probe
