@@ -9,8 +9,8 @@
 // STATUS. `packer validate` passes and CI runs it on every push. `packer build` runs unattended
 // against the lab pool and registers the template: 8m31s on 2026-08-12 and 11m12s on 2026-09-03, no
 // keystroke either time. (The second run then failed writing its XVA to a full drive and took the
-// template with it, which is why `format` defaults to "none" below. It reached the export step
-// unattended.) Both served the preseed from a LAN host via preseed_url; Packer's own HTTP server is
+// template with it, which is #195 and is why `format` defaults to "none" below. It reached the
+// export step unattended.) Both served the preseed from a LAN host via preseed_url; Packer's own HTTP server is
 // still unexercised from a build host the installer VM can reach.
 //
 // Everything durable about the image lives in image/provision.sh, which CI executes on every push

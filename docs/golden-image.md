@@ -150,10 +150,18 @@ builds the image, Terraform builds the static fleet, and this plugin scales agen
 which is the one thing neither of the others can do.
 
 **Nothing in this path involves Xen Orchestra or XOA.** The builder speaks XAPI straight to
-`remote_host`; its only Xen dependency at `v0.11.4` is `github.com/terra-farm/go-xen-api-client`, read
-from the shipped plugin binary. If your pool has no XO you are not missing a component, and there is
-nothing in XO to open up for a build. Worth saying because it is not deducible from the outside: a
-reader who assumed an XO component performs the preseed fetch went looking for what to unblock in it.
+`remote_host`. Its only Xen dependency is `github.com/terra-farm/go-xen-api-client`, and no Xen
+Orchestra module appears at all, which you can check against your own copy of the plugin rather than
+taking it from here:
+
+```sh
+go version -m ~/.config/packer/plugins/github.com/vatesfr/xenserver/packer-plugin-xenserver_v0.11.4_* \
+  | grep -iE 'xen|orchestra'
+```
+
+So a pool with no XO on it is not missing a component, and there is nothing in XO to open up for a
+build. Worth stating because it is not deducible from the outside: a reader who assumed an XO
+component performs the preseed fetch went looking for what to unblock in it.
 
 ```sh
 export PKR_VAR_remote_host=192.168.1.87
@@ -273,12 +281,14 @@ neither its documentation nor its own validation error — read from its source 
 >    failed`, a blocking dialog in an otherwise unattended install. **Fixed in
 >    [#114](https://github.com/gounthar/xcpng-cloud-plugin/pull/114) by seeding
 >    `d-i cdrom-detect/hybrid boolean true`**, which leaves the netinst mounted where it already is
->    and stops apt mounting CD drives at all, so apt-cdrom never reaches the second one. It was fixed
->    wrongly twice before that, and read as fixed both times because the run after it went green. The
->    preseed had been answering `apt-setup/cdrom/set-failed`, a boolean reading "Scan extra
->    installation media?"; what blocks is `apt-setup/cdrom/failed`, an *error* template titled "apt
->    configuration problem". One word apart, near-identical body text, and an error template has no
->    value to preseed anyway.
+>    and stops apt mounting CD drives at all, so apt-cdrom never enumerates the second one and never
+>    fails. Three seeded answers were tried before that and none worked, two of them costing a build
+>    each. The preseed had been answering `apt-setup/cdrom/set-failed`, a boolean reading "Scan extra
+>    installation media?", while what blocks is `apt-setup/cdrom/failed`, an *error* template titled
+>    "apt configuration problem": one word apart, near-identical body text. Seeding that one as
+>    `note` and then as `error` changed nothing either, and **why a seen flag does not suppress its
+>    `db_input critical` is still unexplained**, so a seed that works is not ruled out. The comment
+>    in `image/http/preseed.cfg` carries the detail.
 >
 >    Root cause, from the installed system's `/var/log/installer/syslog`: `apt-cdrom` adds the
 >    netinst fine, then *"Repeat this process for the rest of the CDs in your set"* and moves to the
