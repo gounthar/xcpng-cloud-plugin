@@ -262,6 +262,36 @@ jobs:
             || { echo "::error::failed for another reason: $(tail -1 /tmp/provision.out)"; exit 1; }
           test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
 
+      # The fingerprint check reads keytool's exit status, not just whether the fingerprint turned
+      # up, so that an unreadable keystore is reported as an unreadable keystore. Testing only for
+      # the fingerprint would call every anchor missing, which is the wrong fault stated
+      # confidently. Corrupting the store is the cheapest way to reach that branch.
+      #
+      # After the step above, so it inherits a container whose hook is already gone.
+      - name: Operator CA, an unreadable truststore says so rather than blaming the anchor
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          cacerts="$(readlink -f "$(dirname "$(readlink -f "$(command -v keytool)")")/../lib/security/cacerts")"
+          test -f "$cacerts" || { echo "::error::no cacerts at $cacerts"; exit 1; }
+          cp "$cacerts" /tmp/cacerts.bak
+          echo "not a keystore" > "$cacerts"
+
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/broken-store.crt -subj '/CN=Broken Store'
+          rc=0
+          if bash image/provision.sh > /tmp/provision.out 2>&1; then
+            echo "::error::provision.sh went green against a corrupt truststore"; rc=1
+          elif ! grep -qF 'cannot read the Java truststore' /tmp/provision.out; then
+            echo "::error::wrong diagnosis: $(tail -1 /tmp/provision.out)"; rc=1
+          elif [ -e /tmp/ca-certificates ]; then
+            echo "::error::the upload directory survived"; rc=1
+          fi
+          cp /tmp/cacerts.bak "$cacerts"
+          exit $rc
+
   packer:
     name: packer validate
     runs-on: ubuntu-latest

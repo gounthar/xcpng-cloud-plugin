@@ -611,6 +611,23 @@ install_extra_ca_certificates() {
 
     update-ca-certificates
 
+    # One listing for all of them, and its exit status is read rather than its
+    # emptiness. On an unreadable store keytool exits 1 with `keytool error:
+    # java.io.IOException: Keystore was tampered with, or password was incorrect`;
+    # discarding that and testing only for the fingerprint reports every anchor as
+    # missing, which is a confident diagnosis of the wrong fault. Measured on
+    # Temurin 21. In the healthy case keytool writes nothing to stderr, so folding
+    # it in costs no noise.
+    #
+    # Not -v. The default listing already carries a `Certificate fingerprint
+    # (SHA-256):` line per entry on Temurin 21, which is what install_java puts
+    # here; -v prints the full chain for every system anchor to say the same thing.
+    # Both forms were checked against the same certificate and both match.
+    local truststore
+    if ! truststore="$(keytool -list -cacerts -storepass changeit 2>&1)"; then
+        die "cannot read the Java truststore: $(printf '%s\n' "$truststore" | head -1)"
+    fi
+
     # Match on the SHA-256 fingerprint rather than the alias. The hook names the
     # entry itself -- ci-root.crt lands as `ciroot` -- so the alias is not ours to
     # predict, and an alias that happens to exist proves nothing about which
@@ -618,7 +635,7 @@ install_extra_ca_certificates() {
     for cert in "${certs[@]}"; do
         alias="$(basename "$cert")"; alias="${alias%.*}"
         fingerprint="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | cut -d= -f2)"
-        if keytool -list -cacerts -storepass changeit 2>/dev/null | grep -qF "$fingerprint"; then
+        if printf '%s\n' "$truststore" | grep -qF "$fingerprint"; then
             log "trust anchor ${alias} reached the Java truststore"
         else
             # Reached if install_java stops installing Temurin from packages.adoptium.net,
