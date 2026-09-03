@@ -70,6 +70,31 @@ jobs:
       - name: Lint the workflow files
         run: actionlint -color
 
+  # actionlint covers only the shell embedded in run: blocks, so image/provision.sh -- the one
+  # tracked script, and the one that runs as root inside the image -- was linted by nothing. That is
+  # half of why #192 survived: a Copilot Autofix commit on #180 wrapped an array expansion in literal
+  # quotes, and shellcheck calls it two errors (SC2068, SC2145) the moment it is pointed at the file.
+  #
+  # -S warning, not the default: the default adds SC1091 "not following /etc/os-release", which is
+  # about what the linter can reach on the runner rather than about the script.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # ubuntu-latest ships shellcheck; the version is printed so the log shows what actually ran.
+      # The count assertion is the point of the list: a glob that stops matching would otherwise
+      # turn this job into a green step that lints nothing, and say so nowhere.
+      - name: Lint the shell scripts
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh')
+          test "${#scripts[@]}" -gt 0 \
+            || { echo "::error::no shell scripts matched; this job would pass by linting nothing"; exit 1; }
+          shellcheck --version
+          printf 'linting: %s\n' "${scripts[@]}"
+          shellcheck -S warning "${scripts[@]}"
+
   # tools/ destroys VMs and their disks on a live hypervisor. Every bug review found in it
   # was on an error path, which is exactly what never gets exercised by hand. These tests
   # run against a fake XAPI: they guard control flow, not the XAPI contract. The contract is
@@ -221,8 +246,25 @@ jobs:
 
           # Both globs feed one loop, so these are one alias twice: without a guard the system store
           # keeps one certificate and the Java store the other, and the build goes green.
-          mkdir -p /tmp/ca-certificates; newca /tmp/ca-certificates/vates.crt One; newca /tmp/ca-certificates/vates.pem Two
+          mkdir -p /tmp/ca-certificates
+          newca /tmp/ca-certificates/vates.crt One; newca /tmp/ca-certificates/vates.pem Two
           refuses "two files giving one alias" "both give alias vates"
+
+          # The branch nothing reached before #192. It needs an installable certificate AND a stray
+          # file at once: with the stray file alone the run stops one branch earlier, at "but it is
+          # not empty", whose own basename call was always quoted correctly. The space in the
+          # filename is the fixture -- unquoted, the array expansion split that one name into two
+          # entries and appended a stray quote.
+          mkdir -p /tmp/ca-certificates
+          newca /tmp/ca-certificates/mixed.crt Mixed
+          echo stray > '/tmp/ca-certificates/my notes.txt'
+          refuses "a stray file beside a good certificate" "unrecognised entries in"
+
+          # Anchored, and not through refuses: "my notes.txt" is a prefix of the mangled
+          # 'my notes.txt"', so a substring match would go green against the very bug this case
+          # exists for. The trailing space is tr turning the last newline into one.
+          grep -qE 'unrecognised entries in /tmp/ca-certificates: my notes\.txt $' /tmp/provision.out \
+            || { echo "::error::mangled message: $(grep -F 'unrecognised entries' /tmp/provision.out)"; rc=1; }
 
           exit $rc
 
