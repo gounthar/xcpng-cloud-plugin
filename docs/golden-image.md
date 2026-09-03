@@ -35,7 +35,7 @@ it for exactly one renderer — the `/etc/netplan/50-cloud-init.yaml` that cloud
 logs a skip when there is no `/etc/netplan`, rather than returning quietly, because a silent skip
 and a passing check read identically in a build log:
 
-```
+```text
 ==> no /etc/netplan; skipping the MAC-pin rewrite and its check (another renderer is in use)
 ```
 
@@ -49,7 +49,7 @@ Measured 2026-09-03 on `jenkins-agent-debian13-v4`, built by the path documented
 2026-08-12, by attaching its disk to dom0 and mounting it read-only. `/etc/network/interfaces`
 reads:
 
-```
+```text
 allow-hotplug enX0
 iface enX0 inet dhcp
 iface enX0 inet6 auto
@@ -73,21 +73,54 @@ So **no ifupdown branch is needed in the guard**, and an image built by any thir
 the requirement above its own answer.
 
 Reading a template's disk without booting it is worth knowing on its own, since it turns "I cannot
-get into the guest" into a non-problem. The SR is file-based, so attach the VDI to dom0:
+get into the guest" into a non-problem. The SR is file-based, so attach the VDI to dom0. Run this on
+the host holding the disk; every line of it was run on the lab pool:
 
 ```sh
-vdi=<the template's disk uuid>
-dom0=$(xe vm-list is-control-domain=true params=uuid --minimal)
-vbd=$(xe vbd-create vm-uuid="$dom0" vdi-uuid="$vdi" device=autodetect)
+# The disk to read. Take it from the template's VBDs, not from a guess.
+vdi=00000000-0000-0000-0000-000000000000
+
+# This host's control domain. `xe vm-list is-control-domain=true` returns one per host in the
+# pool, comma-separated, and vbd-create takes exactly one, so it is the wrong source on any
+# pool with more than one host. Note the parameter is control-domain-uuid; `control-domain`
+# does not exist and fails with "Missing parameter".
+host=$(awk -F"'" '/^INSTALLATION_UUID/{print $2}' /etc/xensource-inventory)
+dom0=$(xe host-param-get uuid="$host" param-name=control-domain-uuid)
+
+# mode=RO is the part that actually protects the template. See below.
+vbd=$(xe vbd-create vm-uuid="$dom0" vdi-uuid="$vdi" device=autodetect mode=RO type=Disk)
 xe vbd-plug uuid="$vbd"
-kpartx -av /dev/tda                       # the device the plug created
-mount -o ro,norecovery /dev/mapper/tda1 /mnt/probe
+
+# Ask the VBD where it landed rather than assuming /dev/tda. The answer is a
+# /dev/sm/backend/<sr>/<vdi> path, and kpartx names its maps after that basename, so the
+# partition node is /dev/mapper/<vdi>1 and never /dev/mapper/tda1.
+dev="/dev/$(xe vbd-param-get uuid="$vbd" param-name=device)"
+kpartx -av "$dev"
+mkdir -p /mnt/probe
+mount -o ro,norecovery "/dev/mapper/$(basename "$dev")1" /mnt/probe
 ```
 
-`norecovery` matters: a plain `-o ro` mount still replays the journal, which writes to the disk of
-the template you are inspecting. Reverse it afterwards — `umount`, `kpartx -d /dev/tda`,
-`xe vbd-unplug uuid=$vbd`, `xe vbd-destroy uuid=$vbd` — and confirm `xe vbd-list vm-uuid=$dom0`
-comes back empty, because a forgotten VBD keeps the disk attached to dom0.
+Reverse it afterwards, and confirm the last line comes back empty, because a forgotten VBD keeps
+the disk attached to dom0:
+
+```sh
+umount /mnt/probe
+kpartx -d "$dev"
+xe vbd-unplug uuid="$vbd"
+xe vbd-destroy uuid="$vbd"
+xe vbd-list vm-uuid="$dom0" params=uuid --minimal
+```
+
+Two things about the read-only side, because one of them reads as a guarantee and is not. **`ro`
+alone is not enough at mount time**: it still replays the ext4 journal, which writes to the disk of
+the template you are inspecting, so `norecovery` belongs there. And **`mode=RO` on the VBD is what
+protects the data, but nothing you can see says so.** Measured on a scratch VDI: with a known
+pattern on disk and the VBD re-attached `mode=RO`, a flushed `dd` write through the
+device-mapper node reports bytes copied and exits 0, `blockdev --getro` on that node reports 0,
+and the pattern is unchanged when the VDI is read back through a fresh RW handle. A direct write to
+the backend device reports `0 bytes copied`, also exiting 0. So `dd`'s exit status carries no
+information here either way; set `mode=RO`, and do not read a successful-looking write as evidence
+that you have damaged anything, or an unprotected one as evidence that you have not.
 
 [i105]: https://github.com/gounthar/xcpng-cloud-plugin/issues/105
 
