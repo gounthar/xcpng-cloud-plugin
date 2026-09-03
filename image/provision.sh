@@ -570,7 +570,7 @@ install_extra_ca_certificates() {
             *) unrecognised+=("$entry") ;;
         esac
     done
-    [ "${#unrecognised[@]}" -eq 0 ] || die "unrecognised entries in ${EXTRA_CA_DIR}: $(basename -a \"${unrecognised[@]}\" | tr '\n' ' ')"
+    [ "${#unrecognised[@]}" -eq 0 ] || die "unrecognised entries in ${EXTRA_CA_DIR}: $(basename -a "${unrecognised[@]}" | tr '\n' ' ')"
 
     command -v openssl >/dev/null 2>&1 || die "openssl not found, needed to validate ${EXTRA_CA_DIR}"
     command -v keytool >/dev/null 2>&1 || die "keytool not found; install_java must run before this"
