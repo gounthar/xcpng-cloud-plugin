@@ -60,6 +60,17 @@ export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
 # the share, run `xe sr-scan`, then name it here.
 export PKR_VAR_iso_name=debian-13.4.0-amd64-netinst.iso
 
+# Optional, and independent of each other.
+#
+# format decides whether a portable file is written at all. It defaults to none, because the
+# template on the pool is the deliverable. Set it only after reading the warning below: an export
+# that cannot be written takes the template down with it.
+#     export PKR_VAR_format=xva                       # or xva_compressed, vdi_raw, vdi_vhd, none
+#
+# output_directory is worth setting even at format=none, because the builder creates the directory
+# either way. Point it out of the checkout and no empty packer-jenkins-agent/ appears there.
+#     export PKR_VAR_output_directory=/var/tmp/jenkins-image
+
 # RE-COPY preseed.cfg TO THAT HOST BEFORE EVERY BUILD. What the installer reads is a copy, and
 # nothing keeps it in sync with the repo. A build launched to verify a preseed change will happily
 # fetch a months-old file, reproduce the bug you just fixed, and look like the fix did not work.
@@ -76,6 +87,30 @@ The build produces a template named `jenkins-agent-debian13`, which is what you 
 template field. Override it with `PKR_VAR_template_name` to build alongside an existing template
 rather than colliding with it — that is where the `-v3` name in the status note below comes from, and
 whatever name you choose is the one the cloud's template field has to match.
+
+### The build writes no local artifact, and that is deliberate
+
+`format` defaults to `none`, so a build registers the template and leaves no local artifact behind.
+Set `PKR_VAR_format=xva` if you want a portable file, and know what you are buying: an
+XVA is roughly the size of the image, it lands in `PKR_VAR_output_directory` (default
+`packer-jenkins-agent`, relative to the working directory, which is this checkout), and **an export
+that cannot be written destroys the template the build just registered.**
+
+That last part is not a hypothesis. The builder runs its export step last, after
+`StepSetVmToTemplate`, and treats a failed write as a failed build; the teardown then removes the
+template and its VDIs. Measured here on 2026-09-03: an eleven-minute build installed, provisioned and
+registered `jenkins-agent-debian13-v6` correctly, then hit `Could not download XVA: write
+packer-jenkins-agent/jenkins-agent-debian13-v6.xva: input/output error` with 1.05 GiB free on the
+drive holding the checkout, and exited 1 with no template on the pool. The pool itself was left
+clean — same free space, same VDI count, no orphans — so nothing leaked. What was lost was a good
+image. [#195](https://github.com/gounthar/xcpng-cloud-plugin/issues/195)
+
+Two smaller things worth knowing. The builder creates `output_directory` whether or not it writes
+into it, so an empty directory at `format = none` is expected rather than a sign something went
+wrong; set `PKR_VAR_output_directory` somewhere outside the checkout if you would rather not see it.
+And the builder accepts a fifth value, `xva_compressed`, that appears in
+neither its documentation nor its own validation error — read from its source at `v0.11.4`
+(`builder/xenserver/common/common_config.go:208`), not tried here.
 
 > **Status (updated 2026-08-12): `packer build` completes, but NOT unattended.** It stops once, at
 > item 4 below, and needs a single Return on the VM console to continue:

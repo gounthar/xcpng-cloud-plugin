@@ -93,6 +93,48 @@ variable "preseed_url" {
   default     = ""
 }
 
+// What the build leaves on the machine running Packer, on top of the template it registers on the
+// pool. "none" writes no artifact; it still creates output_directory, see below.
+//
+// The builder's export step runs LAST, after the VM has already been turned into a template
+// (builder/xenserver/iso/builder.go orders StepSetVmToTemplate before StepExport), and it halts the
+// whole build if it cannot write. So a default of "xva" means an eleven-minute build that installed,
+// provisioned and registered the template correctly is reported as a total failure, and the teardown
+// destroys the template, because a download afterwards ran out of disk. Measured on 2026-09-03: the
+// XVA write failed with `input/output error` at 1.05 GiB free and no template survived. See #195.
+//
+// The deliverable here is the template record on the pool, which is what XcpngCloud clones. The XVA
+// is a side effect costing an image-sized write, and docs/golden-image.md already explains why this
+// project does not ship one. So the default is "none", and anyone who does want a portable file sets
+// this and gets it.
+//
+// Accepted values, read from the builder at v0.11.4 (common_config.go:208): "xva", "xva_compressed",
+// "vdi_raw", "vdi_vhd", "none". Note "xva_compressed" is accepted by the code but named in neither
+// the builder's docs nor its own validation error.
+variable "format" {
+  type        = string
+  description = "Artifact written to output_directory: xva, xva_compressed, vdi_raw, vdi_vhd, or none."
+  default     = "none"
+
+  validation {
+    condition     = contains(["xva", "xva_compressed", "vdi_raw", "vdi_vhd", "none"], var.format)
+    error_message = "Format must be one of xva, xva_compressed, vdi_raw, vdi_vhd, none."
+  }
+}
+
+// Where that artifact lands. Relative paths resolve against the working directory, and every other
+// path in this template (http_directory, the file provisioner source, the shell provisioner script)
+// is relative to the repository root, so a build has to run from there. That put the XVA inside the
+// checkout with no way to send it elsewhere, which is the other half of #195.
+//
+// The builder creates this directory whether or not it writes anything into it
+// (StepPrepareOutputDir runs unconditionally), so expect an empty directory at format = "none".
+variable "output_directory" {
+  type        = string
+  description = "Directory for the exported artifact. Created even when format is none."
+  default     = "packer-jenkins-agent"
+}
+
 variable "iso_name" {
   type        = string
   default     = ""
@@ -169,7 +211,8 @@ source "xenserver-iso" "jenkins-agent" {
   ssh_password     = "debian"
   ssh_wait_timeout = "60m"
 
-  output_directory = "packer-jenkins-agent"
+  output_directory = var.output_directory
+  format           = var.format
   keep_vm          = "on_success"
 }
 
