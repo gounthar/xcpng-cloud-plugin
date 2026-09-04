@@ -301,11 +301,23 @@ And the builder accepts a fifth value, `xva_compressed`, that appears in
 neither its documentation nor its own validation error — read from its source at `v0.11.4`
 (`builder/xenserver/common/common_config.go:208`), not tried here.
 
-> **Status (updated 2026-09-03): `packer build` runs unattended and registers the template.**
-> No keystroke, twice: **8m31s** on 2026-08-12, producing `jenkins-agent-debian13-v5`, and **11m12s**
-> on 2026-09-03. The second run reached the export step unattended and then failed writing its XVA to
-> a full drive, taking the template with it, which is the hazard described just above rather than an
-> installer problem.
+> **Status (updated 2026-09-04): `packer build` runs unattended and registers the template.**
+> No keystroke, five times: **8m31s** on 2026-08-12, producing `jenkins-agent-debian13-v5`;
+> **11m12s** and **6m15s** on 2026-09-03, both registering a template named
+> `jenkins-agent-debian13-v6`; and the pair that settled
+> [#170](https://github.com/gounthar/xcpng-cloud-plugin/issues/170) on 2026-09-04, **7m00s** with a
+> plain-http preseed URL, producing `jenkins-agent-debian13-v7`, and **7m51s** with a SHA-pinned
+> https one.
+>
+> Template names are written by their suffix from here on. `-v6` means
+> `jenkins-agent-debian13-v6`, and it is the full name, not the suffix, that
+> `PKR_VAR_template_name` and the cloud's template field both take.
+>
+> **The two `-v6` runs did not produce the same image.** The 11m12s one installed, provisioned and
+> registered its template correctly, then lost it to the export failure described just above and
+> exited with nothing on the pool. The 6m15s one rebuilt it under the same name, and that second one
+> is the `-v6` that carried a build. A template name is not an identity: `PKR_VAR_template_name`
+> will reuse one without complaint, so date a build rather than trusting its suffix.
 >
 > The dates on this block are load-bearing, because it has been wrong in both directions. It first
 > said the build completes full stop while the build was still stopping at item 4. It then said the
@@ -314,18 +326,29 @@ neither its documentation nor its own validation error — read from its source 
 >
 > **The images it has produced have carried an agent through a build.** `-v3` on 2026-08-12 midday
 > (`packer build`, the plugin cloned it, the agent connected, build #2 passed), `-v5` that night
-> (build #4 passed on a clone, destroyed, SR back to baseline), and `-v5` again in the 0.3.0 release
-> verification, where the happy path, the capacity cap and the warm pool each cloned it. The `-v3`
-> and `-v5` names are `PKR_VAR_template_name` overrides, so each run sat beside the existing
+> (build #4 passed on a clone, destroyed, SR back to baseline), `-v5` again in the 0.3.0 release
+> verification, where the happy path, the capacity cap and the warm pool each cloned it, `-v6` on
+> 2026-09-03, and `-v7` on 2026-09-04 — twice, the second time against the **released** 0.4.0 `.hpi`
+> rather than a local build. `-v6` has since been deleted: it was built with a throwaway CA in
+> `image/ca-certificates/` to exercise that path, so it is not an image to keep. The `-v3`, `-v5`,
+> `-v6` and `-v7` names are `PKR_VAR_template_name` overrides, so each run sat beside the existing
 > templates rather than replacing them.
 >
 > **What these runs do and do not establish.** One pool, one Debian version. Untested: Packer's own
 > built-in HTTP server from a build host the installer VM can reach, any other pool or Debian
 > version, and the no-netplan branch in `provision.sh`, which CI cannot enter because it runs with
-> `SKIP_CLEANUP`. The newest of these images was built on 2026-08-12, so nothing built since
-> [#180](https://github.com/gounthar/xcpng-cloud-plugin/pull/180) has run a build either
-> ([#202](https://github.com/gounthar/xcpng-cloud-plugin/issues/202)). The five fixes below are each
-> verified against the failure they address; none is verified as portable.
+> `SKIP_CLEANUP`. The five fixes below are each verified against the failure they address; none is
+> verified as portable.
+>
+> **An image built after [#180](https://github.com/gounthar/xcpng-cloud-plugin/pull/180),
+> [#193](https://github.com/gounthar/xcpng-cloud-plugin/pull/193) and
+> [#197](https://github.com/gounthar/xcpng-cloud-plugin/pull/197) has now run a build**, which is
+> what [#202](https://github.com/gounthar/xcpng-cloud-plugin/issues/202) asked for and why it is
+> closed: `-v6` on 2026-09-03, `-v7` on 2026-09-04. This paragraph said the opposite for a day after
+> it stopped being true, and the block above it has now been stale twice
+> ([#203](https://github.com/gounthar/xcpng-cloud-plugin/issues/203) was the first). **Anything here
+> that dates the newest image, or claims no build has run since some pull request, is a claim with a
+> shelf life — check it against the pool before trusting it.**
 >
 > Five separate things were wrong, and none of them was visible in the Packer log, which prints
 > `Wait for VM's IP to become known to us` and then nothing in every one of these cases. All are
