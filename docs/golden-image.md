@@ -177,8 +177,9 @@ export PKR_VAR_remote_password=...        # never commit this
 # Where debian-installer fetches the preseed. The fetch is made by the installer running inside the
 # VM being built, so the machine that has to reach the HTTP server is that VM. Not dom0, not XAPI.
 #
-# Three ways to answer it. The first two hand the installer a copy of the file; the third does not,
-# which is the whole reason it is here.
+# Three ways to answer it. Only the middle one hands the installer a copy of the file, and the copy
+# is where the drift comes from. Packer serves `image/http` straight out of the checkout, and a
+# SHA-pinned URL serves the committed file itself, so neither of those two can fall out of step.
 #
 # LEAVE IT UNSET, and Packer serves the file itself. Right on a build host sitting on the pool's VM
 # network with no NAT in between. It fails when the installer VM cannot reach that host, which is
