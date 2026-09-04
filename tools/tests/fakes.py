@@ -25,7 +25,7 @@ class FakeResponse:
 
 
 def vm_record(name, snapshot=False, template=False, control_domain=False, power="Halted",
-              owner=None, other_config=None):
+              owner=None, other_config=None, xenstore_data=None):
     """The subset of a XAPI VM record that reaper.py filters on.
 
     `owner` stamps the `xcpng-cloud` marker the plugin writes into other_config, i.e. this is
@@ -44,6 +44,10 @@ def vm_record(name, snapshot=False, template=False, control_domain=False, power=
         "is_a_template": template,
         "is_control_domain": control_domain,
         "other_config": config,
+        # The per-clone seed the plugin writes, and the surface #28's scrub clears. Defaults to
+        # empty rather than to a populated seed: a fake that seeded every VM would make a
+        # watcher that never reads the key look like one that reads it correctly.
+        "xenstore_data": dict(xenstore_data or {}),
     }
 
 
