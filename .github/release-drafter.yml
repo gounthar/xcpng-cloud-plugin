@@ -16,27 +16,50 @@
 name-template: '$RESOLVED_VERSION'
 tag-template: '$RESOLVED_VERSION'
 
+# Every changelog category below that carries a `when:` also carries `exclusive: true`, and
+# that is what stops one pull request rendering twice. Release Drafter walks the category
+# list per pull request and appends to *every* category that matches; the `break` in
+# categorize-pull-requests.ts fires only for a category that sets `exclusive`. Removing
+# `java` from Build, CI, and dependencies killed the commonest cause but left the mechanism,
+# so #199 (`bug` plus `build`) still rendered under Bug fixes and again under Build, CI, and
+# dependencies in the 0.4.0 draft.
+#
+# It makes list order load-bearing: first match wins, so a pull request carrying two category
+# labels lands in whichever appears first here. That is why the order below reads
+# most-specific first -- what a change *is* (a feature, a fix, documentation) outranks what
+# it *touched* (the build). Reordering these entries silently reclassifies such pull requests.
+#
+# Deliberately not set on the `version-resolver` entries further down, where it is also legal.
+# Those resolve the version through a Math.max over every matching entry
+# (`getHighestPriority` in resolve-version-increment.ts); making them exclusive would switch
+# that to first-match-wins and let a `patch` entry mask a `minor` one.
 categories:
   - title: Features
+    exclusive: true
     when:
       labels:
         - enhancement
   - title: Bug fixes
+    exclusive: true
     when:
       labels:
         - bug
   - title: Documentation
+    exclusive: true
     when:
       labels:
         - documentation
-  # `java` is deliberately absent from this list, and putting it back reintroduces a
-  # published defect. Release Drafter files a pull request under *every* category it
-  # matches -- the `break` in categorize-pull-requests.ts fires only when a category sets
-  # `exclusive` -- and every Java code change here carries `java` plus `bug` or
-  # `enhancement`. Nine entries in the 0.3.0 draft therefore rendered twice, under Bug
-  # fixes or Features and again here. The other three labels say what kind of change it
-  # is; `java` says what it touched, which is true of nearly every pull request. See #177.
+  # `java` is deliberately absent from this list. Every Java code change here carries `java`
+  # plus `bug` or `enhancement`, and listing it put nine entries of the 0.3.0 draft under Bug
+  # fixes or Features and again here. The other three labels say what a change *is*; `java`
+  # says what it touched, which is true of nearly every pull request. See #177.
+  #
+  # `exclusive: true` above now hides that symptom rather than making it safe: a `java` entry
+  # here would be reached only after Features, Bug fixes and Documentation had all missed, so
+  # a `java`-only pull request would file under Build, CI, and dependencies with nothing to
+  # show it had been misfiled. Putting `java` back is quieter than it was, not better.
   - title: Build, CI, and dependencies
+    exclusive: true
     when:
       labels:
         - build
