@@ -98,6 +98,22 @@ variable "debian_version" {
 // the wrong test, for the reason above.
 //
 // Then set this to a URL the installer VM can reach, and serve image/http/preseed.cfg there.
+//
+// That URL may be https. Measured 2026-09-04 on the Debian 13.4.0 netinst, as two builds differing
+// only in this variable: the https one installed unattended and reached the provisioner exactly as
+// the plain-http control did, and the installed system's /var/log/installer/syslog says
+// `preseed: successfully loaded preseed file from https://...` with a 12908/12908 byte fetch.
+//
+// No *custom* trust anchor had to be injected. The initrd already carries public roots and the
+// handshake validated against those; only an internal CA would need one added. Two conditions, read
+// off the fetcher itself at /usr/lib/fetch-url/http in di-utils 1.155 because a passing build shows
+// neither: https needs GNU wget in the initrd, since against busybox wget the handler prints
+// "busybox wget does not support https" and fails; and the certificate is checked, because
+// `--no-check-certificate` is added only when debian-installer/allow_unauthenticated_ssl is true,
+// which nothing here sets.
+//
+// It was measured rather than read because the initrd's fetcher is not the wget of an installed
+// system and its TLS support has varied by release, so re-measure if the point release moves.
 variable "preseed_url" {
   type        = string
   description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server, which the installer VM must be able to reach."
