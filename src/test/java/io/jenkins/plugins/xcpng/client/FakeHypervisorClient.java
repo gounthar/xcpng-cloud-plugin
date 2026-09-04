@@ -174,6 +174,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public synchronized Optional<String> primaryIpAddress(VmRef vm) {
+        checkNotInterrupted("primaryIpAddress");
         if (assignIpOnStart != null && states.get(vm.value()) == VmState.RUNNING) {
             return Optional.of(assignIpOnStart);
         }
@@ -182,6 +183,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
 
     @Override
     public synchronized VmState state(VmRef vm) {
+        checkNotInterrupted("state");
         return states.getOrDefault(vm.value(), VmState.UNKNOWN);
     }
 
