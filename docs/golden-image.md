@@ -202,15 +202,18 @@ export PKR_VAR_remote_password=...        # never commit this
 #     answer `cache-control: max-age=300` (measured 2026-09-04), so a build started within five
 #     minutes of a push can read the previous file with nothing in the log to say so. A SHA-pinned
 #     URL is cached identically and cannot change underneath it.
-#   - It is https-only and needs outbound internet and DNS from the VM network.
-#     `http://raw.githubusercontent.com/...` answers 301 to the https URL (measured 2026-09-04), so
-#     there is no cleartext path. An air-gapped or restricted-egress pool cannot use this at all,
-#     which is why the LAN-host recipe above stays documented rather than being replaced.
+#   - Write the https URL, never an http one. `http://raw.githubusercontent.com/...` answers 301 to
+#     it (measured 2026-09-04), so GitHub never serves the file in the clear. That redirect is not
+#     a safety net and must not be leaned on: the first request and the 301 reply are themselves
+#     unauthenticated and an on-path attacker can rewrite either, and whether the installer's
+#     fetcher follows a redirect at all is untested here. It also needs outbound internet and DNS
+#     from the VM network, so an air-gapped or restricted-egress pool cannot use this at all, which
+#     is why the LAN-host recipe above stays documented rather than being replaced.
 #   - It publishes nothing that is not already published. preseed.cfg holds the installer's
 #     debian/debian account and a NOPASSWD sudo drop-in, in a public repository, and provision.sh
 #     locks that password and deletes that drop-in during template cleanup. Serving the file from
-#     GitHub exposes no more than browsing to it does. That is a property to re-check rather than assume: it stops being true the day
-#     anything genuinely secret goes into that file.
+#     GitHub exposes no more than browsing to it does. That is a property to re-check rather than
+#     assume: it stops being true the day anything genuinely secret goes into that file.
 #
 # https works for either served option. debian-installer 13 fetches a preseed over https, and it
 # validates the certificate while doing so. Measured 2026-09-04 on the Debian 13.4.0 netinst against
@@ -233,6 +236,8 @@ export PKR_VAR_remote_password=...        # never commit this
 #     preseed is authenticated, which is what makes pinning one worth doing.
 # Re-measure if the point release moves. This was measured rather than read because the initrd's
 # fetcher is not the wget of an installed system and its TLS support has varied by release.
+# This line is the LAN-host option. Delete it to let Packer serve the file, or replace it with a
+# SHA-pinned https URL. Copied as-is, it selects LAN-host whatever you read above.
 export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
 
 # Use an ISO VDI already present in sr_iso_name instead of uploading one. Needed
