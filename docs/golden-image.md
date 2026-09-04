@@ -183,6 +183,17 @@ export PKR_VAR_remote_password=...        # never commit this
 # a connection error (see item 3 below). Then serve image/http/preseed.cfg anywhere the installer VM
 # can reach:
 #     python3 -m http.server 8000    # in image/http/, on a host the installer VM can reach
+#
+# The URL does not have to be plain http: debian-installer 13 fetches a preseed over https on its
+# own, with no trust anchor seeded into the initrd. Measured 2026-09-04 on the Debian 13.4.0 netinst
+# against this pool, as a pair of builds differing only in this variable. The https build installed
+# unattended and reached the provisioner exactly as the plain-http control did, and the installed
+# system's /var/log/installer/syslog records the fetch rather than leaving it to be inferred from the
+# absence of prompts:
+#     preseed: successfully loaded preseed file from https://raw.githubusercontent.com/...
+#     URL:https://raw.githubusercontent.com/... [12908/12908] -> "/tmp/debconf-seed.fetch-url.2936"
+# Re-measure if the point release moves. This was measured rather than read because the initrd's
+# fetcher is not the wget of an installed system and its TLS support has varied by release.
 export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
 
 # Use an ISO VDI already present in sr_iso_name instead of uploading one. Needed

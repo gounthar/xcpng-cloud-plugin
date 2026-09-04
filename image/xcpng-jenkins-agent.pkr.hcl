@@ -98,6 +98,14 @@ variable "debian_version" {
 // the wrong test, for the reason above.
 //
 // Then set this to a URL the installer VM can reach, and serve image/http/preseed.cfg there.
+//
+// That URL may be https. Measured 2026-09-04 on the Debian 13.4.0 netinst, as two builds differing
+// only in this variable: the https one installed unattended and reached the provisioner exactly as
+// the plain-http control did, and the installed system's /var/log/installer/syslog says
+// `preseed: successfully loaded preseed file from https://...` with a 12908/12908 byte fetch. So the
+// initrd completes a TLS handshake against a public CA with nothing seeded into it. It was measured
+// rather than read because the initrd's fetcher is not the wget of an installed system, and its TLS
+// support has varied by release — so re-measure if the point release moves.
 variable "preseed_url" {
   type        = string
   description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server, which the installer VM must be able to reach."
