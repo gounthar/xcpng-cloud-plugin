@@ -184,14 +184,25 @@ export PKR_VAR_remote_password=...        # never commit this
 # can reach:
 #     python3 -m http.server 8000    # in image/http/, on a host the installer VM can reach
 #
-# The URL does not have to be plain http: debian-installer 13 fetches a preseed over https on its
-# own, with no trust anchor seeded into the initrd. Measured 2026-09-04 on the Debian 13.4.0 netinst
-# against this pool, as a pair of builds differing only in this variable. The https build installed
+# The URL does not have to be plain http. debian-installer 13 fetches a preseed over https, and it
+# validates the certificate while doing so. Measured 2026-09-04 on the Debian 13.4.0 netinst against
+# this pool, as a pair of builds differing only in this variable. The https build installed
 # unattended and reached the provisioner exactly as the plain-http control did, and the installed
 # system's /var/log/installer/syslog records the fetch rather than leaving it to be inferred from the
 # absence of prompts:
 #     preseed: successfully loaded preseed file from https://raw.githubusercontent.com/...
 #     URL:https://raw.githubusercontent.com/... [12908/12908] -> "/tmp/debconf-seed.fetch-url.2936"
+# No *custom* trust anchor had to be injected for that. The initrd already carries public roots, and
+# those are what the handshake validated against; only a pool or mirror behind an internal CA would
+# need one added.
+#
+# Two conditions come from the fetcher's own source, /usr/lib/fetch-url/http in di-utils 1.155, and
+# neither is visible from a build that passes:
+#   - https needs GNU wget in the initrd. Against busybox wget the handler prints "busybox wget does
+#     not support https" and fails, so an image assembled another way may not have it.
+#   - the certificate is checked. `--no-check-certificate` is added only when the debconf question
+#     debian-installer/allow_unauthenticated_ssl is true, and nothing here sets it. So an https
+#     preseed is authenticated, which is what makes pinning one worth doing.
 # Re-measure if the point release moves. This was measured rather than read because the initrd's
 # fetcher is not the wget of an installed system and its TLS support has varied by release.
 export PKR_VAR_preseed_url=http://192.168.1.102:8000/preseed.cfg
