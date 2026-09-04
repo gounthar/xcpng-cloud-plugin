@@ -83,6 +83,34 @@ class HypervisorClientContractTest {
     }
 
     @Test
+    void stateRejectsInterruptedThreadWithoutRecordingCall() {
+        FakeHypervisorClient client = new FakeHypervisorClient();
+        VmRef vm = new VmRef("vm/test");
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(HypervisorException.class, () -> client.state(vm));
+            assertTrue(client.calls().isEmpty(), "interrupted state is not recorded");
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void primaryIpAddressRejectsInterruptedThreadWithoutRecordingCall() {
+        FakeHypervisorClient client = new FakeHypervisorClient();
+        VmRef vm = new VmRef("vm/test");
+
+        Thread.currentThread().interrupt();
+        try {
+            assertThrows(HypervisorException.class, () -> client.primaryIpAddress(vm));
+            assertTrue(client.calls().isEmpty(), "interrupted primaryIpAddress is not recorded");
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
     void pingSurfacesFailure() {
         assertThrows(
                 HypervisorException.class,
