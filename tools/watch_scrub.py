@@ -255,11 +255,16 @@ def main(argv=None):
                 time.sleep(args.interval)
                 continue
 
-            for key in sorted(current, key=lambda k: current[k]["name"]):
+            # (name, uuid), matching Tracker.verdicts(). Sorting on the label alone leaves
+            # same-labelled clones in dict order, so two runs of one scenario could interleave
+            # their lines differently and read as a behaviour change.
+            for key in sorted(current, key=lambda k: (current[k]["name"], k)):
                 tracker.observe(key, current[key], at)
                 if previous.get(key) != current[key]:
                     emit(f"{current[key]['name']}  {format_state(current[key])}")
-            for key in sorted(set(previous) - set(current), key=lambda k: previous[k]["name"]):
+            for key in sorted(
+                set(previous) - set(current), key=lambda k: (previous[k]["name"], k)
+            ):
                 # Recorded, not just printed: a secret that outlived its clone is only a verdict
                 # once the clone is known to have gone.
                 tracker.mark_gone(key)

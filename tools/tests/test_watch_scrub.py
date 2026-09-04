@@ -13,6 +13,8 @@ for it is the positive control the old check never had.
 
 from fakes import vm_record
 
+import argparse
+
 import pytest
 
 from watch_scrub import (
@@ -192,8 +194,13 @@ def test_the_exit_status_follows_its_documented_precedence():
 
 @pytest.mark.parametrize("bad", ["0", "-1", "nan", "-inf"])
 def test_a_polling_interval_that_cannot_work_is_refused_up_front(bad):
-    """Zero polls the pool as fast as it answers; the rest raise inside sleep(), mid-run."""
-    with pytest.raises(Exception):
+    """Zero polls the pool as fast as it answers; the rest raise inside sleep(), mid-run.
+
+    Pinned to ArgumentTypeError rather than to Exception. A bare `raises(Exception)` passes when
+    the function blows up for a reason nobody intended, which is a check that cannot fail for
+    the right cause: the same defect this whole tool was written to replace, one level down.
+    """
+    with pytest.raises(argparse.ArgumentTypeError):
         positive_seconds(bad)
 
 
