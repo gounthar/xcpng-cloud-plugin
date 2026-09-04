@@ -83,11 +83,13 @@ jobs:
               repo: context.repo.repo,
               issue_number: number,
               body: [
-                `Thanks @${author} — that is your first change merged here, and it is in.`,
+                `Thanks @${author}, that is your first change merged here, and it is in.`,
                 '',
-                `If you want another, the [\`good first issue\`](${goodFirstIssue}) label is where the`,
-                `small, self-contained ones live, and [\`CONTRIBUTING.md\`](${contributing}) has the`,
-                'build and test commands. Asking on an issue before you write any code is',
-                'welcome, and usually saves you a round of review.',
+                [
+                  `If you want another, the [\`good first issue\`](${goodFirstIssue}) label is where the`,
+                  `small, self-contained ones live, and [\`CONTRIBUTING.md\`](${contributing}) has the`,
+                  'build and test commands. Asking on an issue before you write any code is',
+                  'welcome, and usually saves you a round of review.',
+                ].join(' '),
               ].join('\n'),
             });
