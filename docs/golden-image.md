@@ -409,6 +409,42 @@ neither its documentation nor its own validation error — read from its source 
 > python3 tools/vnc_console.py 127.0.0.1 5901 --key 0xff0d   # answer a blocking dialog
 > ```
 
+### What the ISO pin fixes, and what it does not
+
+`debian_version` in `image/xcpng-jenkins-agent.pkr.hcl` names a point release, and it is worth
+keeping pinned: Debian moves point releases out of `/release` into `/archive` once the next one
+ships, so an unpinned URL 404s eventually. What the pin does not do is fix what ends up installed.
+It fixes the installer *media*. The installer then fetches the base system from `deb.debian.org`,
+because that is what `image/http/preseed.cfg` tells it to do, and the apt-setup answers in that file
+keep the media out of the installed `sources.list`. `provision.sh` runs no `apt-get upgrade` or
+`dist-upgrade`, so nothing later undoes that either.
+
+The consequence is measured. `jenkins-agent-debian13-v3` and `-v4` were both built on 2026-08-12
+from the 13.4.0 netinst — `debian_version` has defaulted to `13.4.0` since `08a29ce` and has never
+been changed, and nothing bumps it on its own, since the manifests in `updatecli/updatecli.d/` target
+the Packer CLI, the builder plugin and actionlint but not this variable — and both report **13.6** in `/etc/debian_version`, read on 2026-09-03 by attaching
+their VDIs to dom0 with the recipe near the top of this page. That those versions come from the
+mirror as it stood on the build day, rather than from the ISO, is the obvious reading of that and is
+inference: no individual package was traced to its source.
+
+Two things follow.
+
+**`/etc/debian_version` is not a provenance signal on these images.** It names a point release the
+build never used, and it is the first field anyone reaches for to answer "what is on this image". To
+answer that, date the build and take a digest of the installed set from inside a clone:
+
+```sh
+dpkg-query -W -f='${Package} ${Version}\n' | sort | sha256sum
+```
+
+**Two builds from one commit a month apart produce different images**, and nothing in the build log
+says so. For an agent image that is arguably what you want, since it picks up security updates with
+nobody bumping a variable. It stops being fine the moment anyone quotes reproducibility. If that is
+ever wanted, `snapshot.debian.org` pinned to a timestamp is the mechanism, and it costs those
+security updates until someone moves the timestamp — not a trade worth making for an ephemeral
+agent image without a reason to.
+[#201](https://github.com/gounthar/xcpng-cloud-plugin/issues/201)
+
 ## Building it by hand
 
 1. Create a VM from the shipped **Debian Trixie 13** template, or import a Debian generic cloud

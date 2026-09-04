@@ -68,8 +68,26 @@ variable "template_name" {
   default     = "jenkins-agent-debian13"
 }
 
-// Pinned to a point release on purpose. Debian moves point releases out of /release into /archive,
-// so an unpinned URL turns a reproducible build into a time-dependent one.
+// Pinned to a point release on purpose, and the pin buys less than the word "pinned" suggests.
+//
+// WHAT IT BUYS: a URL that keeps resolving. Debian moves point releases out of /release into
+// /archive once the next one ships, so an unpinned URL 404s on a schedule nobody here controls.
+// The iso_url below already names /archive, so this one stays valid.
+//
+// WHAT IT DOES NOT BUY: a fixed package set. The pin fixes the installer media only. preseed.cfg
+// points the installer at deb.debian.org and keeps the media out of the installed sources.list, so
+// the base system comes from the mirror as it stood on the build day, and provision.sh runs no
+// apt-get upgrade or dist-upgrade to undo that afterwards. Measured 2026-09-03:
+// jenkins-agent-debian13-v3 and -v4, both built from this 13.4.0 netinst on 2026-08-12, both report
+// 13.6 in /etc/debian_version. That those versions come from the mirror rather than from the ISO is
+// the obvious reading of that measurement and is inference; no individual package was traced.
+//
+// So /etc/debian_version is not a provenance signal on these images: it names a point release the
+// build never used, and it is the first field anyone reaches for. Two builds from one commit a month
+// apart produce different images with nothing in the log to say so. For an agent image that is
+// arguably what you want, since it picks up security updates with no bump here. snapshot.debian.org
+// pinned to a timestamp is the mechanism if a genuinely reproducible image is ever needed, and it
+// costs those updates until someone moves the timestamp. See issue #201 and docs/golden-image.md.
 variable "debian_version" {
   type    = string
   default = "13.4.0"
