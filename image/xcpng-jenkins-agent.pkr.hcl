@@ -99,6 +99,13 @@ variable "debian_version" {
 //
 // Then set this to a URL the installer VM can reach, and serve image/http/preseed.cfg there.
 //
+// Or skip the copy entirely and point it at this repository, SHA-pinned:
+//     https://raw.githubusercontent.com/gounthar/xcpng-cloud-plugin/<sha>/image/http/preseed.cfg
+// A commit SHA, never a branch: both forms answer cache-control: max-age=300, so a branch URL can
+// serve the pre-push file to a build started within five minutes of a push, and say nothing about
+// it in the log. It needs outbound internet and DNS from the VM network, so it is an addition to
+// the LAN-host recipe rather than a replacement. See docs/golden-image.md for the rest.
+//
 // That URL may be https. Measured 2026-09-04 on the Debian 13.4.0 netinst, as two builds differing
 // only in this variable: the https one installed unattended and reached the provisioner exactly as
 // the plain-http control did, and the installed system's /var/log/installer/syslog says

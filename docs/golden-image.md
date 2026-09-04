@@ -177,14 +177,42 @@ export PKR_VAR_remote_password=...        # never commit this
 # Where debian-installer fetches the preseed. The fetch is made by the installer running inside the
 # VM being built, so the machine that has to reach the HTTP server is that VM. Not dom0, not XAPI.
 #
-# On a build host sitting on the pool's VM network with no NAT in between, leave this unset and use
-# Packer's own server. Set it when the installer VM cannot reach that host, which is what WSL2's
-# default NAT does: it passes outbound and blocks inbound, and it fails as a silent hang rather than
-# a connection error (see item 3 below). Then serve image/http/preseed.cfg anywhere the installer VM
-# can reach:
-#     python3 -m http.server 8000    # in image/http/, on a host the installer VM can reach
+# Three ways to answer it. The first two hand the installer a copy of the file; the third does not,
+# which is the whole reason it is here.
 #
-# The URL does not have to be plain http. debian-installer 13 fetches a preseed over https, and it
+# LEAVE IT UNSET, and Packer serves the file itself. Right on a build host sitting on the pool's VM
+# network with no NAT in between. It fails when the installer VM cannot reach that host, which is
+# what WSL2's default NAT does: it passes outbound and blocks inbound, and it fails as a silent hang
+# rather than a connection error (see the WSL2 NAT entry in the five-failures list below).
+#
+# SERVE IT FROM A HOST THE INSTALLER VM CAN REACH:
+#     python3 -m http.server 8000    # in image/http/
+# What the installer reads is then a copy, and the re-copy warning further down exists for this
+# option alone.
+#
+# SERVE IT OUT OF THIS REPOSITORY, SHA-PINNED. There is no copy, so there is nothing to drift and
+# nothing to check, and `git show <sha>:image/http/preseed.cfg` answers "what did that build
+# actually install":
+#     export PKR_VAR_preseed_url=https://raw.githubusercontent.com/gounthar/xcpng-cloud-plugin/<sha>/image/http/preseed.cfg
+#
+# Three things to know before choosing it.
+#
+#   - PIN A COMMIT SHA, NEVER A BRANCH. A .../main/... URL brings the drift back in a quieter form:
+#     it follows whatever was last pushed rather than the tree you are building from. Both forms
+#     answer `cache-control: max-age=300` (measured 2026-09-04), so a build started within five
+#     minutes of a push can read the previous file with nothing in the log to say so. A SHA-pinned
+#     URL is cached identically and cannot change underneath it.
+#   - It is https-only and needs outbound internet and DNS from the VM network.
+#     `http://raw.githubusercontent.com/...` answers 301 to the https URL (measured 2026-09-04), so
+#     there is no cleartext path. An air-gapped or restricted-egress pool cannot use this at all,
+#     which is why the LAN-host recipe above stays documented rather than being replaced.
+#   - It publishes nothing that is not already published. preseed.cfg holds the installer's
+#     debian/debian account and a NOPASSWD sudo drop-in, in a public repository, and provision.sh
+#     locks that password and deletes that drop-in during template cleanup. Serving the file from
+#     GitHub exposes no more than browsing to it does. That is a property to re-check rather than assume: it stops being true the day
+#     anything genuinely secret goes into that file.
+#
+# https works for either served option. debian-installer 13 fetches a preseed over https, and it
 # validates the certificate while doing so. Measured 2026-09-04 on the Debian 13.4.0 netinst against
 # this pool, as a pair of builds differing only in this variable. The https build installed
 # unattended and reached the provisioner exactly as the plain-http control did, and the installed
@@ -223,12 +251,15 @@ export PKR_VAR_iso_name=debian-13.4.0-amd64-netinst.iso
 # either way. Point it out of the checkout and no empty packer-jenkins-agent/ appears there.
 #     export PKR_VAR_output_directory=/var/tmp/jenkins-image
 
-# RE-COPY preseed.cfg TO THAT HOST BEFORE EVERY BUILD. What the installer reads is a copy, and
-# nothing keeps it in sync with the repo. A build launched to verify a preseed change will happily
-# fetch a months-old file, reproduce the bug you just fixed, and look like the fix did not work.
-# Caught doing exactly this: the served copy was 69 lines against the repo's 133, missing both the
-# apt-setup answers and the whole guest-tools block. Compare the two before you trust a result:
+# IF YOU SERVE THE FILE YOURSELF, RE-COPY preseed.cfg TO THAT HOST BEFORE EVERY BUILD. What the
+# installer reads is a copy, and nothing keeps it in sync with the repo. A build launched to verify
+# a preseed change will happily fetch a months-old file, reproduce the bug you just fixed, and look
+# like the fix did not work. Caught doing exactly this: the served copy was 69 lines against the
+# repo's 133, missing both the apt-setup answers and the whole guest-tools block. Compare the two
+# before you trust a result:
 #     curl -fsS "$PKR_VAR_preseed_url" | diff - image/http/preseed.cfg && echo in sync
+# A SHA-pinned raw URL is the way out of this: it has no copy to re-sync, and the same command
+# either matches by construction or says the URL is wrong.
 
 packer init  image/
 packer validate image/
