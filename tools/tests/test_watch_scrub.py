@@ -177,10 +177,16 @@ def test_each_clone_gets_its_own_verdict():
     ]
 
 
-def test_the_worst_verdict_decides_the_exit_status():
+def test_the_exit_status_follows_its_documented_precedence():
+    """NOT SCRUBBED over CONFIRMED over INCONCLUSIVE, which is not the numeric worst case.
+
+    The last line is the one worth pinning, and the one the docstring used to get wrong: a clone
+    nobody could rule on does not un-observe a transition another clone did show.
+    """
     assert exit_status([("a", CONFIRMED, "")]) == 0
     assert exit_status([("a", CONFIRMED, ""), ("b", NOT_SCRUBBED, "")]) == 1
     assert exit_status([("a", INCONCLUSIVE, "")]) == 2
+    assert exit_status([("a", NOT_SCRUBBED, ""), ("b", INCONCLUSIVE, "")]) == 1
     assert exit_status([("a", CONFIRMED, ""), ("b", INCONCLUSIVE, "")]) == 0
 
 

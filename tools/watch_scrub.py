@@ -184,7 +184,14 @@ class Tracker:
 
 
 def exit_status(verdicts):
-    """0 confirmed, 1 a clone kept its secret, 2 nothing conclusive. Worst answer wins."""
+    """The exit code, by precedence rather than by numeric severity.
+
+    NOT SCRUBBED (1) outranks CONFIRMED (0), which outranks INCONCLUSIVE (2). "Worst answer
+    wins" is what this used to claim and it is not what happens: 2 is the largest code and the
+    weakest result. The middle rule is the deliberate one. A clone nobody could rule on does not
+    un-observe a transition another clone did show, so CONFIRMED beside INCONCLUSIVE still exits
+    0, while a NOT SCRUBBED contradicts it outright and wins.
+    """
     kinds = {kind for _, kind, _ in verdicts}
     if NOT_SCRUBBED in kinds:
         return 1
