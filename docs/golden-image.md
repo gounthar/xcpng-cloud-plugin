@@ -303,11 +303,21 @@ neither its documentation nor its own validation error — read from its source 
 
 > **Status (updated 2026-09-04): `packer build` runs unattended and registers the template.**
 > No keystroke, five times: **8m31s** on 2026-08-12, producing `jenkins-agent-debian13-v5`;
-> **11m12s** and **6m15s** on 2026-09-03, the second producing `-v6`; and the pair that settled
+> **11m12s** and **6m15s** on 2026-09-03, both registering a template named
+> `jenkins-agent-debian13-v6`; and the pair that settled
 > [#170](https://github.com/gounthar/xcpng-cloud-plugin/issues/170) on 2026-09-04, **7m00s** with a
-> plain-http preseed URL, producing `-v7`, and **7m51s** with a SHA-pinned https one. The 11m12s run
-> reached the export step unattended and then failed writing its XVA to a full drive, taking the
-> template with it, which is the hazard described just above rather than an installer problem.
+> plain-http preseed URL, producing `jenkins-agent-debian13-v7`, and **7m51s** with a SHA-pinned
+> https one.
+>
+> Template names are written by their suffix from here on. `-v6` means
+> `jenkins-agent-debian13-v6`, and it is the full name, not the suffix, that
+> `PKR_VAR_template_name` and the cloud's template field both take.
+>
+> **The two `-v6` runs did not produce the same image.** The 11m12s one installed, provisioned and
+> registered its template correctly, then lost it to the export failure described just above and
+> exited with nothing on the pool. The 6m15s one rebuilt it under the same name, and that second one
+> is the `-v6` that carried a build. A template name is not an identity: `PKR_VAR_template_name`
+> will reuse one without complaint, so date a build rather than trusting its suffix.
 >
 > The dates on this block are load-bearing, because it has been wrong in both directions. It first
 > said the build completes full stop while the build was still stopping at item 4. It then said the
