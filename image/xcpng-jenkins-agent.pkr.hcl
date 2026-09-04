@@ -6,15 +6,15 @@
 // the static fleet, and this plugin does the one thing neither can, which is watch a build queue
 // and scale to it.
 //
-// STATUS. `packer validate` passes and CI runs it on every push. `packer build` HAS now been run
-// against the lab pool: the builder uploaded the netinst ISO, created the VM, connected VNC, and
-// drove the Debian installer via boot_command (the installer kernel loaded). It then blocked at the
-// preseed HTTP fetch, an environment wall, not a template one: packer serves the preseed on the
-// host running it, unreachable from the pool when that host is behind WSL2 NAT. Run `packer build`
-// from a pool-reachable host (WSL2 mirrored networking, a netsh portproxy, or a golden-image clone
-// as the builder). Everything durable about the image lives in image/provision.sh, which CI executes
-// on every push inside a debian:13 container. docs/golden-image.md has the full write-up and the
-// manual path, which was performed by hand and does work.
+// STATUS. `packer validate` passes and CI runs it on every push. `packer build` runs unattended
+// against the lab pool and registers the template: 8m31s on 2026-08-12 and 11m12s on 2026-09-03, no
+// keystroke either time. (The second run then failed writing its XVA to a full drive and took the
+// template with it, which is #195 and is why `format` defaults to "none" below. It reached the
+// export step unattended.) Both served the preseed from a LAN host via preseed_url; Packer's own HTTP server is
+// still unexercised from a build host the installer VM can reach.
+//
+// Everything durable about the image lives in image/provision.sh, which CI executes on every push
+// inside a debian:13 container. docs/golden-image.md has the full write-up and the manual path.
 //
 //   export PKR_VAR_remote_host=192.168.1.87
 //   export PKR_VAR_remote_username=root
@@ -68,35 +68,155 @@ variable "template_name" {
   default     = "jenkins-agent-debian13"
 }
 
-// Pinned to a point release on purpose. Debian moves point releases out of /release into /archive,
-// so an unpinned URL turns a reproducible build into a time-dependent one.
+// Pinned to a point release on purpose, and the pin buys less than the word "pinned" suggests.
+//
+// WHAT IT BUYS: a build that keeps naming one installer image. Old point releases live only under
+// /cdimage/archive, which is where iso_url points, while /cdimage/release carries whatever is
+// current. Measured 2026-09-04: .../release/13.4.0/... answers 404, .../archive/13.4.0/... answers
+// 200, and .../release/current/ serves 13.6.0 today. So a URL written to follow the current release
+// would fetch a different image every few weeks, with iso_checksum needing to move in step and
+// nothing in the log to say the media had changed.
+//
+// WHAT IT DOES NOT BUY: a fixed package set. The pin fixes the installer media only. preseed.cfg
+// points the installer at deb.debian.org and keeps the media out of the installed sources.list, so
+// the base system comes from the mirror as it stood on the build day, and provision.sh runs no
+// apt-get upgrade or dist-upgrade afterwards. Measured 2026-09-03: jenkins-agent-debian13-v3 and
+// -v4, both built from this 13.4.0 netinst on 2026-08-12, both report 13.6 in /etc/debian_version.
+// That those versions came from the mirror rather than from the ISO is the obvious reading of that
+// measurement and is inference; no individual package was traced.
+//
+// So /etc/debian_version dates the mirror, not the media. base-files ships that file, so it reports
+// the point release the base system was installed from, which the build did use, and says nothing
+// about which netinst booted, which is the question someone reading it usually means to ask. Two
+// builds from this one commit a month apart differ, with nothing in the log to say so. For an agent
+// image that is arguably what you want, since it picks up security updates with no bump here. If a
+// reproducible base system is ever wanted, snapshot.debian.org pinned to a timestamp is the
+// mechanism for the Debian half and only that half: provision.sh installs an unversioned
+// temurin-21-jre from packages.adoptium.net, whose metadata moves too. See issue #201 and
+// docs/golden-image.md.
 variable "debian_version" {
   type    = string
   default = "13.4.0"
 }
 
-// Where the installer fetches the preseed from. Empty means "use Packer's own HTTP server", which is
-// right whenever the machine running Packer is reachable from the pool on the LAN.
+// Where the installer fetches the preseed from.
 //
-// It is not reachable when Packer runs behind NAT, which includes WSL2 in its default mode. Packer
-// still starts its server and still advertises an address, so nothing looks wrong: the installer
-// boots, tries to fetch, cannot, and stalls on a screen that says nothing. The build then sits until
-// ssh_wait_timeout with a log that only ever says "Wait for VM's IP to become known to us".
+// WHO FETCHES IT, because the answer decides everything below: debian-installer, running inside the
+// VM this build is creating, from the `url=` that boot_command types at the isolinux prompt. So what
+// has to reach the HTTP server is the installer VM's network. Not dom0's, and not XAPI's. On this
+// single-host lab those are one network and the distinction never shows; on a pool whose management
+// network is separate from its VM network they are different questions with different answers.
 //
-// Measured on this lab from dom0: Packer advertised 192.168.1.145:8000 while its server was bound
-// inside WSL at 172.18.157.37:8000, and neither address answered from the pool.
+// Empty means "use Packer's own built-in server", bound on the machine running Packer. That is the
+// simplest correct answer on a build host sitting on the pool's VM network with nothing in between,
+// and it is worth trying first there. No build here has confirmed it: the runs that left it empty
+// were behind WSL2's NAT, and every run since has set the variable.
 //
-// Set this to a URL the pool can reach and serve image/http/preseed.cfg there yourself.
+// It is the wrong answer when Packer sits behind NAT, WSL2 in its default mode being the case this
+// project keeps hitting. Packer still starts its server and still advertises an address, so nothing
+// looks wrong: the installer boots, tries to fetch, cannot, and stalls on a screen that says
+// nothing. The build then sits until ssh_wait_timeout with a log that only ever says "Wait for VM's
+// IP to become known to us". Measured here: Packer advertised 192.168.1.145:8000 while its server
+// was bound inside WSL at 172.18.157.37:8000, and neither address answered. That probe was run from
+// dom0 rather than from a VM, which on this lab is the same network; on a segmented pool it would be
+// the wrong test, for the reason above.
+//
+// Then set this to a URL the installer VM can reach, and serve image/http/preseed.cfg there.
+//
+// Or skip the copy entirely and point it at this repository, SHA-pinned:
+//     https://raw.githubusercontent.com/gounthar/xcpng-cloud-plugin/<sha>/image/http/preseed.cfg
+// A commit SHA, never a branch: both forms answer cache-control: max-age=300, so a branch URL can
+// serve the pre-push file to a build started within five minutes of a push, and say nothing about
+// it in the log. It needs outbound internet and DNS from the VM network, so it is an addition to
+// the LAN-host recipe rather than a replacement. See docs/golden-image.md for the rest.
+//
+// That URL may be https. Measured 2026-09-04 on the Debian 13.4.0 netinst, as two builds differing
+// only in this variable: the https one installed unattended and reached the provisioner exactly as
+// the plain-http control did, and the installed system's /var/log/installer/syslog says
+// `preseed: successfully loaded preseed file from https://...` with a 12908/12908 byte fetch.
+//
+// No *custom* trust anchor had to be injected. The initrd already carries public roots and the
+// handshake validated against those; only an internal CA would need one added. Two conditions, read
+// off the fetcher itself at /usr/lib/fetch-url/http in di-utils 1.155 because a passing build shows
+// neither: https needs GNU wget in the initrd, since against busybox wget the handler prints
+// "busybox wget does not support https" and fails; and the certificate is checked, because
+// `--no-check-certificate` is added only when debian-installer/allow_unauthenticated_ssl is true,
+// which nothing here sets.
+//
+// It was measured rather than read because the initrd's fetcher is not the wget of an installed
+// system and its TLS support has varied by release, so re-measure if the point release moves.
 variable "preseed_url" {
   type        = string
-  description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server (needs LAN reachability)."
+  description = "Full URL to preseed.cfg. Empty uses Packer's built-in HTTP server, which the installer VM must be able to reach."
   default     = ""
+}
+
+// What the build leaves on the machine running Packer, on top of the template it registers on the
+// pool. "none" writes no artifact; it still creates output_directory, see below.
+//
+// The builder's export step runs LAST, after the VM has already been turned into a template
+// (builder/xenserver/iso/builder.go orders StepSetVmToTemplate before StepExport), and it halts the
+// whole build if it cannot write. So a default of "xva" means an eleven-minute build that installed,
+// provisioned and registered the template correctly is reported as a total failure, and the teardown
+// destroys the template, because a download afterwards ran out of disk. Measured on 2026-09-03: the
+// XVA write failed with `input/output error` at 1.05 GiB free and no template survived. See #195.
+//
+// The deliverable here is the template record on the pool, which is what XcpngCloud clones. The XVA
+// is a side effect costing an image-sized write, and docs/golden-image.md already explains why this
+// project does not ship one. So the default is "none", and anyone who does want a portable file sets
+// this and gets it.
+//
+// Accepted values, read from the builder at v0.11.4 (common_config.go:208): "xva", "xva_compressed",
+// "vdi_raw", "vdi_vhd", "none". Note "xva_compressed" is accepted by the code but named in neither
+// the builder's docs nor its own validation error.
+variable "format" {
+  type        = string
+  description = "Artifact written to output_directory: xva, xva_compressed, vdi_raw, vdi_vhd, or none."
+  default     = "none"
+
+  validation {
+    condition     = contains(["xva", "xva_compressed", "vdi_raw", "vdi_vhd", "none"], var.format)
+    error_message = "Format must be one of xva, xva_compressed, vdi_raw, vdi_vhd, none."
+  }
+}
+
+// Where that artifact lands. Relative paths resolve against the working directory, and every other
+// path in this template (http_directory, the file provisioner source, the shell provisioner script)
+// is relative to the repository root, so a build has to run from there. That put the XVA inside the
+// checkout with no way to send it elsewhere, which is the other half of #195.
+//
+// The builder creates this directory whether or not it writes anything into it
+// (StepPrepareOutputDir runs unconditionally), so expect an empty directory at format = "none".
+variable "output_directory" {
+  type        = string
+  description = "Directory for the exported artifact. Created even when format is none."
+  default     = "packer-jenkins-agent"
+}
+
+variable "iso_name" {
+  type        = string
+  default     = ""
+  description = <<-EOT
+      Name of an ISO VDI already present in sr_iso_name. Set it and the builder
+      uses that VDI in place: no download, no upload. Leave empty to have the ISO
+      fetched from iso_url and uploaded, which is the behaviour without this.
+
+      Useful where uploading is not possible: an SR of type `iso` is populated by
+      dropping the file on the share and running `xe sr-scan`, and import_raw_vdi
+      against one fails with VDI_IO_ERROR.
+
+      NOTE: this does not stop the builder from destroying the ISO VDI at cleanup,
+      despite what the builder's PreserveVdi flag suggests. Reported measured on
+      XCP-ng 8.3 against a shared NFS ISO SR: the file is removed on both the
+      success and the failure path. Not yet reproduced here, and not yet filed.
+    EOT
 }
 
 source "xenserver-iso" "jenkins-agent" {
   iso_url = "https://cdimage.debian.org/cdimage/archive/${var.debian_version}/amd64/iso-cd/debian-${var.debian_version}-amd64-netinst.iso"
   // From that directory's SHA256SUMS. Never hand-written.
   iso_checksum = "sha256:0b813535dd76f2ea96eff908c65e8521512c92a0631fd41c95756ffd7d4896dc"
+  iso_name     = var.iso_name
 
   remote_host     = var.remote_host
   remote_username = var.remote_username
@@ -149,12 +269,22 @@ source "xenserver-iso" "jenkins-agent" {
   ssh_password     = "debian"
   ssh_wait_timeout = "60m"
 
-  output_directory = "packer-jenkins-agent"
+  output_directory = var.output_directory
+  format           = var.format
   keep_vm          = "on_success"
 }
 
 build {
   sources = ["source.xenserver-iso.jenkins-agent"]
+
+  # Operator trust anchors. The directory is committed empty; anything dropped
+  # into it before a build is installed by provision.sh. Uploading the
+  # directory rather than a variable means no path juggling and no default
+  # that has to point somewhere.
+  provisioner "file" {
+    source      = "image/ca-certificates"
+    destination = "/tmp"
+  }
 
   // Everything durable about the image. Exercised by CI on every push, in a debian:13 container.
   provisioner "shell" {

@@ -484,12 +484,179 @@ NETPLAN
     fi
 }
 
+# Operator-supplied trust anchors, uploaded by the Packer file provisioner.
+# Empty on a stock build, in which case this returns without touching anything.
+#
+# Both stores have to end up holding the anchor. Java does not read the system
+# store, so an anchor that reaches only there leaves an image where curl succeeds
+# against the controller and the agent still cannot connect — a failure that
+# gives no hint where to look.
+#
+# Only the system store is written here. The Java side is populated by
+# update-ca-certificates(8), through the hook /etc/ca-certificates/update.d/adoptium-cacerts
+# that adoptium-ca-certificates ships and install_java pulls in with Temurin. That
+# hook regenerates the Adoptium truststore from the system store under an alias of
+# its own making. This function used to import each anchor with keytool as well,
+# and the hook discarded it a few lines later, so that import was doing nothing.
+# Because the route is somebody else's hook rather than a call of ours, whether it
+# worked is verified at the end rather than assumed. See #181.
+#
+# Fixed, not taken from the environment. The Packer file provisioner uploads to a
+# path this script does not get to choose, so an override bought nothing, and it
+# is read below by an rm -rf running as root: EXTRA_CA_DIR=/etc would have taken
+# /etc with it. readonly rather than a plain assignment so a later edit that
+# reintroduces the override has to do so deliberately.
+readonly EXTRA_CA_DIR=/tmp/ca-certificates
+
+# Everything the Packer file provisioner uploaded is removed again, whatever
+# happened. /tmp is a plain directory on the root disk here, not a tmpfs -- the
+# tmp.mount mask a hundred lines above sees to that -- so anything left behind
+# is baked into the template and into every clone made from it. An operator who
+# puts a PKCS#12 in this directory by mistake, which the docs warn is the easy
+# mistake to make, would otherwise ship its private key on every agent.
+discard_extra_ca_dir() {
+    [ -d "$EXTRA_CA_DIR" ] || return 0
+    # Belt and braces against a future edit to the constant above: this only ever
+    # deletes below /tmp, whatever it is pointed at.
+    case "$EXTRA_CA_DIR" in
+        /tmp/?*) rm -rf -- "$EXTRA_CA_DIR" ;;
+        *) log "refusing to remove ${EXTRA_CA_DIR}: not under /tmp" ;;
+    esac
+}
+
+install_extra_ca_certificates() {
+    [ -d "$EXTRA_CA_DIR" ] || { log "no operator CA directory, skipping"; return 0; }
+    # Removed on every exit from here on, including the failure paths below, each
+    # of which calls die and would otherwise leave the upload on disk.
+    trap discard_extra_ca_dir EXIT
+
+    # Collect entries under EXTRA_CA_DIR (excluding the placeholder .gitkeep) so the empty-directory
+    # case is a true no-op.
+    local -a everything=()
+    local -a certs=()
+    local entry
+    while IFS= read -r -d '' entry; do
+        everything+=("$entry")
+        [ -f "$entry" ] || continue
+        case "$entry" in
+            *.crt|*.pem) certs+=("$entry") ;;
+        esac
+    done < <(find "$EXTRA_CA_DIR" -mindepth 1 -maxdepth 1 ! -name '.gitkeep' -print0)
+
+    # Scan every regular file, not only the ones that will be installed. A key in
+    # a file this function skips is still a key sitting in the image.
+    local f
+    while IFS= read -r -d '' f; do
+        if grep -q 'PRIVATE KEY' "$f"; then
+            die "$(basename "$f") contains a private key; only certificates belong in ${EXTRA_CA_DIR}"
+        fi
+    done < <(find "$EXTRA_CA_DIR" -type f -print0)
+
+    if [ "${#certs[@]}" -eq 0 ]; then
+        # Silence here is what the whole feature exists to avoid. A file that was
+        # dropped in and not installed means the operator believes the image has
+        # an anchor it does not have, and they find out when an agent will not
+        # connect and nothing says why.
+        [ "${#everything[@]}" -eq 0 ] || die "no .crt or .pem certificates in ${EXTRA_CA_DIR}, but it is not empty: $(basename -a "${everything[@]}" | tr '\n' ' ')"
+        log "no operator CA certificates supplied"
+        return 0
+    fi
+
+    local unrecognised=()
+    local entry
+    for entry in "${everything[@]}"; do
+        case "$entry" in
+            *.crt|*.pem) ;;
+            *) unrecognised+=("$entry") ;;
+        esac
+    done
+    [ "${#unrecognised[@]}" -eq 0 ] || die "unrecognised entries in ${EXTRA_CA_DIR}: $(basename -a "${unrecognised[@]}" | tr '\n' ' ')"
+
+    command -v openssl >/dev/null 2>&1 || die "openssl not found, needed to validate ${EXTRA_CA_DIR}"
+    command -v keytool >/dev/null 2>&1 || die "keytool not found; install_java must run before this"
+    command -v update-ca-certificates >/dev/null 2>&1 \
+        || die "update-ca-certificates not found. Install it with: apt-get install -y ca-certificates"
+
+    local cert alias count fingerprint seen=" "
+    for cert in "${certs[@]}"; do
+        alias="$(basename "$cert")"; alias="${alias%.*}"
+
+        # Both globs above feed this one loop, so foo.crt and foo.pem arrive as the
+        # same alias twice and the second one wins in the system store while the
+        # first one stays in the Java store, which the keytool branch below reports
+        # as already present. Measured with two distinct CAs named vates.crt and
+        # vates.pem: the system store ends up holding one of them, the Java store
+        # the other, and the build is green. The stores disagreeing is the failure
+        # this function's header exists to prevent.
+        case "$seen" in
+            *" ${alias} "*) die "$cert and an earlier file both give alias ${alias}; rename one" ;;
+        esac
+        seen="${seen}${alias} "
+
+        openssl x509 -in "$cert" -noout >/dev/null 2>&1 \
+            || die "$cert is not a PEM certificate"
+
+        # A concatenated chain is a common export format and neither consumer
+        # handles one: keytool imports the first certificate and drops the rest
+        # without an error, and update-ca-certificates(8) says outright that
+        # there should be one certificate per file. Measured: two CAs in one file
+        # gives a keystore with one entry. Refuse rather than half-install.
+        count="$(grep -c 'BEGIN CERTIFICATE' "$cert" || true)"
+        [ "$count" -eq 1 ] \
+            || die "$cert holds $count certificates; split the chain into one file per certificate"
+
+        log "installing trust anchor ${alias} into the system store"
+        install -m 0644 "$cert" "/usr/local/share/ca-certificates/${alias}.crt"
+    done
+
+    update-ca-certificates
+
+    # One listing for all of them, and its exit status is read rather than its
+    # emptiness. On an unreadable store keytool exits 1 with `keytool error:
+    # java.io.IOException: Keystore was tampered with, or password was incorrect`;
+    # discarding that and testing only for the fingerprint reports every anchor as
+    # missing, which is a confident diagnosis of the wrong fault. Measured on
+    # Temurin 21. In the healthy case keytool writes nothing to stderr, so folding
+    # it in costs no noise.
+    #
+    # Not -v. The default listing already carries a `Certificate fingerprint
+    # (SHA-256):` line per entry on Temurin 21, which is what install_java puts
+    # here; -v prints the full chain for every system anchor to say the same thing.
+    # Both forms were checked against the same certificate and both match.
+    local truststore
+    if ! truststore="$(keytool -list -cacerts -storepass changeit 2>&1)"; then
+        die "cannot read the Java truststore: $(printf '%s\n' "$truststore" | head -1)"
+    fi
+
+    # Match on the SHA-256 fingerprint rather than the alias. The hook names the
+    # entry itself -- ci-root.crt lands as `ciroot` -- so the alias is not ours to
+    # predict, and an alias that happens to exist proves nothing about which
+    # certificate sits under it.
+    for cert in "${certs[@]}"; do
+        alias="$(basename "$cert")"; alias="${alias%.*}"
+        fingerprint="$(openssl x509 -in "$cert" -noout -fingerprint -sha256 | cut -d= -f2)"
+        if printf '%s\n' "$truststore" | grep -qF "$fingerprint"; then
+            log "trust anchor ${alias} reached the Java truststore"
+        else
+            # Reached if install_java stops installing Temurin from packages.adoptium.net,
+            # or that package drops the hook. Failing the build here is the point: the
+            # alternative is a green build producing an image whose agents cannot connect,
+            # which is the silence this whole function exists to prevent.
+            die "${alias} did not reach the Java truststore; update-ca-certificates ran, but the Adoptium hook did not place it"
+        fi
+    done
+    return 0
+}
+
+
 main() {
     require_root
     require_deps
 
     install_java
     verify_java
+
+    install_extra_ca_certificates
 
     if [ "${SKIP_GUEST_TOOLS:-0}" = "1" ]; then
         log "skipping guest tools and xenstore client (SKIP_GUEST_TOOLS=1)"

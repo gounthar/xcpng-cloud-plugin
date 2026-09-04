@@ -1,0 +1,48 @@
+<?jelly escape-by-default='true'?>
+<!--
+  The node configuration form for an agent this cloud provisioned.
+
+  Core's Computer/configure.jelly includes this by name, and there is no such view on Slave or
+  AbstractCloudSlave, so without it the include fails: the response is already committed by then, so
+  the page returns 200 and simply stops mid-render with no form on it (#179).
+
+  What is deliberately absent matters as much as what is here.
+
+  No launcher selector and no retention-strategy selector. Both are the cloud's to decide, neither is
+  an operator's to change on a VM that is destroyed when it goes idle, and DumbSlave's version of this
+  file builds its launcher dropdown from ${computerLauncherDescriptors}, the list #158 took this
+  plugin's launcher out of, so including it would offer a control whose current value is missing.
+
+  No remoteFS either: it is fixed on this agent by design, nothing on the submit path reads it, and
+  XcpngAgent.reconfigure never binds it.
+
+  numExecutors is the exception, and it is here under protest. It is fixed at one by #23 as surely as
+  remoteFS is fixed, but Computer.doConfigSubmit reads it straight out of the submitted JSON with
+  JSONObject.getString before it calls reconfigure, and getString throws on an absent key instead of
+  returning null. Leaving the field off the form therefore turns Save into a stack trace rather than
+  the friendly message core wrote for exactly that case (#185).
+
+  It is rendered readonly rather than as a plain input, so the value is submitted while an operator
+  cannot edit it in a browser. readonly is passed through as a raw attribute, NOT via core's
+  readOnlyMode: readOnlyMode renders a <pre> instead of an <input>, which submits nothing and puts
+  the JSONException straight back. The invariant is enforced in reconfigure regardless, because a
+  readonly input constrains a browser and not a POST.
+-->
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
+
+  <f:entry title="${%Description}" field="nodeDescription">
+    <f:textarea />
+  </f:entry>
+
+  <f:entry title="${%# of executors}" field="numExecutors">
+    <f:textbox readonly="readonly" />
+  </f:entry>
+
+  <f:entry title="${%Labels}" field="labelString">
+    <f:textbox />
+  </f:entry>
+
+  <f:descriptorList title="${%Node Properties}" field="nodeProperties"
+                    descriptors="${h.getNodePropertyDescriptors(descriptor.clazz)}" />
+
+</j:jelly>

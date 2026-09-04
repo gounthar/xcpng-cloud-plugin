@@ -16,26 +16,68 @@
 name-template: '$RESOLVED_VERSION'
 tag-template: '$RESOLVED_VERSION'
 
+# Every changelog category below that carries a `when:` also carries `exclusive: true`, and
+# that is what stops one pull request rendering twice. Release Drafter walks the category
+# list per pull request and appends to *every* category that matches; the `break` in
+# categorize-pull-requests.ts fires only for a category that sets `exclusive`. Removing
+# `java` from Build, CI, and dependencies killed the commonest cause but left the mechanism,
+# so #199 (`bug` plus `build`) still rendered under Bug fixes and again under Build, CI, and
+# dependencies in the 0.4.0 draft.
+#
+# It makes list order load-bearing: first match wins, so a pull request carrying two category
+# labels lands in whichever appears first here. That is why the order below reads
+# most-specific first -- what a change *is* (a feature, a fix, documentation) outranks what
+# it *touched* (the build). Reordering these entries silently reclassifies such pull requests.
+#
+# Deliberately not set on the `version-resolver` entries further down, where it is also legal.
+# Those resolve the version through a Math.max over every matching entry
+# (`getHighestPriority` in resolve-version-increment.ts); making them exclusive would switch
+# that to first-match-wins and let a `patch` entry mask a `minor` one.
 categories:
   - title: Features
+    exclusive: true
     when:
       labels:
         - enhancement
   - title: Bug fixes
+    exclusive: true
     when:
       labels:
         - bug
   - title: Documentation
+    exclusive: true
     when:
       labels:
         - documentation
+  # `java` is deliberately absent from this list. Every Java code change here carries `java`
+  # plus `bug` or `enhancement`, and listing it put nine entries of the 0.3.0 draft under Bug
+  # fixes or Features and again here. The other three labels say what a change *is*; `java`
+  # says what it touched, which is true of nearly every pull request. See #177.
+  #
+  # `exclusive: true` above now hides that symptom rather than making it safe: a `java` entry
+  # here would be reached only after Features, Bug fixes and Documentation had all missed, so
+  # a `java`-only pull request would file under Build, CI, and dependencies with nothing to
+  # show it had been misfiled. Putting `java` back is quieter than it was, not better.
   - title: Build, CI, and dependencies
+    exclusive: true
     when:
       labels:
         - build
         - dependencies
         - github_actions
-        - java
+
+  # The catch-all. A `changelog` category with a title and no `when:` parses to `when: []`
+  # (config/parse-categories.ts), which is exactly what categorize-pull-requests.ts looks
+  # for when it picks `uncategorizedCategoryIndex`. Without it an unlabelled pull request
+  # goes to the uncategorized list, which generate-changelog.ts pushes *before* the loop
+  # over categories -- so it renders above every heading with nothing above it, and reads
+  # as a truncated changelog. Three entries did that in the 0.3.0 draft. See #177.
+  #
+  # It cannot move the version. A changelog category's `semver-increment` defaults to
+  # patch and contributes only for pull requests that reach it, and the trailing
+  # version-resolver below already falls back to patch, so the Math.max in
+  # resolve-version-increment.ts is a no-op here.
+  - title: Other changes
 
   - type: 'pre-exclude'
     when:
@@ -47,18 +89,27 @@ categories:
   # unlabelled pull request still lands somewhere sensible instead of silently deciding the
   # version for us. Dropping it does not break the parse -- it stops resolving a version at
   # all for an unlabelled pull request, and that surfaces only when a release is cut.
-  # Where two entries match, the highest increment wins.
+  # Where two entries match, the highest increment wins: `getHighestPriority` in
+  # resolve-version-increment.ts takes a Math.max over every matching entry, so a single
+  # pull request carrying the right label decides the version for the whole release.
+  #
+  # `major` and `minor` are deliberately absent from the label lists below, and putting
+  # either back reintroduces a defect that reaches the published tag. dependabot labels its
+  # own pull requests with the *dependency's* semver bump, unprompted -- nothing here or in
+  # any workflow asks it to. #173 (actions/setup-java 5.6.0 to 6.0.0) arrived carrying
+  # `major`, which is true of the Action and says nothing about this plugin, and the draft
+  # release duly renamed itself 1.0.0. `breaking` covers the case these entries are for, and
+  # it is ours alone. A dependabot pull request now falls through to the patch entry via
+  # `dependencies` / `github_actions`, which is what a dependency bump should do. See #198.
   - type: 'version-resolver'
     semver-increment: major
     when:
       labels:
-        - major
         - breaking
   - type: 'version-resolver'
     semver-increment: minor
     when:
       labels:
-        - minor
         - enhancement
   - type: 'version-resolver'
     semver-increment: patch

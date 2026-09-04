@@ -30,7 +30,7 @@ jobs:
       # maven.compiler.release to 21. The 2.555.3 LTS baseline governs what Jenkins runs
       # on, not what compiles the plugin. proxmox-cloud-plugin builds on 21 alone too.
       - name: Set up JDK 21
-        uses: actions/setup-java@v5.6.0
+        uses: actions/setup-java@v6.0.0
         with:
           distribution: temurin
           java-version: 21
@@ -69,6 +69,31 @@ jobs:
       # shellcheck, so this lints the shell embedded in these workflows as well as their schema.
       - name: Lint the workflow files
         run: actionlint -color
+
+  # actionlint covers only the shell embedded in run: blocks, so image/provision.sh -- the one
+  # tracked script, and the one that runs as root inside the image -- was linted by nothing. That is
+  # half of why #192 survived: a Copilot Autofix commit on #180 wrapped an array expansion in literal
+  # quotes, and shellcheck calls it two errors (SC2068, SC2145) the moment it is pointed at the file.
+  #
+  # -S warning, not the default: the default adds SC1091 "not following /etc/os-release", which is
+  # about what the linter can reach on the runner rather than about the script.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # ubuntu-latest ships shellcheck; the version is printed so the log shows what actually ran.
+      # The count assertion is the point of the list: a glob that stops matching would otherwise
+      # turn this job into a green step that lints nothing, and say so nowhere.
+      - name: Lint the shell scripts
+        run: |
+          mapfile -t scripts < <(git ls-files '*.sh')
+          test "${#scripts[@]}" -gt 0 \
+            || { echo "::error::no shell scripts matched; this job would pass by linting nothing"; exit 1; }
+          shellcheck --version
+          printf 'linting: %s\n' "${scripts[@]}"
+          shellcheck -S warning "${scripts[@]}"
 
   # tools/ destroys VMs and their disks on a live hypervisor. Every bug review found in it
   # was on an error path, which is exactly what never gets exercised by hand. These tests
@@ -130,6 +155,184 @@ jobs:
           SKIP_GUEST_TOOLS: '1'
           SKIP_CLEANUP: '1'
         run: bash image/provision.sh
+
+      # The trust-anchor directory is operator input that ends up baked into the template and then
+      # into every clone the plugin makes from it, so the cases below are the ones verified by hand
+      # in a container during review of #180, kept here so they stay verified. Two things matter:
+      # nothing unrecognised is installed, and the upload never survives provisioning. It must not
+      # survive: provision.sh masks tmp.mount, so /tmp is a plain directory on the root disk and a
+      # PKCS#12 left there would ship its private key on every agent.
+      - name: Operator CA, a valid anchor reaches both trust stores
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          apt-get install -y -qq openssl
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/ci-root.crt -subj '/CN=CI Root'
+          fp="$(openssl x509 -in /tmp/ca-certificates/ci-root.crt -noout -fingerprint -sha256 | cut -d= -f2)"
+          bash image/provision.sh
+          test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
+          test -f /usr/local/share/ca-certificates/ci-root.crt
+          # By fingerprint, not by alias: update-ca-certificates regenerates the Adoptium truststore
+          # from the system store under a name of its own making, so ci-root.crt lands as "ciroot".
+          keytool -list -cacerts -storepass changeit 2>/dev/null | grep -qF "$fp" \
+            || { echo "::error::the anchor is not in the Java truststore"; exit 1; }
+
+      - name: Operator CA, an empty directory is not an error
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          # What the file provisioner uploads from a stock checkout.
+          mkdir -p /tmp/ca-certificates && : > /tmp/ca-certificates/.gitkeep
+          # Not piped into grep: that would hand provision.sh a SIGPIPE and hide its exit status.
+          bash image/provision.sh > /tmp/provision.out
+          grep -q 'no operator CA certificates supplied' /tmp/provision.out
+          test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
+
+      # EXTRA_CA_DIR is a readonly constant precisely so this cannot happen: it is read by an rm -rf
+      # running as root, and taking it from the environment made EXTRA_CA_DIR=/etc delete /etc.
+      - name: Operator CA, EXTRA_CA_DIR from the environment is ignored
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+          EXTRA_CA_DIR: /etc
+        run: |
+          before="$(find /etc -maxdepth 1 | wc -l)"
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/env-root.crt -subj '/CN=Env Root'
+          bash image/provision.sh
+          after="$(find /etc -maxdepth 1 | wc -l)"
+          test "$after" -ge "$before" || { echo "::error::/etc lost entries: $before -> $after"; exit 1; }
+          test -f /etc/passwd || { echo "::error::/etc was emptied"; exit 1; }
+          test ! -e /tmp/ca-certificates || { echo "::error::the real upload directory was not cleaned"; exit 1; }
+
+      - name: Operator CA, anything unrecognised fails the build and leaves nothing behind
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          rc=0
+          # The fixture is already in place; $1 labels it, $2 is the message provision.sh owes us.
+          refuses() {
+            if bash image/provision.sh >/tmp/provision.out 2>&1; then
+              echo "::error::$1: provision.sh succeeded and must not have"; rc=1
+            elif ! grep -qF "$2" /tmp/provision.out; then
+              echo "::error::$1: expected \"$2\", got: $(tail -1 /tmp/provision.out)"; rc=1
+            elif [ -e /tmp/ca-certificates ]; then
+              echo "::error::$1: the upload directory survived the failure"; rc=1
+            else
+              echo "ok, refused: $1"
+            fi
+            rm -rf /tmp/ca-certificates
+          }
+          newca() { openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null -out "$1" -subj "/CN=$2"; }
+
+          mkdir -p /tmp/ca-certificates; openssl genrsa -out /tmp/ca-certificates/leaked.pem 2048
+          refuses "a private key" "contains a private key"
+
+          mkdir -p /tmp/ca-certificates; echo not-a-certificate > /tmp/ca-certificates/notes.txt
+          refuses "a file that is neither .crt nor .pem" "but it is not empty"
+
+          mkdir -p /tmp/ca-certificates; echo not-a-certificate > /tmp/ca-certificates/bogus.crt
+          refuses "a .crt that is not a certificate" "is not a PEM certificate"
+
+          mkdir -p /tmp/ca-certificates; newca /tmp/b1.crt One; newca /tmp/b2.crt Two
+          cat /tmp/b1.crt /tmp/b2.crt > /tmp/ca-certificates/bundle.crt
+          refuses "a concatenated chain" "holds 2 certificates"
+
+          # Both globs feed one loop, so these are one alias twice: without a guard the system store
+          # keeps one certificate and the Java store the other, and the build goes green.
+          mkdir -p /tmp/ca-certificates
+          newca /tmp/ca-certificates/vates.crt One; newca /tmp/ca-certificates/vates.pem Two
+          refuses "two files giving one alias" "both give alias vates"
+
+          # The branch nothing reached before #192. It needs an installable certificate AND a stray
+          # file at once: with the stray file alone the run stops one branch earlier, at "but it is
+          # not empty", whose own basename call was always quoted correctly. The space in the
+          # filename is the fixture -- unquoted, the array expansion split that one name into two
+          # entries and appended a stray quote.
+          mkdir -p /tmp/ca-certificates
+          newca /tmp/ca-certificates/mixed.crt Mixed
+          echo stray > '/tmp/ca-certificates/my notes.txt'
+          refuses "a stray file beside a good certificate" "unrecognised entries in"
+
+          # Anchored, and not through refuses: "my notes.txt" is a prefix of the mangled
+          # 'my notes.txt"', so a substring match would go green against the very bug this case
+          # exists for. The trailing space is tr turning the last newline into one.
+          grep -qE 'unrecognised entries in /tmp/ca-certificates: my notes\.txt $' /tmp/provision.out \
+            || { echo "::error::mangled message: $(grep -F 'unrecognised entries' /tmp/provision.out)"; rc=1; }
+
+          exit $rc
+
+      # The Java truststore is filled in by /etc/ca-certificates/update.d/adoptium-cacerts, a hook
+      # this repository does not own: adoptium-ca-certificates ships it and Temurin pulls it in. So
+      # provision.sh verifies the anchor arrived rather than assuming it, and a check that has never
+      # been seen to fail is not yet a check. Removing the hook reproduces the drift it guards
+      # against -- install_java moving off packages.adoptium.net, or that package dropping the hook.
+      #
+      # Deliberately last in the job: it leaves the container without the hook.
+      - name: Operator CA, an anchor that misses the Java truststore fails the build
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          test -f /etc/ca-certificates/update.d/adoptium-cacerts \
+            || { echo "::error::no Adoptium hook to remove; this case would prove nothing"; exit 1; }
+          rm -f /etc/ca-certificates/update.d/adoptium-cacerts
+
+          # A fresh CA, not the one an earlier step already installed. Reusing that name would leave
+          # its fingerprint in the truststore from the previous run, and the case would pass with the
+          # hook gone -- agreeing with itself instead of testing anything.
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/drift-root.crt -subj '/CN=Drift Root'
+          fp="$(openssl x509 -in /tmp/ca-certificates/drift-root.crt -noout -fingerprint -sha256 | cut -d= -f2)"
+          if keytool -list -cacerts -storepass changeit 2>/dev/null | grep -qF "$fp"; then
+            echo "::error::the fixture is already in the truststore; this case would pass for the wrong reason"
+            exit 1
+          fi
+
+          if bash image/provision.sh > /tmp/provision.out 2>&1; then
+            echo "::error::provision.sh went green with the anchor missing from the Java truststore"
+            exit 1
+          fi
+          grep -qF 'did not reach the Java truststore' /tmp/provision.out \
+            || { echo "::error::failed for another reason: $(tail -1 /tmp/provision.out)"; exit 1; }
+          test ! -e /tmp/ca-certificates || { echo "::error::the upload directory survived"; exit 1; }
+
+      # The fingerprint check reads keytool's exit status, not just whether the fingerprint turned
+      # up, so that an unreadable keystore is reported as an unreadable keystore. Testing only for
+      # the fingerprint would call every anchor missing, which is the wrong fault stated
+      # confidently. Corrupting the store is the cheapest way to reach that branch.
+      #
+      # After the step above, so it inherits a container whose hook is already gone.
+      - name: Operator CA, an unreadable truststore says so rather than blaming the anchor
+        env:
+          SKIP_GUEST_TOOLS: '1'
+          SKIP_CLEANUP: '1'
+        run: |
+          cacerts="$(readlink -f "$(dirname "$(readlink -f "$(command -v keytool)")")/../lib/security/cacerts")"
+          test -f "$cacerts" || { echo "::error::no cacerts at $cacerts"; exit 1; }
+          cp "$cacerts" /tmp/cacerts.bak
+          echo "not a keystore" > "$cacerts"
+
+          mkdir -p /tmp/ca-certificates
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /dev/null \
+            -out /tmp/ca-certificates/broken-store.crt -subj '/CN=Broken Store'
+          rc=0
+          if bash image/provision.sh > /tmp/provision.out 2>&1; then
+            echo "::error::provision.sh went green against a corrupt truststore"; rc=1
+          elif ! grep -qF 'cannot read the Java truststore' /tmp/provision.out; then
+            echo "::error::wrong diagnosis: $(tail -1 /tmp/provision.out)"; rc=1
+          elif [ -e /tmp/ca-certificates ]; then
+            echo "::error::the upload directory survived"; rc=1
+          fi
+          cp /tmp/cacerts.bak "$cacerts"
+          exit $rc
 
   packer:
     name: packer validate
