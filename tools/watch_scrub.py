@@ -33,12 +33,13 @@ create can never appear in the output. It prints whether the secret key is set, 
 
 Exit status is the verdict, so it can gate a lab run:
 
-    0  at least one clone went PRESENT then ABSENT, and none finished still carrying it
-    1  a clone finished with the secret still in its record -- the scrub did not happen
-    2  nothing conclusive: no owner-marked clone appeared, or none was seen holding the secret
+    0  a clone went PRESENT then ABSENT: the scrub was observed
+    1  a clone was destroyed still carrying the secret, or the key came back after a clear
+    2  nothing conclusive, which includes a watch that ended while the secret was still there
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -60,7 +61,11 @@ INCONCLUSIVE = "INCONCLUSIVE"
 
 
 def clone_states(records, cloud=None):
-    """Owner-marked clones from a VM.get_all_records payload, as {name: state}.
+    """Owner-marked clones from a VM.get_all_records payload, as {uuid: state}.
+
+    Keyed by uuid rather than by `name_label`, because XAPI does not enforce unique labels and
+    two clones sharing one history could merge a scrubbed VM's absence with an unscrubbed VM's
+    presence into a single false CONFIRMED. The label rides along in the state for the log.
 
     Only presence is reported. The secret's value is never read out of the record, because a
     tool that prints it to prove it was removed has published it for the life of the log.
@@ -76,7 +81,8 @@ def clone_states(records, cloud=None):
         if marker is None or (cloud is not None and marker != cloud):
             continue
         data = record.get("xenstore_data") or {}
-        states[record["name_label"]] = {
+        states[record["uuid"]] = {
+            "name": record["name_label"],
             "secret": SECRET_KEY in data,
             "control": CONTROL_KEY in data,
             "power": record["power_state"],
@@ -97,46 +103,84 @@ class Tracker:
     """Per-clone history, and the verdict that follows from it.
 
     Keeps only what a verdict needs: when the secret was first seen present, when it was first
-    seen absent *after* that, and whether the control key was ever readable. Nothing here infers
-    a transition it did not observe -- a clone that appears already scrubbed is INCONCLUSIVE,
-    not a pass, because this reader never proved it could see that key on that VM.
+    seen absent after that, whether it came back, whether the control key was ever readable, and
+    whether the clone was watched all the way to its destruction. Nothing here infers a
+    transition it did not observe. A clone that appears already scrubbed is INCONCLUSIVE, not a
+    pass, because this reader never proved it could see that key on that VM.
+
+    The same refusal runs the other way, which is the half that is easy to miss. A watch that
+    ends while the secret is still in the record has not found an unscrubbed clone; it has found
+    a clone that had not connected yet, or a `--duration` that was too short. Reporting that as a
+    failure is the same bug as reporting an unreadable key as a pass, so NOT SCRUBBED needs the
+    clone to have been seen destroyed still carrying it, or seen carrying it again after a clear.
     """
 
     def __init__(self):
         self.seen = {}
 
-    def observe(self, name, state, at):
-        history = self.seen.setdefault(
-            name, {"present_at": None, "absent_at": None, "control": False, "last": None}
+    def _history(self, key, name):
+        return self.seen.setdefault(
+            key,
+            {
+                "name": name,
+                "present_at": None,
+                "absent_at": None,
+                "returned_at": None,
+                "control": False,
+                "last": None,
+                "gone": False,
+            },
         )
+
+    def observe(self, key, state, at):
+        history = self._history(key, state.get("name", key))
         if state["control"]:
             history["control"] = True
         if state["secret"]:
             if history["present_at"] is None:
                 history["present_at"] = at
-            # A key that comes back after being cleared is a real finding, not a blip: drop the
-            # earlier absence so the verdict reads NOT SCRUBBED off the last observation.
-            history["absent_at"] = None
+            elif history["absent_at"] is not None and history["returned_at"] is None:
+                history["returned_at"] = at
         elif history["present_at"] is not None and history["absent_at"] is None:
             history["absent_at"] = at
         history["last"] = state
 
-    def verdict(self, name):
-        history = self.seen[name]
+    def mark_gone(self, key):
+        """The clone left the pool. This is what turns a lingering secret into a verdict."""
+        if key in self.seen:
+            self.seen[key]["gone"] = True
+
+    def verdict(self, key):
+        history = self.seen[key]
+        if history["returned_at"] is not None:
+            return NOT_SCRUBBED, (
+                f"cleared at {history['absent_at']:.1f}s and back in the record at "
+                f"{history['returned_at']:.1f}s"
+            )
         if history["present_at"] is not None and history["absent_at"] is not None:
             return CONFIRMED, (
                 f"present at {history['present_at']:.1f}s, absent at {history['absent_at']:.1f}s"
             )
         if history["last"] is not None and history["last"]["secret"]:
-            return NOT_SCRUBBED, (
-                f"still in the record at {history['present_at']:.1f}s and never cleared"
+            if history["gone"]:
+                return NOT_SCRUBBED, (
+                    f"present from {history['present_at']:.1f}s and still there when the clone "
+                    "was destroyed"
+                )
+            return INCONCLUSIVE, (
+                "the watch ended while the secret was still in the record, which is also what a "
+                "clone that has not connected yet looks like"
             )
         if not history["control"]:
             return INCONCLUSIVE, "no seed key was ever readable on this clone"
         return INCONCLUSIVE, "the secret was never seen present, so its absence proves nothing"
 
     def verdicts(self):
-        return [(name, *self.verdict(name)) for name in sorted(self.seen)]
+        """(name, kind, why) per clone, ordered by name so two runs read the same way."""
+        return [
+            (self.seen[key]["name"], *self.verdict(key))
+            for key in sorted(self.seen, key=lambda k: (self.seen[k]["name"], k))
+        ]
 
 
 def exit_status(verdicts):
@@ -149,10 +193,27 @@ def exit_status(verdicts):
     return 2
 
 
+def positive_seconds(value):
+    """An argparse type for a duration: finite and greater than zero.
+
+    `--interval 0` polls a shared pool as fast as it will answer, and a negative or non-finite
+    value raises inside `time.sleep()` partway through a run, throwing away observations already
+    made. Both are better refused before the first call than diagnosed from the traceback.
+    """
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number of seconds above zero: {value!r}")
+    return seconds
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--duration", type=float, default=300.0, help="seconds to watch")
-    parser.add_argument("--interval", type=float, default=1.0, help="seconds between polls")
+    parser.add_argument(
+        "--duration", type=positive_seconds, default=300.0, help="seconds to watch"
+    )
+    parser.add_argument(
+        "--interval", type=positive_seconds, default=1.0, help="seconds between polls"
+    )
     parser.add_argument(
         "--cloud",
         default=os.environ.get("XCPNG_CLOUD"),
@@ -161,7 +222,7 @@ def main(argv=None):
     parser.add_argument(
         "--until-verdict",
         action="store_true",
-        help="stop as soon as every clone seen so far has a verdict of CONFIRMED",
+        help="stop once every clone seen has been destroyed and every verdict is CONFIRMED",
     )
     args = parser.parse_args(argv)
 
@@ -187,14 +248,20 @@ def main(argv=None):
                 time.sleep(args.interval)
                 continue
 
-            for name in sorted(current):
-                tracker.observe(name, current[name], at)
-                if previous.get(name) != current[name]:
-                    emit(f"{name}  {format_state(current[name])}")
-            for name in sorted(set(previous) - set(current)):
-                emit(f"{name}  GONE (destroyed)")
+            for key in sorted(current, key=lambda k: current[k]["name"]):
+                tracker.observe(key, current[key], at)
+                if previous.get(key) != current[key]:
+                    emit(f"{current[key]['name']}  {format_state(current[key])}")
+            for key in sorted(set(previous) - set(current), key=lambda k: previous[k]["name"]):
+                # Recorded, not just printed: a secret that outlived its clone is only a verdict
+                # once the clone is known to have gone.
+                tracker.mark_gone(key)
+                emit(f"{previous[key]['name']}  GONE (destroyed)")
             previous = current
 
+            # Deliberately waits for `current` to empty rather than stopping at the first
+            # CONFIRMED. A cleared key that comes back is NOT SCRUBBED, and the only window in
+            # which that can still be seen is while the clone is alive.
             if args.until_verdict and tracker.seen and not current:
                 if all(kind == CONFIRMED for _, kind, _ in tracker.verdicts()):
                     break
