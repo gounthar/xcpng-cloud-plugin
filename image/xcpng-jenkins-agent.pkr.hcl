@@ -70,24 +70,30 @@ variable "template_name" {
 
 // Pinned to a point release on purpose, and the pin buys less than the word "pinned" suggests.
 //
-// WHAT IT BUYS: a URL that keeps resolving. Debian moves point releases out of /release into
-// /archive once the next one ships, so an unpinned URL 404s on a schedule nobody here controls.
-// The iso_url below already names /archive, so this one stays valid.
+// WHAT IT BUYS: a build that keeps naming one installer image. Old point releases live only under
+// /cdimage/archive, which is where iso_url points, while /cdimage/release carries whatever is
+// current. Measured 2026-09-04: .../release/13.4.0/... answers 404, .../archive/13.4.0/... answers
+// 200, and .../release/current/ serves 13.6.0 today. So a URL written to follow the current release
+// would fetch a different image every few weeks, with iso_checksum needing to move in step and
+// nothing in the log to say the media had changed.
 //
 // WHAT IT DOES NOT BUY: a fixed package set. The pin fixes the installer media only. preseed.cfg
 // points the installer at deb.debian.org and keeps the media out of the installed sources.list, so
 // the base system comes from the mirror as it stood on the build day, and provision.sh runs no
-// apt-get upgrade or dist-upgrade to undo that afterwards. Measured 2026-09-03:
-// jenkins-agent-debian13-v3 and -v4, both built from this 13.4.0 netinst on 2026-08-12, both report
-// 13.6 in /etc/debian_version. That those versions come from the mirror rather than from the ISO is
-// the obvious reading of that measurement and is inference; no individual package was traced.
+// apt-get upgrade or dist-upgrade afterwards. Measured 2026-09-03: jenkins-agent-debian13-v3 and
+// -v4, both built from this 13.4.0 netinst on 2026-08-12, both report 13.6 in /etc/debian_version.
+// That those versions came from the mirror rather than from the ISO is the obvious reading of that
+// measurement and is inference; no individual package was traced.
 //
-// So /etc/debian_version is not a provenance signal on these images: it names a point release the
-// build never used, and it is the first field anyone reaches for. Two builds from one commit a month
-// apart produce different images with nothing in the log to say so. For an agent image that is
-// arguably what you want, since it picks up security updates with no bump here. snapshot.debian.org
-// pinned to a timestamp is the mechanism if a genuinely reproducible image is ever needed, and it
-// costs those updates until someone moves the timestamp. See issue #201 and docs/golden-image.md.
+// So /etc/debian_version dates the mirror, not the media. base-files ships that file, so it reports
+// the point release the base system was installed from, which the build did use, and says nothing
+// about which netinst booted, which is the question someone reading it usually means to ask. Two
+// builds from this one commit a month apart differ, with nothing in the log to say so. For an agent
+// image that is arguably what you want, since it picks up security updates with no bump here. If a
+// reproducible base system is ever wanted, snapshot.debian.org pinned to a timestamp is the
+// mechanism for the Debian half and only that half: provision.sh installs an unversioned
+// temurin-21-jre from packages.adoptium.net, whose metadata moves too. See issue #201 and
+// docs/golden-image.md.
 variable "debian_version" {
   type    = string
   default = "13.4.0"

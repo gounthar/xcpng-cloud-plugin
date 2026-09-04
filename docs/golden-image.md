@@ -412,37 +412,55 @@ neither its documentation nor its own validation error — read from its source 
 ### What the ISO pin fixes, and what it does not
 
 `debian_version` in `image/xcpng-jenkins-agent.pkr.hcl` names a point release, and it is worth
-keeping pinned: Debian moves point releases out of `/release` into `/archive` once the next one
-ships, so an unpinned URL 404s eventually. What the pin does not do is fix what ends up installed.
-It fixes the installer *media*. The installer then fetches the base system from `deb.debian.org`,
-because that is what `image/http/preseed.cfg` tells it to do, and the apt-setup answers in that file
-keep the media out of the installed `sources.list`. `provision.sh` runs no `apt-get upgrade` or
-`dist-upgrade`, so nothing later undoes that either.
+keeping pinned. Old point releases live only under `/cdimage/archive`, which is where `iso_url`
+points, while `/cdimage/release` carries whatever is current: measured 2026-09-04,
+`.../release/13.4.0/...` answers 404, `.../archive/13.4.0/...` answers 200, and
+`.../release/current/` serves 13.6.0. A URL written to follow the current release would install a
+different image every few weeks, and `iso_checksum` would have to move with it.
+
+What the pin does not do is fix what ends up installed. It fixes the installer *media*. The
+installer then fetches the base system from `deb.debian.org`, because that is what
+`image/http/preseed.cfg` tells it to do, and the apt-setup answers in that file keep the media out of
+the installed `sources.list`. `provision.sh` runs no `apt-get upgrade` or `dist-upgrade`, so nothing
+later undoes that either.
 
 The consequence is measured. `jenkins-agent-debian13-v3` and `-v4` were both built on 2026-08-12
-from the 13.4.0 netinst — `debian_version` has defaulted to `13.4.0` since `08a29ce` and has never
-been changed, and nothing bumps it on its own, since the manifests in `updatecli/updatecli.d/` target
-the Packer CLI, the builder plugin and actionlint but not this variable — and both report **13.6** in `/etc/debian_version`, read on 2026-09-03 by attaching
-their VDIs to dom0 with the recipe near the top of this page. That those versions come from the
-mirror as it stood on the build day, rather than from the ISO, is the obvious reading of that and is
-inference: no individual package was traced to its source.
+from the 13.4.0 netinst (`debian_version` has defaulted to `13.4.0` since `08a29ce` and has never
+been changed, and nothing bumps it on its own: the manifests in `updatecli/updatecli.d/` target the
+Packer CLI, the builder plugin and actionlint, but not this variable) and both report **13.6** in
+`/etc/debian_version`, read on 2026-09-03 by attaching their VDIs to dom0 with the recipe near the
+top of this page. That those versions came from the mirror as it stood on the build day, rather than
+from the ISO, is the obvious reading of that and is inference: no individual package was traced to
+its source.
 
 Two things follow.
 
-**`/etc/debian_version` is not a provenance signal on these images.** It names a point release the
-build never used, and it is the first field anyone reaches for to answer "what is on this image". To
-answer that, date the build and take a digest of the installed set from inside a clone:
+**`/etc/debian_version` dates the mirror, not the media.** `base-files` ships that file, so it
+reports the point release the base system was installed from, which the build genuinely did use. It
+says nothing about which netinst booted, and that is usually the question someone means to ask when
+they reach for it to answer "what is on this image". To answer that properly, date the build and
+take a digest of the installed set from inside a clone:
 
 ```sh
-dpkg-query -W -f='${Package} ${Version}\n' | sort | sha256sum
+LC_ALL=C dpkg-query -W -f='${db:Status-Status} ${binary:Package} ${Version}\n' \
+  | awk '$1=="installed" {print $2, $3}' | LC_ALL=C sort | sha256sum
 ```
+
+Each part of that earns its place, and a plainer `dpkg-query -W -f='${Package} ${Version}\n' | sort`
+gets all three wrong. `dpkg-query -W` lists removed-but-not-purged packages too, so the status filter
+is what keeps a digest from moving on a package that is not installed: on the Debian 13.6 machine
+this was written on, 2564 records against 2546 genuinely installed. `${binary:Package}` carries the
+architecture qualifier on `Multi-Arch: same` and foreign-architecture packages, where `${Package}`
+alone is ambiguous. And `sort` collates by locale, so `LC_ALL=C` is what makes two machines agree.
 
 **Two builds from one commit a month apart produce different images**, and nothing in the build log
 says so. For an agent image that is arguably what you want, since it picks up security updates with
 nobody bumping a variable. It stops being fine the moment anyone quotes reproducibility. If that is
-ever wanted, `snapshot.debian.org` pinned to a timestamp is the mechanism, and it costs those
-security updates until someone moves the timestamp — not a trade worth making for an ephemeral
-agent image without a reason to.
+ever wanted, `snapshot.debian.org` pinned to a timestamp is the mechanism for the *Debian* half of
+the image, and only that half: `provision.sh` adds `packages.adoptium.net` and installs an
+unversioned `temurin-21-jre` from it, so a Debian snapshot alone still leaves the JRE floating.
+Pinning both costs those security updates until someone moves the timestamps, which is not a trade
+worth making for an ephemeral agent image without a reason to.
 [#201](https://github.com/gounthar/xcpng-cloud-plugin/issues/201)
 
 ## Building it by hand
