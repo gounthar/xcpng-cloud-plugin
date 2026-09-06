@@ -14,6 +14,17 @@ and its semantics recorded, and anything created is removed.
 
 Dry run by default. Exit 0 both paths completed, 1 a path failed, 2 controls did not
 hold, 3 something was left on the pool.
+
+DO NOT QUOTE THE CREATE TIMES FROM THIS HARNESS. The two paths run sequentially and REST
+always runs first, so the JSON-RPC create pays for the REST teardown that precedes it: the
+same call measures 1.23s standalone in xo_probe (n=3, 1.225 to 1.240) and 2.21s in this
+harness's second slot, whether or not it is passed VIFs. The bias favours whichever runs
+first, which is REST, which is the backend the numbers were used to choose, so it is the
+direction that matters most to declare.
+
+The defensible figures are the standalone ones, and they agree with what issue #89 already
+records: REST create_vm about 1.03s against JSON-RPC vm.create about 1.23s. What this
+harness is good for is the semantics beside each step, not the milliseconds.
 """
 
 import argparse
@@ -35,7 +46,7 @@ OWNER_TAG = "xcpng-cloud:xo-compare"
 CREATED = []  # (backend, id) pairs; cleanup never touches anything else
 
 
-def create_or_recover(xo, tid, name, backend):
+def create_or_recover(xo, tid, name, backend, **extra):
     """Create a VM, and if our own deadline fires, go and find what may have been made.
 
     `vm.create` has no server-side timeout, so a TIMEOUT here means our patience ran out,
@@ -49,7 +60,7 @@ def create_or_recover(xo, tid, name, backend):
     """
     t0 = time.monotonic()
     try:
-        res = xo.create_from_template(tid, name, clone=True)
+        res = xo.create_from_template(tid, name, clone=True, **extra)
     except XoError as exc:
         if exc.message != "TIMEOUT":
             raise
@@ -98,10 +109,21 @@ def run_jsonrpc(xo, template, name):
     print(f"\n== JSON-RPC path ==")
     tid = template.get("id") or template.get("uuid")
 
-    vm_id, r.steps["create"] = create_or_recover(xo, tid, name, "jsonrpc")
+    # VIFs passed explicitly, because otherwise this is not a comparison. MEASURED
+    # 2026-09-06: create_vm over REST inherits the template's VIFs and vm.create does not,
+    # so the two sides were doing different work and the JSON-RPC side was doing less. It
+    # still lost. Making them equal is what lets the numbers below be quoted at all.
+    vm_id, r.steps["create"] = create_or_recover(xo, tid, name, "jsonrpc",
+                                                 VIFs=xo.template_vifs(template))
     row("vm.create", f"{r.steps['create']:.3f}s -> {vm_id}")
     r.notes.append("accepts the XO object id; no bare-uuid requirement observed")
+    r.notes.append("does NOT inherit the template's VIFs; they are passed here explicitly")
 
+    # Polled: a create is a write, the cache lags a write, and [0] on an empty list is an
+    # IndexError rather than a failed check.
+    seen, _ = poll(lambda: as_list(xo.get_objects({"id": vm_id})), lambda found: len(found) == 1)
+    if not seen:
+        raise XoError("NOT_READABLE", f"created {vm_id} but it never appeared in the cache")
     vm = as_list(xo.get_objects({"id": vm_id}))[0]
     if vm.get("type") != "VM":
         raise XoError("WRONG_TYPE", vm.get("type"))
@@ -154,8 +176,13 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     CREATED.append(("rest", vm_id))
     row("POST /pools/{id}/actions/create_vm", f"{elapsed:.3f}s -> {vm_id}")
     r.notes.append("requires a BARE template uuid; the pool-prefixed form 404s")
+    r.notes.append("inherits the template's VIFs; passing vifs ADDS a second one")
 
-    vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs")
+    read_vm = lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs") or {}  # noqa: E731
+    seen, _ = poll(read_vm, lambda v: v.get("type") is not None)
+    if not seen:
+        raise XoRestError("NOT_READABLE", data=f"created {vm_id} but it never became readable")
+    vm = read_vm()
     if vm.get("type") != "VM":
         raise XoRestError("WRONG_TYPE", data=vm.get("type"))
     row("result type", f"{vm['type']}, {len(vm.get('$VBDs') or [])} VBD")

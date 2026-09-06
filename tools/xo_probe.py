@@ -52,6 +52,12 @@ class ControlFailed(Exception):
     pass
 
 
+def is_link_local(address):
+    """IPv6 fe80::/10 and IPv4 169.254.0.0/16. Neither can reach the controller."""
+    text = str(address).lower()
+    return text.startswith("fe80:") or text.startswith("169.254.")
+
+
 def ok(msg):
     print(f"  PASS  {msg}")
 
@@ -107,8 +113,13 @@ def check_q5(xo):
 def check_q2(xo, template, name):
     print("\n== Q2, create a VM from a template (the reason for issue #89) ==")
     tid = template.get("id") or template.get("uuid")
+    # vm.create does not inherit the template's VIFs and create_vm over REST does, which
+    # is measured rather than assumed; see Xo.template_vifs. Without this the clone boots
+    # perfectly and can never send a packet, and --boot times out against a guest that
+    # reports healthy on every other field.
+    vifs = xo.template_vifs(template)
     started = time.monotonic()
-    result = xo.create_from_template(tid, name, clone=True)
+    result = xo.create_from_template(tid, name, clone=True, VIFs=vifs)
     elapsed = time.monotonic() - started
 
     vm_id = result.get("id") if isinstance(result, dict) else result
@@ -122,9 +133,13 @@ def check_q2(xo, template, name):
     info("vm.create takes no xenStoreData and no tags, so the seed and the owner marker "
          "are separate calls after this one")
 
+    # Polled, not read once. The cache lags a write, and a create is a write: reading
+    # straight back can answer an empty list, and `made[0]` on that is an IndexError
+    # rather than a failed check, which is a traceback with a VM already on the pool.
+    seen, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})), lambda found: len(found) == 1)
     made = as_list(xo.get_objects({"id": vm_id}))
-    if len(made) != 1:
-        raise Failed(f"created {vm_id} but could not read it back")
+    if not seen:
+        raise Failed(f"created {vm_id} but could not read it back within {waited:.1f}s")
     vm = made[0]
     if vm.get("type") != "VM":
         raise Failed(f"expected a VM, got type={vm.get('type')!r}. vm.clone would do this")
@@ -132,6 +147,16 @@ def check_q2(xo, template, name):
     if not vm.get("$VBDs"):
         raise Failed("the new VM has no VBD, so the disk did not come across")
     ok(f"it has {len(vm['$VBDs'])} VBD, so a disk came with it")
+
+    # Checked here rather than left for --boot to discover as a timeout. A VIF-less clone
+    # boots fine and reports healthy on every field except the address, so without this
+    # the failure surfaces 180s later and looks like a broken golden image.
+    got, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})),
+                       lambda found: bool(found and (found[0].get("VIFs") or [])))
+    if not got:
+        raise Failed(f"the new VM has no VIF after {waited:.1f}s, so it can never reach "
+                     f"the network. vm.create does not inherit the template's VIFs")
+    ok("it has a VIF, so the guest has somewhere to send a packet")
     return vm_id, elapsed
 
 
@@ -170,17 +195,25 @@ def read_xenstore(xo, vm_id):
 
 def check_owner_tag(xo, vm_id):
     print("\n== owner marker, which has to be a tag here ==")
+    # Both directions poll, for the reason check_q1 does. Measured on the pool
+    # 2026-09-06: tag.add returned and the tag was NOT on the object when read back
+    # immediately, so this reported a working tag.add as broken. xo_compare polled here
+    # and this file did not, which is the same rule-with-two-homes split that check_q1
+    # had, in a function the review never named. Fixing the instance that fires and not
+    # sweeping for its siblings is how it survived the first pass.
+    tags = lambda: as_list(xo.get_objects({"id": vm_id}))[0].get("tags") or []  # noqa: E731
+
     xo.add_tag(vm_id, OWNER_TAG)
-    vm = as_list(xo.get_objects({"id": vm_id}))[0]
-    if OWNER_TAG not in (vm.get("tags") or []):
-        raise Failed(f"added tag {OWNER_TAG} but it is not on the object")
-    ok(f"tag.add put {OWNER_TAG} on the VM, so a sweep has something to select on")
+    tagged, waited = poll(tags, lambda t: OWNER_TAG in t)
+    if not tagged:
+        raise Failed(f"added tag {OWNER_TAG} but it never appeared on the object")
+    ok(f"tag.add put {OWNER_TAG} on the VM after {waited:.1f}s, so a sweep can select on it")
 
     xo.remove_tag(vm_id, OWNER_TAG)
-    vm = as_list(xo.get_objects({"id": vm_id}))[0]
-    if OWNER_TAG in (vm.get("tags") or []):
-        raise Failed("tag.remove did not remove the tag")
-    ok("tag.remove takes it off again")
+    gone, waited = poll(tags, lambda t: OWNER_TAG not in t)
+    if not gone:
+        raise Failed(f"tag.remove did not remove the tag within {waited:.1f}s")
+    ok(f"tag.remove takes it off again after {waited:.1f}s")
 
 
 def check_boot(xo, vm_id, wait):
@@ -189,13 +222,23 @@ def check_boot(xo, vm_id, wait):
     xo.call("vm.start", {"id": vm_id})
     ok(f"vm.start returned in {time.monotonic() - started:.3f}s")
 
+    # A link-local address is not an answer. MEASURED 2026-09-06, n=2 and one each way:
+    # one clone reported mainIpAddress='fe80::cd1c:...' at 25.3s, and another held None
+    # until 85.1s and then produced IPv4, global IPv6 and link-local together. So
+    # mainIpAddress can transiently carry an address nothing can connect to, and a caller
+    # taking the first non-empty value gets it. Accepting it here would be this probe
+    # reporting success for a check that failed, which is the whole thing these tools
+    # exist to stop doing.
     deadline = time.monotonic() + wait
     address = None
     while time.monotonic() < deadline:
         vm = as_list(xo.get_objects({"id": vm_id}))[0]
-        address = vm.get("mainIpAddress")
-        if address:
+        candidate = vm.get("mainIpAddress")
+        if candidate and not is_link_local(candidate):
+            address = candidate
             break
+        if candidate:
+            info(f"ignoring link-local {candidate}, nothing can connect to it")
         time.sleep(3)
 
     if address:

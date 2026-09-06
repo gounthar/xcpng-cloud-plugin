@@ -57,6 +57,9 @@ def fast_clock(monkeypatch):
 class CreatingXo(FakeXo):
     """A FakeXo whose create can return any shape, raise, and answer a recovery lookup."""
 
+    def template_vifs(self, template):
+        return [{"network": "net-1"}]
+
     def __init__(self, result=None, raises=None, resolves=()):
         super().__init__()
         self.result = result
@@ -293,6 +296,12 @@ class PoolXo:
 
     def create_from_template(self, tid, name_label, clone=True, **extra):
         return {"id": self.pool.create(name_label)}
+
+    def template_vifs(self, template):
+        """vm.create does not inherit the template's VIFs, so the harness passes them.
+        Returning a non-empty list rather than [] on purpose: an empty one would let a
+        caller that dropped the argument entirely pass this fixture unchanged."""
+        return [{"network": "net-1"}]
 
     def get_objects(self, filter_=None, limit=None):
         return self.pool.get((filter_ or {}).get("id"))

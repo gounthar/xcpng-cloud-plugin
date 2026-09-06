@@ -17,7 +17,8 @@ import itertools
 import pytest
 
 from fakes import FakeXo
-from xo_probe import ControlFailed, Failed, as_list, check_boot, check_q1, check_q3, cleanup, controls
+from xo_probe import (ControlFailed, Failed, as_list, check_boot, check_owner_tag, check_q1,
+                      check_q3, cleanup, controls, is_link_local)
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 FOUND = {TEMPLATE: [{"id": "pool/uuid-1", "uuid": "uuid-1"}]}
@@ -284,3 +285,120 @@ def test_a_vm_that_survives_its_delete_stays_on_the_cleanup_list(empty_created, 
     with pytest.raises(Failed, match="still present"):
         check_q3(DeletingXo(survives=True), "vm-1")
     assert empty_created.CREATED == ["vm-1"], "cleanup can no longer reach the leaked VM"
+
+
+# -- check_owner_tag: the one the unit tests missed and the pool caught -----
+
+class TaggingXo(FakeXo):
+    """A VM whose tag reads lag its tag writes, which is what the pool does.
+
+    `lag` defaults to 1 for the same reason XenstoreXo's does: a fixture that answered
+    correctly on the first read would let a single-read implementation pass, and answering
+    correctly on the first read is precisely what the appliance was measured not to do.
+
+    Measured 2026-09-06 on the lab pool: tag.add returned, and the tag was not on the
+    object when read straight back. check_owner_tag read once and reported a working
+    tag.add as broken, which is a false negative on the owner marker, the only handle any
+    sweep has on an XO-made VM. xo_compare polled here and this file did not.
+    """
+
+    def __init__(self, lag=1, honour_writes=True):
+        super().__init__()
+        self.lag = lag
+        self.honour_writes = honour_writes
+        self.tags = []
+        self._pending = None
+        self._left = 0
+
+    def _stage(self, tags):
+        self._pending, self._left = list(tags), self.lag
+
+    def add_tag(self, vm_id, tag):
+        if self.honour_writes:
+            self._stage(self.tags + [tag])
+
+    def remove_tag(self, vm_id, tag):
+        if self.honour_writes:
+            self._stage([t for t in self.tags if t != tag])
+
+    def get_objects(self, filter_=None, limit=None):
+        if self._pending is not None:
+            if self._left <= 0:
+                self.tags, self._pending = self._pending, None
+            else:
+                self._left -= 1
+        return [{"id": "vm-1", "tags": list(self.tags)}]
+
+
+def test_the_owner_tag_is_polled_in_both_directions(capsys):
+    """The failure the pool found. A single read after tag.add sees the pre-write state
+    and calls a working tag broken."""
+    check_owner_tag(TaggingXo(lag=2), "vm-1")
+    out = capsys.readouterr().out
+    assert out.count("PASS") == 2, out
+
+
+def test_a_tag_that_never_lands_is_still_a_failure(capsys):
+    """Polling must not turn the check into one that always passes eventually. The owner
+    marker is the only handle a sweep has on an XO-made VM, since XoVm carries no
+    other_config, so a tag that silently did not stick is a leak waiting to happen."""
+    with pytest.raises(Failed, match="never appeared"):
+        check_owner_tag(TaggingXo(honour_writes=False), "vm-1")
+
+
+def test_a_tag_that_will_not_come_off_is_a_failure(capsys):
+    """The remove direction needs its own negative, or it is pinned only by the add."""
+    class Sticky(TaggingXo):
+        def remove_tag(self, vm_id, tag):
+            return None
+
+    xo = Sticky()
+    xo.tags = ["xcpng-cloud:xo-probe"]
+    with pytest.raises(Failed, match="did not remove"):
+        check_owner_tag(xo, "vm-1")
+
+
+# -- a link-local address is not an answer ----------------------------------
+
+@pytest.mark.parametrize(
+    "address, link_local, why",
+    [
+        ("fe80::cd1c:16b1:f447:6874", True, "measured on the pool, reported as mainIpAddress"),
+        ("FE80::1", True, "the same, upper case"),
+        ("169.254.13.7", True, "IPv4 autoconfiguration, which means DHCP did not answer"),
+        ("192.168.1.152", False, "the address the same clone got 60s later"),
+        ("2a01:e0a:96c:c250:69f3:fb6c:a93c:40a2", False, "a global IPv6 is routable"),
+        ("10.0.0.1", False, "private, but reachable, which is all this needs to be"),
+    ],
+)
+def test_link_local_is_recognised_in_both_families(address, link_local, why):
+    assert is_link_local(address) is link_local, why
+
+
+class AddressXo(BootingXo):
+    """Hands out a sequence of addresses, one per read, the way a booting guest does."""
+
+    def __init__(self, sequence):
+        super().__init__()
+        self.sequence = list(sequence)
+
+    def get_objects(self, filter_=None, limit=None):
+        value = self.sequence.pop(0) if self.sequence else None
+        return [{"id": "vm-1", "mainIpAddress": value}]
+
+
+def test_a_link_local_address_is_skipped_and_the_real_one_taken(capsys):
+    """MEASURED 2026-09-06: one clone reported fe80:: at 25.3s. A caller taking the first
+    non-empty mainIpAddress gets an address nothing can connect to, and reports it as a
+    pass, which is this probe doing the exact thing it exists to catch."""
+    xo = AddressXo([None, "fe80::cd1c:16b1:f447:6874", "fe80::cd1c:16b1:f447:6874",
+                    "192.168.1.152"])
+    assert check_boot(xo, "vm-1", wait=30) == "192.168.1.152"
+    assert "ignoring link-local" in capsys.readouterr().out
+
+
+def test_a_clone_that_only_ever_gets_a_link_local_address_fails(capsys):
+    """Otherwise the skip turns into a hang that ends in a pass on the next lucky read."""
+    xo = AddressXo(["fe80::1"] * 200)
+    with pytest.raises(Failed, match="no mainIpAddress"):
+        check_boot(xo, "vm-1", wait=0.1)
