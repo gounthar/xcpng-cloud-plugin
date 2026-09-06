@@ -263,22 +263,37 @@ def check_boot(xo, vm_id, wait):
     # taking the first non-empty value gets it. Accepting it here would be this probe
     # reporting success for a check that failed, which is the whole thing these tools
     # exist to stop doing.
-    deadline = time.monotonic() + wait
-    address = None
-    while time.monotonic() < deadline:
+    # Through poll rather than a hand-rolled loop. The loop this replaces slept a flat
+    # three seconds whether or not that fitted, so a small budget overran and the "{wait}s"
+    # in the timeout message was not the time actually spent. poll already clamps its sleep
+    # to what is left, and that fix landed there earlier on this branch and not here, which
+    # is the argument for having one loop rather than two.
+    announced = set()
+
+    def usable():
         vm = readable(xo.get_objects({"id": vm_id})) or {}
         candidate = vm.get("mainIpAddress")
-        if candidate and not is_parseable(candidate):
+        if not candidate:
+            return None
+        if not is_parseable(candidate):
             # is_link_local answers False for anything it cannot parse, deliberately, so
-            # the caller has to be the one that refuses nonsense. Without this, a garbage
-            # value is neither link-local nor an address and gets reported as boot success.
-            info(f"ignoring unparseable mainIpAddress {candidate!r}")
-        elif candidate and is_link_local(candidate):
-            info(f"ignoring link-local {candidate}, nothing can connect to it")
-        elif candidate:
-            address = candidate
-            break
-        time.sleep(3)
+            # the caller refuses nonsense. Otherwise a garbage value is neither link-local
+            # nor an address and gets reported as boot success.
+            if candidate not in announced:
+                announced.add(candidate)
+                info(f"ignoring unparseable mainIpAddress {candidate!r}")
+            return None
+        if is_link_local(candidate):
+            if candidate not in announced:
+                announced.add(candidate)
+                info(f"ignoring link-local {candidate}, nothing can connect to it")
+            return None
+        return candidate
+
+    held = []
+    found, _ = poll(usable, lambda a: bool(held.append(a) or a is not None),
+                    timeout=wait, interval=3)
+    address = held[-1] if found else None
 
     if address:
         ok(f"mainIpAddress reported after {time.monotonic() - started:.1f}s: {address}")

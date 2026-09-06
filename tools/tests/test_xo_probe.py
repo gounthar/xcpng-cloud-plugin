@@ -227,18 +227,20 @@ class BootingXo(FakeXo):
         super().__init__()
         self.address = address
         self.calls = []
+        self.reads = 0
 
     def call(self, method, params=None, **kwargs):
         self.calls.append(method)
         return None
 
     def get_objects(self, filter_=None, limit=None):
+        self.reads += 1
         return [{"id": "vm-1", "mainIpAddress": self.address}]
 
 
 def test_an_address_that_arrives_is_reported(capsys):
     xo = BootingXo(address="192.168.1.42")
-    assert check_boot(xo, "vm-1", wait=0.1) == "192.168.1.42"
+    assert check_boot(xo, "vm-1", wait=30) == "192.168.1.42"
     assert "vm.stop" in xo.calls
 
 
@@ -248,7 +250,11 @@ def test_a_boot_that_never_reports_an_address_fails_the_run(capsys):
     is the whole point of having one."""
     xo = BootingXo(address=None)
     with pytest.raises(Failed, match="no mainIpAddress"):
-        check_boot(xo, "vm-1", wait=0.1)
+        check_boot(xo, "vm-1", wait=30)
+    # Both bounds matter. Too few reads and the budget expired before it looked, so the
+    # failure proves nothing; too many and check_boot is not honouring `wait` at all, and
+    # on a real pool that is a probe that hangs long past the timeout it reported.
+    assert 1 < xo.reads <= 31, f"{xo.reads} reads against a 30s budget on a 1s/tick clock"
 
 
 def test_the_vm_is_stopped_even_when_the_address_never_arrives(capsys):
@@ -256,7 +262,7 @@ def test_the_vm_is_stopped_even_when_the_address_never_arrives(capsys):
     running VM behind and the cleanup that follows has more to do than it expects."""
     xo = BootingXo(address=None)
     with pytest.raises(Failed):
-        check_boot(xo, "vm-1", wait=0.1)
+        check_boot(xo, "vm-1", wait=30)
     assert "vm.stop" in xo.calls, "the failure path skipped the stop"
 
 
@@ -409,7 +415,7 @@ def test_a_link_local_address_is_skipped_and_the_real_one_taken(capsys):
     pass, which is this probe doing the exact thing it exists to catch."""
     xo = AddressXo([None, "fe80::cd1c:16b1:f447:6874", "fe80::cd1c:16b1:f447:6874",
                     "192.168.1.152"])
-    assert check_boot(xo, "vm-1", wait=30) == "192.168.1.152"
+    assert check_boot(xo, "vm-1", wait=60) == "192.168.1.152"
     assert "ignoring link-local" in capsys.readouterr().out
 
 
@@ -417,7 +423,8 @@ def test_a_clone_that_only_ever_gets_a_link_local_address_fails(capsys):
     """Otherwise the skip turns into a hang that ends in a pass on the next lucky read."""
     xo = AddressXo(["fe80::1"] * 200)
     with pytest.raises(Failed, match="no mainIpAddress"):
-        check_boot(xo, "vm-1", wait=0.1)
+        check_boot(xo, "vm-1", wait=30)
+    assert "ignoring link-local" in capsys.readouterr().out, "it never looked at one"
 
 
 def test_a_cache_that_flickers_empty_does_not_abort_the_tag_poll(capsys):
@@ -487,3 +494,22 @@ def test_an_unreadable_cache_does_not_count_as_a_scrubbed_key(capsys):
 
     with pytest.raises(Failed, match="survived a null write"):
         check_q1(GoesBlind(), "vm-1")
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    ["not-an-address", "999.999.999.999", "192.168.1", "{}", "0", "fe80:::::1"],
+)
+def test_an_unparseable_address_is_not_boot_success(capsys, garbage):
+    """is_link_local answers False for anything it cannot parse, deliberately, so the
+    caller is the one that has to refuse nonsense. Without that, a garbage value is
+    neither link-local nor an address and gets reported as a working boot."""
+    xo = AddressXo([garbage, garbage, "192.168.1.152"])
+    assert check_boot(xo, "vm-1", wait=60) == "192.168.1.152"
+    assert "ignoring unparseable" in capsys.readouterr().out
+
+
+def test_a_clone_that_only_ever_reports_nonsense_fails(capsys):
+    xo = AddressXo(["not-an-address"] * 200)
+    with pytest.raises(Failed, match="no mainIpAddress"):
+        check_boot(xo, "vm-1", wait=30)

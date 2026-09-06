@@ -331,12 +331,24 @@ class PoolRest:
     def create_vm(self, pool_id, template_id, name_label, clone=True, boot=False, **extra):
         return self.pool.create(name_label), 1.016
 
+    #: go blind on xenStoreData reads from the moment the scrub is written, not before.
+    #: The timing is the whole test. During the SEED poll an empty read is correctly false
+    #: whether the reader answers None or {}, so blinding there cannot tell the two apart.
+    #: It is the SCRUB poll where `SEED_KEY not in {}` is true and a reader that collapses
+    #: "unreadable" into "empty" reports a delete that never happened.
+    blind_after_scrub = False
+    _blind = False
+
     def get(self, path):
+        if self._blind and "xenStoreData" in path:
+            return None            # XoRest.get answers None on an empty HTTP body
         found = self.pool.get(path.split("/vms/")[1].split("?")[0])
         return found[0] if found else {}
 
     def set_xenstore(self, vm_id, data):
         self.pool.set_xenstore(vm_id, data)
+        if self.blind_after_scrub and any(v is None for v in data.values()):
+            self._blind = True
         return 200
 
     def add_tag(self, vm_id, tag):
@@ -422,3 +434,26 @@ def test_the_jsonrpc_path_forwards_the_template_s_vifs(empty_created, capsys):
     _, _, run = next(b for b in run_both(Pool(), xo=xo) if b[0] == "JSON-RPC")
     run()
     assert xo.creates == [{"VIFs": [{"network": "net-1"}]}], xo.creates
+
+
+def test_the_rest_path_survives_an_empty_body_and_does_not_call_it_an_absence(empty_created, capsys):
+    """Two defects in one reader, both caught by the same fixture.
+
+    XoRest.get answers None on an empty HTTP body, so `.get(...)` on it raised
+    AttributeError and took the harness down with a VM already on the pool. And the `or {}`
+    that would have prevented that makes every `d is not None` guard beside it inert, so a
+    negative poll passes the instant the body is empty: `SEED_KEY not in {}` is true.
+
+    The store goes blind the moment the scrub is written and the scrub genuinely does
+    nothing, so every read the scrub poll makes comes back empty. A reader that calls
+    `.get` on None crashes; a reader that answers {} reports a delete that never happened.
+    Blinding earlier would prove neither, because during the seed poll an empty read is
+    correctly false whichever way the reader is written.
+    """
+    pool = Pool(scrub=False)
+    rest = PoolRest(pool)
+    rest.blind_after_scrub = True
+    with pytest.raises(XoRestError) as caught:
+        xo_compare.run_rest(rest, PoolXo(pool), "pool-1", TEMPLATE, "xo-cmp-rest-1")
+    assert "SCRUB_FAILED" in str(caught.value)
+    assert empty_created.CREATED, "the VM was left untracked when the path failed"

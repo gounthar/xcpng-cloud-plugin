@@ -199,7 +199,15 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
     r.steps["seed"] = time.monotonic() - t0
-    read = lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=xenStoreData").get("xenStoreData") or {}
+    def read():
+        # Mirrors the JSON-RPC reader on purpose. Two things were wrong with the lambda
+        # this replaces: XoRest.get answers None on an empty body, so `.get` on it raised
+        # AttributeError and took the harness down with a VM on the pool; and `or {}` meant
+        # the reader never returned None, which made every `d is not None` guard beside it
+        # inert. The guard was added one function above and not here, which is the fourth
+        # time on this branch that a fix landed on one side of a pair.
+        vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=xenStoreData")
+        return None if not isinstance(vm, dict) else (vm.get("xenStoreData") or {})
     seen, waited = poll(read, lambda d: d is not None and SEED_KEY in d)
     r.steps["seed_visible"] = waited
     row("PATCH /vms/{id} seed", f"{r.steps['seed']:.3f}s, visible after {waited:.1f}s poll={seen}")
@@ -217,8 +225,11 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: (rest.get(f"/rest/v0/vms/{vm_id}?fields=tags") or {}).get("tags"),
-                          lambda t: t is not None and OWNER_TAG in t)
+    def read_tags():
+        vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=tags")
+        return None if not isinstance(vm, dict) else (vm.get("tags") or [])
+
+    tagged, waited = poll(read_tags, lambda t: t is not None and OWNER_TAG in t)
     row("PUT /vms/{id}/tags/{tag}", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
         raise XoRestError("TAG_FAILED", data=f"{OWNER_TAG} never appeared on the VM")
