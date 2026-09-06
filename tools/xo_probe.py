@@ -23,6 +23,7 @@ nothing was concluded, 3 cleanup left something behind on the pool.
 """
 
 import argparse
+import ipaddress
 import os
 import sys
 import time
@@ -53,9 +54,24 @@ class ControlFailed(Exception):
 
 
 def is_link_local(address):
-    """IPv6 fe80::/10 and IPv4 169.254.0.0/16. Neither can reach the controller."""
-    text = str(address).lower()
-    return text.startswith("fe80:") or text.startswith("169.254.")
+    """IPv6 fe80::/10 and IPv4 169.254.0.0/16. Neither can reach the controller.
+
+    Uses the stdlib rather than a prefix test, because the prefix test this replaced was
+    wrong in the way its own docstring made hardest to see: it said /10 and matched
+    `fe80:`, which is /16. fe80::/10 runs to febf:ffff:..., so fe90::, fea0:: and febf::
+    are link-local too and were being accepted as routable. The first version of the test
+    beside it only ever fed it fe80::, so the fixture agreed with the narrower behaviour
+    and neither could see the other was wrong.
+
+    An unparseable value counts as not link-local: it is not this function's job to decide
+    whether the appliance handed back nonsense, and the caller checks for a usable address
+    rather than for the absence of a bad one. A scope id is stripped first, since
+    `fe80::1%eth0` is a shape XO can return and ip_address rejects it.
+    """
+    try:
+        return ipaddress.ip_address(str(address).split("%")[0]).is_link_local
+    except ValueError:
+        return False
 
 
 def ok(msg):
@@ -136,11 +152,15 @@ def check_q2(xo, template, name):
     # Polled, not read once. The cache lags a write, and a create is a write: reading
     # straight back can answer an empty list, and `made[0]` on that is an IndexError
     # rather than a failed check, which is a traceback with a VM already on the pool.
-    seen, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})), lambda found: len(found) == 1)
-    made = as_list(xo.get_objects({"id": vm_id}))
+    # The polled value is kept rather than re-read. A second read can find the cache
+    # briefly empty again, and [0] on that is an IndexError with a VM already on the pool,
+    # which is the failure the poll was added to prevent wearing a different hat.
+    held = []
+    seen, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})),
+                        lambda found: bool(held.append(found) or len(found) == 1))
     if not seen:
         raise Failed(f"created {vm_id} but could not read it back within {waited:.1f}s")
-    vm = made[0]
+    vm = held[-1][0]
     if vm.get("type") != "VM":
         raise Failed(f"expected a VM, got type={vm.get('type')!r}. vm.clone would do this")
     ok("the result is a VM, not another template")

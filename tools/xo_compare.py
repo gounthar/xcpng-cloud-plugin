@@ -121,10 +121,14 @@ def run_jsonrpc(xo, template, name):
 
     # Polled: a create is a write, the cache lags a write, and [0] on an empty list is an
     # IndexError rather than a failed check.
-    seen, _ = poll(lambda: as_list(xo.get_objects({"id": vm_id})), lambda found: len(found) == 1)
+    held = []
+    seen, _ = poll(lambda: as_list(xo.get_objects({"id": vm_id})),
+                   lambda found: bool(held.append(found) or len(found) == 1))
     if not seen:
         raise XoError("NOT_READABLE", f"created {vm_id} but it never appeared in the cache")
-    vm = as_list(xo.get_objects({"id": vm_id}))[0]
+    # The polled value, not a fresh read: the cache can flicker back to empty between the
+    # two, and [0] on that is an IndexError with a VM already on the pool.
+    vm = held[-1][0]
     if vm.get("type") != "VM":
         raise XoError("WRONG_TYPE", vm.get("type"))
     row("result type", f"{vm['type']}, {len(vm.get('$VBDs') or [])} VBD")

@@ -365,13 +365,29 @@ def test_a_tag_that_will_not_come_off_is_a_failure(capsys):
     [
         ("fe80::cd1c:16b1:f447:6874", True, "measured on the pool, reported as mainIpAddress"),
         ("FE80::1", True, "the same, upper case"),
+        ("fe80::1%eth0", True, "with a scope id, which is a shape XO can return"),
+        # The rest of fe80::/10. A prefix test on the literal "fe80:" is a /16 and calls
+        # every one of these routable, which is what the first version of this function
+        # did while its own docstring said /10. The first version of this test only fed it
+        # fe80::, so the fixture agreed with the narrower behaviour and neither could see
+        # the other was wrong.
+        ("fe90::1", True, "still fe80::/10"),
+        ("fea0::1", True, "still fe80::/10"),
+        ("feb0::1", True, "still fe80::/10"),
+        ("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", True, "the last address in the range"),
+        ("fec0::1", False, "one past the end: site-local, deprecated, and not link-local"),
         ("169.254.13.7", True, "IPv4 autoconfiguration, which means DHCP did not answer"),
+        ("169.254.0.0", True, "the bottom of that range"),
+        ("169.255.0.1", False, "one past it"),
         ("192.168.1.152", False, "the address the same clone got 60s later"),
         ("2a01:e0a:96c:c250:69f3:fb6c:a93c:40a2", False, "a global IPv6 is routable"),
         ("10.0.0.1", False, "private, but reachable, which is all this needs to be"),
+        ("", False, "an empty value is not an address and is not this function's problem"),
+        ("nonsense", False, "nor is a string the appliance should never have sent"),
+        (None, False, "nor is None, which mainIpAddress is until the guest reports"),
     ],
 )
-def test_link_local_is_recognised_in_both_families(address, link_local, why):
+def test_link_local_is_recognised_across_the_whole_range(address, link_local, why):
     assert is_link_local(address) is link_local, why
 
 
