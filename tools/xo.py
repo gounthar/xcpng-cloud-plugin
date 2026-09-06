@@ -169,7 +169,12 @@ class Xo:
         they came from, so a prefix match would find the template's own offspring.
         """
         found = self.get_objects({"type": "VM-template", "name_label": name_label})
-        return list(found.values()) if isinstance(found, dict) else list(found)
+        if isinstance(found, dict):
+            return list(found.values())
+        # `or []` rather than list(found): a null result is not iterable, and this is the
+        # call the probes' controls make first. A TypeError here escapes as a traceback
+        # instead of the ControlFailed that exists to stop the run and conclude nothing.
+        return list(found or [])
 
     def create_from_template(self, template_id, name_label, clone=True, **extra):
         """The JSON-RPC shape of HypervisorClient.cloneFromTemplate.

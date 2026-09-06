@@ -13,6 +13,7 @@ object", which reads exactly like the capability being missing. That mistake has
 made twice on this project, so it gets a guard in `create_vm` below rather than a comment.
 """
 
+import http.client
 import json
 import os
 import ssl
@@ -82,8 +83,11 @@ class XoRest:
                 data=payload.get("data") if isinstance(payload, dict) else None,
             ) from None
         # urlopen's timeout is per socket operation and covers the body read, and a read
-        # failure is an OSError rather than a URLError. Same trap as the XAPI client.
-        except OSError as exc:
+        # failure is an OSError rather than a URLError. Same trap as the XAPI client, and
+        # IncompleteRead is the half of it that is easy to miss: it is an HTTPException,
+        # not an OSError, so catching OSError alone lets a truncated body escape as a raw
+        # exception through every caller that only handles XoRestError.
+        except (OSError, http.client.HTTPException) as exc:
             raise XoRestError("TRANSPORT", data=str(exc)) from None
 
         if not raw:
