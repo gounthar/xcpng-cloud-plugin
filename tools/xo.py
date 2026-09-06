@@ -120,18 +120,27 @@ class Xo:
 
         self._id += 1
         rid = self._id
-        self._ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "id": rid,
-            "method": method,
-            "params": params if params is not None else {},
-        }))
 
         # One budget, named once. Reporting self.timeout while waiting on a per-call value
         # names a number nobody chose, and a probe that says "did not answer within 120s"
         # after waiting 5 sends the reader looking for a slow appliance.
+        #
+        # It is established before the send, not after, and the socket is set to it. The
+        # send can block: settimeout governs both directions, so a request written to a
+        # stalled socket otherwise waits out the connection timeout rather than the budget
+        # this call was given, and a short per-call timeout silently means the long one.
         budget = timeout if timeout is not None else self.timeout
         deadline = time.monotonic() + budget
+        self._ws.settimeout(budget)
+        try:
+            self._ws.send(json.dumps({
+                "jsonrpc": "2.0",
+                "id": rid,
+                "method": method,
+                "params": params if params is not None else {},
+            }))
+        except websocket.WebSocketTimeoutException:
+            raise XoError("TIMEOUT", f"{method} could not be sent within {budget}s") from None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

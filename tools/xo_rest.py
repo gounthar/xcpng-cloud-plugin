@@ -34,6 +34,29 @@ class XoRestError(RuntimeError):
         self.data = data
 
 
+def _message_of(payload, exc):
+    """Pull something a human can read out of an error body, and never return None.
+
+    `payload.get("error")` alone yields None on any JSON object that names its error
+    differently, and XoRestError formats that into the literal string "None" with
+    `.message` set to None. The error this costs most is the one this client exists for:
+    the pool-prefixed template id answers 404, and losing that body leaves a bare 404 that
+    reads like the route not existing, which is the wrong conclusion this whole module is
+    built to stop someone reaching a third time.
+
+    The key order is a guess about XO's shape and deliberately not the last word, which is
+    why the whole payload is the final fallback rather than a shrug.
+    """
+    if isinstance(payload, dict):
+        for key in ("error", "message", "code", "detail"):
+            value = payload.get(key)
+            if value:
+                return value if isinstance(value, str) else str(value)
+        return str(payload) if payload else f"HTTP {exc.code} {exc.reason}"
+    text = str(payload).strip()
+    return text or f"HTTP {exc.code} {exc.reason}"
+
+
 def _segment(value):
     """Percent-encode one path segment, slash included.
 
@@ -99,7 +122,7 @@ class XoRest:
             except ValueError:
                 payload = raw.decode(errors="replace")
             raise XoRestError(
-                payload.get("error") if isinstance(payload, dict) else str(payload),
+                _message_of(payload, exc),
                 status=exc.code,
                 data=payload.get("data") if isinstance(payload, dict) else None,
             ) from None

@@ -97,3 +97,62 @@ def test_a_predicate_looking_for_an_absence_works_the_same_way(no_sleep):
 )
 def test_as_list_normalises_every_shape_the_api_answers_with(objs, expected, why):
     assert as_list(objs) == expected, why
+
+
+def test_a_sleep_never_outlasts_the_budget_it_is_sleeping_inside(monkeypatch):
+    """`poll(timeout=20, interval=60)` took one failed read and then waited a full minute.
+    The budget in the signature and the time actually spent were different numbers, and
+    the caller was handed the first. An interval longer than the budget is not a silly
+    call: it is what a caller writes when it wants one slow retry.
+
+    The fake sleep advances the fake clock, rather than a fixed list of ticks standing in
+    for both. A list would make this a test of the list: get the entries wrong and it
+    fails against correct code, get them wrong the other way and it passes against the
+    bug, and neither failure says which.
+    """
+    import types
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.slept = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.slept.append(seconds)
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(xo_util, "time",
+                        types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep))
+    satisfied, waited = poll(lambda: {}, lambda d: "k" in d, timeout=20.0, interval=60.0)
+
+    assert satisfied is False
+    assert clock.slept == [20.0], f"slept {clock.slept} against a 20s budget"
+    assert waited == 20.0, "it overran the budget it reported"
+
+
+def test_a_normal_interval_is_left_alone(monkeypatch):
+    """The clamp must not shorten an interval that already fits, or a 0.5s poll becomes a
+    busy loop against a live appliance the moment the budget gets low."""
+    import types
+
+    class Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.slept = []
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.slept.append(seconds)
+            self.now += seconds
+
+    clock = Clock()
+    monkeypatch.setattr(xo_util, "time",
+                        types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep))
+    poll(lambda: {}, lambda d: "k" in d, timeout=2.0, interval=0.5)
+    assert clock.slept == [0.5, 0.5, 0.5, 0.5], f"the clamp altered a fitting interval: {clock.slept}"

@@ -38,8 +38,13 @@ def poll(read, want, timeout=20.0, interval=0.5):
     letting it through makes a timeout indistinguishable from a result.
     """
     started = time.monotonic()
-    while time.monotonic() - started < timeout:
+    while True:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
+            return False, time.monotonic() - started
         if want(read()):
             return True, time.monotonic() - started
-        time.sleep(interval)
-    return False, time.monotonic() - started
+        # Never sleep past the deadline. poll(timeout=20, interval=60) used to take one
+        # failed read and then wait a full minute, so the budget in the signature and the
+        # time actually spent were different numbers, and the caller was told the first.
+        time.sleep(min(interval, remaining))

@@ -366,3 +366,42 @@ def test_anything_that_is_not_an_affirmative_leaves_verification_on(monkeypatch,
     monkeypatch.setenv("XO_TOKEN", SECRET)
     monkeypatch.setenv("XO_TRUST_SELF_SIGNED", value)
     assert XoRest()._ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+# -- an error envelope must always name something ---------------------------
+
+@pytest.mark.parametrize(
+    "payload, expected, why",
+    [
+        (b'{"error": "no such object"}', "no such object", "the key we already handled"),
+        (b'{"message": "no such object"}', "no such object", "the same fault under another key"),
+        (b'{"code": "HANDLE_INVALID"}', "HANDLE_INVALID", "a code, which is still worth printing"),
+        (b'{"detail": "bad id"}', "bad id", "and one more shape"),
+        (b'{"other": 1}', "{'other': 1}", "nothing recognised: show the body rather than nothing"),
+        (b"{}", "HTTP 404 Not Found", "an empty object falls back to the status line"),
+        (b"", "HTTP 404 Not Found", "so does an empty body"),
+        (b"<html>gone</html>", "<html>gone</html>", "a non-JSON body is its own message"),
+        (b"5", "5", "a bare scalar too"),
+    ],
+)
+def test_an_error_message_is_never_none(rest, monkeypatch, payload, expected, why):
+    """`payload.get("error")` alone yields None on any object naming its error otherwise,
+    and XoRestError formats that into the literal string "None".
+
+    The error this costs most is the one this client exists for: a pool-prefixed template
+    id answers 404, and losing that body leaves a bare 404 that reads like the route not
+    existing, which is the wrong conclusion the whole module is built to prevent.
+    """
+    import urllib.request
+
+    def boom(*args, **kwargs):
+        raise urllib.error.HTTPError("https://xo.invalid", 404, "Not Found", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr(urllib.error.HTTPError, "read", lambda self: payload, raising=False)
+
+    with pytest.raises(XoRestError) as caught:
+        rest.get("/rest/v0/vms/x")
+    assert caught.value.message == expected, why
+    assert caught.value.message is not None
+    assert "None" != str(caught.value).strip(), "the exception stringifies to the word None"

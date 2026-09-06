@@ -141,13 +141,16 @@ def test_a_socket_timeout_mid_wait_is_a_timeout_and_not_a_traceback(xo):
     assert caught.value.message == "TIMEOUT"
 
 
-def test_an_expired_deadline_stops_before_reading_the_socket_again(xo):
+def test_an_expired_deadline_stops_before_reading_the_socket(xo):
+    """A spent budget buys no free read. The assertion is on the unread frame rather than
+    on settimeout, because the socket is now set once before the send as well, and
+    counting those calls would be measuring the wrong thing."""
     ws = FakeWs([REPLY])
     xo._ws = ws
     with pytest.raises(XoError) as caught:
         xo.call("vm.create", timeout=-1)
     assert caught.value.message == "TIMEOUT"
-    assert ws.timeouts == [], "it read the socket after its own deadline had passed"
+    assert ws.frames == [REPLY], "it read the socket after its own deadline had passed"
 
 
 @pytest.mark.parametrize(
@@ -195,7 +198,9 @@ def test_the_socket_deadline_shrinks_across_skipped_frames(xo, monkeypatch):
     ws = FakeWs([NOTIFICATION, NOTIFICATION, REPLY])
     xo._ws = ws
     xo.call("vm.create")
-    assert ws.timeouts == [10.0, 9.0, 8.0]
+    # The leading 10.0 is the send: settimeout governs both directions, so the budget is
+    # applied before the request goes out. The three after it are the read budget shrinking.
+    assert ws.timeouts == [10.0, 10.0, 9.0, 8.0]
 
 
 def test_calling_before_connect_says_which_step_is_missing(xo):
@@ -400,3 +405,30 @@ def test_resolve_vm_normalises_every_reply_shape(xo, result, expected):
     failure path, so a TypeError in it would replace a recoverable leak with a traceback."""
     xo._ws = FakeWs([{"id": 1, "result": result}])
     assert len(xo.resolve_vm("nope")) == expected
+
+
+# -- the budget has to cover the send, not just the wait ---------------------
+
+def test_the_socket_is_put_on_the_budget_before_the_request_goes_out(xo):
+    """settimeout governs both directions. A request written to a stalled socket otherwise
+    waits out the connection timeout rather than the budget this call was given, so a
+    short per-call timeout quietly means the long one."""
+    ws = FakeWs([REPLY])
+    xo._ws = ws
+    xo.timeout = 120.0
+    xo.call("vm.create", timeout=3.0)
+    assert ws.timeouts[0] == 3.0, "the send went out on the client default, not the call's budget"
+
+
+def test_a_send_that_blocks_is_a_timeout_and_not_a_traceback(xo):
+    """Every caller handles XoError. A raw WebSocketTimeoutException out of send() would
+    escape all of them, and it escapes at the one moment a VM may already exist."""
+    class Stuck(FakeWs):
+        def send(self, payload):
+            raise websocket.WebSocketTimeoutException("send timed out")
+
+    xo._ws = Stuck([REPLY])
+    with pytest.raises(XoError) as caught:
+        xo.call("vm.create", timeout=3.0)
+    assert caught.value.message == "TIMEOUT"
+    assert "sent" in str(caught.value), "a send failure must not read as an answer that never came"
