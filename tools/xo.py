@@ -127,16 +127,20 @@ class Xo:
             "params": params if params is not None else {},
         }))
 
-        deadline = time.monotonic() + (timeout if timeout is not None else self.timeout)
+        # One budget, named once. Reporting self.timeout while waiting on a per-call value
+        # names a number nobody chose, and a probe that says "did not answer within 120s"
+        # after waiting 5 sends the reader looking for a slow appliance.
+        budget = timeout if timeout is not None else self.timeout
+        deadline = time.monotonic() + budget
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise XoError("TIMEOUT", f"{method} did not answer within {self.timeout}s")
+                raise XoError("TIMEOUT", f"{method} did not answer within {budget}s")
             self._ws.settimeout(remaining)
             try:
                 frame = self._ws.recv()
             except websocket.WebSocketTimeoutException:
-                raise XoError("TIMEOUT", f"{method} did not answer within {self.timeout}s") from None
+                raise XoError("TIMEOUT", f"{method} did not answer within {budget}s") from None
 
             try:
                 msg = json.loads(frame)
@@ -174,6 +178,20 @@ class Xo:
         # `or []` rather than list(found): a null result is not iterable, and this is the
         # call the probes' controls make first. A TypeError here escapes as a traceback
         # instead of the ControlFailed that exists to stop the run and conclude nothing.
+        return list(found or [])
+
+    def resolve_vm(self, name_label):
+        """Exact match on a VM's name_label, the mirror of resolve_template.
+
+        This exists for one case: `vm.create` has no server-side timeout, so a call that
+        hits *our* deadline may still have made a VM. Nothing on that VM carries an owner
+        marker yet, and an XO-made VM has no other_config for the reaper to select on, so
+        its name is the only handle there is. A harness that gives up without looking
+        leaves a VM no sweep in this repository can find.
+        """
+        found = self.get_objects({"type": "VM", "name_label": name_label})
+        if isinstance(found, dict):
+            return list(found.values())
         return list(found or [])
 
     def create_from_template(self, template_id, name_label, clone=True, **extra):

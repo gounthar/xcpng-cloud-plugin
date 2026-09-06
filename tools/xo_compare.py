@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
 from xo_rest import XoRest, XoRestError  # noqa: E402
+from xo_util import as_list, poll  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 SEED_KEY = "vm-data/jenkins/probe"
@@ -34,24 +35,50 @@ OWNER_TAG = "xcpng-cloud:xo-compare"
 CREATED = []  # (backend, id) pairs; cleanup never touches anything else
 
 
-def poll(read, want, timeout=20.0, interval=0.5):
-    """XO's object cache lags a write, so a single read-back reports stale data.
+def create_or_recover(xo, tid, name, backend):
+    """Create a VM, and if our own deadline fires, go and find what may have been made.
 
-    Measured on this pool: a xenstore key written through either backend is absent from
-    an immediate read and present a couple of seconds later. Reading once turns a
-    successful write into an apparent failure, which is what it did the first time this
-    comparison ran. Returns (satisfied, seconds waited).
+    `vm.create` has no server-side timeout, so a TIMEOUT here means our patience ran out,
+    not that the appliance declined. The VM may well exist. It carries no tag yet, and an
+    XO-made VM has no other_config for the reaper to select on, so the unique name this
+    run chose is the only handle anything has on it. Giving up without looking leaves a VM
+    that no sweep in this repository can find.
+
+    Returns (vm_id, elapsed). Raises with the id already tracked when it can be resolved,
+    so cleanup() takes it either way.
     """
-    started = time.monotonic()
-    while time.monotonic() - started < timeout:
-        if want(read()):
-            return True, time.monotonic() - started
-        time.sleep(interval)
-    return False, time.monotonic() - started
+    t0 = time.monotonic()
+    try:
+        res = xo.create_from_template(tid, name, clone=True)
+    except XoError as exc:
+        if exc.message != "TIMEOUT":
+            raise
+        recovered = as_list(xo.resolve_vm(name))
+        if len(recovered) == 1:
+            vm_id = recovered[0].get("id")
+            CREATED.append((backend, vm_id))
+            raise XoError("CREATE_TIMEOUT_RECOVERED",
+                          f"{name} was created despite the timeout; tracked as {vm_id}") from None
+        raise XoError("CREATE_TIMEOUT_UNRESOLVED",
+                      f"{name} timed out and resolves to {len(recovered)} VMs. "
+                      f"This run is inconclusive; check the pool by name before trusting it") from None
+
+    elapsed = time.monotonic() - t0
+    vm_id = res.get("id") if isinstance(res, dict) else res
+    # Validated before tracking: an unexpected shape put None on the list, and cleanup
+    # then tried to delete it while the real VM, if any, went untracked.
+    if not vm_id:
+        raise XoError("CREATE_FAILED", f"vm.create returned nothing usable: {res!r}")
+    CREATED.append((backend, vm_id))
+    return vm_id, elapsed
 
 
-def as_list(objs):
-    return list(objs.values()) if isinstance(objs, dict) else list(objs or [])
+def confirm_gone(read, label):
+    """A delete is not done when the call returns, only when the object stops being there."""
+    gone, waited = poll(read, lambda found: not found)
+    if not gone:
+        raise XoError("STILL_PRESENT", f"{label} is still on the pool {waited:.1f}s after delete")
+    return waited
 
 
 def row(label, value):
@@ -71,11 +98,7 @@ def run_jsonrpc(xo, template, name):
     print(f"\n== JSON-RPC path ==")
     tid = template.get("id") or template.get("uuid")
 
-    t0 = time.monotonic()
-    res = xo.create_from_template(tid, name, clone=True)
-    r.steps["create"] = time.monotonic() - t0
-    vm_id = res.get("id") if isinstance(res, dict) else res
-    CREATED.append(("jsonrpc", vm_id))
+    vm_id, r.steps["create"] = create_or_recover(xo, tid, name, "jsonrpc")
     row("vm.create", f"{r.steps['create']:.3f}s -> {vm_id}")
     r.notes.append("accepts the XO object id; no bare-uuid requirement observed")
 
@@ -99,6 +122,8 @@ def run_jsonrpc(xo, template, name):
     r.steps["scrub"] = time.monotonic() - t0
     gone, waited = poll(read, lambda d: SEED_KEY not in d)
     row("vm.set scrub (null)", f"{r.steps['scrub']:.3f}s, gone after {waited:.1f}s poll={gone}")
+    if not gone:
+        raise XoError("SCRUB_FAILED", f"{SEED_KEY} survived the null write")
 
     t0 = time.monotonic()
     xo.add_tag(vm_id, OWNER_TAG)
@@ -106,17 +131,20 @@ def run_jsonrpc(xo, template, name):
     tagged, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id}))[0].get("tags") or [],
                           lambda t: OWNER_TAG in t)
     row("tag.add", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
+    if not tagged:
+        raise XoError("TAG_FAILED", f"{OWNER_TAG} never appeared on the VM")
 
     t0 = time.monotonic()
     xo.delete_vm(vm_id, delete_disks=True)
     r.steps["delete"] = time.monotonic() - t0
     row("vm.delete(deleteDisks=True)", f"{r.steps['delete']:.3f}s")
     r.notes.append("deleteDisks is a parameter, so keeping the disk is possible")
+    confirm_gone(lambda: as_list(xo.get_objects({"id": vm_id})), vm_id)
     CREATED.remove(("jsonrpc", vm_id))
     return r
 
 
-def run_rest(rest, pool_id, template, name):
+def run_rest(rest, xo_for_reads, pool_id, template, name):
     r = Result("REST")
     print(f"\n== REST path ==")
     bare = template.get("uuid") or (template.get("id") or "").split("/")[-1]
@@ -147,6 +175,8 @@ def run_rest(rest, pool_id, template, name):
     r.steps["scrub"] = time.monotonic() - t0
     gone, waited = poll(read, lambda d: SEED_KEY not in d)
     row("PATCH /vms/{id} scrub (null)", f"{r.steps['scrub']:.3f}s, gone after {waited:.1f}s poll={gone}")
+    if not gone:
+        raise XoRestError("SCRUB_FAILED", data=f"{SEED_KEY} survived the null write")
 
     t0 = time.monotonic()
     rest.add_tag(vm_id, OWNER_TAG)
@@ -154,11 +184,18 @@ def run_rest(rest, pool_id, template, name):
     tagged, waited = poll(lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=tags").get("tags") or [],
                           lambda t: OWNER_TAG in t)
     row("PUT /vms/{id}/tags/{tag}", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
+    if not tagged:
+        raise XoRestError("TAG_FAILED", data=f"{OWNER_TAG} never appeared on the VM")
 
     status, elapsed = rest.delete_vm(vm_id)
     r.steps["delete"] = elapsed
     row("DELETE /vms/{id}", f"{elapsed:.3f}s, http={status}")
     r.notes.append("no deleteDisks parameter; disks always go, no opt-out")
+    # Read back through the JSON-RPC client on purpose: both backends talk to the same
+    # appliance and the same object cache, and resolve/get_objects is verified here. The
+    # REST collection-filter syntax is not, and guessing at it on a teardown-verification
+    # path is how a leak gets certified clean.
+    confirm_gone(lambda: as_list(xo_for_reads.get_objects({"id": vm_id})), vm_id)
     CREATED.remove(("rest", vm_id))
     return r
 
@@ -231,7 +268,7 @@ def main():
 
         results = []
         stamp = int(time.time())
-        for label, fn in (("rest", lambda: run_rest(rest, args.pool, template, f"xo-cmp-rest-{stamp}")),
+        for label, fn in (("rest", lambda: run_rest(rest, xo, args.pool, template, f"xo-cmp-rest-{stamp}")),
                           ("jsonrpc", lambda: run_jsonrpc(xo, template, f"xo-cmp-jrpc-{stamp}"))):
             try:
                 results.append(fn())

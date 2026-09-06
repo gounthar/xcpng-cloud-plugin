@@ -30,6 +30,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
+from xo_util import as_list, poll  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 CLONE_PREFIX = "xo-probe-"
@@ -57,12 +58,6 @@ def ok(msg):
 
 def info(msg):
     print(f"        {msg}")
-
-
-def as_list(objs):
-    if isinstance(objs, dict):
-        return list(objs.values())
-    return list(objs or [])
 
 
 def controls(xo, template_name):
@@ -141,20 +136,29 @@ def check_q2(xo, template, name):
 
 
 def check_q1(xo, vm_id):
-    """The seed and the #28 scrub. The delete half is only evidence after the set half."""
+    """The seed and the #28 scrub. The delete half is only evidence after the set half.
+
+    Both directions poll. XO's object cache lags a write, so a read taken straight after
+    the set finds nothing and reports a successful seed as a failed one. This function
+    read once until 2026-09-06, while xo_compare.py polled, which is the whole reason
+    `poll` now lives in xo_util rather than in whichever file last needed it.
+    """
     print("\n== Q1, xenstore seed and the #28 per-key scrub ==")
 
+    read = lambda: read_xenstore(xo, vm_id)  # noqa: E731
+
     xo.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
-    data = read_xenstore(xo, vm_id)
-    if data.get(SEED_KEY) != SEED_VALUE:
-        raise Failed(f"seeded {SEED_KEY} but read back {data.get(SEED_KEY)!r}")
-    ok(f"set {SEED_KEY} and read it back, so this reader can see the key present")
+    seen, waited = poll(read, lambda d: d.get(SEED_KEY) == SEED_VALUE)
+    if not seen:
+        raise Failed(f"seeded {SEED_KEY} but it never appeared; read back "
+                     f"{read().get(SEED_KEY)!r} after {waited:.1f}s")
+    ok(f"set {SEED_KEY} and read it back after {waited:.1f}s, so this reader sees the key present")
 
     xo.set_xenstore(vm_id, {SEED_KEY: None})
-    data = read_xenstore(xo, vm_id)
-    if SEED_KEY in data:
+    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    if not gone:
         raise Failed(f"{SEED_KEY} survived a null write, so the per-key delete did not happen")
-    ok("a null value removed exactly that key, which is the #28 scrub")
+    ok(f"a null value removed exactly that key after {waited:.1f}s, which is the #28 scrub")
 
 
 def read_xenstore(xo, vm_id):
@@ -197,12 +201,16 @@ def check_boot(xo, vm_id, wait):
     if address:
         ok(f"mainIpAddress reported after {time.monotonic() - started:.1f}s: {address}")
         info("computed for us, so the guest_metrics round trip and the stale-husk check go away")
-    else:
-        print(f"  FAIL  no mainIpAddress within {wait}s")
-        info("this is the golden image's problem, not the API's, but it blocks the plugin")
 
+    # Stop the VM before deciding, so the failure path still tears down what it started.
     xo.call("vm.stop", {"id": vm_id, "force": True})
     ok("vm.stop returned")
+
+    if not address:
+        info("this is the golden image's problem, not the API's, but it blocks the plugin")
+        # Printing FAIL and returning left main() at exit 0, so a --boot run that never
+        # got an address reported success to whatever read the exit code.
+        raise Failed(f"no mainIpAddress within {wait}s")
     return address
 
 
@@ -212,12 +220,16 @@ def check_q3(xo, vm_id):
     xo.delete_vm(vm_id, delete_disks=True)
     ok(f"vm.delete(deleteDisks=True) returned in {time.monotonic() - started:.3f}s")
     info("deleteDisks is a parameter here; over REST it is forced on with no opt-out")
+
+    # Confirm the absence BEFORE untracking. The other order struck the id off the only
+    # list that knows about it and then raised, so cleanup() could not retry and a VM that
+    # survived its own delete was left on the pool with nothing able to find it.
+    gone, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})), lambda found: not found)
+    if not gone:
+        raise Failed(f"{vm_id} is still present {waited:.1f}s after delete")
     if vm_id in CREATED:
         CREATED.remove(vm_id)
-
-    if as_list(xo.get_objects({"id": vm_id})):
-        raise Failed(f"{vm_id} is still present after delete")
-    ok("the VM is gone")
+    ok(f"the VM is gone after {waited:.1f}s")
 
 
 def cleanup(xo):

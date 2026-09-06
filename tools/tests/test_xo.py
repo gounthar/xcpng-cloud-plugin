@@ -150,6 +150,34 @@ def test_an_expired_deadline_stops_before_reading_the_socket_again(xo):
     assert ws.timeouts == [], "it read the socket after its own deadline had passed"
 
 
+@pytest.mark.parametrize(
+    "frames, why",
+    [
+        ([REPLY], "the deadline expires before the first read"),
+        ([websocket.WebSocketTimeoutException("read timed out")], "the socket times out mid-wait"),
+    ],
+)
+def test_the_timeout_message_names_the_budget_actually_used(xo, monkeypatch, frames, why):
+    """A per-call timeout must be the number in the message.
+
+    Reporting `self.timeout` while waiting on a per-call value names a number nobody
+    chose. On a probe that sets a short budget for one call, "did not answer within 120s"
+    sends the reader looking for a slow appliance instead of at the budget they set.
+
+    The clock is faked so both paths reach the raise deterministically, and the assertion
+    is that the client's own default is *absent* as well as the budget being present.
+    Checking only for "3" would pass against a message carrying both numbers.
+    """
+    ticks = iter([0.0, 9.0, 9.0, 9.0])
+    monkeypatch.setattr(xo_module, "time", types.SimpleNamespace(monotonic=lambda: next(ticks)))
+    xo.timeout = 120.0
+    xo._ws = FakeWs(frames)
+    with pytest.raises(XoError) as caught:
+        xo.call("vm.create", timeout=3.0)
+    assert "3.0s" in str(caught.value), why
+    assert "120" not in str(caught.value), "it reported the client default, not the call's budget"
+
+
 def test_the_socket_deadline_shrinks_across_skipped_frames(xo, monkeypatch):
     """settimeout gets what is left of the budget, not the whole of it. Handing it the
     full timeout each time round the loop lets a chatty server keep one call alive
@@ -342,3 +370,33 @@ def test_connect_passes_the_insecure_ssl_options_only_when_asked(xo, monkeypatch
     xo2.__dict__.update(xo.__dict__, _ws=None, _id=0, _trust_self_signed=True)
     xo2.connect()
     assert seen["sslopt"]["check_hostname"] is False
+
+
+# -- resolve_vm, the handle a timed-out create leaves behind ------------------
+
+def test_resolve_vm_filters_on_an_exact_vm_name(xo):
+    """`vm.create` has no server-side timeout, so a call that hits our deadline may still
+    have made a VM. It carries no owner marker yet and an XO-made VM has no other_config,
+    so its name is the only handle a harness has to find and destroy it."""
+    ws = FakeWs([{"id": 1, "result": {}}])
+    xo._ws = ws
+    xo.resolve_vm("xo-cmp-jrpc-1757000000")
+    assert ws.sent[0]["params"]["filter"] == {
+        "type": "VM", "name_label": "xo-cmp-jrpc-1757000000",
+    }
+
+
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        ({"a": {"id": "vm-1"}}, 1),
+        ([{"id": "vm-1"}, {"id": "vm-2"}], 2),
+        (None, 0),
+        ({}, 0),
+    ],
+)
+def test_resolve_vm_normalises_every_reply_shape(xo, result, expected):
+    """Including null, which is the shape that matters here: a recovery lookup runs on the
+    failure path, so a TypeError in it would replace a recoverable leak with a traceback."""
+    xo._ws = FakeWs([{"id": 1, "result": result}])
+    assert len(xo.resolve_vm("nope")) == expected
