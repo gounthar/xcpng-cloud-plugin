@@ -437,3 +437,53 @@ def test_a_cache_that_flickers_empty_does_not_abort_the_tag_poll(capsys):
 
     check_owner_tag(Flickering(), "vm-1")
     assert capsys.readouterr().out.count("PASS") == 2
+
+
+# -- an unreadable cache is not proof that a value is gone ------------------
+
+def test_an_unreadable_cache_does_not_count_as_a_removed_tag(capsys):
+    """The trap a safe subscript introduces if it answers {} or [].
+
+    `OWNER_TAG not in []` is true, so a remove poll reading an empty cache calls the tag
+    gone while it is still on the VM. That is an absence seen by an instrument that could
+    not detect presence, which is the one thing every check in these tools exists to
+    avoid, and the owner tag is the only handle a sweep has on an XO-made VM.
+
+    The fixture goes unreadable exactly when the remove poll starts, and never actually
+    removes the tag. A reader that treats empty as absent reports success.
+    """
+    class GoesBlind(TaggingXo):
+        def __init__(self):
+            super().__init__(lag=0)
+            self.blind = False
+
+        def remove_tag(self, vm_id, tag):
+            self.blind = True          # the remove is accepted and does nothing
+
+        def get_objects(self, filter_=None, limit=None):
+            return [] if self.blind else super().get_objects(filter_, limit)
+
+    with pytest.raises(Failed, match="did not remove"):
+        check_owner_tag(GoesBlind(), "vm-1")
+
+
+def test_an_unreadable_cache_does_not_count_as_a_scrubbed_key(capsys):
+    """The same trap on the #28 scrub, which is the claim that matters most here: a null
+    value removes exactly that key. Reporting that on a read the cache could not answer
+    would certify the secret scrub on no evidence at all."""
+    class GoesBlind(XenstoreXo):
+        def __init__(self):
+            super().__init__(lag=0)
+            self.blind = False
+
+        def set_xenstore(self, vm_id, data):
+            if any(v is None for v in data.values()):
+                self.blind = True      # the scrub is accepted and does nothing
+                return
+            super().set_xenstore(vm_id, data)
+
+        def get_objects(self, filter_=None, limit=None):
+            return [] if self.blind else super().get_objects(filter_, limit)
+
+    with pytest.raises(Failed, match="survived a null write"):
+        check_q1(GoesBlind(), "vm-1")

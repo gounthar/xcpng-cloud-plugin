@@ -24,17 +24,22 @@ def as_list(objs):
     return list(objs or [])
 
 
-def first(objs, default=None):
-    """The first object of a collection reply, or `default` when there is not one.
+def readable(objs):
+    """The first object of a collection reply, or None when the reply held nothing.
 
-    Exists because `as_list(...)[0]` inside a poll's read function is not a read that
-    fails, it is an IndexError that propagates out of the poll and stops it retrying. The
-    cache lag this whole module is about makes a transient empty reply normal, so the
-    subscript has to be the safe kind. Three sites had the unsafe form and the reviewer
-    found the fourth, which is why it is a function rather than three careful edits.
+    None rather than {} is the whole point, and it is the correction to the first version
+    of this function. `as_list(...)[0]` inside a poll is an IndexError that stops the poll
+    retrying, so the subscript has to be safe; but making it safe by answering {} is
+    worse, because a *negative* predicate then passes on a failed read. `SEED_KEY not in
+    {}` is true, so a scrub poll reported a successful delete while the VM was simply not
+    readable yet. That is an absence seen by an instrument that could not detect presence,
+    which is the one thing every check in these tools is written to avoid.
+
+    So callers get None and must say what they mean: `d is not None and KEY not in d`
+    keeps polling through an unreadable moment, where `KEY not in d` would call it done.
     """
     items = as_list(objs)
-    return items[0] if items else (default if default is not None else {})
+    return items[0] if items else None
 
 
 def poll(read, want, timeout=20.0, interval=0.5):

@@ -31,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
-from xo_util import as_list, first, poll  # noqa: E402
+from xo_util import as_list, poll, readable  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 CLONE_PREFIX = "xo-probe-"
@@ -51,6 +51,15 @@ class Failed(Exception):
 
 class ControlFailed(Exception):
     pass
+
+
+def is_parseable(address):
+    """Whether XO handed back something that is actually an address."""
+    try:
+        ipaddress.ip_address(str(address).split("%")[0])
+        return True
+    except ValueError:
+        return False
 
 
 def is_link_local(address):
@@ -193,24 +202,25 @@ def check_q1(xo, vm_id):
     read = lambda: read_xenstore(xo, vm_id)  # noqa: E731
 
     xo.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
-    seen, waited = poll(read, lambda d: d.get(SEED_KEY) == SEED_VALUE)
+    seen, waited = poll(read, lambda d: d is not None and d.get(SEED_KEY) == SEED_VALUE)
     if not seen:
         raise Failed(f"seeded {SEED_KEY} but it never appeared; read back "
-                     f"{read().get(SEED_KEY)!r} after {waited:.1f}s")
+                     f"{(read() or {}).get(SEED_KEY)!r} after {waited:.1f}s")
     ok(f"set {SEED_KEY} and read it back after {waited:.1f}s, so this reader sees the key present")
 
     xo.set_xenstore(vm_id, {SEED_KEY: None})
-    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    gone, waited = poll(read, lambda d: d is not None and SEED_KEY not in d)
     if not gone:
         raise Failed(f"{SEED_KEY} survived a null write, so the per-key delete did not happen")
     ok(f"a null value removed exactly that key after {waited:.1f}s, which is the #28 scrub")
 
 
 def read_xenstore(xo, vm_id):
-    # {} rather than a raise on an empty reply: this runs inside a poll, and the cache
-    # lag it polls for makes a transient empty reply normal. Raising here would stop the
-    # poll retrying and report a successful write as a failed read.
-    return first(xo.get_objects({"id": vm_id})).get("xenStoreData") or {}
+    # None when the VM is not readable, {} when it is readable and holds no keys. The
+    # two must not collapse: a negative predicate over {} passes, so a scrub poll would
+    # report a successful delete on a moment the cache simply had nothing to say.
+    vm = readable(xo.get_objects({"id": vm_id}))
+    return None if vm is None else (vm.get("xenStoreData") or {})
 
 
 def check_owner_tag(xo, vm_id):
@@ -221,16 +231,20 @@ def check_owner_tag(xo, vm_id):
     # and this file did not, which is the same rule-with-two-homes split that check_q1
     # had, in a function the review never named. Fixing the instance that fires and not
     # sweeping for its siblings is how it survived the first pass.
-    tags = lambda: first(xo.get_objects({"id": vm_id})).get("tags") or []  # noqa: E731
+    # None when unreadable, a list when readable. Same reason as the xenstore reader:
+    # `OWNER_TAG not in []` passes, so the remove half would go green on a failed read.
+    def tags():
+        vm = readable(xo.get_objects({"id": vm_id}))
+        return None if vm is None else (vm.get("tags") or [])
 
     xo.add_tag(vm_id, OWNER_TAG)
-    tagged, waited = poll(tags, lambda t: OWNER_TAG in t)
+    tagged, waited = poll(tags, lambda t: t is not None and OWNER_TAG in t)
     if not tagged:
         raise Failed(f"added tag {OWNER_TAG} but it never appeared on the object")
     ok(f"tag.add put {OWNER_TAG} on the VM after {waited:.1f}s, so a sweep can select on it")
 
     xo.remove_tag(vm_id, OWNER_TAG)
-    gone, waited = poll(tags, lambda t: OWNER_TAG not in t)
+    gone, waited = poll(tags, lambda t: t is not None and OWNER_TAG not in t)
     if not gone:
         raise Failed(f"tag.remove did not remove the tag within {waited:.1f}s")
     ok(f"tag.remove takes it off again after {waited:.1f}s")
@@ -252,13 +266,18 @@ def check_boot(xo, vm_id, wait):
     deadline = time.monotonic() + wait
     address = None
     while time.monotonic() < deadline:
-        vm = first(xo.get_objects({"id": vm_id}))
+        vm = readable(xo.get_objects({"id": vm_id})) or {}
         candidate = vm.get("mainIpAddress")
-        if candidate and not is_link_local(candidate):
+        if candidate and not is_parseable(candidate):
+            # is_link_local answers False for anything it cannot parse, deliberately, so
+            # the caller has to be the one that refuses nonsense. Without this, a garbage
+            # value is neither link-local nor an address and gets reported as boot success.
+            info(f"ignoring unparseable mainIpAddress {candidate!r}")
+        elif candidate and is_link_local(candidate):
+            info(f"ignoring link-local {candidate}, nothing can connect to it")
+        elif candidate:
             address = candidate
             break
-        if candidate:
-            info(f"ignoring link-local {candidate}, nothing can connect to it")
         time.sleep(3)
 
     if address:

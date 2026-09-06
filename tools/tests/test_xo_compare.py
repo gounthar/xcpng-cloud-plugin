@@ -293,8 +293,13 @@ class Pool:
 class PoolXo:
     def __init__(self, pool):
         self.pool = pool
+        self.creates = []
 
     def create_from_template(self, tid, name_label, clone=True, **extra):
+        # Recorded, not discarded. A fixture that swallows **extra lets a regression that
+        # stops forwarding VIFs pass every test in this file, and a VIF-less clone is the
+        # failure that boots perfectly and can never send a packet.
+        self.creates.append(extra)
         return {"id": self.pool.create(name_label)}
 
     def template_vifs(self, template):
@@ -343,9 +348,9 @@ class PoolRest:
         return 200, 0.618
 
 
-def run_both(pool):
+def run_both(pool, xo=None):
     """Both paths against one store, so a case cannot be fixed on one side only."""
-    xo = PoolXo(pool)
+    xo = xo or PoolXo(pool)
     return [
         ("JSON-RPC", XoError, lambda: xo_compare.run_jsonrpc(xo, TEMPLATE, "xo-cmp-jrpc-1")),
         ("REST", XoRestError,
@@ -405,3 +410,15 @@ def test_a_delete_that_does_not_delete_fails_the_path(empty_created, capsys, bac
         run()
     assert "STILL_PRESENT" in str(caught.value)
     assert empty_created.CREATED, "the surviving VM was struck off the cleanup list"
+
+
+def test_the_jsonrpc_path_forwards_the_template_s_vifs(empty_created, capsys):
+    """MEASURED on the pool 2026-09-06: vm.create does not inherit the template's VIFs and
+    create_vm over REST does. Without this argument the clone boots, the tools come up,
+    os_version is correct, and the only field telling the truth is the address that never
+    arrives. The fixture records what it was passed because a fixture that discards
+    **extra lets the regression through while looking green."""
+    xo = PoolXo(Pool())
+    _, _, run = next(b for b in run_both(Pool(), xo=xo) if b[0] == "JSON-RPC")
+    run()
+    assert xo.creates == [{"VIFs": [{"network": "net-1"}]}], xo.creates

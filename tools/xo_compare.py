@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
 from xo_rest import XoRest, XoRestError  # noqa: E402
-from xo_util import as_list, first, poll  # noqa: E402
+from xo_util import as_list, poll, readable  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 SEED_KEY = "vm-data/jenkins/probe"
@@ -136,8 +136,10 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
     r.steps["seed"] = time.monotonic() - t0
-    read = lambda: first(xo.get_objects({"id": vm_id})).get("xenStoreData") or {}  # noqa: E731
-    seen, waited = poll(read, lambda d: SEED_KEY in d)
+    def read():
+        vm = readable(xo.get_objects({"id": vm_id}))
+        return None if vm is None else (vm.get("xenStoreData") or {})
+    seen, waited = poll(read, lambda d: d is not None and SEED_KEY in d)
     r.steps["seed_visible"] = waited
     row("vm.set seed", f"{r.steps['seed']:.3f}s, visible after {waited:.1f}s poll={seen}")
     if not seen:
@@ -146,7 +148,7 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.set_xenstore(vm_id, {SEED_KEY: None})
     r.steps["scrub"] = time.monotonic() - t0
-    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    gone, waited = poll(read, lambda d: d is not None and SEED_KEY not in d)
     row("vm.set scrub (null)", f"{r.steps['scrub']:.3f}s, gone after {waited:.1f}s poll={gone}")
     if not gone:
         raise XoError("SCRUB_FAILED", f"{SEED_KEY} survived the null write")
@@ -154,8 +156,8 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: first(xo.get_objects({"id": vm_id})).get("tags") or [],
-                          lambda t: OWNER_TAG in t)
+    tagged, waited = poll(lambda: (readable(xo.get_objects({"id": vm_id})) or {}).get("tags"),
+                          lambda t: t is not None and OWNER_TAG in t)
     row("tag.add", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
         raise XoError("TAG_FAILED", f"{OWNER_TAG} never appeared on the VM")
@@ -198,7 +200,7 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     rest.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
     r.steps["seed"] = time.monotonic() - t0
     read = lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=xenStoreData").get("xenStoreData") or {}
-    seen, waited = poll(read, lambda d: SEED_KEY in d)
+    seen, waited = poll(read, lambda d: d is not None and SEED_KEY in d)
     r.steps["seed_visible"] = waited
     row("PATCH /vms/{id} seed", f"{r.steps['seed']:.3f}s, visible after {waited:.1f}s poll={seen}")
     if not seen:
@@ -207,7 +209,7 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.set_xenstore(vm_id, {SEED_KEY: None})
     r.steps["scrub"] = time.monotonic() - t0
-    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    gone, waited = poll(read, lambda d: d is not None and SEED_KEY not in d)
     row("PATCH /vms/{id} scrub (null)", f"{r.steps['scrub']:.3f}s, gone after {waited:.1f}s poll={gone}")
     if not gone:
         raise XoRestError("SCRUB_FAILED", data=f"{SEED_KEY} survived the null write")
@@ -215,8 +217,8 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=tags").get("tags") or [],
-                          lambda t: OWNER_TAG in t)
+    tagged, waited = poll(lambda: (rest.get(f"/rest/v0/vms/{vm_id}?fields=tags") or {}).get("tags"),
+                          lambda t: t is not None and OWNER_TAG in t)
     row("PUT /vms/{id}/tags/{tag}", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
         raise XoRestError("TAG_FAILED", data=f"{OWNER_TAG} never appeared on the VM")
