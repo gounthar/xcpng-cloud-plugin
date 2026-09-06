@@ -21,6 +21,8 @@ for _path in (_HERE.parent, _HERE):
 
 from fakes import FakeResponse  # noqa: E402
 from xapi import Xapi  # noqa: E402
+from xo import Xo  # noqa: E402
+from xo_rest import XoRest  # noqa: E402
 
 
 @pytest.fixture
@@ -57,3 +59,57 @@ def raise_from_urlopen(monkeypatch):
         monkeypatch.setattr(urllib.request, "urlopen", boom)
 
     return _raise
+
+
+# The token these two carry is deliberately conspicuous. Several tests assert it does not
+# turn up in an error message or a URL, and a bland value would make that hard to read.
+SECRET = "sekrit-token-value"
+
+
+@pytest.fixture
+def rest():
+    """An XoRest with its __init__ skipped, so no environment and no network."""
+    r = XoRest.__new__(XoRest)
+    r.base = "https://xo.invalid"
+    r._token = SECRET
+    r.timeout = 5
+    r._ctx = None
+    return r
+
+
+@pytest.fixture
+def xo():
+    """An Xo with its __init__ skipped and no socket. Tests attach a FakeWs to `_ws`."""
+    x = Xo.__new__(Xo)
+    x.url = "wss://xo.invalid/api/"
+    x._token = SECRET
+    x.timeout = 5
+    x._ws = None
+    x._id = 0
+    x.user = None
+    x._trust_self_signed = False
+    return x
+
+
+@pytest.fixture
+def capture(monkeypatch):
+    """Answer the next urlopen with a canned response, recording the Request it was given.
+
+    Returns the list the requests land in, so a test can assert on the URL, the method,
+    the headers and the serialised body -- not only on what the client returned. Several
+    of the REST guards are about what goes out rather than what comes back, and those are
+    invisible to a fixture that only fakes the reply.
+    """
+    import urllib.request
+
+    sent = []
+
+    def _capture(body=b"{}", status=200):
+        def fake_urlopen(req, *args, **kwargs):
+            sent.append(req)
+            return FakeResponse(body, status=status)
+
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+        return sent
+
+    return _capture

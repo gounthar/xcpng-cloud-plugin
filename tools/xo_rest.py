@@ -1,0 +1,183 @@
+"""Minimal Xen Orchestra REST client, the third transport in this toolbox.
+
+`xapi.py` speaks XAPI JSON-RPC over HTTP, `xo.py` speaks XO JSON-RPC over a WebSocket,
+and this speaks XO's REST API. It exists so issue #89's two candidate backends can be
+measured against each other on the same pool rather than argued about from source.
+
+    XO_BASE=https://192.168.1.5 XO_TOKEN=... XO_TRUST_SELF_SIGNED=1
+
+The one thing worth knowing before using it: **VM creation hangs off /pools, not /vms**.
+`POST /pools/{id}/actions/create_vm` is the route, and it wants a BARE template uuid.
+The pool-prefixed form that XO hands you nearly everywhere else returns 404 "no such
+object", which reads exactly like the capability being missing. That mistake has now been
+made twice on this project, so it gets a guard in `create_vm` below rather than a comment.
+"""
+
+import http.client
+import json
+import os
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+BARE_UUID_LEN = 36
+
+
+class XoRestError(RuntimeError):
+    def __init__(self, message, status=None, data=None):
+        super().__init__(f"{message} {data if data is not None else ''}".strip())
+        self.message = message
+        self.status = status
+        self.data = data
+
+
+def _message_of(payload, exc):
+    """Pull something a human can read out of an error body, and never return None.
+
+    `payload.get("error")` alone yields None on any JSON object that names its error
+    differently, and XoRestError formats that into the literal string "None" with
+    `.message` set to None. The error this costs most is the one this client exists for:
+    the pool-prefixed template id answers 404, and losing that body leaves a bare 404 that
+    reads like the route not existing, which is the wrong conclusion this whole module is
+    built to stop someone reaching a third time.
+
+    The key order is a guess about XO's shape and deliberately not the last word, which is
+    why the whole payload is the final fallback rather than a shrug.
+    """
+    if isinstance(payload, dict):
+        for key in ("error", "message", "code", "detail"):
+            value = payload.get(key)
+            if value:
+                return value if isinstance(value, str) else str(value)
+        return str(payload) if payload else f"HTTP {exc.code} {exc.reason}"
+    text = str(payload).strip()
+    return text or f"HTTP {exc.code} {exc.reason}"
+
+
+def _segment(value):
+    """Percent-encode one path segment, slash included.
+
+    The tag is the owner marker, and on the plugin side it will carry an operator-supplied
+    cloud name. A space or a slash in that name walks straight into the URL: a slash makes
+    the request address a different route entirely, which answers something rather than
+    erroring, and a sweep then finds no tag on a VM the tool believes it tagged.
+
+    `safe=""` is the point. quote() leaves "/" alone by default, which is exactly the
+    character that has to go. A colon is left encoded too, harmlessly: it is legal in a
+    path segment, so encoding it changes nothing the server does with it.
+
+    vm_id is deliberately not passed through here. It comes from XO rather than from an
+    operator, and /rest/v0/vms/{id} is a single segment, so encoding it would be a no-op
+    on every id this tool has seen. Encoding operator input and leaving server output
+    alone is the line, and it is worth keeping visible.
+    """
+    return urllib.parse.quote(str(value), safe="")
+
+
+def _from_env(name):
+    try:
+        return os.environ[name]
+    except KeyError:
+        raise XoRestError("MISSING_ENV", data=f"{name} is not set.") from None
+
+
+class XoRest:
+    def __init__(self, base=None, token=None, trust_self_signed=None, timeout=300):
+        self.base = (base or _from_env("XO_BASE")).rstrip("/")
+        self._token = token or _from_env("XO_TOKEN")
+        self.timeout = timeout
+
+        if trust_self_signed is None:
+            trust_self_signed = os.environ.get("XO_TRUST_SELF_SIGNED", "").lower() in (
+                "1", "true", "yes",
+            )
+        self._ctx = ssl.create_default_context()
+        if trust_self_signed:
+            self._ctx.check_hostname = False
+            self._ctx.verify_mode = ssl.CERT_NONE
+            print(
+                f"warning: TLS verification disabled for {self.base} (XO_TRUST_SELF_SIGNED).",
+                file=sys.stderr,
+            )
+
+    def request(self, method, path, body=None):
+        url = f"{self.base}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Cookie", f"authenticationToken={self._token}")
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self._ctx) as resp:
+                raw = resp.read()
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            try:
+                payload = json.loads(raw)
+            except ValueError:
+                payload = raw.decode(errors="replace")
+            raise XoRestError(
+                _message_of(payload, exc),
+                status=exc.code,
+                data=payload.get("data") if isinstance(payload, dict) else None,
+            ) from None
+        # urlopen's timeout is per socket operation and covers the body read, and a read
+        # failure is an OSError rather than a URLError. Same trap as the XAPI client, and
+        # IncompleteRead is the half of it that is easy to miss: it is an HTTPException,
+        # not an OSError, so catching OSError alone lets a truncated body escape as a raw
+        # exception through every caller that only handles XoRestError.
+        except (OSError, http.client.HTTPException) as exc:
+            raise XoRestError("TRANSPORT", data=str(exc)) from None
+
+        if not raw:
+            return None, status
+        try:
+            return json.loads(raw), status
+        except ValueError:
+            return raw.decode(errors="replace"), status
+
+    def get(self, path):
+        return self.request("GET", path)[0]
+
+    def create_vm(self, pool_id, template_id, name_label, clone=True, boot=False, **extra):
+        """POST /pools/{id}/actions/create_vm. Template id must be BARE."""
+        if "/" in template_id:
+            raise XoRestError(
+                "PREFIXED_TEMPLATE_ID",
+                data=(f"{template_id!r} is pool-prefixed. This route needs the bare uuid; "
+                      f"the prefixed form returns 404 and looks like a missing capability."),
+            )
+        if len(template_id) != BARE_UUID_LEN:
+            raise XoRestError("ODD_TEMPLATE_ID", data=f"{template_id!r} is not a bare uuid")
+
+        body = {"name_label": name_label, "template": template_id, "clone": clone, "boot": boot}
+        body.update(extra)
+        started = time.monotonic()
+        payload, status = self.request(
+            "POST", f"/rest/v0/pools/{pool_id}/actions/create_vm?sync=true", body
+        )
+        elapsed = time.monotonic() - started
+        vm_id = payload.get("id") if isinstance(payload, dict) else payload
+        if status != 201 or not vm_id:
+            raise XoRestError("CREATE_FAILED", status=status, data=payload)
+        return vm_id, elapsed
+
+    def set_xenstore(self, vm_id, data):
+        return self.request("PATCH", f"/rest/v0/vms/{vm_id}", {"xenStoreData": data})[1]
+
+    def add_tag(self, vm_id, tag):
+        return self.request("PUT", f"/rest/v0/vms/{vm_id}/tags/{_segment(tag)}")[1]
+
+    def remove_tag(self, vm_id, tag):
+        return self.request("DELETE", f"/rest/v0/vms/{vm_id}/tags/{_segment(tag)}")[1]
+
+    def delete_vm(self, vm_id):
+        """No deleteDisks parameter exists on this route. Disks always go."""
+        started = time.monotonic()
+        _, status = self.request("DELETE", f"/rest/v0/vms/{vm_id}")
+        return status, time.monotonic() - started

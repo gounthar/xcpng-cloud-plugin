@@ -112,8 +112,13 @@ jobs:
 
       # python -m pip, so the install targets the interpreter setup-python configured
       # rather than whatever pip happens to be first on the runner's PATH.
+      #
+      # websocket-client is xo.py's one runtime dependency, and it is installed rather than
+      # stubbed on purpose: the client catches websocket.WebSocketTimeoutException by name,
+      # and a stub written here would be a class of our own making, so a typo in that except
+      # clause would pass against the stub and hang against a real appliance.
       - name: Install pytest
-        run: python -m pip install --disable-pip-version-check pytest
+        run: python -m pip install --disable-pip-version-check pytest websocket-client
 
       - name: Test
         run: python -m pytest tools/tests -q
