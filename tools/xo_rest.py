@@ -20,6 +20,7 @@ import ssl
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BARE_UUID_LEN = 36
@@ -31,6 +32,26 @@ class XoRestError(RuntimeError):
         self.message = message
         self.status = status
         self.data = data
+
+
+def _segment(value):
+    """Percent-encode one path segment, slash included.
+
+    The tag is the owner marker, and on the plugin side it will carry an operator-supplied
+    cloud name. A space or a slash in that name walks straight into the URL: a slash makes
+    the request address a different route entirely, which answers something rather than
+    erroring, and a sweep then finds no tag on a VM the tool believes it tagged.
+
+    `safe=""` is the point. quote() leaves "/" alone by default, which is exactly the
+    character that has to go. A colon is left encoded too, harmlessly: it is legal in a
+    path segment, so encoding it changes nothing the server does with it.
+
+    vm_id is deliberately not passed through here. It comes from XO rather than from an
+    operator, and /rest/v0/vms/{id} is a single segment, so encoding it would be a no-op
+    on every id this tool has seen. Encoding operator input and leaving server output
+    alone is the line, and it is worth keeping visible.
+    """
+    return urllib.parse.quote(str(value), safe="")
 
 
 def _from_env(name):
@@ -127,10 +148,10 @@ class XoRest:
         return self.request("PATCH", f"/rest/v0/vms/{vm_id}", {"xenStoreData": data})[1]
 
     def add_tag(self, vm_id, tag):
-        return self.request("PUT", f"/rest/v0/vms/{vm_id}/tags/{tag}")[1]
+        return self.request("PUT", f"/rest/v0/vms/{vm_id}/tags/{_segment(tag)}")[1]
 
     def remove_tag(self, vm_id, tag):
-        return self.request("DELETE", f"/rest/v0/vms/{vm_id}/tags/{tag}")[1]
+        return self.request("DELETE", f"/rest/v0/vms/{vm_id}/tags/{_segment(tag)}")[1]
 
     def delete_vm(self, vm_id):
         """No deleteDisks parameter exists on this route. Disks always go."""

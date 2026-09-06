@@ -241,12 +241,48 @@ def test_the_owner_marker_is_a_tag_route(rest, capture):
     to become a tag here. A clone leaked by one backend is invisible to a sweep written
     for the other, which is why the route is pinned rather than assumed."""
     sent = capture(b"{}", status=200)
-    rest.add_tag("vm-1", "xcpng-cloud:lab")
+    rest.add_tag("vm-1", "xcpng-cloud")
     assert sent[0].get_method() == "PUT"
-    assert sent[0].full_url == "https://xo.invalid/rest/v0/vms/vm-1/tags/xcpng-cloud:lab"
+    assert sent[0].full_url == "https://xo.invalid/rest/v0/vms/vm-1/tags/xcpng-cloud"
 
-    rest.remove_tag("vm-1", "xcpng-cloud:lab")
+    rest.remove_tag("vm-1", "xcpng-cloud")
     assert sent[1].get_method() == "DELETE"
+
+
+@pytest.mark.parametrize(
+    "tag, encoded, why",
+    [
+        ("xcpng-cloud/lab", "xcpng-cloud%2Flab", "a slash addresses a different route entirely"),
+        ("xcpng-cloud lab", "xcpng-cloud%20lab", "a space is not legal in a URL at all"),
+        ("xcpng-cloud?x=1", "xcpng-cloud%3Fx%3D1", "a question mark turns the rest into a query"),
+        ("xcpng-cloud#lab", "xcpng-cloud%23lab", "a hash truncates the path at the fragment"),
+        ("xcpng-cloud:lab", "xcpng-cloud%3Alab", "a colon is legal in a segment, and encoding it is harmless"),
+    ],
+)
+def test_a_tag_is_encoded_as_one_path_segment(rest, capture, tag, encoded, why):
+    """The tag is the owner marker, and on the plugin side it will carry an operator-
+    supplied cloud name. Interpolated raw, a slash makes the request address a different
+    route, which answers something rather than erroring, so a sweep later finds no tag on
+    a VM the tool believes it tagged.
+
+    Asserting the full URL rather than that the raw character is absent: a check for
+    "no slash present" passes against a tag that was silently dropped.
+    """
+    sent = capture(b"{}", status=200)
+    rest.add_tag("vm-1", tag)
+    assert sent[0].full_url == f"https://xo.invalid/rest/v0/vms/vm-1/tags/{encoded}", why
+
+    rest.remove_tag("vm-1", tag)
+    assert sent[1].full_url == f"https://xo.invalid/rest/v0/vms/vm-1/tags/{encoded}", why
+
+
+def test_a_vm_id_is_left_alone(rest, capture):
+    """The line is operator input versus server output. vm_id comes from XO and
+    /rest/v0/vms/{id} is one segment, so encoding it is a no-op on every id seen here;
+    encoding everything reflexively would hide where the untrusted input actually is."""
+    sent = capture(b"{}", status=200)
+    rest.add_tag("5436f445-a341-cc10-7312-e1077b0c4e69", "t")
+    assert "5436f445-a341-cc10-7312-e1077b0c4e69/tags/t" in sent[0].full_url
 
 
 # -- teardown ---------------------------------------------------------------
