@@ -418,3 +418,22 @@ def test_a_clone_that_only_ever_gets_a_link_local_address_fails(capsys):
     xo = AddressXo(["fe80::1"] * 200)
     with pytest.raises(Failed, match="no mainIpAddress"):
         check_boot(xo, "vm-1", wait=0.1)
+
+
+def test_a_cache_that_flickers_empty_does_not_abort_the_tag_poll(capsys):
+    """`as_list(...)[0]` inside a poll's read is not a read that fails, it is an
+    IndexError that propagates out and stops the poll retrying. The lag this polls for
+    makes a transient empty reply normal, so the subscript has to be the safe kind."""
+    class Flickering(TaggingXo):
+        def __init__(self):
+            super().__init__(lag=0)
+            self.reads = 0
+
+        def get_objects(self, filter_=None, limit=None):
+            self.reads += 1
+            if self.reads in (1, 3):
+                return []
+            return super().get_objects(filter_, limit)
+
+    check_owner_tag(Flickering(), "vm-1")
+    assert capsys.readouterr().out.count("PASS") == 2

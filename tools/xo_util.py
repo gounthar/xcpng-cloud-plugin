@@ -24,6 +24,19 @@ def as_list(objs):
     return list(objs or [])
 
 
+def first(objs, default=None):
+    """The first object of a collection reply, or `default` when there is not one.
+
+    Exists because `as_list(...)[0]` inside a poll's read function is not a read that
+    fails, it is an IndexError that propagates out of the poll and stops it retrying. The
+    cache lag this whole module is about makes a transient empty reply normal, so the
+    subscript has to be the safe kind. Three sites had the unsafe form and the reviewer
+    found the fourth, which is why it is a function rather than three careful edits.
+    """
+    items = as_list(objs)
+    return items[0] if items else (default if default is not None else {})
+
+
 def poll(read, want, timeout=20.0, interval=0.5):
     """Read until `want` is satisfied, or the budget runs out. Returns (satisfied, waited).
 

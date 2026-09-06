@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
 from xo_rest import XoRest, XoRestError  # noqa: E402
-from xo_util import as_list, poll  # noqa: E402
+from xo_util import as_list, first, poll  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 SEED_KEY = "vm-data/jenkins/probe"
@@ -136,7 +136,7 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
     r.steps["seed"] = time.monotonic() - t0
-    read = lambda: (as_list(xo.get_objects({"id": vm_id}))[0].get("xenStoreData") or {})
+    read = lambda: first(xo.get_objects({"id": vm_id})).get("xenStoreData") or {}  # noqa: E731
     seen, waited = poll(read, lambda d: SEED_KEY in d)
     r.steps["seed_visible"] = waited
     row("vm.set seed", f"{r.steps['seed']:.3f}s, visible after {waited:.1f}s poll={seen}")
@@ -154,7 +154,7 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id}))[0].get("tags") or [],
+    tagged, waited = poll(lambda: first(xo.get_objects({"id": vm_id})).get("tags") or [],
                           lambda t: OWNER_TAG in t)
     row("tag.add", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
@@ -183,10 +183,13 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     r.notes.append("inherits the template's VIFs; passing vifs ADDS a second one")
 
     read_vm = lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs") or {}  # noqa: E731
-    seen, _ = poll(read_vm, lambda v: v.get("type") is not None)
+    held = []
+    seen, _ = poll(read_vm, lambda v: bool(held.append(v) or v.get("type") is not None))
     if not seen:
         raise XoRestError("NOT_READABLE", data=f"created {vm_id} but it never became readable")
-    vm = read_vm()
+    # The polled value, not a fresh read. Readability can flicker back, and this is the
+    # third spelling of the same hazard on this branch, so it is worth the two lines.
+    vm = held[-1]
     if vm.get("type") != "VM":
         raise XoRestError("WRONG_TYPE", data=vm.get("type"))
     row("result type", f"{vm['type']}, {len(vm.get('$VBDs') or [])} VBD")

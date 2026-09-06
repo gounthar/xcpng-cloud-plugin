@@ -31,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
-from xo_util import as_list, poll  # noqa: E402
+from xo_util import as_list, first, poll  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 CLONE_PREFIX = "xo-probe-"
@@ -207,10 +207,10 @@ def check_q1(xo, vm_id):
 
 
 def read_xenstore(xo, vm_id):
-    found = as_list(xo.get_objects({"id": vm_id}))
-    if not found:
-        raise Failed(f"could not read {vm_id} back")
-    return found[0].get("xenStoreData") or {}
+    # {} rather than a raise on an empty reply: this runs inside a poll, and the cache
+    # lag it polls for makes a transient empty reply normal. Raising here would stop the
+    # poll retrying and report a successful write as a failed read.
+    return first(xo.get_objects({"id": vm_id})).get("xenStoreData") or {}
 
 
 def check_owner_tag(xo, vm_id):
@@ -221,7 +221,7 @@ def check_owner_tag(xo, vm_id):
     # and this file did not, which is the same rule-with-two-homes split that check_q1
     # had, in a function the review never named. Fixing the instance that fires and not
     # sweeping for its siblings is how it survived the first pass.
-    tags = lambda: as_list(xo.get_objects({"id": vm_id}))[0].get("tags") or []  # noqa: E731
+    tags = lambda: first(xo.get_objects({"id": vm_id})).get("tags") or []  # noqa: E731
 
     xo.add_tag(vm_id, OWNER_TAG)
     tagged, waited = poll(tags, lambda t: OWNER_TAG in t)
@@ -252,7 +252,7 @@ def check_boot(xo, vm_id, wait):
     deadline = time.monotonic() + wait
     address = None
     while time.monotonic() < deadline:
-        vm = as_list(xo.get_objects({"id": vm_id}))[0]
+        vm = first(xo.get_objects({"id": vm_id}))
         candidate = vm.get("mainIpAddress")
         if candidate and not is_link_local(candidate):
             address = candidate
