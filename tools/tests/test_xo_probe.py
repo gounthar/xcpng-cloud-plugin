@@ -17,7 +17,8 @@ import itertools
 import pytest
 
 from fakes import FakeXo
-from xo_probe import ControlFailed, Failed, as_list, check_boot, check_q1, check_q3, cleanup, controls
+from xo_probe import (ControlFailed, Failed, as_list, check_boot, check_owner_tag, check_q1,
+                      check_q2, check_q3, cleanup, controls, is_link_local)
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 FOUND = {TEMPLATE: [{"id": "pool/uuid-1", "uuid": "uuid-1"}]}
@@ -226,18 +227,20 @@ class BootingXo(FakeXo):
         super().__init__()
         self.address = address
         self.calls = []
+        self.reads = 0
 
     def call(self, method, params=None, **kwargs):
         self.calls.append(method)
         return None
 
     def get_objects(self, filter_=None, limit=None):
+        self.reads += 1
         return [{"id": "vm-1", "mainIpAddress": self.address}]
 
 
 def test_an_address_that_arrives_is_reported(capsys):
     xo = BootingXo(address="192.168.1.42")
-    assert check_boot(xo, "vm-1", wait=0.1) == "192.168.1.42"
+    assert check_boot(xo, "vm-1", wait=30) == "192.168.1.42"
     assert "vm.stop" in xo.calls
 
 
@@ -247,7 +250,11 @@ def test_a_boot_that_never_reports_an_address_fails_the_run(capsys):
     is the whole point of having one."""
     xo = BootingXo(address=None)
     with pytest.raises(Failed, match="no mainIpAddress"):
-        check_boot(xo, "vm-1", wait=0.1)
+        check_boot(xo, "vm-1", wait=30)
+    # Both bounds matter. Too few reads and the budget expired before it looked, so the
+    # failure proves nothing; too many and check_boot is not honouring `wait` at all, and
+    # on a real pool that is a probe that hangs long past the timeout it reported.
+    assert 1 < xo.reads <= 31, f"{xo.reads} reads against a 30s budget on a 1s/tick clock"
 
 
 def test_the_vm_is_stopped_even_when_the_address_never_arrives(capsys):
@@ -255,7 +262,7 @@ def test_the_vm_is_stopped_even_when_the_address_never_arrives(capsys):
     running VM behind and the cleanup that follows has more to do than it expects."""
     xo = BootingXo(address=None)
     with pytest.raises(Failed):
-        check_boot(xo, "vm-1", wait=0.1)
+        check_boot(xo, "vm-1", wait=30)
     assert "vm.stop" in xo.calls, "the failure path skipped the stop"
 
 
@@ -284,3 +291,277 @@ def test_a_vm_that_survives_its_delete_stays_on_the_cleanup_list(empty_created, 
     with pytest.raises(Failed, match="still present"):
         check_q3(DeletingXo(survives=True), "vm-1")
     assert empty_created.CREATED == ["vm-1"], "cleanup can no longer reach the leaked VM"
+
+
+# -- check_owner_tag: the one the unit tests missed and the pool caught -----
+
+class TaggingXo(FakeXo):
+    """A VM whose tag reads lag its tag writes, which is what the pool does.
+
+    `lag` defaults to 1 for the same reason XenstoreXo's does: a fixture that answered
+    correctly on the first read would let a single-read implementation pass, and answering
+    correctly on the first read is precisely what the appliance was measured not to do.
+
+    Measured 2026-09-06 on the lab pool: tag.add returned, and the tag was not on the
+    object when read straight back. check_owner_tag read once and reported a working
+    tag.add as broken, which is a false negative on the owner marker, the only handle any
+    sweep has on an XO-made VM. xo_compare polled here and this file did not.
+    """
+
+    def __init__(self, lag=1, honour_writes=True):
+        super().__init__()
+        self.lag = lag
+        self.honour_writes = honour_writes
+        self.tags = []
+        self._pending = None
+        self._left = 0
+
+    def _stage(self, tags):
+        self._pending, self._left = list(tags), self.lag
+
+    def add_tag(self, vm_id, tag):
+        if self.honour_writes:
+            self._stage(self.tags + [tag])
+
+    def remove_tag(self, vm_id, tag):
+        if self.honour_writes:
+            self._stage([t for t in self.tags if t != tag])
+
+    def get_objects(self, filter_=None, limit=None):
+        if self._pending is not None:
+            if self._left <= 0:
+                self.tags, self._pending = self._pending, None
+            else:
+                self._left -= 1
+        return [{"id": "vm-1", "tags": list(self.tags)}]
+
+
+def test_the_owner_tag_is_polled_in_both_directions(capsys):
+    """The failure the pool found. A single read after tag.add sees the pre-write state
+    and calls a working tag broken."""
+    check_owner_tag(TaggingXo(lag=2), "vm-1")
+    out = capsys.readouterr().out
+    assert out.count("PASS") == 2, out
+
+
+def test_a_tag_that_never_lands_is_still_a_failure(capsys):
+    """Polling must not turn the check into one that always passes eventually. The owner
+    marker is the only handle a sweep has on an XO-made VM, since XoVm carries no
+    other_config, so a tag that silently did not stick is a leak waiting to happen."""
+    with pytest.raises(Failed, match="never appeared"):
+        check_owner_tag(TaggingXo(honour_writes=False), "vm-1")
+
+
+def test_a_tag_that_will_not_come_off_is_a_failure(capsys):
+    """The remove direction needs its own negative, or it is pinned only by the add."""
+    class Sticky(TaggingXo):
+        def remove_tag(self, vm_id, tag):
+            return None
+
+    xo = Sticky()
+    xo.tags = ["xcpng-cloud:xo-probe"]
+    with pytest.raises(Failed, match="did not remove"):
+        check_owner_tag(xo, "vm-1")
+
+
+# -- a link-local address is not an answer ----------------------------------
+
+@pytest.mark.parametrize(
+    "address, link_local, why",
+    [
+        ("fe80::cd1c:16b1:f447:6874", True, "measured on the pool, reported as mainIpAddress"),
+        ("FE80::1", True, "the same, upper case"),
+        ("fe80::1%eth0", True, "with a scope id, which is a shape XO can return"),
+        # The rest of fe80::/10. A prefix test on the literal "fe80:" is a /16 and calls
+        # every one of these routable, which is what the first version of this function
+        # did while its own docstring said /10. The first version of this test only fed it
+        # fe80::, so the fixture agreed with the narrower behaviour and neither could see
+        # the other was wrong.
+        ("fe90::1", True, "still fe80::/10"),
+        ("fea0::1", True, "still fe80::/10"),
+        ("feb0::1", True, "still fe80::/10"),
+        ("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff", True, "the last address in the range"),
+        ("fec0::1", False, "one past the end: site-local, deprecated, and not link-local"),
+        ("169.254.13.7", True, "IPv4 autoconfiguration, which means DHCP did not answer"),
+        ("169.254.0.0", True, "the bottom of that range"),
+        ("169.255.0.1", False, "one past it"),
+        ("192.168.1.152", False, "the address the same clone got 60s later"),
+        ("2a01:e0a:96c:c250:69f3:fb6c:a93c:40a2", False, "a global IPv6 is routable"),
+        ("10.0.0.1", False, "private, but reachable, which is all this needs to be"),
+        ("", False, "an empty value is not an address and is not this function's problem"),
+        ("nonsense", False, "nor is a string the appliance should never have sent"),
+        (None, False, "nor is None, which mainIpAddress is until the guest reports"),
+    ],
+)
+def test_link_local_is_recognised_across_the_whole_range(address, link_local, why):
+    assert is_link_local(address) is link_local, why
+
+
+class AddressXo(BootingXo):
+    """Hands out a sequence of addresses, one per read, the way a booting guest does."""
+
+    def __init__(self, sequence):
+        super().__init__()
+        self.sequence = list(sequence)
+
+    def get_objects(self, filter_=None, limit=None):
+        value = self.sequence.pop(0) if self.sequence else None
+        return [{"id": "vm-1", "mainIpAddress": value}]
+
+
+def test_a_link_local_address_is_skipped_and_the_real_one_taken(capsys):
+    """MEASURED 2026-09-06: one clone reported fe80:: at 25.3s. A caller taking the first
+    non-empty mainIpAddress gets an address nothing can connect to, and reports it as a
+    pass, which is this probe doing the exact thing it exists to catch."""
+    xo = AddressXo([None, "fe80::cd1c:16b1:f447:6874", "fe80::cd1c:16b1:f447:6874",
+                    "192.168.1.152"])
+    assert check_boot(xo, "vm-1", wait=60) == "192.168.1.152"
+    assert "ignoring link-local" in capsys.readouterr().out
+
+
+def test_a_clone_that_only_ever_gets_a_link_local_address_fails(capsys):
+    """Otherwise the skip turns into a hang that ends in a pass on the next lucky read."""
+    xo = AddressXo(["fe80::1"] * 200)
+    with pytest.raises(Failed, match="no mainIpAddress"):
+        check_boot(xo, "vm-1", wait=30)
+    assert "ignoring link-local" in capsys.readouterr().out, "it never looked at one"
+
+
+def test_a_cache_that_flickers_empty_does_not_abort_the_tag_poll(capsys):
+    """`as_list(...)[0]` inside a poll's read is not a read that fails, it is an
+    IndexError that propagates out and stops the poll retrying. The lag this polls for
+    makes a transient empty reply normal, so the subscript has to be the safe kind."""
+    class Flickering(TaggingXo):
+        def __init__(self):
+            super().__init__(lag=0)
+            self.reads = 0
+
+        def get_objects(self, filter_=None, limit=None):
+            self.reads += 1
+            if self.reads in (1, 3):
+                return []
+            return super().get_objects(filter_, limit)
+
+    check_owner_tag(Flickering(), "vm-1")
+    assert capsys.readouterr().out.count("PASS") == 2
+
+
+# -- an unreadable cache is not proof that a value is gone ------------------
+
+def test_an_unreadable_cache_does_not_count_as_a_removed_tag(capsys):
+    """The trap a safe subscript introduces if it answers {} or [].
+
+    `OWNER_TAG not in []` is true, so a remove poll reading an empty cache calls the tag
+    gone while it is still on the VM. That is an absence seen by an instrument that could
+    not detect presence, which is the one thing every check in these tools exists to
+    avoid, and the owner tag is the only handle a sweep has on an XO-made VM.
+
+    The fixture goes unreadable exactly when the remove poll starts, and never actually
+    removes the tag. A reader that treats empty as absent reports success.
+    """
+    class GoesBlind(TaggingXo):
+        def __init__(self):
+            super().__init__(lag=0)
+            self.blind = False
+
+        def remove_tag(self, vm_id, tag):
+            self.blind = True          # the remove is accepted and does nothing
+
+        def get_objects(self, filter_=None, limit=None):
+            return [] if self.blind else super().get_objects(filter_, limit)
+
+    with pytest.raises(Failed, match="did not remove"):
+        check_owner_tag(GoesBlind(), "vm-1")
+
+
+def test_an_unreadable_cache_does_not_count_as_a_scrubbed_key(capsys):
+    """The same trap on the #28 scrub, which is the claim that matters most here: a null
+    value removes exactly that key. Reporting that on a read the cache could not answer
+    would certify the secret scrub on no evidence at all."""
+    class GoesBlind(XenstoreXo):
+        def __init__(self):
+            super().__init__(lag=0)
+            self.blind = False
+
+        def set_xenstore(self, vm_id, data):
+            if any(v is None for v in data.values()):
+                self.blind = True      # the scrub is accepted and does nothing
+                return
+            super().set_xenstore(vm_id, data)
+
+        def get_objects(self, filter_=None, limit=None):
+            return [] if self.blind else super().get_objects(filter_, limit)
+
+    with pytest.raises(Failed, match="survived a null write"):
+        check_q1(GoesBlind(), "vm-1")
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    ["not-an-address", "999.999.999.999", "192.168.1", "{}", "0", "fe80:::::1"],
+)
+def test_an_unparseable_address_is_not_boot_success(capsys, garbage):
+    """is_link_local answers False for anything it cannot parse, deliberately, so the
+    caller is the one that has to refuse nonsense. Without that, a garbage value is
+    neither link-local nor an address and gets reported as a working boot."""
+    xo = AddressXo([garbage, garbage, "192.168.1.152"])
+    assert check_boot(xo, "vm-1", wait=60) == "192.168.1.152"
+    assert "ignoring unparseable" in capsys.readouterr().out
+
+
+def test_a_clone_that_only_ever_reports_nonsense_fails(capsys):
+    xo = AddressXo(["not-an-address"] * 200)
+    with pytest.raises(Failed, match="no mainIpAddress"):
+        check_boot(xo, "vm-1", wait=30)
+
+
+# -- check_q2: the argument whose absence produces a clone that cannot send a packet ----
+
+class CreatingXo(FakeXo):
+    """A pool that records what create_from_template was passed and answers reads from it.
+
+    `vifs` is what template_vifs returns, deliberately non-empty: a fixture returning []
+    would let a regression that drops the argument pass unchanged, which is the whole
+    thing this test exists to catch.
+    """
+
+    def __init__(self, vifs=({"network": "net-1"},), give_vif=True):
+        super().__init__()
+        self.vifs = list(vifs)
+        self.give_vif = give_vif
+        self.creates = []
+
+    def template_vifs(self, template):
+        return list(self.vifs)
+
+    def create_from_template(self, template_id, name_label, clone=True, **extra):
+        self.creates.append(extra)
+        return {"id": "vm-1"}
+
+    def get_objects(self, filter_=None, limit=None):
+        return [{"id": "vm-1", "type": "VM", "$VBDs": ["vbd-1"],
+                 "VIFs": ["vif-1"] if self.give_vif else []}]
+
+
+def test_the_probe_forwards_the_template_s_vifs_to_vm_create(capsys):
+    """MEASURED on the pool 2026-09-06: vm.create does not inherit the template's VIFs and
+    create_vm over REST does. Drop this argument and the clone boots, the tools come up,
+    os_version is correct, and the only field telling the truth is the address that never
+    arrives -- which reads as a broken golden image rather than as a missing argument.
+
+    Untested until now: the equivalent test existed for run_jsonrpc in test_xo_compare.py
+    and not for check_q2, so dropping the argument here passed CI in silence.
+    """
+    xo = CreatingXo()
+    vm_id, elapsed = check_q2(xo, {"id": "tmpl", "VIFs": ["vif-t"]}, "xo-probe-1")
+    assert vm_id == "vm-1"
+    assert elapsed >= 0
+    assert xo.creates == [{"VIFs": [{"network": "net-1"}]}], xo.creates
+
+
+def test_a_clone_that_comes_up_with_no_vif_fails_here_not_180s_later(capsys):
+    """Checked at create time rather than left for --boot to find as a timeout. A VIF-less
+    clone reports healthy on every other field, so the failure surfaces three minutes later
+    looking like somebody else's bug."""
+    with pytest.raises(Failed, match="no VIF"):
+        check_q2(CreatingXo(give_vif=False), {"id": "tmpl", "VIFs": ["vif-t"]}, "xo-probe-1")

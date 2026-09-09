@@ -57,6 +57,9 @@ def fast_clock(monkeypatch):
 class CreatingXo(FakeXo):
     """A FakeXo whose create can return any shape, raise, and answer a recovery lookup."""
 
+    def template_vifs(self, template):
+        return [{"network": "net-1"}]
+
     def __init__(self, result=None, raises=None, resolves=()):
         super().__init__()
         self.result = result
@@ -290,9 +293,20 @@ class Pool:
 class PoolXo:
     def __init__(self, pool):
         self.pool = pool
+        self.creates = []
 
     def create_from_template(self, tid, name_label, clone=True, **extra):
+        # Recorded, not discarded. A fixture that swallows **extra lets a regression that
+        # stops forwarding VIFs pass every test in this file, and a VIF-less clone is the
+        # failure that boots perfectly and can never send a packet.
+        self.creates.append(extra)
         return {"id": self.pool.create(name_label)}
+
+    def template_vifs(self, template):
+        """vm.create does not inherit the template's VIFs, so the harness passes them.
+        Returning a non-empty list rather than [] on purpose: an empty one would let a
+        caller that dropped the argument entirely pass this fixture unchanged."""
+        return [{"network": "net-1"}]
 
     def get_objects(self, filter_=None, limit=None):
         return self.pool.get((filter_ or {}).get("id"))
@@ -317,12 +331,32 @@ class PoolRest:
     def create_vm(self, pool_id, template_id, name_label, clone=True, boot=False, **extra):
         return self.pool.create(name_label), 1.016
 
+    #: go blind on xenStoreData reads from the moment the scrub is written, not before.
+    #: The timing is the whole test. During the SEED poll an empty read is correctly false
+    #: whether the reader answers None or {}, so blinding there cannot tell the two apart.
+    #: It is the SCRUB poll where `SEED_KEY not in {}` is true and a reader that collapses
+    #: "unreadable" into "empty" reports a delete that never happened.
+    blind_after_scrub = False
+    _blind = False
+
+    #: answer this instead of a document on reads whose path contains `garble_on`.
+    #: A string, because XoRest.get decodes a non-JSON body to one and that is the case
+    #: `or {}` does not cover: a string is truthy, so the fallback never fires.
+    garble_on = None
+    garble = "<html>502 Bad Gateway</html>"
+
     def get(self, path):
+        if self.garble_on and self.garble_on in path:
+            return self.garble
+        if self._blind and "xenStoreData" in path:
+            return None            # XoRest.get answers None on an empty HTTP body
         found = self.pool.get(path.split("/vms/")[1].split("?")[0])
         return found[0] if found else {}
 
     def set_xenstore(self, vm_id, data):
         self.pool.set_xenstore(vm_id, data)
+        if self.blind_after_scrub and any(v is None for v in data.values()):
+            self._blind = True
         return 200
 
     def add_tag(self, vm_id, tag):
@@ -334,9 +368,9 @@ class PoolRest:
         return 200, 0.618
 
 
-def run_both(pool):
+def run_both(pool, xo=None):
     """Both paths against one store, so a case cannot be fixed on one side only."""
-    xo = PoolXo(pool)
+    xo = xo or PoolXo(pool)
     return [
         ("JSON-RPC", XoError, lambda: xo_compare.run_jsonrpc(xo, TEMPLATE, "xo-cmp-jrpc-1")),
         ("REST", XoRestError,
@@ -396,3 +430,59 @@ def test_a_delete_that_does_not_delete_fails_the_path(empty_created, capsys, bac
         run()
     assert "STILL_PRESENT" in str(caught.value)
     assert empty_created.CREATED, "the surviving VM was struck off the cleanup list"
+
+
+def test_the_jsonrpc_path_forwards_the_template_s_vifs(empty_created, capsys):
+    """MEASURED on the pool 2026-09-06: vm.create does not inherit the template's VIFs and
+    create_vm over REST does. Without this argument the clone boots, the tools come up,
+    os_version is correct, and the only field telling the truth is the address that never
+    arrives. The fixture records what it was passed because a fixture that discards
+    **extra lets the regression through while looking green."""
+    # One Pool, per run_both's contract. Two stores is harmless while this selects only
+    # the JSON-RPC branch and correct-looking forever after somebody adds the REST one,
+    # at which point the two backends read different stores and drift while staying green.
+    pool = Pool()
+    xo = PoolXo(pool)
+    _, _, run = next(b for b in run_both(pool, xo=xo) if b[0] == "JSON-RPC")
+    run()
+    assert xo.creates == [{"VIFs": [{"network": "net-1"}]}], xo.creates
+
+
+def test_the_rest_path_survives_an_empty_body_and_does_not_call_it_an_absence(empty_created, capsys):
+    """Two defects in one reader, both caught by the same fixture.
+
+    XoRest.get answers None on an empty HTTP body, so `.get(...)` on it raised
+    AttributeError and took the harness down with a VM already on the pool. And the `or {}`
+    that would have prevented that makes every `d is not None` guard beside it inert, so a
+    negative poll passes the instant the body is empty: `SEED_KEY not in {}` is true.
+
+    The store goes blind the moment the scrub is written and the scrub genuinely does
+    nothing, so every read the scrub poll makes comes back empty. A reader that calls
+    `.get` on None crashes; a reader that answers {} reports a delete that never happened.
+    Blinding earlier would prove neither, because during the seed poll an empty read is
+    correctly false whichever way the reader is written.
+    """
+    pool = Pool(scrub=False)
+    rest = PoolRest(pool)
+    rest.blind_after_scrub = True
+    with pytest.raises(XoRestError) as caught:
+        xo_compare.run_rest(rest, PoolXo(pool), "pool-1", TEMPLATE, "xo-cmp-rest-1")
+    assert "SCRUB_FAILED" in str(caught.value)
+    assert empty_created.CREATED, "the VM was left untracked when the path failed"
+
+
+def test_a_non_json_body_on_the_readability_poll_does_not_escape(empty_created, capsys):
+    """XoRest.get decodes a non-JSON body to a string, so `rest.get(...) or {}` leaves it
+    a string and `.get("type")` raises AttributeError. That escapes main()'s
+    `except (XoError, XoRestError)`, skips cleanup, and leaves a VM on a pool where an
+    XO-made clone carries no owner marker for any sweep to find.
+
+    A proxy answering HTML instead of the appliance is the ordinary way to reach this.
+    """
+    pool = Pool()
+    rest = PoolRest(pool)
+    rest.garble_on = "fields=type"
+    with pytest.raises(XoRestError) as caught:
+        xo_compare.run_rest(rest, PoolXo(pool), "pool-1", TEMPLATE, "xo-cmp-rest-1")
+    assert caught.value.message == "NOT_READABLE"
+    assert empty_created.CREATED, "the VM was left untracked when the path failed"

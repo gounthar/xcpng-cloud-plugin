@@ -23,6 +23,7 @@ nothing was concluded, 3 cleanup left something behind on the pool.
 """
 
 import argparse
+import ipaddress
 import os
 import sys
 import time
@@ -30,7 +31,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
-from xo_util import as_list, poll  # noqa: E402
+from xo_util import as_list, poll, readable  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 CLONE_PREFIX = "xo-probe-"
@@ -50,6 +51,36 @@ class Failed(Exception):
 
 class ControlFailed(Exception):
     pass
+
+
+def is_parseable(address):
+    """Whether XO handed back something that is actually an address."""
+    try:
+        ipaddress.ip_address(str(address).split("%")[0])
+        return True
+    except ValueError:
+        return False
+
+
+def is_link_local(address):
+    """IPv6 fe80::/10 and IPv4 169.254.0.0/16. Neither can reach the controller.
+
+    Uses the stdlib rather than a prefix test, because the prefix test this replaced was
+    wrong in the way its own docstring made hardest to see: it said /10 and matched
+    `fe80:`, which is /16. fe80::/10 runs to febf:ffff:..., so fe90::, fea0:: and febf::
+    are link-local too and were being accepted as routable. The first version of the test
+    beside it only ever fed it fe80::, so the fixture agreed with the narrower behaviour
+    and neither could see the other was wrong.
+
+    An unparseable value counts as not link-local: it is not this function's job to decide
+    whether the appliance handed back nonsense, and the caller checks for a usable address
+    rather than for the absence of a bad one. A scope id is stripped first, since
+    `fe80::1%eth0` is a shape XO can return and ip_address rejects it.
+    """
+    try:
+        return ipaddress.ip_address(str(address).split("%")[0]).is_link_local
+    except ValueError:
+        return False
 
 
 def ok(msg):
@@ -107,8 +138,13 @@ def check_q5(xo):
 def check_q2(xo, template, name):
     print("\n== Q2, create a VM from a template (the reason for issue #89) ==")
     tid = template.get("id") or template.get("uuid")
+    # vm.create does not inherit the template's VIFs and create_vm over REST does, which
+    # is measured rather than assumed; see Xo.template_vifs. Without this the clone boots
+    # perfectly and can never send a packet, and --boot times out against a guest that
+    # reports healthy on every other field.
+    vifs = xo.template_vifs(template)
     started = time.monotonic()
-    result = xo.create_from_template(tid, name, clone=True)
+    result = xo.create_from_template(tid, name, clone=True, VIFs=vifs)
     elapsed = time.monotonic() - started
 
     vm_id = result.get("id") if isinstance(result, dict) else result
@@ -122,16 +158,34 @@ def check_q2(xo, template, name):
     info("vm.create takes no xenStoreData and no tags, so the seed and the owner marker "
          "are separate calls after this one")
 
-    made = as_list(xo.get_objects({"id": vm_id}))
-    if len(made) != 1:
-        raise Failed(f"created {vm_id} but could not read it back")
-    vm = made[0]
+    # Polled, not read once. The cache lags a write, and a create is a write: reading
+    # straight back can answer an empty list, and `made[0]` on that is an IndexError
+    # rather than a failed check, which is a traceback with a VM already on the pool.
+    # The polled value is kept rather than re-read. A second read can find the cache
+    # briefly empty again, and [0] on that is an IndexError with a VM already on the pool,
+    # which is the failure the poll was added to prevent wearing a different hat.
+    held = []
+    seen, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})),
+                        lambda found: bool(held.append(found) or len(found) == 1))
+    if not seen:
+        raise Failed(f"created {vm_id} but could not read it back within {waited:.1f}s")
+    vm = held[-1][0]
     if vm.get("type") != "VM":
         raise Failed(f"expected a VM, got type={vm.get('type')!r}. vm.clone would do this")
     ok("the result is a VM, not another template")
     if not vm.get("$VBDs"):
         raise Failed("the new VM has no VBD, so the disk did not come across")
     ok(f"it has {len(vm['$VBDs'])} VBD, so a disk came with it")
+
+    # Checked here rather than left for --boot to discover as a timeout. A VIF-less clone
+    # boots fine and reports healthy on every field except the address, so without this
+    # the failure surfaces 180s later and looks like a broken golden image.
+    got, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id})),
+                       lambda found: bool(found and (found[0].get("VIFs") or [])))
+    if not got:
+        raise Failed(f"the new VM has no VIF after {waited:.1f}s, so it can never reach "
+                     f"the network. vm.create does not inherit the template's VIFs")
+    ok("it has a VIF, so the guest has somewhere to send a packet")
     return vm_id, elapsed
 
 
@@ -148,39 +202,52 @@ def check_q1(xo, vm_id):
     read = lambda: read_xenstore(xo, vm_id)  # noqa: E731
 
     xo.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
-    seen, waited = poll(read, lambda d: d.get(SEED_KEY) == SEED_VALUE)
+    seen, waited = poll(read, lambda d: d is not None and d.get(SEED_KEY) == SEED_VALUE)
     if not seen:
         raise Failed(f"seeded {SEED_KEY} but it never appeared; read back "
-                     f"{read().get(SEED_KEY)!r} after {waited:.1f}s")
+                     f"{(read() or {}).get(SEED_KEY)!r} after {waited:.1f}s")
     ok(f"set {SEED_KEY} and read it back after {waited:.1f}s, so this reader sees the key present")
 
     xo.set_xenstore(vm_id, {SEED_KEY: None})
-    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    gone, waited = poll(read, lambda d: d is not None and SEED_KEY not in d)
     if not gone:
         raise Failed(f"{SEED_KEY} survived a null write, so the per-key delete did not happen")
     ok(f"a null value removed exactly that key after {waited:.1f}s, which is the #28 scrub")
 
 
 def read_xenstore(xo, vm_id):
-    found = as_list(xo.get_objects({"id": vm_id}))
-    if not found:
-        raise Failed(f"could not read {vm_id} back")
-    return found[0].get("xenStoreData") or {}
+    # None when the VM is not readable, {} when it is readable and holds no keys. The
+    # two must not collapse: a negative predicate over {} passes, so a scrub poll would
+    # report a successful delete on a moment the cache simply had nothing to say.
+    vm = readable(xo.get_objects({"id": vm_id}))
+    return None if vm is None else (vm.get("xenStoreData") or {})
 
 
 def check_owner_tag(xo, vm_id):
     print("\n== owner marker, which has to be a tag here ==")
+    # Both directions poll, for the reason check_q1 does. Measured on the pool
+    # 2026-09-06: tag.add returned and the tag was NOT on the object when read back
+    # immediately, so this reported a working tag.add as broken. xo_compare polled here
+    # and this file did not, which is the same rule-with-two-homes split that check_q1
+    # had, in a function the review never named. Fixing the instance that fires and not
+    # sweeping for its siblings is how it survived the first pass.
+    # None when unreadable, a list when readable. Same reason as the xenstore reader:
+    # `OWNER_TAG not in []` passes, so the remove half would go green on a failed read.
+    def tags():
+        vm = readable(xo.get_objects({"id": vm_id}))
+        return None if vm is None else (vm.get("tags") or [])
+
     xo.add_tag(vm_id, OWNER_TAG)
-    vm = as_list(xo.get_objects({"id": vm_id}))[0]
-    if OWNER_TAG not in (vm.get("tags") or []):
-        raise Failed(f"added tag {OWNER_TAG} but it is not on the object")
-    ok(f"tag.add put {OWNER_TAG} on the VM, so a sweep has something to select on")
+    tagged, waited = poll(tags, lambda t: t is not None and OWNER_TAG in t)
+    if not tagged:
+        raise Failed(f"added tag {OWNER_TAG} but it never appeared on the object")
+    ok(f"tag.add put {OWNER_TAG} on the VM after {waited:.1f}s, so a sweep can select on it")
 
     xo.remove_tag(vm_id, OWNER_TAG)
-    vm = as_list(xo.get_objects({"id": vm_id}))[0]
-    if OWNER_TAG in (vm.get("tags") or []):
-        raise Failed("tag.remove did not remove the tag")
-    ok("tag.remove takes it off again")
+    gone, waited = poll(tags, lambda t: t is not None and OWNER_TAG not in t)
+    if not gone:
+        raise Failed(f"tag.remove did not remove the tag within {waited:.1f}s")
+    ok(f"tag.remove takes it off again after {waited:.1f}s")
 
 
 def check_boot(xo, vm_id, wait):
@@ -189,14 +256,51 @@ def check_boot(xo, vm_id, wait):
     xo.call("vm.start", {"id": vm_id})
     ok(f"vm.start returned in {time.monotonic() - started:.3f}s")
 
-    deadline = time.monotonic() + wait
-    address = None
-    while time.monotonic() < deadline:
-        vm = as_list(xo.get_objects({"id": vm_id}))[0]
-        address = vm.get("mainIpAddress")
-        if address:
-            break
-        time.sleep(3)
+    # A link-local address is not an answer. MEASURED 2026-09-06, n=2 and one each way:
+    # one clone reported mainIpAddress='fe80::cd1c:...' at 25.3s, and another held None
+    # until 85.1s and then produced IPv4, global IPv6 and link-local together. So
+    # mainIpAddress can transiently carry an address nothing can connect to, and a caller
+    # taking the first non-empty value gets it. Accepting it here would be this probe
+    # reporting success for a check that failed, which is the whole thing these tools
+    # exist to stop doing.
+    # Through poll rather than a hand-rolled loop. The loop this replaces slept a flat
+    # three seconds whether or not that fitted, so a small budget overran and the "{wait}s"
+    # in the timeout message was not the time actually spent. poll already clamps its sleep
+    # to what is left, and that fix landed there earlier on this branch and not here, which
+    # is the argument for having one loop rather than two.
+    announced = set()
+
+    def usable():
+        # The one `or {}` left in either harness, and it is deliberate rather than missed.
+        # The others read collections, where empty is a meaningful "absent" that a negative
+        # predicate would wrongly accept. This reads a scalar and already folds both states
+        # into None on the next line, under a positive predicate, so the poll retries
+        # either way. Do not copy the shape to a collection reader, and note the latent
+        # edge if a negative predicate is ever written over this one: `a is None` would be
+        # satisfied instantly by a cache that simply could not answer.
+        vm = readable(xo.get_objects({"id": vm_id})) or {}
+        candidate = vm.get("mainIpAddress")
+        if not candidate:
+            return None
+        if not is_parseable(candidate):
+            # is_link_local answers False for anything it cannot parse, deliberately, so
+            # the caller refuses nonsense. Otherwise a garbage value is neither link-local
+            # nor an address and gets reported as boot success.
+            if candidate not in announced:
+                announced.add(candidate)
+                info(f"ignoring unparseable mainIpAddress {candidate!r}")
+            return None
+        if is_link_local(candidate):
+            if candidate not in announced:
+                announced.add(candidate)
+                info(f"ignoring link-local {candidate}, nothing can connect to it")
+            return None
+        return candidate
+
+    held = []
+    found, _ = poll(usable, lambda a: bool(held.append(a) or a is not None),
+                    timeout=wait, interval=3)
+    address = held[-1] if found else None
 
     if address:
         ok(f"mainIpAddress reported after {time.monotonic() - started:.1f}s: {address}")

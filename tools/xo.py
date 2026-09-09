@@ -203,6 +203,33 @@ class Xo:
             return list(found.values())
         return list(found or [])
 
+    def template_vifs(self, template):
+        """The `VIFs` argument vm.create needs to give a clone the template's networks.
+
+        MEASURED on the lab pool 2026-09-06, and it is the single biggest behavioural
+        difference found between the two backends: **vm.create does NOT inherit the
+        template's VIFs, and the REST create_vm route DOES.** Same appliance, same
+        template, same minute: the template carries 1 VIF, a bare vm.create clone carries
+        0, a bare REST clone carries 1.
+
+        A VIF-less clone is the worst shape this project knows. The guest boots, the tools
+        come up, `pvDriversDetected` goes true, `os_version` is correct and complete, and
+        the only field telling the truth is the address that never arrives. Measured here:
+        240s of a perfectly healthy-looking Debian 13 guest with no way to send a packet.
+
+        The mirror-image trap is on the REST side, so do not copy this call there: `vifs`
+        is ADDITIVE, not a replacement. Passing the template's own network to create_vm
+        produced a clone with 2 VIFs, which is a two-NIC agent rather than an error.
+        """
+        vifs = []
+        for vif_id in template.get("VIFs") or []:
+            found = self.get_objects({"id": vif_id})
+            found = list(found.values()) if isinstance(found, dict) else list(found or [])
+            network = found[0].get("$network") if found else None
+            if network:
+                vifs.append({"network": network})
+        return vifs
+
     def create_from_template(self, template_id, name_label, clone=True, **extra):
         """The JSON-RPC shape of HypervisorClient.cloneFromTemplate.
 

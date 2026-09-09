@@ -14,6 +14,17 @@ and its semantics recorded, and anything created is removed.
 
 Dry run by default. Exit 0 both paths completed, 1 a path failed, 2 controls did not
 hold, 3 something was left on the pool.
+
+DO NOT QUOTE THE CREATE TIMES FROM THIS HARNESS. The two paths run sequentially and REST
+always runs first, so the JSON-RPC create pays for the REST teardown that precedes it: the
+same call measures 1.23s standalone in xo_probe (n=3, 1.225 to 1.240) and 2.21s in this
+harness's second slot, whether or not it is passed VIFs. The bias favours whichever runs
+first, which is REST, which is the backend the numbers were used to choose, so it is the
+direction that matters most to declare.
+
+The defensible figures are the standalone ones, and they agree with what issue #89 already
+records: REST create_vm about 1.03s against JSON-RPC vm.create about 1.23s. What this
+harness is good for is the semantics beside each step, not the milliseconds.
 """
 
 import argparse
@@ -25,7 +36,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from xo import Xo, XoError  # noqa: E402
 from xo_rest import XoRest, XoRestError  # noqa: E402
-from xo_util import as_list, poll  # noqa: E402
+from xo_util import as_list, poll, readable  # noqa: E402
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 SEED_KEY = "vm-data/jenkins/probe"
@@ -35,7 +46,7 @@ OWNER_TAG = "xcpng-cloud:xo-compare"
 CREATED = []  # (backend, id) pairs; cleanup never touches anything else
 
 
-def create_or_recover(xo, tid, name, backend):
+def create_or_recover(xo, tid, name, backend, **extra):
     """Create a VM, and if our own deadline fires, go and find what may have been made.
 
     `vm.create` has no server-side timeout, so a TIMEOUT here means our patience ran out,
@@ -49,7 +60,7 @@ def create_or_recover(xo, tid, name, backend):
     """
     t0 = time.monotonic()
     try:
-        res = xo.create_from_template(tid, name, clone=True)
+        res = xo.create_from_template(tid, name, clone=True, **extra)
     except XoError as exc:
         if exc.message != "TIMEOUT":
             raise
@@ -98,11 +109,26 @@ def run_jsonrpc(xo, template, name):
     print(f"\n== JSON-RPC path ==")
     tid = template.get("id") or template.get("uuid")
 
-    vm_id, r.steps["create"] = create_or_recover(xo, tid, name, "jsonrpc")
+    # VIFs passed explicitly, because otherwise this is not a comparison. MEASURED
+    # 2026-09-06: create_vm over REST inherits the template's VIFs and vm.create does not,
+    # so the two sides were doing different work and the JSON-RPC side was doing less. It
+    # still lost. Making them equal is what lets the numbers below be quoted at all.
+    vm_id, r.steps["create"] = create_or_recover(xo, tid, name, "jsonrpc",
+                                                 VIFs=xo.template_vifs(template))
     row("vm.create", f"{r.steps['create']:.3f}s -> {vm_id}")
     r.notes.append("accepts the XO object id; no bare-uuid requirement observed")
+    r.notes.append("does NOT inherit the template's VIFs; they are passed here explicitly")
 
-    vm = as_list(xo.get_objects({"id": vm_id}))[0]
+    # Polled: a create is a write, the cache lags a write, and [0] on an empty list is an
+    # IndexError rather than a failed check.
+    held = []
+    seen, _ = poll(lambda: as_list(xo.get_objects({"id": vm_id})),
+                   lambda found: bool(held.append(found) or len(found) == 1))
+    if not seen:
+        raise XoError("NOT_READABLE", f"created {vm_id} but it never appeared in the cache")
+    # The polled value, not a fresh read: the cache can flicker back to empty between the
+    # two, and [0] on that is an IndexError with a VM already on the pool.
+    vm = held[-1][0]
     if vm.get("type") != "VM":
         raise XoError("WRONG_TYPE", vm.get("type"))
     row("result type", f"{vm['type']}, {len(vm.get('$VBDs') or [])} VBD")
@@ -110,8 +136,10 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
     r.steps["seed"] = time.monotonic() - t0
-    read = lambda: (as_list(xo.get_objects({"id": vm_id}))[0].get("xenStoreData") or {})
-    seen, waited = poll(read, lambda d: SEED_KEY in d)
+    def read():
+        vm = readable(xo.get_objects({"id": vm_id}))
+        return None if vm is None else (vm.get("xenStoreData") or {})
+    seen, waited = poll(read, lambda d: d is not None and SEED_KEY in d)
     r.steps["seed_visible"] = waited
     row("vm.set seed", f"{r.steps['seed']:.3f}s, visible after {waited:.1f}s poll={seen}")
     if not seen:
@@ -120,7 +148,7 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.set_xenstore(vm_id, {SEED_KEY: None})
     r.steps["scrub"] = time.monotonic() - t0
-    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    gone, waited = poll(read, lambda d: d is not None and SEED_KEY not in d)
     row("vm.set scrub (null)", f"{r.steps['scrub']:.3f}s, gone after {waited:.1f}s poll={gone}")
     if not gone:
         raise XoError("SCRUB_FAILED", f"{SEED_KEY} survived the null write")
@@ -128,8 +156,15 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: as_list(xo.get_objects({"id": vm_id}))[0].get("tags") or [],
-                          lambda t: OWNER_TAG in t)
+    # The last reader in this file still collapsing "unreadable" into "readable and
+    # empty". The predicate below is positive, so today it only costs consistency; the
+    # cost arrives the moment somebody adds a negative one beside it, because
+    # `OWNER_TAG not in []` is true and that is exactly the defect 61eaa77 fixed.
+    def read_owner_tags():
+        vm = readable(xo.get_objects({"id": vm_id}))
+        return None if vm is None else (vm.get("tags") or [])
+
+    tagged, waited = poll(read_owner_tags, lambda t: t is not None and OWNER_TAG in t)
     row("tag.add", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
         raise XoError("TAG_FAILED", f"{OWNER_TAG} never appeared on the VM")
@@ -154,8 +189,27 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     CREATED.append(("rest", vm_id))
     row("POST /pools/{id}/actions/create_vm", f"{elapsed:.3f}s -> {vm_id}")
     r.notes.append("requires a BARE template uuid; the pool-prefixed form 404s")
+    r.notes.append("inherits the template's VIFs; passing vifs ADDS a second one")
 
-    vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs")
+    def read_vm():
+        # The third reader in this function, and the last one still spelled `or {}`. The
+        # other two were given this shape two commits ago and this one was not, which is
+        # the sixth time on this branch a fix has landed on one side of a set.
+        #
+        # `or {}` does not save it: XoRest.get decodes a non-JSON body to a *string*,
+        # which is truthy, so the fallback never fires and `.get` raises AttributeError.
+        # That escapes main()'s `except (XoError, XoRestError)`, skips cleanup, and leaves
+        # a VM on a pool where an XO-made clone carries no marker for any sweep to find.
+        vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs")
+        return None if not isinstance(vm, dict) else vm
+
+    held = []
+    seen, _ = poll(read_vm, lambda v: bool(held.append(v) or (v is not None and v.get("type"))))
+    if not seen:
+        raise XoRestError("NOT_READABLE", data=f"created {vm_id} but it never became readable")
+    # The polled value, not a fresh read. Readability can flicker back, and this is the
+    # third spelling of the same hazard on this branch, so it is worth the two lines.
+    vm = held[-1]
     if vm.get("type") != "VM":
         raise XoRestError("WRONG_TYPE", data=vm.get("type"))
     row("result type", f"{vm['type']}, {len(vm.get('$VBDs') or [])} VBD")
@@ -163,8 +217,16 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.set_xenstore(vm_id, {SEED_KEY: SEED_VALUE})
     r.steps["seed"] = time.monotonic() - t0
-    read = lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=xenStoreData").get("xenStoreData") or {}
-    seen, waited = poll(read, lambda d: SEED_KEY in d)
+    def read():
+        # Mirrors the JSON-RPC reader on purpose. Two things were wrong with the lambda
+        # this replaces: XoRest.get answers None on an empty body, so `.get` on it raised
+        # AttributeError and took the harness down with a VM on the pool; and `or {}` meant
+        # the reader never returned None, which made every `d is not None` guard beside it
+        # inert. The guard was added one function above and not here, which is the fourth
+        # time on this branch that a fix landed on one side of a pair.
+        vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=xenStoreData")
+        return None if not isinstance(vm, dict) else (vm.get("xenStoreData") or {})
+    seen, waited = poll(read, lambda d: d is not None and SEED_KEY in d)
     r.steps["seed_visible"] = waited
     row("PATCH /vms/{id} seed", f"{r.steps['seed']:.3f}s, visible after {waited:.1f}s poll={seen}")
     if not seen:
@@ -173,7 +235,7 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.set_xenstore(vm_id, {SEED_KEY: None})
     r.steps["scrub"] = time.monotonic() - t0
-    gone, waited = poll(read, lambda d: SEED_KEY not in d)
+    gone, waited = poll(read, lambda d: d is not None and SEED_KEY not in d)
     row("PATCH /vms/{id} scrub (null)", f"{r.steps['scrub']:.3f}s, gone after {waited:.1f}s poll={gone}")
     if not gone:
         raise XoRestError("SCRUB_FAILED", data=f"{SEED_KEY} survived the null write")
@@ -181,8 +243,11 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     t0 = time.monotonic()
     rest.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=tags").get("tags") or [],
-                          lambda t: OWNER_TAG in t)
+    def read_tags():
+        vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=tags")
+        return None if not isinstance(vm, dict) else (vm.get("tags") or [])
+
+    tagged, waited = poll(read_tags, lambda t: t is not None and OWNER_TAG in t)
     row("PUT /vms/{id}/tags/{tag}", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
         raise XoRestError("TAG_FAILED", data=f"{OWNER_TAG} never appeared on the VM")
