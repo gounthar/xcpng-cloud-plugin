@@ -156,8 +156,15 @@ def run_jsonrpc(xo, template, name):
     t0 = time.monotonic()
     xo.add_tag(vm_id, OWNER_TAG)
     r.steps["tag"] = time.monotonic() - t0
-    tagged, waited = poll(lambda: (readable(xo.get_objects({"id": vm_id})) or {}).get("tags"),
-                          lambda t: t is not None and OWNER_TAG in t)
+    # The last reader in this file still collapsing "unreadable" into "readable and
+    # empty". The predicate below is positive, so today it only costs consistency; the
+    # cost arrives the moment somebody adds a negative one beside it, because
+    # `OWNER_TAG not in []` is true and that is exactly the defect 61eaa77 fixed.
+    def read_owner_tags():
+        vm = readable(xo.get_objects({"id": vm_id}))
+        return None if vm is None else (vm.get("tags") or [])
+
+    tagged, waited = poll(read_owner_tags, lambda t: t is not None and OWNER_TAG in t)
     row("tag.add", f"{r.steps['tag']:.3f}s, visible after {waited:.1f}s poll={tagged}")
     if not tagged:
         raise XoError("TAG_FAILED", f"{OWNER_TAG} never appeared on the VM")

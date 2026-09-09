@@ -271,6 +271,13 @@ def check_boot(xo, vm_id, wait):
     announced = set()
 
     def usable():
+        # The one `or {}` left in either harness, and it is deliberate rather than missed.
+        # The others read collections, where empty is a meaningful "absent" that a negative
+        # predicate would wrongly accept. This reads a scalar and already folds both states
+        # into None on the next line, under a positive predicate, so the poll retries
+        # either way. Do not copy the shape to a collection reader, and note the latent
+        # edge if a negative predicate is ever written over this one: `a is None` would be
+        # satisfied instantly by a cache that simply could not answer.
         vm = readable(xo.get_objects({"id": vm_id})) or {}
         candidate = vm.get("mainIpAddress")
         if not candidate:

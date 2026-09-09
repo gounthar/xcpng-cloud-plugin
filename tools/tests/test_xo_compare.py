@@ -438,8 +438,12 @@ def test_the_jsonrpc_path_forwards_the_template_s_vifs(empty_created, capsys):
     os_version is correct, and the only field telling the truth is the address that never
     arrives. The fixture records what it was passed because a fixture that discards
     **extra lets the regression through while looking green."""
-    xo = PoolXo(Pool())
-    _, _, run = next(b for b in run_both(Pool(), xo=xo) if b[0] == "JSON-RPC")
+    # One Pool, per run_both's contract. Two stores is harmless while this selects only
+    # the JSON-RPC branch and correct-looking forever after somebody adds the REST one,
+    # at which point the two backends read different stores and drift while staying green.
+    pool = Pool()
+    xo = PoolXo(pool)
+    _, _, run = next(b for b in run_both(pool, xo=xo) if b[0] == "JSON-RPC")
     run()
     assert xo.creates == [{"VIFs": [{"network": "net-1"}]}], xo.creates
 
