@@ -18,7 +18,7 @@ import pytest
 
 from fakes import FakeXo
 from xo_probe import (ControlFailed, Failed, as_list, check_boot, check_owner_tag, check_q1,
-                      check_q3, cleanup, controls, is_link_local)
+                      check_q2, check_q3, cleanup, controls, is_link_local)
 
 TEMPLATE = "jenkins-agent-debian13-v7"
 FOUND = {TEMPLATE: [{"id": "pool/uuid-1", "uuid": "uuid-1"}]}
@@ -513,3 +513,55 @@ def test_a_clone_that_only_ever_reports_nonsense_fails(capsys):
     xo = AddressXo(["not-an-address"] * 200)
     with pytest.raises(Failed, match="no mainIpAddress"):
         check_boot(xo, "vm-1", wait=30)
+
+
+# -- check_q2: the argument whose absence produces a clone that cannot send a packet ----
+
+class CreatingXo(FakeXo):
+    """A pool that records what create_from_template was passed and answers reads from it.
+
+    `vifs` is what template_vifs returns, deliberately non-empty: a fixture returning []
+    would let a regression that drops the argument pass unchanged, which is the whole
+    thing this test exists to catch.
+    """
+
+    def __init__(self, vifs=({"network": "net-1"},), give_vif=True):
+        super().__init__()
+        self.vifs = list(vifs)
+        self.give_vif = give_vif
+        self.creates = []
+
+    def template_vifs(self, template):
+        return list(self.vifs)
+
+    def create_from_template(self, template_id, name_label, clone=True, **extra):
+        self.creates.append(extra)
+        return {"id": "vm-1"}
+
+    def get_objects(self, filter_=None, limit=None):
+        return [{"id": "vm-1", "type": "VM", "$VBDs": ["vbd-1"],
+                 "VIFs": ["vif-1"] if self.give_vif else []}]
+
+
+def test_the_probe_forwards_the_template_s_vifs_to_vm_create(capsys):
+    """MEASURED on the pool 2026-09-06: vm.create does not inherit the template's VIFs and
+    create_vm over REST does. Drop this argument and the clone boots, the tools come up,
+    os_version is correct, and the only field telling the truth is the address that never
+    arrives -- which reads as a broken golden image rather than as a missing argument.
+
+    Untested until now: the equivalent test existed for run_jsonrpc in test_xo_compare.py
+    and not for check_q2, so dropping the argument here passed CI in silence.
+    """
+    xo = CreatingXo()
+    vm_id, elapsed = check_q2(xo, {"id": "tmpl", "VIFs": ["vif-t"]}, "xo-probe-1")
+    assert vm_id == "vm-1"
+    assert elapsed >= 0
+    assert xo.creates == [{"VIFs": [{"network": "net-1"}]}], xo.creates
+
+
+def test_a_clone_that_comes_up_with_no_vif_fails_here_not_180s_later(capsys):
+    """Checked at create time rather than left for --boot to find as a timeout. A VIF-less
+    clone reports healthy on every other field, so the failure surfaces three minutes later
+    looking like somebody else's bug."""
+    with pytest.raises(Failed, match="no VIF"):
+        check_q2(CreatingXo(give_vif=False), {"id": "tmpl", "VIFs": ["vif-t"]}, "xo-probe-1")

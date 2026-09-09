@@ -184,9 +184,20 @@ def run_rest(rest, xo_for_reads, pool_id, template, name):
     r.notes.append("requires a BARE template uuid; the pool-prefixed form 404s")
     r.notes.append("inherits the template's VIFs; passing vifs ADDS a second one")
 
-    read_vm = lambda: rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs") or {}  # noqa: E731
+    def read_vm():
+        # The third reader in this function, and the last one still spelled `or {}`. The
+        # other two were given this shape two commits ago and this one was not, which is
+        # the sixth time on this branch a fix has landed on one side of a set.
+        #
+        # `or {}` does not save it: XoRest.get decodes a non-JSON body to a *string*,
+        # which is truthy, so the fallback never fires and `.get` raises AttributeError.
+        # That escapes main()'s `except (XoError, XoRestError)`, skips cleanup, and leaves
+        # a VM on a pool where an XO-made clone carries no marker for any sweep to find.
+        vm = rest.get(f"/rest/v0/vms/{vm_id}?fields=type,$VBDs")
+        return None if not isinstance(vm, dict) else vm
+
     held = []
-    seen, _ = poll(read_vm, lambda v: bool(held.append(v) or v.get("type") is not None))
+    seen, _ = poll(read_vm, lambda v: bool(held.append(v) or (v is not None and v.get("type"))))
     if not seen:
         raise XoRestError("NOT_READABLE", data=f"created {vm_id} but it never became readable")
     # The polled value, not a fresh read. Readability can flicker back, and this is the

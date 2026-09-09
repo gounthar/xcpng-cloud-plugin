@@ -339,7 +339,15 @@ class PoolRest:
     blind_after_scrub = False
     _blind = False
 
+    #: answer this instead of a document on reads whose path contains `garble_on`.
+    #: A string, because XoRest.get decodes a non-JSON body to one and that is the case
+    #: `or {}` does not cover: a string is truthy, so the fallback never fires.
+    garble_on = None
+    garble = "<html>502 Bad Gateway</html>"
+
     def get(self, path):
+        if self.garble_on and self.garble_on in path:
+            return self.garble
         if self._blind and "xenStoreData" in path:
             return None            # XoRest.get answers None on an empty HTTP body
         found = self.pool.get(path.split("/vms/")[1].split("?")[0])
@@ -456,4 +464,21 @@ def test_the_rest_path_survives_an_empty_body_and_does_not_call_it_an_absence(em
     with pytest.raises(XoRestError) as caught:
         xo_compare.run_rest(rest, PoolXo(pool), "pool-1", TEMPLATE, "xo-cmp-rest-1")
     assert "SCRUB_FAILED" in str(caught.value)
+    assert empty_created.CREATED, "the VM was left untracked when the path failed"
+
+
+def test_a_non_json_body_on_the_readability_poll_does_not_escape(empty_created, capsys):
+    """XoRest.get decodes a non-JSON body to a string, so `rest.get(...) or {}` leaves it
+    a string and `.get("type")` raises AttributeError. That escapes main()'s
+    `except (XoError, XoRestError)`, skips cleanup, and leaves a VM on a pool where an
+    XO-made clone carries no owner marker for any sweep to find.
+
+    A proxy answering HTML instead of the appliance is the ordinary way to reach this.
+    """
+    pool = Pool()
+    rest = PoolRest(pool)
+    rest.garble_on = "fields=type"
+    with pytest.raises(XoRestError) as caught:
+        xo_compare.run_rest(rest, PoolXo(pool), "pool-1", TEMPLATE, "xo-cmp-rest-1")
+    assert caught.value.message == "NOT_READABLE"
     assert empty_created.CREATED, "the VM was left untracked when the path failed"
