@@ -188,7 +188,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
 
     /**
      * How a client is opened from the {@link #poolUrl} snapshot when the owning cloud is gone. Null in
-     * production, where {@link #openClientFromSnapshot()} builds an {@code XapiClient} through
+     * production, where {@link #openClientFromSnapshot(boolean)} builds an {@code XapiClient} through
      * {@link XcpngCloud#openClient(String, String, String, String)}; a test injects an in-memory fake and
      * asserts the snapshot it was handed. Transient: behaviour, not configuration, and never persisted.
      */
@@ -503,7 +503,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         } else {
             listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
         }
-        try (HypervisorClient client = fromSnapshot ? openClientFromSnapshot() : cloud.openClient()) {
+        try (HypervisorClient client = fromSnapshot ? openClientFromSnapshot(cloud == null) : cloud.openClient()) {
             client.destroyWithDisks(new VmRef(vmRef));
         } catch (RuntimeException e) {
             if (cloud == null) {
@@ -548,12 +548,20 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * {@link #_terminate} for why the snapshot outranks the live cloud.
      */
     @NonNull
-    private HypervisorClient openClientFromSnapshot() {
+    private HypervisorClient openClientFromSnapshot(boolean cloudIsGone) {
         if (connectionClientFactory != null) {
             return connectionClientFactory.open(poolUrl, credentialsId, certificateFingerprint, getBackend());
         }
+        // The label reaches an administrator in the failure message, so it has to be true. This method used
+        // to run only when the cloud had been deleted and said so unconditionally; it runs on every teardown
+        // now, and a live cloud reported as removed sends whoever reads that log looking for a configuration
+        // change that never happened.
         return XcpngCloud.openClient(
-                poolUrl, credentialsId, certificateFingerprint, getBackend(), "the removed cloud '" + cloudName + "'");
+                poolUrl,
+                credentialsId,
+                certificateFingerprint,
+                getBackend(),
+                (cloudIsGone ? "the removed cloud '" : "cloud '") + cloudName + "'");
     }
 
     /**
@@ -571,7 +579,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     }
 
     /**
-     * How {@link #openClientFromSnapshot()} obtains a client. Production leaves this null; a test supplies an
+     * How {@link #openClientFromSnapshot(boolean)} obtains a client. Production leaves this null; a test supplies an
      * in-memory fake, which is handed the snapshot itself rather than this agent, so a test can assert the
      * three parameters actually survived provisioning. Not {@code Serializable} on purpose: it is held only in
      * the transient {@link #connectionClientFactory} field and never reaches the node's {@code config.xml}.

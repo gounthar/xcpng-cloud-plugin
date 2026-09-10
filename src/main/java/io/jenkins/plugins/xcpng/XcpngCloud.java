@@ -1206,7 +1206,12 @@ public class XcpngCloud extends Cloud {
         }
         StandardUsernamePasswordCredentials credentials = DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
         if (credentials == null) {
-            throw new IllegalStateException("No XAPI credentials configured for " + owner + ".");
+            // Says which kind is wanted, for the same reason the XO branch above does: the commonest way to
+            // reach here is a credential of the other kind selected under this backend, and "no credentials
+            // configured" reads as none at all rather than none of the right sort.
+            throw new IllegalStateException("No XAPI credentials configured for " + owner
+                    + ". The XAPI backend authenticates with a username and password, not a secret-text"
+                    + " token.");
         }
         return new XapiClient(
                 poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), certificateFingerprint);
@@ -1699,18 +1704,18 @@ public class XcpngCloud extends Cloud {
                 // openClient's message below, which names the kind this backend needs.
                 return FormValidation.error(Messages.XcpngCloud_credentials_required());
             }
-            final HypervisorClient client;
-            try {
-                client = openClient(url, credentialsId, pin, selected, "this cloud");
-            } catch (IllegalStateException missingCredential) {
-                // The only thing openClient throws before it opens anything: no credential of the kind
-                // this backend needs is resolvable under the selected ID. Its message already names which
-                // kind, which is the actionable half when the pairing is what is wrong.
-                return FormValidation.error(missingCredential.getMessage());
-            }
-            try (HypervisorClient session = client) {
+            // Built inside the try, not before it. Constructing a client is not merely a credential lookup:
+            // both backends reach TrustedHttpClients, which throws HypervisorException when it cannot build
+            // a pinning SSL context. Constructed outside, that escapes this method and the administrator
+            // gets a 500 page instead of a message on the form -- which is what the pre-backend code
+            // avoided by having `new XapiClient(...)` inside the resource clause.
+            try (HypervisorClient session = openClient(url, credentialsId, pin, selected, "this cloud")) {
                 session.ping();
                 return connectedResult(pin);
+            } catch (IllegalStateException missingCredential) {
+                // No credential of the kind this backend needs resolves under the selected ID. Its message
+                // already names which kind, which is the actionable half when the pairing is what is wrong.
+                return FormValidation.error(missingCredential.getMessage());
             } catch (RuntimeException e) {
                 // The button is admin-only and the message carries no secret, so it is returned to the
                 // operator as the diagnostic they asked for; the stack trace is kept server-side. A
