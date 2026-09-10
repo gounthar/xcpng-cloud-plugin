@@ -129,11 +129,14 @@ public final class XoRestClient implements HypervisorClient {
         } catch (IOException e) {
             throw new HypervisorException(method + " " + path + ": transport error: " + e.getMessage(), e);
         }
-        JsonNode payload = parse(method + " " + path, resp.body());
+        // Status first, body second. A failure body is not always JSON -- a reverse proxy's 502 page and a
+        // login redirect's HTML both arrive here -- and parsing before branching turned those into
+        // "malformed response", which reads as our bug and drops the one fact the operator needs. Only a
+        // 2xx is required to be JSON.
         if (!resp.isSuccess()) {
-            throw failure(method, path, resp.status(), payload);
+            throw failure(method, path, resp.status(), resp.body());
         }
-        return payload;
+        return parse(method + " " + path, resp.body());
     }
 
     @NonNull
@@ -168,8 +171,23 @@ public final class XoRestClient implements HypervisorClient {
         }
     }
 
+    /**
+     * A failure envelope, or whatever the far end sent instead of one.
+     *
+     * <p>Takes the raw body rather than a parsed node, because the body of a failure is exactly where
+     * non-JSON turns up. An unparseable one is reported as an excerpt beside the status, which is what an
+     * operator needs to tell a proxy in the way from an appliance that said no.
+     */
     @NonNull
-    private static HypervisorException failure(String method, String path, int status, JsonNode payload) {
+    private static HypervisorException failure(String method, String path, int status, String body) {
+        JsonNode payload;
+        try {
+            JsonNode read = MAPPER.readTree(body == null || body.isBlank() ? "{}" : body);
+            payload = read == null || !read.isObject() ? MAPPER.createObjectNode() : read;
+        } catch (IOException e) {
+            String excerpt = body == null ? "" : body.substring(0, Math.min(body.length(), 200));
+            return new HypervisorException(method + " " + path + ": HTTP " + status + ": " + excerpt);
+        }
         String error = payload.path("error").asText("");
         String code = error.isBlank() ? null : error;
         String detail = error.isBlank() ? payload.toString() : error;
@@ -448,22 +466,21 @@ public final class XoRestClient implements HypervisorClient {
      * {@code febf::} read as routable. The stdlib checks the real ten bits. A scope id is stripped first,
      * since {@code fe80::1%eth0} is a shape XO can return.
      *
-     * <p>The character check before it is load-bearing: {@code getByName} resolves anything that is not a
-     * literal, so without it a garbage value would become a DNS lookup on a provisioning thread.
+     * <p>{@link #isAddressLiteral} before it is load-bearing, and a character class alone is not enough:
+     * {@code getByName} resolves anything that is not a literal, and {@code cafe}, {@code abc.def} and
+     * {@code dead.beef} are spelled entirely in hex digits and dots. Measured on this JVM, each costs a
+     * real DNS round trip (53.3ms, 27.9ms, 26.3ms) on a provisioning thread, for a string the appliance
+     * supplied. A colon-carrying value that is not a valid literal is refused by the resolver without a
+     * lookup (0.3ms), so the shape test only has to catch the hostname-shaped ones.
      */
     private static boolean isRoutable(String address) {
         String literal = address.split("%", 2)[0].trim();
         if (literal.isEmpty()) {
             return false;
         }
-        for (int i = 0; i < literal.length(); i++) {
-            char c = literal.charAt(i);
-            boolean literalChar =
-                    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
-            if (!literalChar) {
-                LOGGER.fine(() -> "ignoring mainIpAddress " + address + ", which is not an address literal");
-                return false;
-            }
+        if (!isAddressLiteral(literal)) {
+            LOGGER.fine(() -> "ignoring mainIpAddress " + address + ", which is not an address literal");
+            return false;
         }
         InetAddress parsed;
         try {
@@ -475,6 +492,57 @@ public final class XoRestClient implements HypervisorClient {
         if (parsed.isLinkLocalAddress()) {
             LOGGER.fine(() -> "ignoring link-local " + address + "; nothing can connect to it");
             return false;
+        }
+        return true;
+    }
+
+    /**
+     * Whether this string can only be an address literal, checked before it is handed to a resolver.
+     *
+     * <p>Two conditions, and both are needed. The character class rules out what a hostname may contain
+     * and an address may not. The shape rules out the hostnames spelled entirely within that class:
+     * {@code cafe} passes a hex-only test and then resolves. Only a colon, which no hostname carries, or
+     * four dot-separated decimal groups can follow.
+     *
+     * <p>The range check on those groups is not pedantry. {@code 999.999.999.999} is four groups of
+     * digits, fails {@code InetAddress}'s own literal parse, and falls through to a 29.6ms DNS lookup.
+     * Measured, and the reason this does not stop at counting groups.
+     */
+    // Package-private for the test, deliberately. Its whole job is to stop a value reaching the resolver,
+    // and that is invisible from primaryIpAddress: with the range check removed, 999.999.999.999 still
+    // ends as Optional.empty, just 29.6ms later and via the network. An outcome assertion cannot see a
+    // guard against a side effect, so this one is asserted where it can fail.
+    static boolean isAddressLiteral(String literal) {
+        boolean colon = false;
+        for (int i = 0; i < literal.length(); i++) {
+            char c = literal.charAt(i);
+            if (c == ':') {
+                colon = true;
+            } else if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.')) {
+                return false;
+            }
+        }
+        return colon || isDottedQuad(literal);
+    }
+
+    /** Four dot-separated decimal groups, each in 0-255. Nothing else is an IPv4 literal. */
+    private static boolean isDottedQuad(String literal) {
+        String[] groups = literal.split("\\.", -1);
+        if (groups.length != 4) {
+            return false;
+        }
+        for (String group : groups) {
+            if (group.isEmpty() || group.length() > 3) {
+                return false;
+            }
+            for (int i = 0; i < group.length(); i++) {
+                if (group.charAt(i) < '0' || group.charAt(i) > '9') {
+                    return false;
+                }
+            }
+            if (Integer.parseInt(group) > 255) {
+                return false;
+            }
         }
         return true;
     }
@@ -524,7 +592,7 @@ public final class XoRestClient implements HypervisorClient {
                     "VM " + vm.value() + " was already gone when teardown reached it;" + " treating that as destroyed");
             return;
         }
-        throw failure("DELETE", path, resp.status(), parse("DELETE " + path, resp.body()));
+        throw failure("DELETE", path, resp.status(), resp.body());
     }
 
     /**

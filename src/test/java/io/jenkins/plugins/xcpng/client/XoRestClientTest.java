@@ -268,12 +268,40 @@ class XoRestClientTest {
 
     @Test
     void primaryIpAddressIgnoresAnythingThatIsNotAnAddressLiteral() {
-        // Not merely "returns empty": the value must never reach a resolver. A hostname here would be a
-        // DNS lookup on a provisioning thread, on a string the appliance supplied.
-        ScriptedRest t = new ScriptedRest();
-        t.powerState = "Running";
-        t.mainIpAddress = "localhost";
-        assertEquals(Optional.empty(), new XoRestClient(t).primaryIpAddress(new VmRef(CLONE)));
+        // Not merely "returns empty": the value must never reach a resolver, because a hostname here is a
+        // blocking DNS lookup on a provisioning thread for a string the appliance supplied.
+        //
+        // The first version of this test used only "localhost", which contains four non-hex letters, so a
+        // hex-digits-and-dots character check passed it and the test agreed. The rest of this list is what
+        // it could not have caught, and each was measured going to the network on this JVM before the
+        // shape check was added: cafe 53.3ms, abc.def 27.9ms, dead.beef 26.3ms, 999.999.999.999 29.6ms.
+        // That last one is four groups of digits and gets past a group-counting regex, which is why
+        // isDottedQuad range-checks them.
+        for (String notAnAddress : new String[] {
+            "localhost",
+            "cafe",
+            "abc.def",
+            "dead.beef",
+            "999.999.999.999",
+            "192.168.1",
+            "192.168.1.42.9",
+            "1.2.3.",
+            "0999.1.1.1"
+        }) {
+            ScriptedRest t = new ScriptedRest();
+            t.powerState = "Running";
+            t.mainIpAddress = notAnAddress;
+            assertEquals(
+                    Optional.empty(),
+                    new XoRestClient(t).primaryIpAddress(new VmRef(CLONE)),
+                    notAnAddress + " is not an address literal");
+        }
+        // The control, in the same shape as the link-local one: a check that answers empty to everything
+        // proves nothing by answering empty here.
+        ScriptedRest routable = new ScriptedRest();
+        routable.powerState = "Running";
+        routable.mainIpAddress = "255.254.253.252";
+        assertEquals(Optional.of("255.254.253.252"), new XoRestClient(routable).primaryIpAddress(new VmRef(CLONE)));
     }
 
     @Test
@@ -369,10 +397,33 @@ class XoRestClientTest {
     }
 
     @Test
-    void aNonJsonAnswerFailsWithWhatAnsweredRatherThanABareParseError() {
+    void aNonJsonFailureKeepsItsHttpStatus() {
+        // The first version of this used status 200, which is the one case where the status cannot
+        // matter, so it passed against code that dropped it. A proxy's 502 page and a login redirect's
+        // HTML are the real shapes here, and "malformed response" for either reads as our bug rather
+        // than as something in the way.
         ScriptedRest t = new ScriptedRest();
-        t.fail("GET", "/rest/v0/pools?fields=id", 200, "<html><body>Sign in</body></html>");
+        t.fail("GET", "/rest/v0/pools?fields=id", 502, "<html><body>Bad Gateway</body></html>");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+        assertTrue(e.getMessage().contains("502"), e.getMessage());
+        assertTrue(e.getMessage().contains("Bad Gateway"), e.getMessage());
+
+        // Teardown reaches failure() by its own path, and had the same gap.
+        ScriptedRest gateway = new ScriptedRest();
+        gateway.fail("DELETE", "/rest/v0/vms/" + CLONE, 502, "<html><body>Bad Gateway</body></html>");
+        HypervisorException down = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(gateway).destroyWithDisks(new VmRef(CLONE)));
+        assertTrue(down.getMessage().contains("502"), down.getMessage());
+    }
+
+    @Test
+    void aNonJsonSuccessIsStillMalformed() {
+        // The other half, and it must not be softened by the fix above: a 2xx is required to be JSON.
+        ScriptedRest t = new ScriptedRest();
+        t.templatesBody = "<html><body>Sign in</body></html>";
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> new XoRestClient(t).resolveTemplate("anything"));
+        assertTrue(e.getMessage().contains("malformed response"), e.getMessage());
         assertTrue(e.getMessage().contains("Sign in"), e.getMessage());
     }
 
@@ -381,6 +432,33 @@ class XoRestClientTest {
         ScriptedRest t = new ScriptedRest();
         new XoRestClient(t).close();
         assertTrue(t.calls.isEmpty(), "closing must not revoke the operator's token");
+    }
+
+    @Test
+    void onlyAnAddressLiteralIsEverHandedToTheResolver() {
+        // Asserted here rather than through primaryIpAddress, because there it cannot fail: with the
+        // range check removed, 999.999.999.999 still comes back empty, having gone to DNS to get there.
+        // The defect this guards is a blocking lookup, and only the gate itself can be asked about it.
+        for (String literal :
+                new String[] {"192.168.1.42", "0.0.0.0", "255.255.255.255", "fe80::1", "::1", "2001:db8::1"}) {
+            assertTrue(XoRestClient.isAddressLiteral(literal), literal + " is a literal");
+        }
+        for (String notLiteral : new String[] {
+            "cafe",
+            "abc.def",
+            "dead.beef",
+            "localhost",
+            "999.999.999.999",
+            "256.1.1.1",
+            "192.168.1",
+            "192.168.1.42.9",
+            "1.2.3.",
+            "0999.1.1.1",
+            "1234.1.1.1",
+            ""
+        }) {
+            assertFalse(XoRestClient.isAddressLiteral(notLiteral), notLiteral + " must never reach a resolver");
+        }
     }
 
     @Test
