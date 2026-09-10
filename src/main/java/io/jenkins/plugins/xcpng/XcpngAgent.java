@@ -443,6 +443,15 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * teardown paths (single-use completion, idle timeout, manual delete) converge here. Failures are
      * logged rather than thrown: the node is going away regardless, and a thrown exception would only
      * leave it half-removed.
+     *
+     * <p>Three cases, decided by whether this agent carries a connection snapshot and whether the owning
+     * cloud still resolves. The snapshot supplies the client whenever it exists; the cloud supplies only
+     * the durable leaked-VM set, and only when it is still there. An agent with neither is the one case
+     * nothing can reclaim, and it is named on the build log rather than passed over quietly.
+     *
+     * <p>An agent predating the snapshot has no parameters of its own, so it falls back to the live cloud.
+     * That is the pre-#149 behaviour, kept because for such an agent it is the only thing available, not
+     * because it is right.
      */
     @Override
     protected void _terminate(TaskListener listener) {
@@ -461,14 +470,57 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
             return;
         }
         XcpngCloud cloud = getCloud();
-        if (cloud == null) {
-            terminateWithoutCloud(listener, vmRef);
+        // The connection snapshot, not the live cloud, decides how this VM is reached. The two agree in the
+        // ordinary case and the snapshot is right whenever they do not: a VM belongs to the configuration it
+        // was created under, and an administrator editing a running cloud does not move it. The backend is
+        // where that matters most, because the handle itself is backend-shaped -- XapiClient's refs are
+        // OpaqueRef strings and XoRestClient's are uuids -- so a cloud flipped from XO to XAPI mid-build
+        // would hand an XO handle to XAPI, fail, and strand the VM. The same reasoning covers poolUrl and
+        // credentialsId: a cloud repointed at another pool must not have this VM's destroy aimed at it.
+        //
+        // The cloud is still consulted for one thing, and only when it exists: recording the leak.
+        boolean fromSnapshot = poolUrl != null;
+        if (!fromSnapshot && cloud == null) {
+            LOGGER.log(
+                    Level.SEVERE,
+                    () -> "Cloud '" + cloudName + "' is gone and agent " + getNodeName()
+                            + " predates the connection snapshot, so VM " + vmRef
+                            + " cannot be destroyed; reclaim it with tools/reaper.py");
+            listener.getLogger()
+                    .println("XCP-ng cloud '" + cloudName + "' not found and this agent holds no connection"
+                            + " details; VM " + vmRef + " is orphaned. Reclaim it with tools/reaper.py.");
             return;
         }
-        listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
-        try (HypervisorClient client = cloud.openClient()) {
+        if (cloud == null) {
+            LOGGER.log(
+                    Level.WARNING,
+                    () -> "Cloud '" + cloudName + "' is gone; destroying VM " + vmRef + " for agent "
+                            + getNodeName()
+                            + " from the connection snapshot taken when it was provisioned");
+            listener.getLogger()
+                    .println("XCP-ng cloud '" + cloudName + "' not found; destroying VM " + vmRef
+                            + " from this agent's connection snapshot.");
+        } else {
+            listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
+        }
+        try (HypervisorClient client = fromSnapshot ? openClientFromSnapshot() : cloud.openClient()) {
             client.destroyWithDisks(new VmRef(vmRef));
         } catch (RuntimeException e) {
+            if (cloud == null) {
+                // Nothing downstream can recover this one: the durable leaked-VM set lives on the cloud that
+                // no longer exists, so say so on the build log rather than recording it nowhere.
+                LOGGER.log(
+                        Level.SEVERE,
+                        e,
+                        () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName() + " after cloud '"
+                                + cloudName + "' was removed; no cloud remains to retry it, so reclaim the VM with"
+                                + " tools/reaper.py");
+                listener.getLogger()
+                        .println("Failed to destroy VM " + vmRef + " and cloud '" + cloudName
+                                + "' is gone, so it cannot be retried: " + e.getMessage()
+                                + ". Reclaim it with tools/reaper.py.");
+                return;
+            }
             // The base class removes this node in a finally regardless of what happens here, so once we
             // return nothing in Jenkins references vmRef any more: a swallowed failure would leak the VM
             // and its disks for the controller's whole life. Hand the ref to the cloud's durable orphan set
@@ -486,62 +538,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     }
 
     /**
-     * Destroy the VM without an owning cloud to ask, using the connection snapshot taken at provision time.
-     *
-     * <p>The cloud being gone is not an edge case an administrator has to go looking for: deleting a cloud
-     * while its agents run does it, and so does renaming one, since the node holds a name and the UI replaces
-     * the instance under the new one. Before the snapshot existed this method's predecessor logged a warning
-     * and returned, and because the base class removes the node in a {@code finally} either way, that return
-     * dropped the last reference to {@link #vmRef} — one VM and its copy-on-write disks stranded on the pool
-     * per running agent, recoverable only by hand with {@code tools/reaper.py}.
-     *
-     * <p>Two cases still strand the VM, and both are logged at SEVERE and named on the build log because
-     * nothing downstream can recover them: an agent persisted before the snapshot existed, which reloads with
-     * no parameters to connect with, and a snapshot that no longer opens — its credential deleted from the
-     * store, or the pool unreachable. The cloud's durable leaked-VM set cannot stand in for either, since
-     * {@link XcpngCloud#recordLeakedVm} lives on the very cloud that no longer exists.
-     */
-    private void terminateWithoutCloud(TaskListener listener, @NonNull String vmRef) {
-        if (poolUrl == null) {
-            LOGGER.log(
-                    Level.SEVERE,
-                    () -> "Cloud '" + cloudName + "' is gone and agent " + getNodeName()
-                            + " predates the connection snapshot, so VM " + vmRef
-                            + " cannot be destroyed; reclaim it with tools/reaper.py");
-            listener.getLogger()
-                    .println("XCP-ng cloud '" + cloudName + "' not found and this agent holds no connection"
-                            + " details; VM " + vmRef + " is orphaned. Reclaim it with tools/reaper.py.");
-            return;
-        }
-        LOGGER.log(
-                Level.WARNING,
-                () -> "Cloud '" + cloudName + "' is gone; destroying VM " + vmRef + " for agent " + getNodeName()
-                        + " from the connection snapshot taken when it was provisioned");
-        listener.getLogger()
-                .println("XCP-ng cloud '" + cloudName + "' not found; destroying VM " + vmRef
-                        + " from this agent's connection snapshot.");
-        try (HypervisorClient client = openClientFromSnapshot()) {
-            client.destroyWithDisks(new VmRef(vmRef));
-        } catch (RuntimeException e) {
-            LOGGER.log(
-                    Level.SEVERE,
-                    e,
-                    () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName() + " after cloud '"
-                            + cloudName + "' was removed; no cloud remains to retry it, so reclaim the VM with"
-                            + " tools/reaper.py");
-            listener.getLogger()
-                    .println("Failed to destroy VM " + vmRef + " and cloud '" + cloudName
-                            + "' is gone, so it cannot be retried: " + e.getMessage()
-                            + ". Reclaim it with tools/reaper.py.");
-        }
-    }
-
-    /**
      * Open a session to the pool from this agent's connection snapshot. Production resolves the credential
-     * from the store and builds an {@code XapiClient} through the same helper {@link XcpngCloud#openClient()}
-     * uses, so the two paths cannot differ on TLS trust or credential scoping; a test injects a fake through
-     * {@link #setConnectionClientFactory} and asserts the snapshot it receives. The caller owns the returned
-     * client and must close it.
+     * from the store and builds the client this agent's snapshotted backend names, through the same helper
+     * {@link XcpngCloud#openClient()} uses, so the two paths cannot differ on TLS trust or credential
+     * scoping; a test injects a fake through {@link #setConnectionClientFactory} and asserts the snapshot it
+     * receives. The caller owns the returned client and must close it.
+     *
+     * <p>This is now every teardown's client, not only the one for a cloud that has gone away. See
+     * {@link #_terminate} for why the snapshot outranks the live cloud.
      */
     @NonNull
     private HypervisorClient openClientFromSnapshot() {

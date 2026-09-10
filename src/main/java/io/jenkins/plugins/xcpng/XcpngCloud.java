@@ -569,7 +569,18 @@ public class XcpngCloud extends Cloud {
             throws Descriptor.FormException, IOException {
         // The cloud itself, not just its name: the agent snapshots this cloud's connection parameters so it
         // can still destroy its VM if the cloud is later deleted or renamed.
-        return new XcpngAgent(displayName, this, template, idleMinutes, activityId, warm);
+        XcpngAgent agent = new XcpngAgent(displayName, this, template, idleMinutes, activityId, warm);
+        if (clientFactory != null) {
+            // Carry the test seam into the snapshot alongside everything else it holds. Teardown opens from
+            // the agent's own snapshot on every path now, so without this an agent built by a faked cloud
+            // could not reach that fake to destroy anything -- and warm spares are built here, inside
+            // reconcileWarmPool, where no test can reach in and wire one up afterwards. Null in production,
+            // and the field it lands in is transient, so nothing about this is persisted.
+            HypervisorClientFactory seam = clientFactory;
+            agent.setConnectionClientFactory(
+                    (poolUrl, credentialsId, certificateFingerprint, backend) -> seam.open(this));
+        }
+        return agent;
     }
 
     /**

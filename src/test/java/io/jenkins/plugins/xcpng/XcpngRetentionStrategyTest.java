@@ -420,6 +420,11 @@ class XcpngRetentionStrategyTest {
         XcpngCloud cloud = cloudBackedBy(r, fake);
         XcpngAgent provisioned = agent(cloud, "xcpng-agent-1", false);
         XcpngAgent reloaded = (XcpngAgent) Jenkins.XSTREAM2.fromXML(Jenkins.XSTREAM2.toXML(provisioned));
+        // The client factory is transient by design, so the round trip drops the one agent() installed and
+        // this instance has to be wired again. Production needs no equivalent: a reloaded agent resolves its
+        // credential from the store through the snapshot, which is what the snapshot is for.
+        reloaded.setConnectionClientFactory(
+                (poolUrl, credentialsId, certificateFingerprint, backend) -> cloud.openClient());
         r.jenkins.addNode(reloaded);
         AbstractCloudComputer<?> computer = assertInstanceOf(AbstractCloudComputer.class, reloaded.toComputer());
 
@@ -765,6 +770,49 @@ class XcpngRetentionStrategyTest {
         assertTrue(
                 cloud.leakedVmRefs().contains(agent.getVmRef()),
                 "a failed destroy must record the VM as leaked for later reclamation: " + cloud.leakedVmRefs());
+    }
+
+    /**
+     * An administrator changes a live cloud's backend while an agent provisioned from it is still running.
+     * The cloud is still there, so this is not the cloud-gone path; teardown must still reach the backend
+     * the VM was created under.
+     *
+     * <p>This is the case that made the snapshot outrank the live cloud on every path rather than only when
+     * the cloud has been deleted. A VM handle is backend-shaped -- {@code XapiClient} hands out
+     * {@code OpaqueRef:...} strings and {@code XoRestClient} hands out uuids -- so destroying an XO-created
+     * VM over XAPI cannot work even in principle. It fails, the node goes away regardless, and the clone and
+     * its disks stay on the pool.
+     *
+     * <p>The same argument covers {@code poolUrl} and {@code credentialsId}, and a cloud repointed at another
+     * pool is the likelier version of it in practice. The backend is the one that cannot even fail politely.
+     */
+    @Test
+    void teardownUsesTheSnapshottedBackendAfterTheLiveCloudIsChanged(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        cloud.setBackend(XcpngBackend.XO);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        RecordingConnectionFactory connections = new RecordingConnectionFactory(fake);
+        agent.setConnectionClientFactory(connections);
+
+        // The cloud stays registered. Only its backend changes, which is what separates this from the
+        // cloud-gone tests below: getCloud() still resolves, and the old code took the live cloud's word.
+        cloud.setBackend(XcpngBackend.XAPI);
+
+        agent.terminate();
+
+        assertEquals(
+                XcpngBackend.XO,
+                connections.backend,
+                "teardown must speak the backend the VM was created under, not the cloud's current one");
+        assertEquals(1, connections.opens, "teardown must open exactly one client, and it must be the snapshot's");
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                "the VM must still be destroyed: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(),
+                "a destroy that succeeded must record nothing as leaked: " + cloud.leakedVmRefs());
     }
 
     // ---- Teardown once the owning cloud no longer resolves ----

@@ -182,10 +182,12 @@ stick:
   retired key is still accepted so the document keeps loading, but it does nothing, and an edit made
   through the UI would be overwritten on the next reload.
 
-Leave `certificateFingerprint` empty for a pool whose certificate chains to a CA the controller
-trusts. For a stock pool, set it to that pool's SHA-256 certificate fingerprint, which you can read on
-the host with `openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256`. Colons are
-optional and case does not matter. See [Security notes](#security-notes).
+Leave `certificateFingerprint` empty when the certificate chains to a CA the controller trusts.
+Otherwise set it to the SHA-256 fingerprint of whichever host `poolUrl` names. On a stock XCP-ng pool
+you can read it on the host with
+`openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256`; under the `XO` backend it
+is the appliance's certificate, and **Test connection** reports whatever the host actually presented
+either way. Colons are optional and case does not matter. See [Security notes](#security-notes).
 
 A document that names no `backend` gets `XAPI`, so an existing configuration needs no edit. To select
 the other one, add `backend: XO` beside `poolUrl` and point `credentialsId` at a secret-text
@@ -204,7 +206,7 @@ Cloud fields:
 | Backend | `backend` | Which API this cloud speaks: `XAPI` (the default, direct to a pool master) or `XO` (a Xen Orchestra appliance's REST API, requiring XO 6.5.0 or newer). Optional; an absent value is `XAPI`. See [Backends](#backends). |
 | Pool URL | `poolUrl` | Base URL of the XCP-ng pool master, for example `https://192.168.1.87`. With the `XO` backend this is the appliance's URL instead. Do not embed credentials in the URL. |
 | Credentials | `credentialsId` | ID of the credential used to authenticate: a username/password credential for `XAPI`, a secret-text credential holding an XO authentication token for `XO`. |
-| Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the pool is expected to present, with or without colons. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; a stock XCP-ng pool is self-signed and needs its fingerprint here. Once set, only that exact certificate is accepted. |
+| Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the host at **Pool URL** is expected to present, with or without colons: the XCP-ng pool under the `XAPI` backend, the Xen Orchestra appliance under `XO`. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; a stock XCP-ng pool is self-signed and needs its fingerprint here. Once set, only that exact certificate is accepted. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
 | Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
 | Templates | `templates` | One or more agent templates (see below). |
