@@ -98,10 +98,19 @@ class XcpngRetentionStrategyTest {
 
         private final HypervisorClient client;
         private final RuntimeException failure;
-        private String poolUrl;
-        private String credentialsId;
-        private String certificateFingerprint;
-        private int opens;
+
+        // Volatile because the write and the read are not guaranteed to be on one thread: the factory is
+        // called from whichever thread runs the teardown, and asserted on from the test thread. Without
+        // it a stale read is legal, and it would look exactly like the snapshot having lost the value.
+        private volatile String poolUrl;
+
+        private volatile String credentialsId;
+
+        private volatile String certificateFingerprint;
+
+        private volatile XcpngBackend backend;
+
+        private volatile int opens;
 
         /** A factory that always answers with {@code client}, for the paths where the fallback succeeds. */
         RecordingConnectionFactory(HypervisorClient client) {
@@ -116,10 +125,12 @@ class XcpngRetentionStrategyTest {
 
         /** Record the snapshot, then answer with the fake or throw, whichever this factory was built for. */
         @Override
-        public HypervisorClient open(String poolUrl, String credentialsId, String certificateFingerprint) {
+        public HypervisorClient open(
+                String poolUrl, String credentialsId, String certificateFingerprint, XcpngBackend backend) {
             this.poolUrl = poolUrl;
             this.credentialsId = credentialsId;
             this.certificateFingerprint = certificateFingerprint;
+            this.backend = backend;
             opens++;
             if (failure != null) {
                 throw failure;
@@ -791,7 +802,45 @@ class XcpngRetentionStrategyTest {
                 PINNED_FINGERPRINT,
                 connections.certificateFingerprint,
                 "the fallback must carry the snapshotted certificate fingerprint");
+        assertEquals(XcpngBackend.XAPI, connections.backend, "the fallback must speak the snapshotted backend");
         assertFalse(r.jenkins.getNodes().contains(agent), "the node must still be removed");
+    }
+
+    /**
+     * The same fallback on an XO-backed cloud has to reach XO, and this is the assertion the backend
+     * snapshot exists for. XAPI is the default, so a snapshot that dropped the field, or a fallback that
+     * ignored it, would open an XAPI session -- against an appliance URL, with a token credential XAPI
+     * cannot authenticate with. Teardown would fail and the clone and its disks would stay on the pool.
+     *
+     * <p>Deliberately not folded into the test above as a second assertion: the two differ in the value
+     * being carried, and a single test parameterised over it would still have run against one cloud. The
+     * sibling above pins XAPI, which is the value a dropped field decays to, so only this one can fail
+     * when the field goes missing.
+     */
+    @Test
+    void theFallbackSpeaksTheBackendTheCloudWasConfiguredWith(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        cloud.setBackend(XcpngBackend.XO);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-xo", false);
+        r.jenkins.addNode(agent);
+        // Two assertions on the same value, split on purpose so a failure says which half broke: the
+        // snapshot not carrying the backend, or the fallback not using what it carried. Without this one
+        // the test can only report the second, and the first is where the field could go missing.
+        assertEquals(XcpngBackend.XO, agent.getBackend(), "the snapshot must carry the cloud's backend");
+        RecordingConnectionFactory connections = new RecordingConnectionFactory(fake);
+        agent.setConnectionClientFactory(connections);
+
+        r.jenkins.clouds.remove(cloud);
+
+        assertDoesNotThrow(agent::terminate, "terminating an XO-backed agent whose cloud is gone must not throw");
+        assertEquals(
+                XcpngBackend.XO,
+                connections.backend,
+                "an agent provisioned over XO must be torn down over XO, not over the default");
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                "a deleted XO-backed cloud must not strand the VM: " + fake.calls());
     }
 
     /**

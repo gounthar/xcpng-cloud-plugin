@@ -64,7 +64,7 @@ class XcpngFormValidationGuardTest {
                 new NamedCheck("doCheckPoolUrl", () -> cloud.doCheckPoolUrl("https://pool.example.test")),
                 new NamedCheck(
                         "doCheckTemplateName",
-                        () -> tpl.doCheckTemplateName("jenkins-agent-debian13", null, null, null)),
+                        () -> tpl.doCheckTemplateName("jenkins-agent-debian13", null, null, null, null)),
                 new NamedCheck("doCheckLabelString", () -> tpl.doCheckLabelString("xcpng-linux")),
                 new NamedCheck("doCheckNumCpus", () -> tpl.doCheckNumCpus("2")),
                 new NamedCheck("doCheckMemoryMb", () -> tpl.doCheckMemoryMb("2048")),

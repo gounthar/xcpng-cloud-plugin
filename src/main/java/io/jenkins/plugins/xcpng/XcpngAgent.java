@@ -131,6 +131,22 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private final String certificateFingerprint;
 
     /**
+     * Which API the owning cloud spoke, snapshotted for the same reason as the three fields above: an
+     * agent whose cloud has been deleted or renamed still has to tear its VM down, and it cannot ask the
+     * cloud which backend to use.
+     *
+     * <p>This is the field that makes the snapshot correct rather than merely present. Without it a clone
+     * provisioned by an XO-backed cloud would be torn down over XAPI once the cloud was gone -- against an
+     * appliance URL, with a token credential that XAPI cannot authenticate with -- and the VM would leak.
+     *
+     * <p>Null on an agent persisted before this field existed, which {@link XcpngBackend#resolve} reads as
+     * XAPI. That is the right default and not merely a convenient one: every agent that predates this
+     * field was provisioned by the only backend there was.
+     */
+    @CheckForNull
+    private final XcpngBackend backend;
+
+    /**
      * The cloud-stats provisioning activity this agent belongs to. Serialisable and persisted with the
      * node so a controller restart keeps the correlation; {@link #getId()} hands it to cloud-stats.
      */
@@ -225,6 +241,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.poolUrl = cloud.getPoolUrl();
         this.credentialsId = cloud.getCredentialsId();
         this.certificateFingerprint = cloud.getCertificateFingerprint();
+        this.backend = cloud.getBackend();
     }
 
     /** The VM this agent runs on, as an opaque backend handle, or null while it has none yet. */
@@ -529,10 +546,19 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @NonNull
     private HypervisorClient openClientFromSnapshot() {
         if (connectionClientFactory != null) {
-            return connectionClientFactory.open(poolUrl, credentialsId, certificateFingerprint);
+            return connectionClientFactory.open(poolUrl, credentialsId, certificateFingerprint, getBackend());
         }
         return XcpngCloud.openClient(
-                poolUrl, credentialsId, certificateFingerprint, "the removed cloud '" + cloudName + "'");
+                poolUrl, credentialsId, certificateFingerprint, getBackend(), "the removed cloud '" + cloudName + "'");
+    }
+
+    /**
+     * The backend this agent's VM was provisioned over. Never null: an agent persisted before the
+     * snapshot carried a backend reads as XAPI, which is the only one that existed then.
+     */
+    @NonNull
+    public XcpngBackend getBackend() {
+        return XcpngBackend.resolve(backend);
     }
 
     /** Test seam: replace how the cloud-gone fallback opens a client with an in-memory fake. */
@@ -558,12 +584,15 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
          * @param credentialsId the snapshotted credential ID, resolved against the store by the caller.
          * @param certificateFingerprint the pinned certificate fingerprint the removed cloud used, or
          *     null for ordinary verification against the JVM trust store.
+         * @param backend which API the removed cloud spoke. Resolved before it gets here, so it is never
+         *     null: a test asserting the snapshot survived provisioning can compare it directly.
          */
         @NonNull
         HypervisorClient open(
                 @CheckForNull String poolUrl,
                 @CheckForNull String credentialsId,
-                @CheckForNull String certificateFingerprint);
+                @CheckForNull String certificateFingerprint,
+                @NonNull XcpngBackend backend);
     }
 
     @Extension

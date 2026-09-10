@@ -265,7 +265,7 @@ class XcpngCloudTest {
     @Test
     void testConnectionRejectsMalformedUrlBeforeConnecting(JenkinsRule r) {
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
-        FormValidation v = d.doTestConnection("192.168.1.87", "", null);
+        FormValidation v = d.doTestConnection("192.168.1.87", "", null, null);
         assertEquals(FormValidation.Kind.ERROR, v.kind);
         assertTrue(v.getMessage().contains("http"), v.getMessage());
     }

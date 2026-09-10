@@ -93,21 +93,56 @@ restart, old spare destroyed 10 min 45 s after it reconnected.
   unreachable, a clone never connects and is destroyed after the connect timeout.
 - XAPI credentials stored in Jenkins as a username/password credential.
 
+The plugin can also talk to the pool through a **Xen Orchestra** appliance instead of XAPI. That
+backend is selectable per cloud, needs **XO 6.5.0 or newer**, and authenticates with a secret-text
+credential holding an XO authentication token rather than a username and password. It is new: it has
+not yet been through the lab scenarios the XAPI backend was released on, and XAPI remains the default.
+See [Backends](#backends).
+
 ## Configuration
 
 ### Through the UI
 
 1. **Manage Jenkins** then **Clouds**, and add a new **XCP-ng Cloud**.
-2. Set the **Pool URL** (for example `https://192.168.1.87`) and select the XAPI **Credentials**.
-3. Leave **Certificate fingerprint** empty and press **Test connection**. If the pool's certificate is
+2. Leave **Backend** on `XAPI (direct to the pool)` unless you are deliberately exercising the Xen
+   Orchestra one; see [Backends](#backends).
+3. Set the **Pool URL** (for example `https://192.168.1.87`) and select the XAPI **Credentials**.
+4. Leave **Certificate fingerprint** empty and press **Test connection**. If the pool's certificate is
    signed by a CA the controller already trusts, it connects and there is nothing more to do. XCP-ng
    ships a self-signed certificate, so the usual answer is that the result shows you the SHA-256
    fingerprint the pool presented. Check it against the pool itself, then paste it into the field. See
    [Security notes](#security-notes).
-4. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
+5. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
    the shape of the agents cloned from it. At least one label is required, and labels are how builds
    reach these agents: give the jobs you want on XCP-ng a matching label expression.
-5. Use **Test connection** to confirm the controller can authenticate against the pool.
+6. Use **Test connection** to confirm the controller can authenticate against the pool.
+
+### Backends
+
+A cloud speaks one of two APIs, chosen by its **Backend** field:
+
+| Backend | Symbol | Talks to | Credential |
+| --- | --- | --- | --- |
+| XAPI (direct to the pool) | `XAPI` | A pool master, over JSON-RPC. No appliance needed. | Username/password |
+| Xen Orchestra REST API | `XO` | An XO appliance's `/rest/v0`, which reaches the pool for you. | Secret text (an XO authentication token) |
+
+`XAPI` is the default and is what every existing configuration keeps, including one that names no
+backend at all.
+
+Three things to know before switching a cloud to `XO`:
+
+- **Pool URL means the appliance**, not the pool master.
+- **The credential kind changes with the backend.** A username/password credential cannot authenticate
+  against XO, and a token cannot authenticate against XAPI. The credential dropdown deliberately offers
+  both kinds whichever backend is selected, so that changing the backend can never leave you looking at
+  a list with none of the right kind in it. Picking the wrong one is caught by **Test connection**,
+  which names the kind the backend needs, and by the first provision.
+- **XO 6.5.0 or newer is required.** That release added `PATCH /vms/{id}`, the route the plugin uses to
+  seed a clone. Against an older appliance the seed fails as a 404.
+
+The XO backend is staging for a migration rather than a permanent second option: the intent is for it
+to become the only backend and for the XAPI client to be removed. Until it has been through the lab
+scenarios the XAPI backend was released on, prefer XAPI.
 
 ### Through Configuration as Code
 
@@ -152,8 +187,12 @@ trusts. For a stock pool, set it to that pool's SHA-256 certificate fingerprint,
 the host with `openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256`. Colons are
 optional and case does not matter. See [Security notes](#security-notes).
 
-The exported configuration never contains the XAPI password; it holds only the credential ID, which
-the controller resolves at the point of use.
+A document that names no `backend` gets `XAPI`, so an existing configuration needs no edit. To select
+the other one, add `backend: XO` beside `poolUrl` and point `credentialsId` at a secret-text
+credential; see [Backends](#backends).
+
+The exported configuration never contains the XAPI password or the XO token; it holds only the
+credential ID, which the controller resolves at the point of use.
 
 ### Configuration reference
 
@@ -162,8 +201,9 @@ Cloud fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Name | `name` | Display name for this cloud. |
-| Pool URL | `poolUrl` | Base URL of the XCP-ng pool master, for example `https://192.168.1.87`. Do not embed credentials in the URL. |
-| Credentials | `credentialsId` | ID of the username/password credential used for XAPI login. |
+| Backend | `backend` | Which API this cloud speaks: `XAPI` (the default, direct to a pool master) or `XO` (a Xen Orchestra appliance's REST API, requiring XO 6.5.0 or newer). Optional; an absent value is `XAPI`. See [Backends](#backends). |
+| Pool URL | `poolUrl` | Base URL of the XCP-ng pool master, for example `https://192.168.1.87`. With the `XO` backend this is the appliance's URL instead. Do not embed credentials in the URL. |
+| Credentials | `credentialsId` | ID of the credential used to authenticate: a username/password credential for `XAPI`, a secret-text credential holding an XO authentication token for `XO`. |
 | Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the pool is expected to present, with or without colons. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; a stock XCP-ng pool is self-signed and needs its fingerprint here. Once set, only that exact certificate is accepted. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
 | Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
