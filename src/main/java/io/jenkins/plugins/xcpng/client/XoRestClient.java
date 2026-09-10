@@ -182,8 +182,12 @@ public final class XoRestClient implements HypervisorClient {
     private static HypervisorException failure(String method, String path, int status, String body) {
         JsonNode payload;
         try {
+            // Any valid JSON is kept, object or not. The "collapse a non-object" guard that was here is a
+            // port of tools/xapi.py's, where `"error" in payload` raises TypeError on a bare scalar. Java
+            // does not need it: JsonNode.path answers a missing node for a field on an array or a scalar.
+            // It cost the diagnostic instead, turning a 502 body of ["Bad Gateway"] into "HTTP 502: {}".
             JsonNode read = MAPPER.readTree(body == null || body.isBlank() ? "{}" : body);
-            payload = read == null || !read.isObject() ? MAPPER.createObjectNode() : read;
+            payload = read == null ? MAPPER.createObjectNode() : read;
         } catch (IOException e) {
             String excerpt = body == null ? "" : body.substring(0, Math.min(body.length(), 200));
             return new HypervisorException(method + " " + path + ": HTTP " + status + ": " + excerpt);

@@ -417,6 +417,25 @@ class XoRestClientTest {
     }
 
     @Test
+    void aValidJsonFailureBodyThatIsNotAnObjectKeepsItsDiagnostic() {
+        // A gateway or a middlebox can answer valid JSON that is not an envelope. Collapsing those to {}
+        // left "HTTP 502: {}", which names the status and throws away the only line saying what refused.
+        for (String body : new String[] {"[\"Bad Gateway\"]", "\"Bad Gateway\"", "{\"detail\":\"Bad Gateway\"}"}) {
+            ScriptedRest t = new ScriptedRest();
+            t.fail("GET", "/rest/v0/pools?fields=id", 502, body);
+            HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+            assertTrue(e.getMessage().contains("502"), e.getMessage());
+            assertTrue(e.getMessage().contains("Bad Gateway"), body + " -> " + e.getMessage());
+        }
+        // The envelope shape must still win, or the above could pass by reporting every body verbatim.
+        ScriptedRest enveloped = new ScriptedRest();
+        enveloped.fail("GET", "/rest/v0/pools?fields=id", 409, "{\"error\":\"incorrect state\",\"data\":[\"VM\"]}");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(enveloped).ping());
+        assertEquals("incorrect state", e.getErrorCode());
+        assertEquals(List.of("VM"), e.getErrorParams());
+    }
+
+    @Test
     void aNonJsonSuccessIsStillMalformed() {
         // The other half, and it must not be softened by the fix above: a 2xx is required to be JSON.
         ScriptedRest t = new ScriptedRest();
