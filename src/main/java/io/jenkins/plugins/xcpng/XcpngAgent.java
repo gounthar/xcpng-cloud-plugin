@@ -187,10 +187,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private transient volatile boolean reloaded;
 
     /**
-     * How a client is opened from the {@link #poolUrl} snapshot when the owning cloud is gone. Null in
-     * production, where {@link #openClientFromSnapshot(boolean)} builds an {@code XapiClient} through
-     * {@link XcpngCloud#openClient(String, String, String, String)}; a test injects an in-memory fake and
-     * asserts the snapshot it was handed. Transient: behaviour, not configuration, and never persisted.
+     * How a client is opened from the {@link #poolUrl} snapshot. Null in production, where
+     * {@link #openClientFromSnapshot(boolean)} builds the client this agent's backend names through
+     * {@link XcpngCloud#openClient(String, String, String, XcpngBackend, String)}; a test injects an
+     * in-memory fake and asserts the snapshot it was handed. Transient: behaviour, not configuration,
+     * and never persisted.
      */
     private transient ConnectionClientFactory connectionClientFactory;
 
