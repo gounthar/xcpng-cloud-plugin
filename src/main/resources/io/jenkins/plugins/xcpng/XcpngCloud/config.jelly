@@ -3,6 +3,9 @@
   <f:entry title="${%Name}" field="name">
     <f:textbox default="xcpng"/>
   </f:entry>
+  <f:entry title="${%Backend}" field="backend">
+    <f:select default="XAPI"/>
+  </f:entry>
   <f:entry title="${%Pool URL}" field="poolUrl">
     <f:textbox/>
   </f:entry>
@@ -22,5 +25,5 @@
     <f:repeatableHeteroProperty field="templates" hasHeader="true" addCaption="${%Add template}"/>
   </f:entry>
   <f:validateButton title="${%Test connection}" progress="${%Testing...}"
-                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint"/>
+                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint,backend"/>
 </j:jelly>
