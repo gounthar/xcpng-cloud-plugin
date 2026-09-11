@@ -1,7 +1,9 @@
 <div>
-  The SHA-256 fingerprint of the certificate this pool presents, as 32 hexadecimal pairs. Colons are
-  optional and case does not matter, so a value pasted from
-  <code>openssl x509 -fingerprint -sha256</code> or from a browser's certificate viewer is accepted as-is.
+  The SHA-256 fingerprint of the certificate presented by whichever host <em>Pool URL</em> names, as 32
+  hexadecimal pairs. Under the <code>XAPI</code> backend that is the XCP-ng pool; under
+  <code>Xen Orchestra REST API</code> it is the appliance. Colons are optional and case does not matter, so a
+  value pasted from <code>openssl x509 -fingerprint -sha256</code> or from a browser's certificate viewer is
+  accepted as-is.
   <p>
     Leave it empty if the pool's certificate is signed by a certificate authority the controller's JVM
     already trusts. XCP-ng ships a self-signed certificate, so a stock pool is not that case and needs its
@@ -9,8 +11,8 @@
   </p>
   <p>
     <strong>To find it:</strong> leave this empty and press <em>Test connection</em>. If the certificate is
-    not trusted, the result shows the fingerprint the pool presented. Check it against the pool itself
-    &mdash; on the host, <code>openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256</code>
+    not trusted, the result shows the fingerprint the host presented. Check it against that host itself
+    &mdash; on an XCP-ng pool, <code>openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256</code>
     &mdash; then paste it here and test again. Reading the fingerprint does not complete the connection:
     the certificate is inspected and refused, so no credential is sent to a host that has not been confirmed.
   </p>

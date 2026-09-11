@@ -1,0 +1,27 @@
+<div>
+  Which API this cloud speaks.
+  <dl>
+    <dt><code>XAPI (direct to the pool)</code></dt>
+    <dd>
+      JSON-RPC straight to a pool master. Needs no Xen Orchestra appliance, and authenticates with a
+      <b>username and password</b> credential. This is the default and what every existing configuration
+      keeps.
+    </dd>
+    <dt><code>Xen Orchestra REST API</code></dt>
+    <dd>
+      The <code>/rest/v0</code> API on an XO appliance in front of the pool. <b>Requires XO 6.5.0 or
+      newer</b> &mdash; the release that added <code>PATCH /vms/{id}</code>, which the plugin needs to seed
+      a clone. Against an older appliance the seed fails as a 404. Authenticates with a
+      <b>secret-text</b> credential holding an XO authentication token, not a username and password.
+    </dd>
+  </dl>
+  <p>
+    <b>Pool URL</b> means the appliance when this is set to Xen Orchestra, not the pool master. The
+    credential kind changes with the backend, so switching this normally means selecting a different
+    credential too; <b>Test connection</b> says so if the pair does not match.
+  </p>
+  <p>
+    The XO backend is new and has not yet been through the lab scenarios the XAPI one was released on.
+    Prefer XAPI unless you are helping to exercise it.
+  </p>
+</div>
