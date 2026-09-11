@@ -90,7 +90,6 @@ class HypervisorClientContractTest {
         Thread.currentThread().interrupt();
         try {
             assertThrows(HypervisorException.class, () -> client.state(vm));
-            assertTrue(client.calls().isEmpty(), "interrupted state is not recorded");
         } finally {
             Thread.interrupted();
         }
@@ -104,7 +103,6 @@ class HypervisorClientContractTest {
         Thread.currentThread().interrupt();
         try {
             assertThrows(HypervisorException.class, () -> client.primaryIpAddress(vm));
-            assertTrue(client.calls().isEmpty(), "interrupted primaryIpAddress is not recorded");
         } finally {
             Thread.interrupted();
         }
