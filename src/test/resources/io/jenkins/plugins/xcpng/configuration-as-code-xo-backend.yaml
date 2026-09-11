@@ -1,0 +1,19 @@
+# A cloud that speaks the Xen Orchestra REST API instead of XAPI. The backend is an ordinary
+# @DataBoundSetter, so nothing plugin-specific binds it; this fixture is here because an omitted value
+# and a value of "XAPI" are indistinguishable in every other document, and only a non-default one can
+# show that the choice actually crosses the YAML boundary.
+#
+# The value is quoted here deliberately, where the README documents it unquoted: a quoted scalar has to
+# bind to the enum as well, and export emits it bare either way.
+jenkins:
+  clouds:
+    - xcpng:
+        name: "xo-lab"
+        backend: "XO"
+        poolUrl: "https://192.168.1.5"
+        credentialsId: "xo-token"
+        certificateFingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+        maxInstances: 3
+        templates:
+          - templateName: "jenkins-agent-debian13"
+            labelString: "xcpng-linux"

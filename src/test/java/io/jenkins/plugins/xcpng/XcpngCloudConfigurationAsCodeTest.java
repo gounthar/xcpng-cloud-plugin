@@ -474,6 +474,34 @@ class XcpngCloudConfigurationAsCodeTest {
         ConfigurationAsCode.get().configure(getClass().getResource(YAML).toExternalForm());
     }
 
+    /**
+     * A document naming the XO backend binds it, and exports it back.
+     *
+     * <p>Both halves are needed and neither is implied by the round-trip test above, because that
+     * document leaves the backend at its default: JCasC omits an attribute whose value matches a freshly
+     * constructed object's, so the passing byte-for-byte comparison there says nothing at all about
+     * whether this field can cross the YAML boundary in either direction. A cloud saved as XO and
+     * exported back as XAPI, or as nothing, would silently lose the choice on the next apply.
+     */
+    @Test
+    void aDocumentCanNameTheBackend(JenkinsRule r) throws Exception {
+        ConfigurationAsCode.get()
+                .configure(getClass()
+                        .getResource("configuration-as-code-xo-backend.yaml")
+                        .toExternalForm());
+
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xo-lab");
+        assertNotNull(cloud, "the xo-lab cloud should be created from YAML");
+        assertEquals(XcpngBackend.XO, cloud.getBackend(), "the document names XO and the cloud must speak it");
+
+        // Unquoted on the way out: JCasC emits an enum as a bare scalar, whatever the document that bound
+        // it wrote. Measured -- this assertion was first written expecting quotes and the export said
+        // otherwise, which is the half of a round-trip test that only a real export can settle.
+        assertTrue(
+                exportedClouds().contains("backend: XO"),
+                "a non-default backend must export, or it is lost on the next apply: " + exportedClouds());
+    }
+
     /** The {@code clouds} subtree of the live Jenkins config, serialised to YAML. */
     private static String exportedClouds() throws Exception {
         ConfigurationContext context = new ConfigurationContext(ConfiguratorRegistry.get());
