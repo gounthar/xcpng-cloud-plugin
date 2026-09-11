@@ -503,7 +503,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         } else {
             listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
         }
-        try (HypervisorClient client = fromSnapshot ? openClientFromSnapshot(cloud == null) : cloud.openClient()) {
+        try (HypervisorClient client = openClientForVm(cloud)) {
             client.destroyWithDisks(new VmRef(vmRef));
         } catch (RuntimeException e) {
             if (cloud == null) {
@@ -547,6 +547,33 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * <p>This is now every teardown's client, not only the one for a cloud that has gone away. See
      * {@link #_terminate} for why the snapshot outranks the live cloud.
      */
+    /**
+     * Open a session to the pool this agent's VM lives on, from the connection snapshot whenever there is
+     * one and from {@code fallback} only when there is not.
+     *
+     * <p>The single place this decision is made, deliberately. Provisioning and teardown both need it and
+     * they have to agree: the VM is created through one client and destroyed through another, minutes or
+     * hours apart, and an administrator editing the cloud in between must not be able to make the two
+     * disagree about which pool, backend or credential the VM belongs to. Written out twice, the two copies
+     * drift, which is the defect this method was extracted to fix.
+     *
+     * @param fallback the owning cloud if it still resolves, for an agent whose snapshot predates #149 and
+     *     has nothing of its own to connect with. Null when the cloud is gone; passing null for an agent
+     *     that also has no snapshot is a programming error and throws, so a caller that can be in that
+     *     state checks for it first and says something more useful.
+     */
+    @NonNull
+    HypervisorClient openClientForVm(@CheckForNull XcpngCloud fallback) {
+        if (poolUrl != null) {
+            return openClientFromSnapshot(fallback == null);
+        }
+        if (fallback == null) {
+            throw new IllegalStateException("Agent " + getNodeName() + " has no connection snapshot and cloud '"
+                    + cloudName + "' is gone, so there is nothing to open a session with.");
+        }
+        return fallback.openClient();
+    }
+
     @NonNull
     private HypervisorClient openClientFromSnapshot(boolean cloudIsGone) {
         if (connectionClientFactory != null) {

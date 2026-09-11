@@ -28,6 +28,7 @@ import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -106,6 +107,49 @@ class XcpngProvisionTest {
         r.jenkins.addNode(agent);
         awaitLaunched(agent);
         return agent;
+    }
+
+    /**
+     * Provisioning must clone through the agent's connection snapshot, not through the cloud's settings as
+     * they stand when the launcher happens to run.
+     *
+     * <p>The snapshot is taken in {@code createAgent}; the launcher calls {@code provisionVm} some time
+     * later, on core's remoting pool. A configuration save or a configuration-as-code reload landing in that
+     * window used to mean the VM was cloned on the new settings and, because teardown reads the snapshot,
+     * destroyed against the old ones. A VM handle is backend-shaped -- {@code OpaqueRef:...} on XAPI, a uuid
+     * on XO -- so that teardown could not fail politely; it would hand the wrong API a handle it cannot
+     * parse, and the clone and its disks would stay on the pool.
+     *
+     * <p>The flip here is deliberately between building the node and registering it, which is precisely the
+     * window the launcher runs in.
+     */
+    @Test
+    void provisioningClonesThroughTheSnapshotNotTheCloudsCurrentSettings(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        cloud.setBackend(XcpngBackend.XO);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        List<XcpngBackend> provisionedWith = Collections.synchronizedList(new ArrayList<>());
+        agent.setConnectionClientFactory((poolUrl, credentialsId, certificateFingerprint, backend) -> {
+            provisionedWith.add(backend);
+            return fake;
+        });
+
+        // The administrator saves the cloud while this agent is on its way to being launched.
+        cloud.setBackend(XcpngBackend.XAPI);
+
+        r.jenkins.addNode(agent);
+        awaitLaunched(agent);
+
+        assertFalse(provisionedWith.isEmpty(), "provisioning must open its client through the agent's snapshot");
+        assertEquals(
+                XcpngBackend.XO,
+                provisionedWith.get(0),
+                "the clone must go through the backend the agent was built with, not the cloud's current one");
+        assertTrue(
+                fake.calls().stream().anyMatch(c -> c.startsWith("cloneFromTemplate:")),
+                "the VM must actually have been cloned through that client: " + fake.calls());
     }
 
     /** Wait until the launcher has cloned this agent's VM and returned. */

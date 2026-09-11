@@ -594,7 +594,13 @@ public class XcpngCloud extends Cloud {
     void provisionVm(@NonNull XcpngAgent agent, @NonNull XcpngTemplate template, @NonNull TaskListener listener)
             throws Exception {
         String displayName = agent.getNodeName();
-        try (HypervisorClient client = openClient()) {
+        // The agent's snapshot, not this cloud's current configuration. The two are the same object's worth
+        // of settings at the moment createAgent ran, and they stop being the same the instant an
+        // administrator saves the cloud or a configuration-as-code reload lands -- which can happen between
+        // createAgent and the launcher calling this. Cloning on the new settings and tearing down on the
+        // snapshot would strand the VM, and the handle itself is backend-shaped, so the teardown could not
+        // even fail politely. Both ends read the same rule now; see XcpngAgent.openClientForVm.
+        try (HypervisorClient client = agent.openClientForVm(this)) {
             VmRef templateRef = client.resolveTemplate(template.getTemplateName());
             ProvisionSpec spec = new ProvisionSpec(
                     displayName,
