@@ -52,6 +52,9 @@ class HttpTransportPinningTest {
     private static final char[] KEYSTORE_PASSWORD = "changeit".toCharArray();
     private static final String BODY = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
 
+    /** OpenSSL's placeholder subject, which is all a Xen Orchestra appliance's own certificate carries. */
+    private static final String XO_DEFAULT_DN = "C=AU,ST=Some-State,O=Internet Widgits Pty Ltd";
+
     private HttpsServer server;
     private X509Certificate served;
     private String servedFingerprint;
@@ -133,35 +136,40 @@ class HttpTransportPinningTest {
     }
 
     /**
-     * Pinning does not replace hostname verification, it stacks on top of it. {@code HttpClient} forces
-     * endpoint identification on regardless of what a caller asks for, so a certificate that matches the
-     * pin but does not name the host is still refused. Worth a test of its own because the opposite is the
-     * intuitive guess, and because the transport's own comment is the only other place it is written down.
+     * A pinned certificate is accepted whether or not it names the host. This is the certificate a Xen
+     * Orchestra appliance generates for itself: {@code openssl req -batch -new -x509} with no subject and
+     * no extensions, so OpenSSL's placeholder DN, no CN and no subjectAltName. No address can ever match
+     * it, and until #229 a pinned connection refused it on the hostname check after the pin had already
+     * accepted it, which made every appliance still on its default certificate unreachable.
      */
     @Test
-    void aCertificateThatDoesNotNameTheHostIsRejected() throws Exception {
+    void aPinnedCertificateThatNamesNoHostIsAccepted() throws Exception {
         KeyPair keyPair = generateKeyPair();
-        X509Certificate anonymous = selfSigned(keyPair, "CN=somewhere-else", null);
+        X509Certificate xoDefault = selfSigned(keyPair, XO_DEFAULT_DN, null);
 
-        HttpsServer other = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        other.setHttpsConfigurator(new HttpsConfigurator(serverContext(keyPair, anonymous)));
-        other.createContext("/jsonrpc", exchange -> {
-            byte[] bytes = BODY.getBytes(StandardCharsets.UTF_8);
-            exchange.sendResponseHeaders(200, bytes.length);
-            try (OutputStream out = exchange.getResponseBody()) {
-                out.write(bytes);
-            }
+        withServer(keyPair, xoDefault, url -> {
+            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(xoDefault));
+            assertEquals(BODY, transport.post(BODY), "the pin alone must identify the server");
         });
-        other.start();
-        try {
-            String url = "https://127.0.0.1:" + other.getAddress().getPort();
-            // Pinned to exactly what this server serves, so only the missing hostname can fail it.
-            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(anonymous));
+    }
+
+    /**
+     * The control for the test above. Accepting a certificate that names no host must not mean accepting
+     * any such certificate: served one of them and pinned to another, the handshake still fails, so the
+     * pin is doing the rejecting and not merely surviving a relaxed check.
+     */
+    @Test
+    void aDifferentCertificateThatNamesNoHostIsStillRejected() throws Exception {
+        KeyPair keyPair = generateKeyPair();
+        X509Certificate served = selfSigned(keyPair, XO_DEFAULT_DN, null);
+        X509Certificate pinned = selfSigned(generateKeyPair(), XO_DEFAULT_DN, null);
+        assertNotEquals(CertificateFingerprint.of(served), CertificateFingerprint.of(pinned));
+
+        withServer(keyPair, served, url -> {
+            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(pinned));
             IOException failure = assertThrows(IOException.class, () -> transport.post(BODY));
-            assertTrue(isTlsFailure(failure), "a certificate that names no host must fail: " + failure);
-        } finally {
-            other.stop(0);
-        }
+            assertTrue(isTlsFailure(failure), "a mismatched pin must fail the handshake: " + failure);
+        });
     }
 
     /**
@@ -179,6 +187,30 @@ class HttpTransportPinningTest {
     void fetchFailsRatherThanInventingAFingerprint() {
         server.stop(0);
         assertThrows(IOException.class, () -> CertificateFingerprint.fetch(poolUrl));
+    }
+
+    /** Run {@code body} against a second server presenting {@code certificate}, then stop it. */
+    private static void withServer(KeyPair keyPair, X509Certificate certificate, ServerBody body) throws Exception {
+        HttpsServer other = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        other.setHttpsConfigurator(new HttpsConfigurator(serverContext(keyPair, certificate)));
+        other.createContext("/jsonrpc", exchange -> {
+            byte[] bytes = BODY.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (OutputStream out = exchange.getResponseBody()) {
+                out.write(bytes);
+            }
+        });
+        other.start();
+        try {
+            body.run("https://127.0.0.1:" + other.getAddress().getPort());
+        } finally {
+            other.stop(0);
+        }
+    }
+
+    @FunctionalInterface
+    private interface ServerBody {
+        void run(String url) throws Exception;
     }
 
     private static boolean isTlsFailure(Throwable failure) {
@@ -200,7 +232,7 @@ class HttpTransportPinningTest {
      * A throwaway self-signed certificate, valid around now, for one test run.
      *
      * @param ipSan an address to place in the subjectAltName, or null for a certificate that names no
-     *     address at all -- which is what {@link #aCertificateThatDoesNotNameTheHostIsRejected} needs.
+     *     address at all -- which is what {@link #aPinnedCertificateThatNamesNoHostIsAccepted} needs.
      */
     private static X509Certificate selfSigned(KeyPair keyPair, String dn, String ipSan) throws Exception {
         X500Name subject = new X500Name(dn);

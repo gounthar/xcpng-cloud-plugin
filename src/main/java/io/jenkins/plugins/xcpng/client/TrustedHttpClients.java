@@ -1,6 +1,7 @@
 package io.jenkins.plugins.xcpng.client;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
+import java.net.Socket;
 import java.net.http.HttpClient;
 import java.security.SecureRandom;
 import java.security.cert.CertificateException;
@@ -9,7 +10,9 @@ import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509ExtendedTrustManager;
 import javax.net.ssl.X509TrustManager;
 
 /**
@@ -56,27 +59,30 @@ final class TrustedHttpClients {
     /**
      * A client that completes a handshake only against the certificate with this fingerprint.
      *
-     * <p>Hostname verification still applies, and it is not optional here even if we wanted it to be:
-     * {@code java.net.http.HttpClient} overwrites whatever endpoint-identification algorithm a caller
-     * sets, in {@code AbstractAsyncSSLConnection} lines 138-139 of the JDK source, unless the JVM-wide
-     * {@code jdk.internal.httpclient.disableHostnameVerification} property is set. Setting that property
-     * would disable the check for every HTTP client in the controller, which is a far larger hole than
-     * the one being closed, so it is not set and the algorithm is left alone rather than assigned a value
-     * that would be silently discarded. The trust-all path this replaced set it to null and was subject to
-     * exactly the same override, so hostname verification was in force there too, whatever it looked like.
+     * <p>The pin is the whole of the identity check; the certificate does not also have to name the host.
+     * An exact leaf match already identifies the server more tightly than a CA signature plus a name does,
+     * so on a pinned connection a hostname check can only refuse a certificate the pin has accepted. It
+     * did, for the certificate every Xen Orchestra appliance generates for itself, which carries no CN and
+     * no subjectAltName and so matches no address at all (#229).
      *
-     * <p>The two checks therefore stack: a connection succeeds only if the certificate both matches the
-     * pinned fingerprint and identifies the host being dialled. XCP-ng's generated certificate carries the
-     * host's address in its subject and its subjectAltName -- measured on the lab pool, {@code
-     * CN=192.168.1.87} with {@code IP Address:192.168.1.87} -- so a pool reached at the address its
-     * certificate names satisfies both. A pool reached under some other name needs a certificate that
-     * says so, which is a fair thing to require and was already required before this change.
+     * <p>How the check is left out matters. {@code java.net.http.HttpClient} forces the endpoint-
+     * identification algorithm to HTTPS whatever a caller sets, in {@code AbstractAsyncSSLConnection},
+     * unless the JVM-wide {@code jdk.internal.httpclient.disableHostnameVerification} property is set, and
+     * setting that would drop the check for every HTTP client in the controller. It is not set. The check
+     * is instead skipped by the trust manager's type: JSSE wraps a plain {@link X509TrustManager} in an
+     * {@code AbstractTrustManagerWrapper} that runs the hostname check after it, and uses an {@link
+     * X509ExtendedTrustManager} as it is, leaving identity to that trust manager. {@link PinnedTrustManager}
+     * is the second kind, and checks the pin only. An earlier version of this comment said the check could
+     * not be avoided here; that was true of the plain kind this class used to be.
+     *
+     * <p>Unpinned connections go through {@link #SHARED}, which keeps the JVM trust store and its hostname
+     * check. Nothing here changes those.
      *
      * <p>The scan flags every {@code SSLContext#init}, because that call is how TLS verification is
      * normally switched off; it does not read the trust manager it is handed. This one narrows trust
      * rather than widening it: {@link PinnedTrustManager} accepts a single certificate where the JVM
-     * default accepts every public CA, and hostname verification still applies on top. Suppressed
-     * rather than dismissed through the API so the reasoning sits beside the code. See #142.
+     * default accepts every public CA. Suppressed rather than dismissed through the API so the reasoning
+     * sits beside the code. See #142.
      */
     @SuppressWarnings("lgtm[jenkins/unsafe-calls]") // Pins one certificate; strictly narrower than the JVM default.
     private static HttpClient pinnedClient(String fingerprint) {
@@ -96,8 +102,12 @@ final class TrustedHttpClients {
     /**
      * Accepts one certificate and no other. Unlike the trust manager it replaced, every method here can
      * fail: an empty {@code checkServerTrusted} is what made the old one accept the world.
+     *
+     * <p>Extends {@link X509ExtendedTrustManager} rather than implementing {@link X509TrustManager} so that
+     * JSSE does not add its own hostname check after this one; see {@link #pinnedClient}. The socket and
+     * engine overloads are the ones JSSE actually calls, and each applies the same pin as the plain one.
      */
-    private static final class PinnedTrustManager implements X509TrustManager {
+    private static final class PinnedTrustManager extends X509ExtendedTrustManager {
 
         private final String expected;
 
@@ -109,6 +119,18 @@ final class TrustedHttpClients {
         public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
             // This manager is only ever installed on a client. Reached only if it were misused as a server.
             throw new CertificateException("this trust manager never authenticates a client");
+        }
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] chain, String authType, Socket socket)
+                throws CertificateException {
+            checkClientTrusted(chain, authType);
+        }
+
+        @Override
+        public void checkClientTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
+                throws CertificateException {
+            checkClientTrusted(chain, authType);
         }
 
         @Override
@@ -125,6 +147,18 @@ final class TrustedHttpClients {
                         + ". If the pool's certificate was replaced, confirm the new one and update the cloud's"
                         + " Certificate fingerprint field.");
             }
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] chain, String authType, Socket socket)
+                throws CertificateException {
+            checkServerTrusted(chain, authType);
+        }
+
+        @Override
+        public void checkServerTrusted(X509Certificate[] chain, String authType, SSLEngine engine)
+                throws CertificateException {
+            checkServerTrusted(chain, authType);
         }
 
         @Override

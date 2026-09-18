@@ -258,9 +258,11 @@ table, the Packer workflow and its honest status, and the produced template name
   record is not a secret disclosure.
 - **A pool certificate is either trusted by the JVM or pinned by fingerprint.** There is no setting
   that accepts an unrecognised certificate, because the first thing sent over that connection is the
-  XAPI credential. Pinning is checked in addition to the ordinary hostname check, not instead of it:
-  a connection succeeds only if the certificate both matches the fingerprint and names the host being
-  dialled. If the pool's certificate is later replaced, connections fail until an administrator
+  XAPI credential. A pinned connection succeeds only against the exact certificate whose fingerprint
+  was confirmed, and it does not also require that certificate to name the host being dialled: the
+  certificate a Xen Orchestra appliance generates for itself names no host at all, and pinning is how
+  such a certificate is trusted. Without a pin, the JVM trust store and the ordinary hostname check
+  both apply. If the pool's certificate is later replaced, connections fail until an administrator
   confirms the new fingerprint — that failure is the feature, since a replaced certificate is either
   routine maintenance or an interception and only a human can tell which.
 - **Reading a fingerprint does not trust it.** `Test connection` inspects the certificate an unknown
