@@ -13,6 +13,7 @@ import java.security.cert.PKIXParameters;
 import java.security.cert.TrustAnchor;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -87,12 +88,14 @@ final class TrustedHttpClients {
      * <p>That wrapper also enforced the runtime's certificate algorithm policy, {@code
      * jdk.certpath.disabledAlgorithms}: weak keys such as RSA under 1024 bits, and signatures such as MD5.
      * Skipping the wrapper skipped that too, so {@link PinnedTrustManager} puts it back itself by running the
-     * JDK's own PKIX validator over the served chain, anchored at the top of that chain. The pin is what
-     * establishes trust; the validator is there for the policy, which it applies exactly as this JVM's
-     * {@code java.security} says, including any local tightening. It also brings two checks the wrapper did
-     * not make: an expired or not-yet-valid certificate is refused, and a pinned certificate issued by a CA
-     * has to be served with its chain, since the validator must be able to check each signature up to the
-     * anchor. Handing the pinned certificate to a {@code TrustManagerFactory} instead would look equivalent
+     * JDK's own PKIX validator over the leaf's issuer path in the served chain. The pin is what establishes
+     * trust; the validator is there for the policy, which it takes from this JVM's {@code java.security},
+     * including any local tightening. It applies it to every certificate on that path, the served root
+     * included, with one exception: a chain served without its root ends at a certificate that can only be
+     * trusted as the anchor, and that certificate's own signature is not checked. The validator also brings
+     * three checks the wrapper did not make: an expired or not-yet-valid certificate is refused, a pinned
+     * certificate issued by a CA has to be served with its chain, and a certificate carrying a critical
+     * extension the JDK does not recognise is refused. Handing the pinned certificate to a {@code TrustManagerFactory} instead would look equivalent
      * and check nothing: {@code sun.security.validator.PKIXValidator} returns a chain whose first
      * certificate is already trusted without validating it.
      *
@@ -157,7 +160,17 @@ final class TrustedHttpClients {
 
         @Override
         public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
-            if (chain == null || chain.length == 0) {
+            try {
+                checkPinAndPolicy(chain);
+            } catch (RuntimeException e) {
+                // Fail closed with the type JSSE expects. JSSE hands over a chain it has already parsed, so
+                // nothing here should throw one; this is for the day something does.
+                throw new CertificateException("cannot check the pool's certificate: " + e, e);
+            }
+        }
+
+        private void checkPinAndPolicy(X509Certificate[] chain) throws CertificateException {
+            if (chain == null || chain.length == 0 || chain[0] == null) {
                 throw new CertificateException("the pool presented no certificate");
             }
             String actual = CertificateFingerprint.of(chain[0]);
@@ -173,27 +186,35 @@ final class TrustedHttpClients {
         }
 
         /**
-         * Run the JDK's PKIX validator over the served chain, anchored at its last certificate, for the
-         * runtime's algorithm policy and validity dates. A single certificate is its own anchor, which only
-         * works when it signed itself; a leaf issued by a CA and served alone cannot be checked, and says so.
+         * Run the JDK's PKIX validator over the leaf's issuer path, for the runtime's algorithm policy and
+         * validity dates.
+         *
+         * <p>The path is found by issuer rather than by position, starting from the pinned leaf, so a chain
+         * served out of order is still checked and a certificate the leaf does not chain through decides
+         * nothing. When the path ends at a self-issued certificate, that certificate is both the anchor and
+         * part of the path, so its own signature, key and dates are checked as well. When it ends short of
+         * one, because the server did not send its root, the last certificate sent can only be the anchor,
+         * and its own signature is not checked; a leaf issued by a CA and served entirely alone cannot be
+         * checked at all, and says so.
          */
         private static void checkAgainstRuntimePolicy(X509Certificate[] chain) throws CertificateException {
-            X509Certificate leaf = chain[0];
-            if (chain.length == 1 && !leaf.getSubjectX500Principal().equals(leaf.getIssuerX500Principal())) {
+            List<X509Certificate> path = issuerPath(chain);
+            X509Certificate top = path.get(path.size() - 1);
+            boolean topSelfIssued = isSelfIssued(top);
+            if (path.size() == 1 && !topSelfIssued) {
                 throw new CertificateException("the pool's certificate matches the pinned fingerprint, but it was"
-                        + " issued by " + leaf.getIssuerX500Principal().getName() + " and the pool served it"
+                        + " issued by " + top.getIssuerX500Principal().getName() + " and the pool served it"
                         + " without that chain, so this JVM's certificate policy cannot be checked against it."
                         + " Configure the pool to send its intermediate and root certificates.");
             }
-            List<X509Certificate> path =
-                    chain.length == 1 ? List.of(leaf) : Arrays.asList(chain).subList(0, chain.length - 1);
+            List<X509Certificate> validated = topSelfIssued ? path : path.subList(0, path.size() - 1);
             try {
-                PKIXParameters parameters = new PKIXParameters(Set.of(new TrustAnchor(chain[chain.length - 1], null)));
+                PKIXParameters parameters = new PKIXParameters(Set.of(new TrustAnchor(top, null)));
                 // No revocation: a pinned certificate is trusted by its bytes, and a self-signed one has no
                 // issuer to publish a revocation list. The policy and the dates are what this is for.
                 parameters.setRevocationEnabled(false);
                 CertPathValidator.getInstance("PKIX")
-                        .validate(CertificateFactory.getInstance("X.509").generateCertPath(path), parameters);
+                        .validate(CertificateFactory.getInstance("X.509").generateCertPath(validated), parameters);
             } catch (CertPathValidatorException e) {
                 throw new CertificateException(
                         "the pool's certificate matches the pinned fingerprint but this JVM's certificate policy"
@@ -203,6 +224,39 @@ final class TrustedHttpClients {
                 throw new CertificateException(
                         "cannot check the pool's certificate against this JVM's policy: " + e.getMessage(), e);
             }
+        }
+
+        /**
+         * The pinned leaf, then its issuer, then that certificate's issuer, each looked up by subject among
+         * the rest of the served chain, stopping at a self-issued certificate or at one whose issuer was not
+         * sent. Each certificate is used at most once, so a loop in the served chain ends the walk.
+         */
+        private static List<X509Certificate> issuerPath(X509Certificate[] chain) {
+            List<X509Certificate> path = new ArrayList<>();
+            List<X509Certificate> rest = new ArrayList<>(Arrays.asList(chain).subList(1, chain.length));
+            X509Certificate current = chain[0];
+            path.add(current);
+            while (!isSelfIssued(current)) {
+                X509Certificate issuer = null;
+                for (X509Certificate candidate : rest) {
+                    if (candidate != null
+                            && candidate.getSubjectX500Principal().equals(current.getIssuerX500Principal())) {
+                        issuer = candidate;
+                        break;
+                    }
+                }
+                if (issuer == null) {
+                    break;
+                }
+                rest.remove(issuer);
+                path.add(issuer);
+                current = issuer;
+            }
+            return path;
+        }
+
+        private static boolean isSelfIssued(X509Certificate certificate) {
+            return certificate.getSubjectX500Principal().equals(certificate.getIssuerX500Principal());
         }
 
         @Override

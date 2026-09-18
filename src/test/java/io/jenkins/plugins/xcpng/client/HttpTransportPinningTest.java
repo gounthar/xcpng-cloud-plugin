@@ -11,10 +11,11 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
-import java.security.KeyStore;
+import java.security.Principal;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.cert.Certificate;
@@ -22,8 +23,10 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Date;
-import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.X509ExtendedKeyManager;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
@@ -52,7 +55,6 @@ import org.junit.jupiter.api.Test;
  */
 class HttpTransportPinningTest {
 
-    private static final char[] KEYSTORE_PASSWORD = "changeit".toCharArray();
     private static final String BODY = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
 
     /** OpenSSL's placeholder subject, which is all a Xen Orchestra appliance's own certificate carries. */
@@ -265,6 +267,125 @@ class HttpTransportPinningTest {
     }
 
     /**
+     * The policy reaches past a single certificate. Served with a root appended, a weak leaf is no longer
+     * the chain's last element, and a check that only looked at lone certificates would let it through.
+     */
+    @Test
+    void aWeakPinnedLeafIsRejectedEvenWithItsRootAppended() throws Exception {
+        CertificateAuthority root = CertificateAuthority.root("CN=Lab CA", generateKeyPair(), "SHA256withRSA");
+        KeyPair weak = generateKeyPair(768);
+        X509Certificate leaf = root.issueLeaf(weak.getPublic());
+        assertRefusedByPolicy(weak.getPrivate(), new Certificate[] {leaf, root.certificate}, "768");
+    }
+
+    /** The issuer's key is under the same policy: a leaf signed by a 768-bit root is refused. */
+    @Test
+    void aPinnedLeafIssuedByAWeakRootIsRejected() throws Exception {
+        CertificateAuthority root = CertificateAuthority.root("CN=Lab CA", generateKeyPair(768), "SHA256withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = root.issueLeaf(leafKeys.getPublic());
+        assertRefusedByPolicy(leafKeys.getPrivate(), new Certificate[] {leaf, root.certificate}, "768");
+    }
+
+    /**
+     * A served root is checked too, not only trusted as an anchor. Anchoring at the last certificate
+     * without validating it left the root's own signature unexamined, so an MD5 self-signature passed
+     * where the plain trust manager refused it.
+     */
+    @Test
+    void aRootThatSignedItselfWithADisabledAlgorithmIsRejected() throws Exception {
+        CertificateAuthority root = CertificateAuthority.root("CN=Lab CA", generateKeyPair(), "MD5withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = root.issueLeaf(leafKeys.getPublic());
+        assertRefusedByPolicy(leafKeys.getPrivate(), new Certificate[] {leaf, root.certificate}, "MD5");
+    }
+
+    /**
+     * Certificates the leaf does not chain through do not decide anything. A self-signed pinned leaf
+     * followed by an unrelated certificate was accepted before the policy check existed, and still is.
+     */
+    @Test
+    void anUnrelatedCertificateAfterAPinnedSelfSignedLeafIsIgnored() throws Exception {
+        KeyPair keyPair = generateKeyPair();
+        X509Certificate leaf = selfSigned(keyPair, "CN=127.0.0.1", "127.0.0.1");
+        X509Certificate unrelated =
+                CertificateAuthority.root("CN=Unrelated", generateKeyPair(), "SHA256withRSA").certificate;
+
+        withServer(keyPair.getPrivate(), new Certificate[] {leaf, unrelated}, url -> {
+            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(leaf));
+            assertEquals(BODY, transport.post(BODY), "an unrelated extra certificate must not refuse the pin");
+        });
+    }
+
+    /** Servers do send chains out of order; the path is found by issuer, not by position. */
+    @Test
+    void aChainServedOutOfOrderIsAccepted() throws Exception {
+        CertificateAuthority root = CertificateAuthority.root("CN=Lab CA", generateKeyPair(), "SHA256withRSA");
+        CertificateAuthority intermediate = root.intermediate("CN=Lab Intermediate", generateKeyPair());
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = intermediate.issueLeaf(leafKeys.getPublic());
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf, root.certificate, intermediate.certificate}, url -> {
+            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(leaf));
+            assertEquals(BODY, transport.post(BODY), "a chain served out of order must still be checked and accepted");
+        });
+    }
+
+    /** A CA for one test: its own certificate and the key it signs with. */
+    private static final class CertificateAuthority {
+        final X509Certificate certificate;
+        final KeyPair keyPair;
+
+        private CertificateAuthority(X509Certificate certificate, KeyPair keyPair) {
+            this.certificate = certificate;
+            this.keyPair = keyPair;
+        }
+
+        static CertificateAuthority root(String dn, KeyPair keyPair, String selfSignature) throws Exception {
+            return new CertificateAuthority(
+                    issue(
+                            keyPair.getPublic(),
+                            dn,
+                            dn,
+                            keyPair.getPrivate(),
+                            selfSignature,
+                            Instant.now().minus(Duration.ofDays(1)),
+                            Instant.now().plus(Duration.ofDays(10)),
+                            null,
+                            true),
+                    keyPair);
+        }
+
+        CertificateAuthority intermediate(String dn, KeyPair keys) throws Exception {
+            return new CertificateAuthority(
+                    issue(
+                            keys.getPublic(),
+                            dn,
+                            certificate.getSubjectX500Principal().getName(),
+                            keyPair.getPrivate(),
+                            "SHA256withRSA",
+                            Instant.now().minus(Duration.ofDays(1)),
+                            Instant.now().plus(Duration.ofDays(10)),
+                            null,
+                            true),
+                    keys);
+        }
+
+        X509Certificate issueLeaf(PublicKey subjectKey) throws Exception {
+            return issue(
+                    subjectKey,
+                    "CN=127.0.0.1",
+                    certificate.getSubjectX500Principal().getName(),
+                    keyPair.getPrivate(),
+                    "SHA256withRSA",
+                    Instant.now().minus(Duration.ofDays(1)),
+                    Instant.now().plus(Duration.ofDays(5)),
+                    "127.0.0.1",
+                    false);
+        }
+    }
+
+    /**
      * Pinned to exactly what is served, so only the certificate policy can refuse it, and the refusal must
      * be the plugin's own, naming {@code expected}: a handshake failing for any other reason proves nothing.
      */
@@ -418,14 +539,64 @@ class HttpTransportPinningTest {
         return serverContext(keyPair.getPrivate(), new Certificate[] {certificate});
     }
 
+    /**
+     * A server that presents {@code chain} exactly as given. A keystore will not hold a chain that does not
+     * link in order, which is precisely the shape some of these tests need to serve, so the key manager
+     * answers with the chain directly instead.
+     */
     private static SSLContext serverContext(PrivateKey key, Certificate[] chain) throws Exception {
-        KeyStore keyStore = KeyStore.getInstance("PKCS12");
-        keyStore.load(null, null);
-        keyStore.setKeyEntry("pool", key, KEYSTORE_PASSWORD, chain);
-        KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        keyManagers.init(keyStore, KEYSTORE_PASSWORD);
+        X509Certificate[] served = new X509Certificate[chain.length];
+        for (int i = 0; i < chain.length; i++) {
+            served[i] = (X509Certificate) chain[i];
+        }
         SSLContext context = SSLContext.getInstance("TLS");
-        context.init(keyManagers.getKeyManagers(), null, null);
+        context.init(new KeyManager[] {new FixedKeyManager(key, served)}, null, null);
         return context;
+    }
+
+    private static final class FixedKeyManager extends X509ExtendedKeyManager {
+        private static final String ALIAS = "pool";
+        private final PrivateKey key;
+        private final X509Certificate[] chain;
+
+        FixedKeyManager(PrivateKey key, X509Certificate[] chain) {
+            this.key = key;
+            this.chain = chain;
+        }
+
+        @Override
+        public String chooseEngineServerAlias(String keyType, Principal[] issuers, SSLEngine engine) {
+            return keyType.equals(key.getAlgorithm()) ? ALIAS : null;
+        }
+
+        @Override
+        public String chooseServerAlias(String keyType, Principal[] issuers, Socket socket) {
+            return keyType.equals(key.getAlgorithm()) ? ALIAS : null;
+        }
+
+        @Override
+        public String[] getServerAliases(String keyType, Principal[] issuers) {
+            return keyType.equals(key.getAlgorithm()) ? new String[] {ALIAS} : null;
+        }
+
+        @Override
+        public X509Certificate[] getCertificateChain(String alias) {
+            return chain.clone();
+        }
+
+        @Override
+        public PrivateKey getPrivateKey(String alias) {
+            return key;
+        }
+
+        @Override
+        public String[] getClientAliases(String keyType, Principal[] issuers) {
+            return null;
+        }
+
+        @Override
+        public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
+            return null;
+        }
     }
 }
