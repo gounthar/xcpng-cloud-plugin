@@ -3,11 +3,20 @@ package io.jenkins.plugins.xcpng.client;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import java.net.Socket;
 import java.net.http.HttpClient;
+import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
+import java.security.cert.CertPathValidator;
+import java.security.cert.CertPathValidatorException;
 import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.PKIXParameters;
+import java.security.cert.TrustAnchor;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -72,8 +81,20 @@ final class TrustedHttpClients {
      * is instead skipped by the trust manager's type: JSSE wraps a plain {@link X509TrustManager} in an
      * {@code AbstractTrustManagerWrapper} that runs the hostname check after it, and uses an {@link
      * X509ExtendedTrustManager} as it is, leaving identity to that trust manager. {@link PinnedTrustManager}
-     * is the second kind, and checks the pin only. An earlier version of this comment said the check could
-     * not be avoided here; that was true of the plain kind this class used to be.
+     * is the second kind. An earlier version of this comment said the check could not be avoided here; that
+     * was true of the plain kind this class used to be.
+     *
+     * <p>That wrapper also enforced the runtime's certificate algorithm policy, {@code
+     * jdk.certpath.disabledAlgorithms}: weak keys such as RSA under 1024 bits, and signatures such as MD5.
+     * Skipping the wrapper skipped that too, so {@link PinnedTrustManager} puts it back itself by running the
+     * JDK's own PKIX validator over the served chain, anchored at the top of that chain. The pin is what
+     * establishes trust; the validator is there for the policy, which it applies exactly as this JVM's
+     * {@code java.security} says, including any local tightening. It also brings two checks the wrapper did
+     * not make: an expired or not-yet-valid certificate is refused, and a pinned certificate issued by a CA
+     * has to be served with its chain, since the validator must be able to check each signature up to the
+     * anchor. Handing the pinned certificate to a {@code TrustManagerFactory} instead would look equivalent
+     * and check nothing: {@code sun.security.validator.PKIXValidator} returns a chain whose first
+     * certificate is already trusted without validating it.
      *
      * <p>Unpinned connections go through {@link #SHARED}, which keeps the JVM trust store and its hostname
      * check. Nothing here changes those.
@@ -90,7 +111,7 @@ final class TrustedHttpClients {
         try {
             ctx = SSLContext.getInstance("TLS");
             ctx.init(null, new TrustManager[] {new PinnedTrustManager(fingerprint)}, new SecureRandom());
-        } catch (java.security.GeneralSecurityException e) {
+        } catch (GeneralSecurityException e) {
             throw new HypervisorException("cannot build a certificate-pinning SSL context: " + e.getMessage(), e);
         }
         return HttpClient.newBuilder()
@@ -104,8 +125,9 @@ final class TrustedHttpClients {
      * fail: an empty {@code checkServerTrusted} is what made the old one accept the world.
      *
      * <p>Extends {@link X509ExtendedTrustManager} rather than implementing {@link X509TrustManager} so that
-     * JSSE does not add its own hostname check after this one; see {@link #pinnedClient}. The socket and
-     * engine overloads are the ones JSSE actually calls, and each applies the same pin as the plain one.
+     * JSSE does not add its own hostname check after this one, and so it applies the runtime's certificate
+     * policy itself; see {@link #pinnedClient}. The socket and engine overloads are the ones JSSE actually
+     * calls, and each applies the same checks as the plain one.
      */
     private static final class PinnedTrustManager extends X509ExtendedTrustManager {
 
@@ -146,6 +168,40 @@ final class TrustedHttpClients {
                         + " Expected " + expected + ", got " + actual
                         + ". If the pool's certificate was replaced, confirm the new one and update the cloud's"
                         + " Certificate fingerprint field.");
+            }
+            checkAgainstRuntimePolicy(chain);
+        }
+
+        /**
+         * Run the JDK's PKIX validator over the served chain, anchored at its last certificate, for the
+         * runtime's algorithm policy and validity dates. A single certificate is its own anchor, which only
+         * works when it signed itself; a leaf issued by a CA and served alone cannot be checked, and says so.
+         */
+        private static void checkAgainstRuntimePolicy(X509Certificate[] chain) throws CertificateException {
+            X509Certificate leaf = chain[0];
+            if (chain.length == 1 && !leaf.getSubjectX500Principal().equals(leaf.getIssuerX500Principal())) {
+                throw new CertificateException("the pool's certificate matches the pinned fingerprint, but it was"
+                        + " issued by " + leaf.getIssuerX500Principal().getName() + " and the pool served it"
+                        + " without that chain, so this JVM's certificate policy cannot be checked against it."
+                        + " Configure the pool to send its intermediate and root certificates.");
+            }
+            List<X509Certificate> path =
+                    chain.length == 1 ? List.of(leaf) : Arrays.asList(chain).subList(0, chain.length - 1);
+            try {
+                PKIXParameters parameters = new PKIXParameters(Set.of(new TrustAnchor(chain[chain.length - 1], null)));
+                // No revocation: a pinned certificate is trusted by its bytes, and a self-signed one has no
+                // issuer to publish a revocation list. The policy and the dates are what this is for.
+                parameters.setRevocationEnabled(false);
+                CertPathValidator.getInstance("PKIX")
+                        .validate(CertificateFactory.getInstance("X.509").generateCertPath(path), parameters);
+            } catch (CertPathValidatorException e) {
+                throw new CertificateException(
+                        "the pool's certificate matches the pinned fingerprint but this JVM's certificate policy"
+                                + " refuses it: " + e.getMessage(),
+                        e);
+            } catch (GeneralSecurityException e) {
+                throw new CertificateException(
+                        "cannot check the pool's certificate against this JVM's policy: " + e.getMessage(), e);
             }
         }
 

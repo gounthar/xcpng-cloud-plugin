@@ -15,6 +15,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
 import java.security.KeyStore;
+import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
@@ -23,6 +25,7 @@ import java.util.Date;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import org.bouncycastle.asn1.x500.X500Name;
+import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.asn1.x509.GeneralNames;
@@ -173,6 +176,113 @@ class HttpTransportPinningTest {
     }
 
     /**
+     * The pin does not waive the runtime's certificate policy. JSSE used to enforce {@code
+     * jdk.certpath.disabledAlgorithms} in the wrapper that {@link #aPinnedCertificateThatNamesNoHostIsAccepted}
+     * needed bypassed, so {@code PinnedTrustManager} applies it itself. A 768-bit RSA key is under the
+     * default floor and can be factored, and the handshake only proves the server holds that key.
+     */
+    @Test
+    void aPinnedCertificateWithAWeakKeyIsRejected() throws Exception {
+        KeyPair weak = generateKeyPair(768);
+        X509Certificate certificate = selfSigned(weak, "CN=127.0.0.1", "127.0.0.1");
+        assertRefusedByPolicy(weak.getPrivate(), new Certificate[] {certificate}, "RSA 768");
+    }
+
+    /** The signature half of the same policy: MD5 is disabled by default, pinned or not. */
+    @Test
+    void aPinnedCertificateSignedWithADisabledAlgorithmIsRejected() throws Exception {
+        KeyPair keyPair = generateKeyPair();
+        X509Certificate certificate = issue(
+                keyPair.getPublic(),
+                "CN=127.0.0.1",
+                "CN=127.0.0.1",
+                keyPair.getPrivate(),
+                "MD5withRSA",
+                Instant.now().minus(Duration.ofDays(1)),
+                Instant.now().plus(Duration.ofDays(1)),
+                "127.0.0.1",
+                false);
+        assertRefusedByPolicy(keyPair.getPrivate(), new Certificate[] {certificate}, "MD5");
+    }
+
+    /**
+     * A behaviour the plain trust manager never had: validity dates are checked, so an expired pinned
+     * certificate is refused. Xen Orchestra regenerates its own certificate when it finds it expired, which
+     * changes the fingerprint anyway, so a pin on an appliance breaks at renewal either way.
+     */
+    @Test
+    void anExpiredPinnedCertificateIsRejected() throws Exception {
+        KeyPair keyPair = generateKeyPair();
+        X509Certificate certificate = issue(
+                keyPair.getPublic(),
+                "CN=127.0.0.1",
+                "CN=127.0.0.1",
+                keyPair.getPrivate(),
+                "SHA256withRSA",
+                Instant.now().minus(Duration.ofDays(10)),
+                Instant.now().minus(Duration.ofDays(8)),
+                "127.0.0.1",
+                false);
+        assertRefusedByPolicy(keyPair.getPrivate(), new Certificate[] {certificate}, "NotAfter");
+    }
+
+    /**
+     * A pinned leaf issued by a CA is checked up the chain the server serves, anchored at its top. This
+     * is the control for the test below: the same leaf, pinned the same way, with its chain.
+     */
+    @Test
+    void aPinnedCertificateIssuedByACaNeedsItsChain() throws Exception {
+        KeyPair caKeys = generateKeyPair();
+        X509Certificate ca = issue(
+                caKeys.getPublic(),
+                "CN=Lab CA",
+                "CN=Lab CA",
+                caKeys.getPrivate(),
+                "SHA256withRSA",
+                Instant.now().minus(Duration.ofDays(1)),
+                Instant.now().plus(Duration.ofDays(10)),
+                null,
+                true);
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = issue(
+                leafKeys.getPublic(),
+                "CN=127.0.0.1",
+                "CN=Lab CA",
+                caKeys.getPrivate(),
+                "SHA256withRSA",
+                Instant.now().minus(Duration.ofDays(1)),
+                Instant.now().plus(Duration.ofDays(5)),
+                "127.0.0.1",
+                false);
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf, ca}, url -> {
+            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(leaf));
+            assertEquals(BODY, transport.post(BODY), "a CA-issued pinned leaf served with its chain must connect");
+        });
+
+        // The cost, on the same leaf: served alone, its signature cannot be checked, and the refusal says why.
+        assertRefusedByPolicy(leafKeys.getPrivate(), new Certificate[] {leaf}, "without that chain");
+    }
+
+    /**
+     * Pinned to exactly what is served, so only the certificate policy can refuse it, and the refusal must
+     * be the plugin's own, naming {@code expected}: a handshake failing for any other reason proves nothing.
+     */
+    private static void assertRefusedByPolicy(PrivateKey key, Certificate[] chain, String expected) throws Exception {
+        String pin = CertificateFingerprint.of((X509Certificate) chain[0]);
+        withServer(key, chain, url -> {
+            HttpTransport transport = new HttpTransport(url, pin);
+            IOException failure = assertThrows(IOException.class, () -> transport.post(BODY));
+            assertTrue(isTlsFailure(failure), "the refusal must be a TLS failure: " + failure);
+            String messages = messages(failure);
+            assertTrue(
+                    messages.contains("matches the pinned fingerprint"),
+                    "refused by the pin check instead: " + messages);
+            assertTrue(messages.contains(expected), "expected a refusal naming " + expected + ": " + messages);
+        });
+    }
+
+    /**
      * Reading the fingerprint off a live host is what the operator is shown before they confirm it. It
      * must report exactly what the server serves, and it must do so without completing a handshake --
      * asserted here by the value alone, since a wrong value would make the pinning tests above unusable.
@@ -191,8 +301,13 @@ class HttpTransportPinningTest {
 
     /** Run {@code body} against a second server presenting {@code certificate}, then stop it. */
     private static void withServer(KeyPair keyPair, X509Certificate certificate, ServerBody body) throws Exception {
+        withServer(keyPair.getPrivate(), new Certificate[] {certificate}, body);
+    }
+
+    /** As above, serving {@code chain} exactly as given, leaf first. */
+    private static void withServer(PrivateKey key, Certificate[] chain, ServerBody body) throws Exception {
         HttpsServer other = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        other.setHttpsConfigurator(new HttpsConfigurator(serverContext(keyPair, certificate)));
+        other.setHttpsConfigurator(new HttpsConfigurator(serverContext(key, chain)));
         other.createContext("/jsonrpc", exchange -> {
             byte[] bytes = BODY.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, bytes.length);
@@ -213,6 +328,14 @@ class HttpTransportPinningTest {
         void run(String url) throws Exception;
     }
 
+    private static String messages(Throwable failure) {
+        StringBuilder all = new StringBuilder();
+        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+            all.append(cause.getMessage()).append(" | ");
+        }
+        return all.toString();
+    }
+
     private static boolean isTlsFailure(Throwable failure) {
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
             if (cause instanceof javax.net.ssl.SSLException) {
@@ -223,8 +346,12 @@ class HttpTransportPinningTest {
     }
 
     private static KeyPair generateKeyPair() throws Exception {
+        return generateKeyPair(2048);
+    }
+
+    private static KeyPair generateKeyPair(int bits) throws Exception {
         KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
-        generator.initialize(2048);
+        generator.initialize(bits);
         return generator.generateKeyPair();
     }
 
@@ -235,31 +362,66 @@ class HttpTransportPinningTest {
      *     address at all -- which is what {@link #aPinnedCertificateThatNamesNoHostIsAccepted} needs.
      */
     private static X509Certificate selfSigned(KeyPair keyPair, String dn, String ipSan) throws Exception {
-        X500Name subject = new X500Name(dn);
         Instant now = Instant.now();
+        return issue(
+                keyPair.getPublic(),
+                dn,
+                dn,
+                keyPair.getPrivate(),
+                "SHA256withRSA",
+                now.minus(Duration.ofDays(1)),
+                now.plus(Duration.ofDays(1)),
+                ipSan,
+                false);
+    }
+
+    /**
+     * A throwaway certificate for {@code subjectKey}, signed by {@code issuerKey}.
+     *
+     * @param ipSan an address to place in the subjectAltName, or null for none.
+     * @param ca whether to mark it as a CA, which a chain's anchor needs.
+     */
+    private static X509Certificate issue(
+            PublicKey subjectKey,
+            String subjectDn,
+            String issuerDn,
+            PrivateKey issuerKey,
+            String signatureAlgorithm,
+            Instant notBefore,
+            Instant notAfter,
+            String ipSan,
+            boolean ca)
+            throws Exception {
         JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
-                subject,
-                // Serials must differ between the two certificates a run generates, and the clock alone is
-                // too coarse: both are built inside the same millisecond.
+                new X500Name(issuerDn),
+                // Serials must differ between the certificates a run generates, and the clock alone is too
+                // coarse: several are built inside the same millisecond.
                 new BigInteger(64, new java.security.SecureRandom()),
-                Date.from(now.minus(Duration.ofDays(1))),
-                Date.from(now.plus(Duration.ofDays(1))),
-                subject,
-                keyPair.getPublic());
+                Date.from(notBefore),
+                Date.from(notAfter),
+                new X500Name(subjectDn),
+                subjectKey);
         if (ipSan != null) {
             builder.addExtension(
                     Extension.subjectAlternativeName,
                     false,
                     new GeneralNames(new GeneralName(GeneralName.iPAddress, ipSan)));
         }
-        ContentSigner signer = new JcaContentSignerBuilder("SHA256withRSA").build(keyPair.getPrivate());
+        if (ca) {
+            builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(true));
+        }
+        ContentSigner signer = new JcaContentSignerBuilder(signatureAlgorithm).build(issuerKey);
         return new JcaX509CertificateConverter().getCertificate(builder.build(signer));
     }
 
     private static SSLContext serverContext(KeyPair keyPair, X509Certificate certificate) throws Exception {
+        return serverContext(keyPair.getPrivate(), new Certificate[] {certificate});
+    }
+
+    private static SSLContext serverContext(PrivateKey key, Certificate[] chain) throws Exception {
         KeyStore keyStore = KeyStore.getInstance("PKCS12");
         keyStore.load(null, null);
-        keyStore.setKeyEntry("pool", keyPair.getPrivate(), KEYSTORE_PASSWORD, new Certificate[] {certificate});
+        keyStore.setKeyEntry("pool", key, KEYSTORE_PASSWORD, chain);
         KeyManagerFactory keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
         keyManagers.init(keyStore, KEYSTORE_PASSWORD);
         SSLContext context = SSLContext.getInstance("TLS");
