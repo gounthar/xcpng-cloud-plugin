@@ -81,6 +81,42 @@ def test_cloud_filter_selects_only_that_clouds_vms(pool):
     assert fake.destroyed == ["vm-ours"]
 
 
+def test_a_vm_leaked_by_an_xo_cloud_is_found_by_default(pool):
+    """#231. The XO backend cannot write other_config, so it tags the clone instead. Before
+    the reaper read tags it listed this VM as "nothing to reap" and left it holding its disk."""
+    fake = pool(
+        {
+            "vm-xo-leaked": vm_record(PLUGIN_VM, owner_tag="xcpng-xo"),
+            "vm-prod": vm_record("production-db"),
+        }
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-xo-leaked"], "the reaper cannot see a VM an XO cloud leaked"
+
+
+def test_cloud_filter_matches_the_xo_tag_and_spares_other_clouds(pool):
+    """--cloud reads either marker, and a tag for another cloud is still another cloud's."""
+    fake = pool(
+        {
+            "vm-xo": vm_record("xcpng-a-1111", owner_tag="xcpng-xo"),
+            "vm-xapi": vm_record("xcpng-b-2222", owner="xcpng-xo"),
+            "vm-other": vm_record("xcpng-c-3333", owner_tag="xcpng-lab"),
+        },
+        argv=("reaper.py", "--apply", "--cloud", "xcpng-xo"),
+    )
+    assert reaper.main() == 0
+    assert sorted(fake.destroyed) == ["vm-xapi", "vm-xo"]
+
+
+@pytest.mark.parametrize("flag", ["snapshot", "template", "control_domain"])
+def test_each_guard_also_spares_a_tagged_vm(pool, flag):
+    """Whether XAPI copies tags onto a snapshot is not measured here. If it does, the tag
+    alone would condemn a restore point, so the flags have to spare it either way."""
+    fake = pool({"vm-x": vm_record(PLUGIN_VM, owner_tag="xcpng-xo", **{flag: True})})
+    assert reaper.main() == 0
+    assert fake.destroyed == [], f"the {flag} guard did not spare a tagged VM"
+
+
 def test_snapshots_templates_and_the_control_domain_are_spared(pool):
     """A snapshot is a VM object, inherits the marker from the VM it was taken of, and reports
     Halted like a dead agent. Destroying one takes the operator's restore point with it.

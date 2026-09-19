@@ -41,10 +41,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from owner import owned_by
 from xapi import Xapi
-
-# Must match XapiClient.OWNER_KEY, and reaper.py's copy. If they drift, this watches nothing.
-OWNER_KEY = "xcpng-cloud"
 
 # Read the agent flags off the live objects. The class is matched by name rather than with
 # `instanceof` so the probe degrades to "no agents" on a controller without the plugin
@@ -110,7 +108,7 @@ def vm_states(records):
     for record in records.values():
         if record["is_a_template"] or record["is_a_snapshot"] or record["is_control_domain"]:
             continue
-        if (record.get("other_config") or {}).get(OWNER_KEY):
+        if owned_by(record):
             states[record["name_label"]] = record["power_state"]
     return states
 

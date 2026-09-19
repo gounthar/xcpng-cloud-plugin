@@ -79,6 +79,17 @@ def test_cloud_narrows_to_one_cloud():
     assert list(clone_states(payload, cloud="lab")) == ["uuid-mine"]
 
 
+def test_a_clone_an_xo_cloud_made_is_watched_and_narrowed_by_its_tag():
+    """#231. An XO clone carries `xcpng-cloud:<cloud>` as a tag and nothing in other_config.
+    The step-2 lab runs had to monkeypatch the selector to see one at all."""
+    payload = records(
+        vm_record("xo-clone", owner_tag="xcpng-xo", xenstore_data=SEED),
+        vm_record("other-cloud", owner_tag="xcpng-lab", xenstore_data=SEED),
+    )
+    assert sorted(clone_states(payload)) == ["uuid-other-cloud", "uuid-xo-clone"]
+    assert list(clone_states(payload, cloud="xcpng-xo")) == ["uuid-xo-clone"]
+
+
 def test_present_then_absent_is_confirmed():
     tracker = Tracker()
     tracker.observe("clone", {"secret": True, "control": True, "power": "Running"}, 10.0)

@@ -16,8 +16,9 @@ skips the shutdown on Halted, so without this check it can take a live domain's
 disk. Recommended before any --apply on a shared pool; needs sshpass and dom0
 root sharing XCPNG_PASS, and fails closed if dom0 cannot be reached.
 
-Selection is by the `xcpng-cloud` marker the plugin stamps into each clone's
-other_config (XapiClient.OWNER_KEY), not by name. This tool used to default to
+Selection is by the owner marker the plugin stamps on each clone, not by name: the
+`xcpng-cloud` key in other_config on a clone made over XAPI, or the `xcpng-cloud:<cloud>` tag
+on one made through Xen Orchestra (owner.py reads both). This tool used to default to
 the name prefix "jenkins-ci-" while the plugin named its clones
 "xcpng-<template>-<uuid8>", so it matched none of them and exited 0 while
 leaked VMs held pool memory and SR space. A marker cannot drift out of sync with
@@ -34,10 +35,8 @@ import shutil
 import subprocess
 import sys
 
+from owner import OWNER_KEY, owned_by
 from xapi import Xapi, XapiError
-
-# Must match XapiClient.OWNER_KEY. If they drift, this tool silently reaps nothing again.
-OWNER_KEY = "xcpng-cloud"
 
 # The legacy tools-era prefix, kept only as the suggested value for --prefix.
 LEGACY_PREFIX = "jenkins-ci-"
@@ -114,11 +113,11 @@ def _selector(args):
     if args.prefix is None:
         if args.cloud:
             return (
-                lambda rec: (rec.get("other_config") or {}).get(OWNER_KEY) == args.cloud,
+                lambda rec: owned_by(rec, args.cloud),
                 f"provisioned by cloud {args.cloud!r}",
             )
         return (
-            lambda rec: OWNER_KEY in (rec.get("other_config") or {}),
+            lambda rec: owned_by(rec),
             f"carrying the {OWNER_KEY!r} marker",
         )
     return (

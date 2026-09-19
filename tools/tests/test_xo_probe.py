@@ -117,8 +117,8 @@ def test_cleanup_touches_nothing_when_nothing_was_created(empty_created):
 
 
 def test_cleanup_only_ever_deletes_what_this_run_created(empty_created):
-    """The reaper cannot help here: an XO-made VM carries no other_config owner marker, so
-    it is invisible to a marker-based sweep and this list is the only record there is."""
+    """This list is what cleanup trusts. The reaper finds a probe VM only once its tag has
+    landed, so a VM made and never tagged has no other record anywhere."""
     empty_created.CREATED.extend(["vm-mine-1", "vm-mine-2"])
     xo = FakeXo()
     assert cleanup(xo) == 0

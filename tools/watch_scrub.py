@@ -44,11 +44,8 @@ import os
 import sys
 import time
 
+from owner import owned_by
 from xapi import Xapi
-
-# Must match XapiClient.OWNER_KEY, and the copies in reaper.py and watch_warm.py. If they drift,
-# this watches nothing and reports it as "no clone appeared", which is exit 2 rather than a pass.
-OWNER_KEY = "xcpng-cloud"
 
 # Must match XapiClient.GUEST_DATA_PREFIX. SECRET_KEY is what the scrub removes; CONTROL_KEY is
 # seeded beside it and is never removed, so it answers "could this reader have seen a key at all".
@@ -77,8 +74,7 @@ def clone_states(records, cloud=None):
     for record in records.values():
         if record["is_a_template"] or record["is_a_snapshot"] or record["is_control_domain"]:
             continue
-        marker = (record.get("other_config") or {}).get(OWNER_KEY)
-        if marker is None or (cloud is not None and marker != cloud):
+        if not owned_by(record, cloud):
             continue
         data = record.get("xenstore_data") or {}
         states[record["uuid"]] = {

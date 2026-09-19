@@ -73,6 +73,15 @@ def test_vm_states_selects_on_the_owner_marker_only():
     assert vm_states(records) == {"xcpng-agent-1": "Running"}
 
 
+def test_vm_states_sees_a_warm_spare_an_xo_cloud_made():
+    """#231: the XO backend marks with a tag, never other_config."""
+    records = {
+        "ref1": vm_record("xcpng-xo-spare", power="Running", owner_tag="xcpng-xo"),
+        "ref2": vm_record("tagged-by-an-operator", power="Running", tags=["prod"]),
+    }
+    assert vm_states(records) == {"xcpng-xo-spare": "Running"}
+
+
 def test_vm_states_excludes_templates_snapshots_and_dom0_even_when_marked():
     """A marked snapshot is an operator's restore point, and reporting it as an agent is how a
     filter that checks only one of the three flags gets someone's rollback destroyed."""

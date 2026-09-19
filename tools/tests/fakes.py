@@ -35,17 +35,22 @@ class FakeResponse:
 
 
 def vm_record(name, snapshot=False, template=False, control_domain=False, power="Halted",
-              owner=None, other_config=None, xenstore_data=None):
+              owner=None, other_config=None, xenstore_data=None, owner_tag=None, tags=None):
     """The subset of a XAPI VM record that reaper.py filters on.
 
     `owner` stamps the `xcpng-cloud` marker the plugin writes into other_config, i.e. this is
-    a VM the plugin provisioned and is answerable for. Leave it None for everything the plugin
-    did not create: an operator's VM, the golden image, a pre-plugin probe. Defaulting to None
-    matters, because a fake that marked every VM would make the marker filter untestable.
+    a VM the plugin provisioned over XAPI and is answerable for. `owner_tag` marks it the way
+    the XO backend does instead, with the tag `xcpng-cloud:<cloud>`. Leave both None for
+    everything the plugin did not create: an operator's VM, the golden image, a pre-plugin
+    probe. Defaulting to None matters, because a fake that marked every VM would make the
+    marker filter untestable.
     """
     config = dict(other_config or {})
     if owner is not None:
         config["xcpng-cloud"] = owner
+    labels = list(tags or [])
+    if owner_tag is not None:
+        labels.append(f"xcpng-cloud:{owner_tag}")
     return {
         "name_label": name,
         "uuid": f"uuid-{name}",
@@ -54,6 +59,8 @@ def vm_record(name, snapshot=False, template=False, control_domain=False, power=
         "is_a_template": template,
         "is_control_domain": control_domain,
         "other_config": config,
+        # XAPI types tags as a string set and returns [] when there are none.
+        "tags": labels,
         # The per-clone seed the plugin writes, and the surface #28's scrub clears. Defaults to
         # empty rather than to a populated seed: a fake that seeded every VM would make a
         # watcher that never reads the key look like one that reads it correctly.

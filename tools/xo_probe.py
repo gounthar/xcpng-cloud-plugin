@@ -40,8 +40,8 @@ SEED_KEY = "vm-data/jenkins/probe"
 SEED_VALUE = "seeded-by-xo-probe"
 
 # Set only after --run has actually created something, so cleanup can never reach a VM
-# this probe did not make. The reaper cannot help here: a clone made through XO carries
-# no other_config owner marker, so it is invisible to a marker-based sweep.
+# this probe did not make. Once OWNER_TAG is on a VM, `reaper.py --cloud xo-probe` finds it
+# too; before the tag lands, the name is the only handle anything has on it.
 CREATED = []
 
 
@@ -352,7 +352,7 @@ def cleanup(xo):
             print(f"  FAILED to remove {vm_id}: {exc}", file=sys.stderr)
     if stuck:
         print(f"\nLEFT ON THE POOL: {', '.join(stuck)}", file=sys.stderr)
-        print("The reaper cannot see these: an XO-made VM carries no other_config marker.",
+        print("Once tagged, `reaper.py --cloud xo-probe` finds these; an untagged one only by name.",
               file=sys.stderr)
     return len(stuck)
 

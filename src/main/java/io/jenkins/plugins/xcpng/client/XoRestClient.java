@@ -38,9 +38,9 @@ import java.util.logging.Logger;
  *       the PATCH body type, so {@link XapiClient#OWNER_KEY} has no home here. The equivalent is
  *       {@code PUT /vms/{id}/tags/{tag}}, which bottoms out on XAPI {@code add_tags}. Tags are visible in
  *       the XO UI where {@code other_config} effectively is not, so an operator will see
- *       {@code xcpng-cloud:<cloud>} on every clone. <b>While both backends exist, a clone leaked by one
- *       is invisible to a sweep written for the other</b> -- {@code tools/reaper.py} selects on
- *       {@code other_config} and cannot see an XO-made VM at all.
+ *       {@code xcpng-cloud:<cloud>} on every clone. <b>While both backends exist, a sweep has to read
+ *       both markers</b>, or a clone leaked by one is invisible to it: {@code tools/reaper.py} read
+ *       only {@code other_config} until #231, and {@code tools/owner.py} now reads either.
  *   <li><b>Teardown captures no disks.</b> {@code DELETE /vms/{id}} deletes them unconditionally and
  *       offers no way to ask it not to, so the capture-before-destroy ordering this interface documents
  *       is XO's problem now rather than ours. It gets it right ({@code VM_getDisks} before
