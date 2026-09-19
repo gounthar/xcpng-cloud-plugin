@@ -534,7 +534,9 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                             + "; recorded it as a leaked VM for the warm-pool maintainer to reclaim");
             listener.getLogger()
                     .println("Failed to destroy VM " + vmRef + "; recorded for later cleanup: " + e.getMessage());
-            cloud.recordLeakedVm(vmRef);
+            // With this agent's connection, not the cloud's: the sweep must reach the VM the way it was made,
+            // even after the cloud is edited (#223). An agent predating the snapshot records none.
+            cloud.recordLeakedVm(XcpngLeakedVm.of(vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint));
         }
     }
 

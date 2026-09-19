@@ -11,8 +11,10 @@ import hudson.model.Saveable;
 import hudson.model.listeners.SaveableListener;
 import java.io.File;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -23,7 +25,7 @@ import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 
 /**
- * The VM references the plugin failed to destroy, held per cloud, outside the cloud object.
+ * The VMs the plugin failed to destroy, held per cloud, outside the cloud object.
  *
  * <p>This exists because the set has to outlive the {@link XcpngCloud} instance that recorded it, and on
  * every configuration path but one it does not. A cloud is rebuilt through its
@@ -45,6 +47,11 @@ import jenkins.model.Jenkins;
  * latter would give us persistence for free and would also expose the set to configuration-as-code under
  * {@code unclassified}, which is the export this design exists to avoid.
  * {@code XcpngCloudConfigurationAsCodeTest} asserts that it stays out of the YAML.
+ *
+ * <p>Each entry carries the connection its VM was provisioned over, not only the ref (#223). A ref is
+ * meaningful only to the connection that minted it, and a sweep over any other can report a false success;
+ * {@link XcpngLeakedVm} has the measurement. A file written before #223 holds bare refs, which
+ * {@link #normalize()} converts on load and the next save writes back in the new shape.
  *
  * <p>Keyed by cloud name, which is what a rebuilt cloud carries across. A renamed cloud therefore
  * orphans its entries, and so does a deleted one; nothing sweeps those, since only a live cloud runs
@@ -83,12 +90,27 @@ public class XcpngLeakedVmStore implements Saveable {
     private static final Object SAVE_LOCK = new Object();
 
     /**
-     * Cloud name to the VM refs that cloud could not destroy. Not final and not typed to the concurrent
+     * Cloud name to the VMs that cloud could not destroy. Not final and not typed to the concurrent
      * implementations: {@link XmlFile#unmarshal} writes the deserialized collections straight into the
      * field, so whatever XStream built lands here and {@link #normalize()} swaps it for the concurrent
      * shapes the runtime paths need.
      */
-    private Map<String, Set<String>> refsByCloud = new ConcurrentHashMap<>();
+    private Map<String, Set<XcpngLeakedVm>> leakedByCloud = new ConcurrentHashMap<>();
+
+    /**
+     * Where a file written before #223 kept its bare refs, read on the way in and never written again. No
+     * initializer, so it is null unless an old file carried it, and XStream omits a null field from what it
+     * writes; {@link #normalize()} converts whatever it holds and clears it.
+     */
+    private Map<String, Set<String>> refsByCloud;
+
+    /**
+     * Entries whose sweep has already failed once in this controller's life, so the next failure logs at FINE
+     * rather than WARNING. Runtime state and deliberately forgotten on restart: one WARNING per entry per
+     * process is the point. Transient, and final with its initializer: {@link XmlFile#unmarshal} fills this
+     * existing object rather than building a new one, so the constructor has always run.
+     */
+    private final transient Set<String> failedOnce = ConcurrentHashMap.newKeySet();
 
     public XcpngLeakedVmStore() {
         load();
@@ -150,18 +172,18 @@ public class XcpngLeakedVmStore implements Saveable {
      * writes the file nor logs again. Persisted at once: the VM outlives the controller process, so a leak
      * recorded before a restart must still be reclaimed after one.
      */
-    boolean record(String cloudName, @NonNull String vmRef) {
+    boolean record(String cloudName, @NonNull XcpngLeakedVm vm) {
         drainPendingMigrations();
-        if (unkeyable(cloudName, "record leaked VM " + vmRef)) {
+        if (unkeyable(cloudName, "record leaked VM " + vm.getVmRef())) {
             return false;
         }
         // compute() rather than computeIfAbsent().add(): the add has to happen under the map's per-key lock,
         // the same one drop() takes, or the two interleave and lose the ref. computeIfAbsent returns the set
         // and releases the lock before the caller adds to it, which leaves exactly that window open.
         boolean[] added = {false};
-        refsByCloud.compute(cloudName, (key, refs) -> {
-            Set<String> target = refs == null ? new CopyOnWriteArraySet<>() : refs;
-            added[0] = target.add(vmRef);
+        leakedByCloud.compute(cloudName, (key, vms) -> {
+            Set<XcpngLeakedVm> target = vms == null ? new CopyOnWriteArraySet<>() : vms;
+            added[0] = target.add(vm);
             return target;
         });
         if (added[0]) {
@@ -170,24 +192,46 @@ public class XcpngLeakedVmStore implements Saveable {
         return added[0];
     }
 
-    /** A snapshot of one cloud's leaked refs. A copy: the caller iterates it while a sweep may be mutating. */
+    /** A snapshot of one cloud's leaked VMs. A copy: the caller iterates it while a sweep may be mutating. */
     @NonNull
-    Set<String> refs(String cloudName) {
+    Set<XcpngLeakedVm> entries(String cloudName) {
         drainPendingMigrations();
         if (unkeyable(cloudName, "read leaked VMs")) {
             return new LinkedHashSet<>();
         }
-        Set<String> refs = refsByCloud.get(cloudName);
-        return refs == null ? new LinkedHashSet<>() : new LinkedHashSet<>(refs);
+        Set<XcpngLeakedVm> vms = leakedByCloud.get(cloudName);
+        return vms == null ? new LinkedHashSet<>() : new LinkedHashSet<>(vms);
+    }
+
+    /** Just the refs of {@link #entries}, for callers that ask which VMs are recorded, not how to reach them. */
+    @NonNull
+    Set<String> refs(String cloudName) {
+        Set<String> refs = new LinkedHashSet<>();
+        for (XcpngLeakedVm vm : entries(cloudName)) {
+            refs.add(vm.getVmRef());
+        }
+        return refs;
     }
 
     /**
-     * Drop the refs a sweep managed to destroy. The cloud's entry is removed once it empties, so a healthy
+     * Whether this is the first failed sweep of {@code vm} since the controller started. Cleared by
+     * {@link #drop}, so an entry recorded again later warns again.
+     */
+    boolean firstFailure(String cloudName, @NonNull XcpngLeakedVm vm) {
+        return cloudName != null && failedOnce.add(failureKey(cloudName, vm));
+    }
+
+    private static String failureKey(String cloudName, XcpngLeakedVm vm) {
+        return cloudName + '\n' + vm.getVmRef();
+    }
+
+    /**
+     * Drop the entries a sweep destroyed or gave up on. The cloud's entry is removed once it empties, so a healthy
      * controller's file holds nothing rather than a row of empty sets.
      */
-    void drop(String cloudName, @NonNull Collection<String> vmRefs) {
+    void drop(String cloudName, @NonNull Collection<XcpngLeakedVm> vms) {
         drainPendingMigrations();
-        if (vmRefs.isEmpty() || unkeyable(cloudName, "drop leaked VMs")) {
+        if (vms.isEmpty() || unkeyable(cloudName, "drop leaked VMs")) {
             return;
         }
         // The removal and the decision to delete the now-empty entry must be one atomic step, under the same
@@ -195,13 +239,16 @@ public class XcpngLeakedVmStore implements Saveable {
         // isEmpty() check and the delete adds to the very set about to be dropped, and remove(key, value)
         // compares by equals against that same object, so it deletes the entry the new ref just went into.
         boolean[] changed = {false};
-        refsByCloud.compute(cloudName, (key, refs) -> {
-            if (refs == null) {
+        leakedByCloud.compute(cloudName, (key, recorded) -> {
+            if (recorded == null) {
                 return null;
             }
-            changed[0] = refs.removeAll(vmRefs);
-            return refs.isEmpty() ? null : refs;
+            changed[0] = recorded.removeAll(vms);
+            return recorded.isEmpty() ? null : recorded;
         });
+        for (XcpngLeakedVm vm : vms) {
+            failedOnce.remove(failureKey(cloudName, vm));
+        }
         if (changed[0]) {
             saveQuietly();
         }
@@ -242,10 +289,15 @@ public class XcpngLeakedVmStore implements Saveable {
             // per-key lock, so a drop() landing in between sees an empty set, returns null, and the migrated
             // refs land in a set no longer in the map. Third site of the same shape; the other two were
             // fixed first and this one was left behind.
+            // A deferral is a bare ref out of a pre-#149 config.xml: no connection was ever recorded for it.
+            List<XcpngLeakedVm> converted = new ArrayList<>();
+            for (String vmRef : pending) {
+                converted.add(XcpngLeakedVm.legacy(vmRef));
+            }
             boolean[] added = {false};
-            refsByCloud.compute(cloudName, (key, refs) -> {
-                Set<String> target = refs == null ? new CopyOnWriteArraySet<>() : refs;
-                added[0] = target.addAll(pending);
+            leakedByCloud.compute(cloudName, (key, vms) -> {
+                Set<XcpngLeakedVm> target = vms == null ? new CopyOnWriteArraySet<>() : vms;
+                added[0] = target.addAll(converted);
                 return target;
             });
             migrated |= added[0];
@@ -307,21 +359,51 @@ public class XcpngLeakedVmStore implements Saveable {
             // the retry of whatever is recorded in it, while throwing here would cost the whole plugin.
             LOGGER.log(Level.WARNING, e, () -> "Could not read the XCP-ng leaked-VM store; starting empty");
         }
-        normalize();
+        if (normalize()) {
+            // Rewrite at once in the new shape, so the legacy element is gone from disk rather than lingering
+            // until the next record or drop happens to save.
+            saveQuietly();
+        }
     }
 
-    /** Swap whatever XStream deserialized for the concurrent shapes {@link #record} and {@link #drop} need. */
-    private void normalize() {
-        Map<String, Set<String>> deserialized = refsByCloud;
-        ConcurrentMap<String, Set<String>> normalized = new ConcurrentHashMap<>();
+    /**
+     * Swap whatever XStream deserialized for the concurrent shapes {@link #record} and {@link #drop} need,
+     * converting any bare refs a pre-#223 file carried. Returns whether there were any to convert.
+     */
+    private boolean normalize() {
+        ConcurrentMap<String, Set<XcpngLeakedVm>> normalized = new ConcurrentHashMap<>();
+        Map<String, Set<XcpngLeakedVm>> deserialized = leakedByCloud;
         if (deserialized != null) {
-            deserialized.forEach((cloudName, refs) -> {
-                if (cloudName != null && refs != null && !refs.isEmpty()) {
-                    normalized.put(cloudName, new CopyOnWriteArraySet<>(refs));
+            deserialized.forEach((cloudName, vms) -> {
+                if (cloudName != null && vms != null && !vms.isEmpty()) {
+                    normalized.put(cloudName, new CopyOnWriteArraySet<>(vms));
                 }
             });
         }
-        refsByCloud = normalized;
+        boolean converted = false;
+        Map<String, Set<String>> legacy = refsByCloud;
+        if (legacy != null) {
+            for (Map.Entry<String, Set<String>> entry : legacy.entrySet()) {
+                String cloudName = entry.getKey();
+                Set<String> refs = entry.getValue();
+                if (cloudName == null || refs == null || refs.isEmpty()) {
+                    continue;
+                }
+                Set<XcpngLeakedVm> target = normalized.computeIfAbsent(cloudName, k -> new CopyOnWriteArraySet<>());
+                for (String vmRef : refs) {
+                    target.add(XcpngLeakedVm.legacy(vmRef));
+                }
+                converted = true;
+                LOGGER.log(
+                        Level.INFO,
+                        () -> "Converted " + refs.size() + " leaked XCP-ng VM ref(s) for cloud " + cloudName
+                                + " to the #223 shape; no connection was recorded for them, so each is retried"
+                                + " over the cloud's current connection only if its backend matches");
+            }
+        }
+        leakedByCloud = normalized;
+        refsByCloud = null;
+        return converted;
     }
 
     private static XmlFile configFile() {

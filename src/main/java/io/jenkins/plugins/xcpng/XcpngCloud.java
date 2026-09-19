@@ -44,6 +44,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -182,6 +183,12 @@ public class XcpngCloud extends Cloud {
      * Transient: it is behaviour, not configuration, and must never be persisted to {@code config.xml}.
      */
     private transient HypervisorClientFactory clientFactory;
+
+    /**
+     * How {@link #sweepLeakedVms} opens a connection this cloud no longer has. Null in production; a test
+     * injects a fake. Transient, like {@link #clientFactory}.
+     */
+    private transient XcpngAgent.ConnectionClientFactory recordedConnectionClientFactory;
 
     /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
@@ -966,51 +973,183 @@ public class XcpngCloud extends Cloud {
      * one {@code destroyWithDisks} failure path there now is, {@link XcpngAgent#_terminate}, which every
      * teardown converges on -- including the one {@link XcpngLauncher} runs when a launch fails after the
      * clone. This set then holds the last reference to the VM. Persisted at once so the ref survives a
-     * restart; a duplicate ref is a no-op. {@link #sweepLeakedVms} reissues the destroy.
+     * restart; a duplicate is a no-op. {@link #sweepLeakedVms} reissues the destroy, over the connection
+     * recorded with the ref.
      */
+    void recordLeakedVm(@NonNull XcpngLeakedVm vm) {
+        // The store persists itself, and reports whether the entry was new so a duplicate record is silent.
+        if (XcpngLeakedVmStore.get().record(name, vm)) {
+            LOGGER.log(Level.FINE, () -> "Recorded leaked XCP-ng VM " + vm + " for cloud " + name);
+        }
+    }
+
+    /** Record a leak whose VM was provisioned over this cloud's connection as it is configured now. */
     void recordLeakedVm(@NonNull String vmRef) {
-        // The store persists itself, and reports whether the ref was new so a duplicate record is silent.
-        if (XcpngLeakedVmStore.get().record(name, vmRef)) {
-            LOGGER.log(Level.FINE, () -> "Recorded leaked XCP-ng VM " + vmRef + " for cloud " + name);
+        recordLeakedVm(XcpngLeakedVm.of(vmRef, this));
+    }
+
+    /**
+     * Reissue the destroy for every VM a past teardown failed to remove, dropping each one that now destroys
+     * cleanly and leaving the rest for the next tick. Called on a schedule by {@link XcpngWarmPoolMaintainer};
+     * package-visible so a test can drive it directly. Opens one client per recorded connection, and none at
+     * all when nothing is recorded, so a healthy cloud pays nothing for it. Runs off the cloud monitor: the
+     * blocking destroy must not stall a concurrent {@link #provision} or {@link #reconcileWarmPool}, and the
+     * leaked set carries its own lock.
+     *
+     * <p>Each ref goes back to the connection it was provisioned over and to no other (#223), because a ref
+     * handed to the wrong backend or pool can read as already destroyed; {@link XcpngLeakedVm} has the
+     * measurement. An entry recorded over the connection this cloud still has is swept through
+     * {@link #openClient()}, the same client provisioning uses. An entry from a connection the cloud has
+     * since left is swept over that recorded connection instead. An entry with no recorded connection has
+     * only the cloud's current one, and is swept over it only when the backends match.
+     *
+     * <p>Two outcomes drop an entry: the destroy succeeded, or the sweep gave up on it. It gives up only
+     * when retrying cannot help -- a connection the cloud has left behind no longer opens at all (the
+     * credential or URL it names is gone), or an entry with no connection belongs to a backend the cloud no
+     * longer speaks -- and says so once at SEVERE, naming {@code tools/reaper.py}, which finds the VM by its
+     * owner marker. Everything else keeps the entry, with no age limit: a pool that is down, a destroy that
+     * fails, and the cloud's own connection failing to open, which is live configuration an operator can
+     * repair. The first failure of each entry is logged at WARNING so a stuck entry is visible at the
+     * default level, and the repeats at FINE.
+     */
+    void sweepLeakedVms() {
+        // A snapshot off the store: iterating it cannot throw even if a record lands mid-sweep.
+        List<XcpngLeakedVm> pending = new ArrayList<>(XcpngLeakedVmStore.get().entries(name));
+        if (pending.isEmpty()) {
+            return;
+        }
+        List<XcpngLeakedVm> overCurrent = new ArrayList<>();
+        Map<XcpngLeakedVm.Connection, List<XcpngLeakedVm>> overRecorded = new LinkedHashMap<>();
+        // Reclaimed or given up on: either way it leaves the store.
+        List<XcpngLeakedVm> done = new ArrayList<>();
+        try {
+            for (XcpngLeakedVm vm : pending) {
+                if (vm.sameConnectionAs(this)) {
+                    overCurrent.add(vm);
+                } else if (vm.hasConnection()) {
+                    overRecorded
+                            .computeIfAbsent(vm.connection(), k -> new ArrayList<>())
+                            .add(vm);
+                } else if (vm.getBackend() == getBackend()) {
+                    overCurrent.add(vm);
+                } else {
+                    giveUp(
+                            vm,
+                            "it was recorded without a connection under the " + vm.getBackend()
+                                    + " backend, and this cloud now speaks " + getBackend()
+                                    + ". Handing its ref to another backend can report it destroyed while it runs");
+                    done.add(vm);
+                }
+            }
+            if (!overCurrent.isEmpty()) {
+                // Retryable even when it cannot be opened: this is the cloud's live configuration, so a
+                // credential an operator deleted is one they can put back, and the next tick would then work.
+                sweepOver(overCurrent, this::openClient, done, false);
+            }
+            for (Map.Entry<XcpngLeakedVm.Connection, List<XcpngLeakedVm>> group : overRecorded.entrySet()) {
+                XcpngLeakedVm.Connection connection = group.getKey();
+                sweepOver(group.getValue(), () -> openRecordedClient(connection), done, true);
+            }
+        } finally {
+            // In a finally, so a client whose close() throws cannot resurrect an entry whose destroy already
+            // succeeded. The store drops and persists them in one step.
+            XcpngLeakedVmStore.get().drop(name, done);
         }
     }
 
     /**
-     * Reissue the destroy for every VM a past teardown failed to remove, dropping each ref that now destroys
-     * cleanly and leaving the rest for the next tick. Called on a schedule by {@link XcpngWarmPoolMaintainer};
-     * package-visible so a test can drive it directly. Opens at most one client per sweep, and none at all when
-     * nothing is recorded, so a healthy cloud pays nothing for it. Runs off the cloud monitor: the blocking
-     * destroy must not stall a concurrent {@link #provision} or {@link #reconcileWarmPool}, and the leaked set
-     * carries its own lock.
+     * Destroy {@code vms} over one client, adding each reclaimed or given-up entry to {@code done}.
+     *
+     * @param abandonIfUnopenable whether a connection that cannot be built at all ends these entries.
+     *     True for a connection the cloud has left behind, where nothing is going to restore the credential
+     *     it names. False for the cloud's current one, which an operator is still editing and can repair.
      */
-    void sweepLeakedVms() {
-        // A snapshot off the store: iterating it cannot throw even if a record lands mid-sweep.
-        List<String> pending = new ArrayList<>(XcpngLeakedVmStore.get().refs(name));
-        if (pending.isEmpty()) {
+    private void sweepOver(
+            @NonNull List<XcpngLeakedVm> vms,
+            @NonNull Supplier<HypervisorClient> opener,
+            @NonNull List<XcpngLeakedVm> done,
+            boolean abandonIfUnopenable) {
+        HypervisorClient opened;
+        try {
+            opened = opener.get();
+        } catch (IllegalStateException e) {
+            // openClient's own verdict that these parameters cannot build a client at all: the credential or
+            // the URL is gone. On a connection the cloud no longer has, no tick will bring that back.
+            if (!abandonIfUnopenable) {
+                for (XcpngLeakedVm vm : vms) {
+                    stillLeaked(vm, e, "could not open this cloud's own connection for it");
+                }
+                return;
+            }
+            for (XcpngLeakedVm vm : vms) {
+                giveUp(vm, "its connection can no longer be opened: " + e.getMessage());
+                done.add(vm);
+            }
+            return;
+        } catch (RuntimeException e) {
+            for (XcpngLeakedVm vm : vms) {
+                stillLeaked(vm, e, "could not open a client for it");
+            }
             return;
         }
-        List<String> reclaimed = new ArrayList<>();
-        try (HypervisorClient client = openClient()) {
-            for (String vmRef : pending) {
+        try (HypervisorClient client = opened) {
+            for (XcpngLeakedVm vm : vms) {
                 try {
-                    client.destroyWithDisks(new VmRef(vmRef));
-                    reclaimed.add(vmRef);
-                    LOGGER.log(Level.INFO, () -> "Reclaimed leaked XCP-ng VM " + vmRef + " for cloud " + name);
+                    client.destroyWithDisks(new VmRef(vm.getVmRef()));
+                    done.add(vm);
+                    LOGGER.log(Level.INFO, () -> "Reclaimed leaked XCP-ng VM " + vm + " for cloud " + name);
                 } catch (RuntimeException e) {
-                    // Still unreachable. Keep it recorded and retry next tick; logged at FINE so a
-                    // persistently-stuck ref does not spam the log every minute (the leak itself was SEVERE).
-                    LOGGER.log(Level.FINE, e, () -> "Leaked XCP-ng VM " + vmRef + " still could not be destroyed");
+                    stillLeaked(vm, e, "still could not be destroyed");
                 }
             }
         } catch (RuntimeException e) {
-            // Could not even open a session (bad credentials, pool down). Whatever was reclaimed before the
-            // failure is still dropped in the finally; the rest stay recorded for the next tick.
-            LOGGER.log(Level.FINE, e, () -> "Could not open a client to sweep leaked XCP-ng VMs for cloud " + name);
-        } finally {
-            // In a finally, not after the try, so a client whose close() throws cannot resurrect a ref whose
-            // destroy already succeeded. The store drops and persists them in one step.
-            XcpngLeakedVmStore.get().drop(name, reclaimed);
+            // close() threw. Whatever was reclaimed is already in done and is dropped by the caller's finally.
+            LOGGER.log(Level.FINE, e, () -> "Could not close the client used to sweep leaked VMs for cloud " + name);
         }
+    }
+
+    /**
+     * Open a client over a connection this cloud no longer has, which a leaked entry recorded when its VM was
+     * provisioned. Production resolves the credential now, through the same static helper provisioning uses;
+     * a test injects a fake through {@link #setRecordedConnectionClientFactory}.
+     */
+    @NonNull
+    private HypervisorClient openRecordedClient(@NonNull XcpngLeakedVm.Connection connection) {
+        if (recordedConnectionClientFactory != null) {
+            return recordedConnectionClientFactory.open(
+                    connection.poolUrl(),
+                    connection.credentialsId(),
+                    connection.certificateFingerprint(),
+                    connection.backend());
+        }
+        return openClient(
+                connection.poolUrl(),
+                connection.credentialsId(),
+                connection.certificateFingerprint(),
+                connection.backend(),
+                "the connection a leaked VM of cloud '" + name + "' was provisioned over");
+    }
+
+    private void giveUp(@NonNull XcpngLeakedVm vm, @NonNull String reason) {
+        LOGGER.log(
+                Level.SEVERE,
+                () -> "Giving up on leaked XCP-ng VM " + vm + " for cloud " + name + ": " + reason
+                        + ". It may still exist; reclaim it with tools/reaper.py");
+    }
+
+    private void stillLeaked(@NonNull XcpngLeakedVm vm, @NonNull RuntimeException e, @NonNull String what) {
+        // Once at WARNING, then FINE: a stuck entry has to be visible at the default level, and a sweep runs
+        // every minute, so repeating it would bury everything else in the log.
+        Level level = XcpngLeakedVmStore.get().firstFailure(name, vm) ? Level.WARNING : Level.FINE;
+        LOGGER.log(
+                level,
+                e,
+                () -> "Leaked XCP-ng VM " + vm + " for cloud " + name + " " + what + "; keeping it for the next sweep");
+    }
+
+    /** Test seam: replace how the sweep opens a connection a leaked entry recorded, with an in-memory fake. */
+    void setRecordedConnectionClientFactory(XcpngAgent.ConnectionClientFactory factory) {
+        this.recordedConnectionClientFactory = factory;
     }
 
     /** A snapshot of the VM refs a past teardown could not destroy, for asserting the durable orphan set in tests. */

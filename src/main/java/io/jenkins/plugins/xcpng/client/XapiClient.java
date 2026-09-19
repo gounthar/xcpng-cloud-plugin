@@ -34,6 +34,12 @@ import java.util.regex.Pattern;
  */
 public final class XapiClient implements HypervisorClient {
 
+    /**
+     * XAPI's handle prefix. Every ref this backend mints carries it and no Xen Orchestra id does, which is
+     * what makes it a usable guard in {@link #destroyWithDisks}.
+     */
+    public static final String REF_PREFIX = "OpaqueRef:";
+
     private static final Logger LOGGER = Logger.getLogger(XapiClient.class.getName());
     private static final Pattern OPAQUE_REF = Pattern.compile("OpaqueRef:[0-9a-fA-F-]+");
 
@@ -482,6 +488,15 @@ public final class XapiClient implements HypervisorClient {
 
     @Override
     public void destroyWithDisks(@NonNull VmRef vm) {
+        if (!vm.value().startsWith(REF_PREFIX)) {
+            // A handle this backend never minted, which only a mismatched record can produce (#223). Refusing
+            // it here matters because the failure downstream is silent and wrong: XAPI answers a Xen
+            // Orchestra uuid with HANDLE_INVALID naming that uuid -- measured on the lab pool, 2026-09-19 --
+            // and alreadyGone() below reads exactly that as "the VM is already destroyed". The caller would
+            // then record a clean teardown for a VM that is still running.
+            throw new HypervisorException("refusing to destroy " + vm.value() + ": not a XAPI handle, which start with "
+                    + REF_PREFIX + ". A VM is only destroyable through the backend that created it.");
+        }
         ensureSession();
         // The whole VM half runs under one already-gone guard rather than each call carrying its own,
         // because every one of them can lose the same race. Two teardowns can reach the same VM (the

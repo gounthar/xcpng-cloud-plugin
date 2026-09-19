@@ -42,7 +42,7 @@ class XcpngLeakedVmStoreTest {
      */
     @Test
     void aRecordedRefSurvivesARestart(JenkinsRule r) throws Exception {
-        XcpngLeakedVmStore.get().record("xcpng-lab", "OpaqueRef:leaked-1");
+        XcpngLeakedVmStore.get().record("xcpng-lab", leak("OpaqueRef:leaked-1"));
 
         File file = new File(Jenkins.get().getRootDir(), STORE_FILE);
         assertTrue(file.isFile(), "recording a leak must write the store's own file: " + file);
@@ -61,8 +61,8 @@ class XcpngLeakedVmStoreTest {
     @Test
     void aDroppedRefLeavesTheFile(JenkinsRule r) throws Exception {
         XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
-        store.record("xcpng-lab", "OpaqueRef:leaked-1");
-        store.drop("xcpng-lab", List.of("OpaqueRef:leaked-1"));
+        store.record("xcpng-lab", leak("OpaqueRef:leaked-1"));
+        store.drop("xcpng-lab", List.of(leak("OpaqueRef:leaked-1")));
 
         assertTrue(store.refs("xcpng-lab").isEmpty(), "the dropped ref must be gone from the live store");
         File file = new File(Jenkins.get().getRootDir(), STORE_FILE);
@@ -76,8 +76,8 @@ class XcpngLeakedVmStoreTest {
     @Test
     void refsAreKeptPerCloud(JenkinsRule r) {
         XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
-        store.record("xcpng-lab", "OpaqueRef:lab-1");
-        store.record("xcpng-other", "OpaqueRef:other-1");
+        store.record("xcpng-lab", leak("OpaqueRef:lab-1"));
+        store.record("xcpng-other", leak("OpaqueRef:other-1"));
 
         assertEquals(Set.of("OpaqueRef:lab-1"), store.refs("xcpng-lab"));
         assertEquals(Set.of("OpaqueRef:other-1"), store.refs("xcpng-other"));
@@ -101,16 +101,16 @@ class XcpngLeakedVmStoreTest {
             for (int i = 0; i < 300; i++) {
                 String surviving = "OpaqueRef:new-" + i;
                 String doomed = "OpaqueRef:old-" + i;
-                store.record("xcpng-lab", doomed);
+                store.record("xcpng-lab", leak(doomed));
 
                 CountDownLatch go = new CountDownLatch(1);
                 Future<?> dropping = pool.submit(() -> {
                     awaitQuietly(go);
-                    store.drop("xcpng-lab", List.of(doomed));
+                    store.drop("xcpng-lab", List.of(leak(doomed)));
                 });
                 Future<?> recording = pool.submit(() -> {
                     awaitQuietly(go);
-                    store.record("xcpng-lab", surviving);
+                    store.record("xcpng-lab", leak(surviving));
                 });
                 go.countDown();
                 dropping.get(30, TimeUnit.SECONDS);
@@ -119,7 +119,7 @@ class XcpngLeakedVmStoreTest {
                 assertTrue(
                         store.refs("xcpng-lab").contains(surviving),
                         "a ref recorded while a sweep emptied the set must survive, iteration " + i);
-                store.drop("xcpng-lab", List.of(surviving));
+                store.drop("xcpng-lab", List.of(leak(surviving)));
             }
         } finally {
             pool.shutdownNow();
@@ -164,13 +164,13 @@ class XcpngLeakedVmStoreTest {
             for (int i = 0; i < 200; i++) {
                 String migrating = "OpaqueRef:migrated-" + i;
                 String doomed = "OpaqueRef:swept-" + i;
-                store.record("xcpng-lab", doomed);
+                store.record("xcpng-lab", leak(doomed));
                 XcpngLeakedVmStore.deferMigration("xcpng-lab", List.of(migrating));
 
                 CountDownLatch go = new CountDownLatch(1);
                 Future<?> dropping = pool.submit(() -> {
                     awaitQuietly(go);
-                    store.drop("xcpng-lab", List.of(doomed));
+                    store.drop("xcpng-lab", List.of(leak(doomed)));
                 });
                 Future<?> draining = pool.submit(() -> {
                     awaitQuietly(go);
@@ -183,7 +183,7 @@ class XcpngLeakedVmStoreTest {
                 assertTrue(
                         store.refs("xcpng-lab").contains(migrating),
                         "a migrated ref must survive a concurrent sweep, iteration " + i);
-                store.drop("xcpng-lab", List.of(migrating));
+                store.drop("xcpng-lab", List.of(leak(migrating)));
             }
         } finally {
             pool.shutdownNow();
@@ -223,7 +223,7 @@ class XcpngLeakedVmStoreTest {
                 assertTrue(
                         store.refs("xcpng-lab").contains(migrating),
                         "a deferral overlapping a drain must still reach the store, iteration " + i);
-                store.drop("xcpng-lab", List.of(migrating));
+                store.drop("xcpng-lab", List.of(leak(migrating)));
             }
         } finally {
             pool.shutdownNow();
@@ -240,13 +240,19 @@ class XcpngLeakedVmStoreTest {
     void anUnnamedCloudIsRefusedRatherThanThrowing(JenkinsRule r) {
         XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
 
-        assertFalse(store.record(null, "OpaqueRef:orphan"), "a nameless cloud cannot record, and must say so");
+        assertFalse(store.record(null, leak("OpaqueRef:orphan")), "a nameless cloud cannot record, and must say so");
         assertTrue(store.refs(null).isEmpty(), "reading a nameless cloud must be empty, not an exception");
         assertDoesNotThrow(
-                () -> store.drop(null, List.of("OpaqueRef:orphan")), "dropping for a nameless cloud must not throw");
+                () -> store.drop(null, List.of(leak("OpaqueRef:orphan"))),
+                "dropping for a nameless cloud must not throw");
     }
 
     /** {@link CountDownLatch#await()} without the checked exception, for use inside a submitted task. */
+    /** A bare ref with no connection recorded, which is what this class held before #223. */
+    private static XcpngLeakedVm leak(String vmRef) {
+        return XcpngLeakedVm.legacy(vmRef);
+    }
+
     private static void awaitQuietly(CountDownLatch latch) {
         try {
             latch.await();
@@ -254,6 +260,64 @@ class XcpngLeakedVmStoreTest {
             Thread.currentThread().interrupt();
             throw new IllegalStateException(e);
         }
+    }
+
+    /**
+     * The connection is the half #223 added, and it is the half that has to survive a restart: without it a
+     * sweep after the cloud is edited aims the ref at whatever the cloud says now, which can report a VM
+     * destroyed while it is still running.
+     */
+    @Test
+    void anEntryKeepsItsConnectionAcrossARestart(JenkinsRule r) throws Exception {
+        XcpngLeakedVm recorded = XcpngLeakedVm.of(
+                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", "AA:BB");
+        XcpngLeakedVmStore.get().record("xcpng-lab", recorded);
+
+        Set<XcpngLeakedVm> readBack = new XcpngLeakedVmStore().entries("xcpng-lab");
+
+        assertEquals(Set.of(recorded), readBack, "the connection must come back off disk with the ref");
+        XcpngLeakedVm reloaded = readBack.iterator().next();
+        assertEquals("https://old.example.test", reloaded.getPoolUrl());
+        assertEquals("cred-old", reloaded.getCredentialsId());
+        assertEquals("AA:BB", reloaded.getCertificateFingerprint());
+        assertEquals(XcpngBackend.XAPI, reloaded.getBackend());
+    }
+
+    /**
+     * A file written before #223 holds bare refs under {@code refsByCloud}. They must survive the upgrade,
+     * keep a backend read off their shape, and leave the file in the new form: a legacy element left behind
+     * would be re-migrated on every load, and the two copies could then diverge.
+     */
+    @Test
+    void aPre223FileMigratesItsBareRefs(JenkinsRule r) throws Exception {
+        File file = new File(Jenkins.get().getRootDir(), STORE_FILE);
+        Files.writeString(file.toPath(), """
+                <io.jenkins.plugins.xcpng.XcpngLeakedVmStore>
+                  <refsByCloud>
+                    <entry>
+                      <string>xcpng-lab</string>
+                      <set>
+                        <string>OpaqueRef:legacy-xapi</string>
+                        <string>55703ef8-ca33-ee80-e0d1-f9aee081ab7e</string>
+                      </set>
+                    </entry>
+                  </refsByCloud>
+                </io.jenkins.plugins.xcpng.XcpngLeakedVmStore>
+                """, StandardCharsets.UTF_8);
+
+        Set<XcpngLeakedVm> migrated = new XcpngLeakedVmStore().entries("xcpng-lab");
+
+        assertEquals(
+                Set.of("OpaqueRef:legacy-xapi", "55703ef8-ca33-ee80-e0d1-f9aee081ab7e"),
+                migrated.stream().map(XcpngLeakedVm::getVmRef).collect(java.util.stream.Collectors.toSet()),
+                "refs written before #223 must not be lost on upgrade: " + migrated);
+        for (XcpngLeakedVm vm : migrated) {
+            assertFalse(vm.hasConnection(), "a pre-#223 ref recorded no connection, so none may be invented: " + vm);
+            XcpngBackend expected = vm.getVmRef().startsWith("OpaqueRef:") ? XcpngBackend.XAPI : XcpngBackend.XO;
+            assertEquals(expected, vm.getBackend(), "the backend must be read off the ref's shape: " + vm);
+        }
+        String rewritten = Files.readString(file.toPath(), StandardCharsets.UTF_8);
+        assertFalse(rewritten.contains("refsByCloud"), "the legacy element must be gone from the file: " + rewritten);
     }
 
     /**

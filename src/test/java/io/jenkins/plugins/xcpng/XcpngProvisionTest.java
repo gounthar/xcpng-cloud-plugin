@@ -25,6 +25,7 @@ import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
 import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
+import io.jenkins.plugins.xcpng.client.HypervisorException;
 import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collection;
@@ -2068,6 +2069,220 @@ class XcpngProvisionTest {
                 fake.calls().contains("destroyWithDisks:vm/leaked/1"),
                 "the maintainer tick must sweep recorded leaks: " + fake.calls());
         assertTrue(cloud.leakedVmRefs().isEmpty(), "the swept VM must be dropped: " + cloud.leakedVmRefs());
+    }
+
+    // ---- A leak is swept over the connection it was recorded with (#223) ----
+
+    /**
+     * The cloud has been repointed since the VM was provisioned, so its current connection is the wrong one.
+     * A ref only means anything to the connection that minted it, and both backends answer a ref they do not
+     * know with what they use for "already destroyed", so sweeping over the current connection would drop
+     * the entry and leave the VM running.
+     */
+    @Test
+    void aLeakIsSweptOverTheConnectionItWasRecordedWith(JenkinsRule r) {
+        FakeHypervisorClient current = new FakeHypervisorClient("jenkins-golden-debian");
+        FakeHypervisorClient recorded = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(current, 2);
+        r.jenkins.clouds.add(cloud);
+        List<String> openedWith = new ArrayList<>();
+        cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, certificateFingerprint, backend) -> {
+            openedWith.add(backend + " " + poolUrl + " " + credentialsId + " " + certificateFingerprint);
+            return recorded;
+        });
+        cloud.recordLeakedVm(XcpngLeakedVm.of(
+                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", "AA:BB"));
+
+        cloud.sweepLeakedVms();
+
+        assertEquals(
+                List.of("XAPI https://old.example.test cred-old AA:BB"),
+                openedWith,
+                "the sweep must open the connection recorded with the ref, in full");
+        assertTrue(
+                recorded.calls().contains("destroyWithDisks:OpaqueRef:leaked-1"),
+                "the destroy must go to the recorded connection: " + recorded.calls());
+        assertTrue(
+                current.calls().isEmpty(),
+                "the cloud's current connection must never see a ref it did not mint: " + current.calls());
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "a reclaimed VM must be dropped: " + cloud.leakedVmRefs());
+    }
+
+    /**
+     * A ref stored before #223 carries no connection, only a backend read off its shape. This cloud speaks
+     * the other one, so there is nothing here that can destroy it: XAPI would answer this uuid with
+     * HANDLE_INVALID, which reads as "already destroyed", and the VM would be dropped while it runs.
+     */
+    @Test
+    void aBareRefFromTheOtherBackendIsGivenUpRatherThanSweptHere(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2); // XAPI, the default
+        r.jenkins.clouds.add(cloud);
+        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("55703ef8-ca33-ee80-e0d1-f9aee081ab7e"));
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(fake.calls().isEmpty(), "an XO ref must never be handed to an XAPI connection: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(),
+                "nothing here can ever destroy it, so it must be given up rather than retried forever: "
+                        + cloud.leakedVmRefs());
+    }
+
+    /** A bare ref whose backend does match is swept over the cloud's current connection: it is all there is. */
+    @Test
+    void aBareRefFromThisBackendIsSweptOverTheCloudsCurrentConnection(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("OpaqueRef:legacy-1"));
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:OpaqueRef:legacy-1"),
+                "a pre-#223 ref of this backend must still be swept: " + fake.calls());
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "and dropped once destroyed: " + cloud.leakedVmRefs());
+    }
+
+    /**
+     * The credential the entry was recorded with has been deleted, so {@code openClient} refuses to build a
+     * client at all. No tick will ever fix that, so the entry is given up with the operator told where to
+     * look, rather than retried every minute for the controller's life.
+     */
+    @Test
+    void aLeakWhoseConnectionCannotBeOpenedIsGivenUp(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        // No recorded-connection seam here: this is the production path, and no such credential exists.
+        cloud.recordLeakedVm(XcpngLeakedVm.of(
+                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-deleted", null));
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(),
+                "an entry whose connection no longer resolves must be given up: " + cloud.leakedVmRefs());
+        assertTrue(fake.calls().isEmpty(), "and must not fall back to this cloud's connection: " + fake.calls());
+    }
+
+    /**
+     * The cloud's own credential is missing, so its connection will not open either. That is live
+     * configuration an operator can put back, unlike a connection the cloud has already left, so the entry
+     * has to survive it. Found the hard way: giving up here dropped the entry during an ordinary UI save,
+     * because a maintainer tick swept a cloud whose credential the test never created.
+     */
+    @Test
+    void aLeakOnThisCloudsOwnConnectionIsKeptWhenItCannotBeOpened(JenkinsRule r) {
+        // No client factory, so this takes the production path, and no such credential exists.
+        XcpngCloud cloud =
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred-missing", null, 2, List.of(LINUX_TEMPLATE));
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("OpaqueRef:leaked-1");
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                cloud.leakedVmRefs().contains("OpaqueRef:leaked-1"),
+                "a credential an operator can restore must not end the entry: " + cloud.leakedVmRefs());
+    }
+
+    /** A pool that is merely down is the retryable case, and the entry has to survive it. */
+    @Test
+    void aLeakWhoseConnectionIsDownIsKept(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, certificateFingerprint, backend) -> {
+            throw new HypervisorException("pool unreachable");
+        });
+        cloud.recordLeakedVm(XcpngLeakedVm.of(
+                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", null));
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(
+                cloud.leakedVmRefs().contains("OpaqueRef:leaked-1"),
+                "an unreachable pool is temporary, so the entry must stay: " + cloud.leakedVmRefs());
+    }
+
+    /**
+     * A stuck entry must be visible at the default log level, and only once: the sweep runs every minute, so
+     * a WARNING per tick would bury everything else in the log.
+     */
+    @Test
+    void aStuckLeakWarnsOnceThenGoesQuiet(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        List<Level> levels = new ArrayList<>();
+        Logger logger = Logger.getLogger(XcpngCloud.class.getName());
+        Level previous = logger.getLevel();
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                if (record.getMessage().contains("vm/leaked/1")
+                        && record.getMessage().contains("next sweep")) {
+                    levels.add(record.getLevel());
+                }
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.setLevel(Level.ALL);
+        logger.addHandler(handler);
+        try {
+            cloud.sweepLeakedVms();
+            cloud.sweepLeakedVms();
+        } finally {
+            logger.removeHandler(handler);
+            logger.setLevel(previous);
+        }
+
+        assertEquals(List.of(Level.WARNING, Level.FINE), levels, "the first failure warns, the next is quiet");
+    }
+
+    /**
+     * The teardown records the agent's own connection, which is the whole point of carrying it.
+     *
+     * <p>The cloud is repointed between provisioning and teardown, because that is the only state in which
+     * the agent's connection and the cloud's differ. Without it the assertion cannot fail: a first version of
+     * this test passed happily against an agent that recorded the cloud's current connection instead.
+     */
+    @Test
+    void aFailedTeardownRecordsTheAgentsConnection(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        XcpngCloud provisioning = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(provisioning);
+        XcpngAgent agent = provisioned(r, provisioning, LINUX_TEMPLATE, "xcpng-agent-1");
+        String provisionedOver = agent.getPoolUrl();
+
+        // The operator repoints the cloud at another pool, under the same name, after the VM exists.
+        XcpngCloud repointed =
+                new XcpngCloud("xcpng", "https://other.example.test", "cred-new", null, 2, List.of(LINUX_TEMPLATE));
+        repointed.setClientFactory(c -> fake);
+        repointed.setWaitForOnline(false);
+        r.jenkins.clouds.remove(provisioning);
+        r.jenkins.clouds.add(repointed);
+
+        agent.terminate();
+
+        Set<XcpngLeakedVm> recorded = XcpngLeakedVmStore.get().entries("xcpng");
+        assertEquals(1, recorded.size(), "the failed teardown must record exactly one entry: " + recorded);
+        XcpngLeakedVm leak = recorded.iterator().next();
+        assertEquals(agent.getVmRef(), leak.getVmRef());
+        assertEquals(
+                provisionedOver,
+                leak.getPoolUrl(),
+                "the entry must carry the pool the VM was provisioned on, not the one the cloud now points at");
+        assertEquals("cred", leak.getCredentialsId(), "and the credential it was provisioned with");
+        assertEquals(agent.getBackend(), leak.getBackend());
     }
 
     @Test

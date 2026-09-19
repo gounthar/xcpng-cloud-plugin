@@ -296,6 +296,24 @@ class XapiClientTest {
         assertTrue(t.methods().contains("Async.VM.start"));
     }
 
+    /**
+     * A handle this backend never minted must be refused before any call goes out (#223). It matters because
+     * the failure downstream is silent and backwards: measured on the lab pool on 2026-09-19, XAPI answers a
+     * Xen Orchestra uuid with {@code HANDLE_INVALID ["VM", "<uuid>"]}, which {@code alreadyGone} reads as the
+     * VM being destroyed already, so the caller would record a clean teardown for a VM that is still running.
+     */
+    @Test
+    void destroyWithDisksRefusesAHandleFromAnotherBackend() {
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException thrown = assertThrows(
+                HypervisorException.class, () -> c.destroyWithDisks(new VmRef("55703ef8-ca33-ee80-e0d1-f9aee081ab7e")));
+
+        assertTrue(thrown.getMessage().contains("not a XAPI handle"), thrown.getMessage());
+        assertTrue(t.methods().isEmpty(), "it must refuse before logging in or calling anything: " + t.methods());
+    }
+
     @Test
     void destroyWithDisksCapturesVdisBeforeTheVmThenDestroysThem() {
         ScriptedTransport t = new ScriptedTransport();
