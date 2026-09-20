@@ -156,3 +156,86 @@ def test_a_normal_interval_is_left_alone(monkeypatch):
                         types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep))
     poll(lambda: {}, lambda d: "k" in d, timeout=2.0, interval=0.5)
     assert clock.slept == [0.5, 0.5, 0.5, 0.5], f"the clamp altered a fitting interval: {clock.slept}"
+
+
+# -- env_flag: the affirmative, in one place rather than two ----------------
+
+@pytest.mark.parametrize("value", ["1", "true", "TRUE", "Yes", "yes"])
+def test_an_affirmative_is_recognised_in_any_case(monkeypatch, value):
+    monkeypatch.setenv("XO_PROBE_FLAG", value)
+    assert xo_util.env_flag("XO_PROBE_FLAG") is True
+
+
+@pytest.mark.parametrize("value", ["0", "no", "", "off", "false", "2", "sure"])
+def test_anything_else_fails_closed(monkeypatch, value):
+    """The trap this function exists for: plain truthiness makes a non-empty string true,
+    so `=0` would enable the insecure behaviour the variable is meant to gate. "sure" and
+    "2" are in the list on purpose -- a value meant as a yes still fails closed, which is
+    the direction that costs a puzzled minute rather than a credential."""
+    monkeypatch.setenv("XO_PROBE_FLAG", value)
+    assert xo_util.env_flag("XO_PROBE_FLAG") is False
+
+
+def test_an_unset_variable_takes_the_default(monkeypatch):
+    monkeypatch.delenv("XO_PROBE_FLAG", raising=False)
+    assert xo_util.env_flag("XO_PROBE_FLAG") is False
+    assert xo_util.env_flag("XO_PROBE_FLAG", default=True) is True
+
+
+# -- transport_refusal: may the token go down this URL? ---------------------
+
+@pytest.mark.parametrize("url", [
+    "https://xo.invalid",
+    "https://192.168.1.5:443/rest/v0",
+    "wss://xo.invalid/api/",
+    "WSS://xo.invalid/api/",
+])
+def test_an_encrypted_address_is_allowed_silently(url, capsys):
+    """The control. Three refusals below mean nothing without a case that passes: a
+    function that refused everything would satisfy every negative test here."""
+    assert xo_util.transport_refusal(url) is None
+    assert capsys.readouterr().err == "", "a verified address must not print a warning"
+
+
+@pytest.mark.parametrize("url", ["http://xo.invalid", "ws://xo.invalid/api/"])
+def test_cleartext_is_refused_by_default(monkeypatch, url):
+    monkeypatch.delenv(xo_util.ALLOW_CLEARTEXT, raising=False)
+    refusal = xo_util.transport_refusal(url)
+    assert refusal is not None
+    assert xo_util.ALLOW_CLEARTEXT in refusal, "the refusal must name the way past it"
+
+
+@pytest.mark.parametrize("url", ["http://xo.invalid", "ws://xo.invalid/api/"])
+def test_cleartext_can_be_opted_into_and_says_so_every_time(monkeypatch, capsys, url):
+    """Opt-in rather than hard refusal, matching XO_TRUST_SELF_SIGNED. The warning is the
+    half that justifies the choice: a tool that cannot be told "yes, I mean it" gets
+    worked around by editing the source, and the edit takes the warning with it."""
+    monkeypatch.setenv(xo_util.ALLOW_CLEARTEXT, "1")
+    assert xo_util.transport_refusal(url) is None
+    err = capsys.readouterr().err
+    assert xo_util.ALLOW_CLEARTEXT in err and url in err
+
+
+def test_the_explicit_argument_beats_the_environment(monkeypatch):
+    monkeypatch.setenv(xo_util.ALLOW_CLEARTEXT, "1")
+    assert xo_util.transport_refusal("http://xo.invalid", allow=False) is not None
+
+
+@pytest.mark.parametrize("url, why", [
+    ("192.168.1.5", "no scheme at all: urlopen answers this with ValueError, not OSError"),
+    ("//192.168.1.5/rest/v0", "a protocol-relative URL names no scheme either"),
+    ("ftp://xo.invalid", "a scheme neither client speaks"),
+])
+def test_an_address_that_is_neither_encrypted_nor_cleartext_is_refused(monkeypatch, url, why):
+    """And refused even with the opt-in set: XO_ALLOW_CLEARTEXT says the token may go out
+    in the clear, not that any string is an address."""
+    monkeypatch.setenv(xo_util.ALLOW_CLEARTEXT, "1")
+    assert xo_util.transport_refusal(url) is not None, why
+
+
+def test_a_refusal_never_carries_the_token():
+    """It is handed a URL, so it cannot leak the token -- but the refusal is printed and
+    logged by callers that hold one, and this is the assertion that stays true if someone
+    later passes the client in to make the message friendlier."""
+    refusal = xo_util.transport_refusal("http://xo.invalid", allow=False)
+    assert "authenticationToken" not in refusal

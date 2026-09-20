@@ -6,6 +6,10 @@ measured against each other on the same pool rather than argued about from sourc
 
     XO_BASE=https://192.168.1.5 XO_TOKEN=... XO_TRUST_SELF_SIGNED=1
 
+The token is a bearer credential and goes out on every request, so a base that is not
+https:// is refused. XO_ALLOW_CLEARTEXT=1 overrides that and warns, for an appliance
+served over plain http; it is the same opt-in shape as XO_TRUST_SELF_SIGNED.
+
 The one thing worth knowing before using it: **VM creation hangs off /pools, not /vms**.
 `POST /pools/{id}/actions/create_vm` is the route, and it wants a BARE template uuid.
 The pool-prefixed form that XO hands you nearly everywhere else returns 404 "no such
@@ -22,6 +26,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from xo_util import env_flag, transport_refusal
 
 BARE_UUID_LEN = 36
 
@@ -87,13 +93,19 @@ def _from_env(name):
 class XoRest:
     def __init__(self, base=None, token=None, trust_self_signed=None, timeout=300):
         self.base = (base or _from_env("XO_BASE")).rstrip("/")
+
+        # Before the token is read, not after. Nothing here leaks a credential the process
+        # already holds, but a client that refuses the address only once it has gone
+        # looking for the secret invites the next reader to move the check for tidiness.
+        refusal = transport_refusal(self.base)
+        if refusal:
+            raise XoRestError("INSECURE_TRANSPORT", data=refusal)
+
         self._token = token or _from_env("XO_TOKEN")
         self.timeout = timeout
 
         if trust_self_signed is None:
-            trust_self_signed = os.environ.get("XO_TRUST_SELF_SIGNED", "").lower() in (
-                "1", "true", "yes",
-            )
+            trust_self_signed = env_flag("XO_TRUST_SELF_SIGNED")
         self._ctx = ssl.create_default_context()
         if trust_self_signed:
             self._ctx.check_hostname = False
@@ -107,7 +119,18 @@ class XoRest:
         url = f"{self.base}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
-        req.add_header("Cookie", f"authenticationToken={self._token}")
+        # add_unredirected_header, never add_header. urllib follows redirects by default
+        # and HTTPRedirectHandler.redirect_request copies every header except the two
+        # content ones onto the new request, so a 302 to another host is handed the
+        # token verbatim -- and the client reports the redirect target's answer as if it
+        # were XO's. unredirected_hdrs is urllib's own mechanism for exactly this: it
+        # goes out on this request and on no redirect of it, which is what the standard
+        # library does with Authorization for the same reason.
+        #
+        # The cost is that a redirect XO genuinely wanted followed now arrives
+        # unauthenticated and answers 401. That is the safe direction and a loud one; a
+        # silently forwarded credential is neither.
+        req.add_unredirected_header("Cookie", f"authenticationToken={self._token}")
         if data is not None:
             req.add_header("Content-Type", "application/json")
 
@@ -116,7 +139,19 @@ class XoRest:
                 raw = resp.read()
                 status = resp.status
         except urllib.error.HTTPError as exc:
-            raw = exc.read()
+            # An HTTPError is a response, so reading its body is a socket read like any
+            # other and fails like one. This read sits above the transport guard below
+            # and is not covered by it, so a connection dropped between the status line
+            # and the body escapes as a raw exception through every caller that handles
+            # only XoRestError. Same gap as the main read path, closed the same way.
+            try:
+                raw = exc.read()
+            except (OSError, http.client.HTTPException) as read_exc:
+                raise XoRestError(
+                    "TRANSPORT",
+                    status=exc.code,
+                    data=f"reading the body of the {exc.code} answer failed: {read_exc}",
+                ) from None
             try:
                 payload = json.loads(raw)
             except ValueError:

@@ -7,6 +7,10 @@ read from source.
 
     XO_URL=wss://192.168.1.5/api/ XO_TOKEN=... XO_TRUST_SELF_SIGNED=1 python3 tools/xo_probe.py
 
+A ws:// URL is refused: /api/ is served on both schemes, so the missing letter connects,
+signs in, works, and puts the token on the wire in the clear every run. XO_ALLOW_CLEARTEXT=1
+overrides it and warns.
+
 Three things about this transport that the REST one does not have, and that the plugin
 will have to handle:
 
@@ -27,6 +31,8 @@ import os
 import ssl
 import sys
 import time
+
+from xo_util import env_flag, transport_refusal
 
 try:
     import websocket  # websocket-client
@@ -62,6 +68,15 @@ def _from_env(name):
 class Xo:
     def __init__(self, url=None, token=None, trust_self_signed=None, timeout=DEFAULT_TIMEOUT):
         self.url = url or _from_env("XO_URL")
+
+        # ws:// is the trap this catches, and it is easier to reach than http:// is on the
+        # REST side: the appliance serves both schemes on /api/, so a URL with the one
+        # letter missing connects, signs in, and works -- while putting the token on the
+        # wire in the clear on every run. Nothing downstream would ever complain.
+        refusal = transport_refusal(self.url)
+        if refusal:
+            raise XoError("INSECURE_TRANSPORT", refusal)
+
         self._token = token or _from_env("XO_TOKEN")
         self.timeout = timeout
         self._ws = None
@@ -71,9 +86,7 @@ class Xo:
         # Same posture as the XAPI client and as the plugin's trustSelfSigned checkbox:
         # opt-in, off by default, and it says so out loud when it is on.
         if trust_self_signed is None:
-            trust_self_signed = os.environ.get("XO_TRUST_SELF_SIGNED", "").lower() in (
-                "1", "true", "yes",
-            )
+            trust_self_signed = env_flag("XO_TRUST_SELF_SIGNED")
         self._trust_self_signed = trust_self_signed
         if trust_self_signed:
             print(
@@ -89,7 +102,23 @@ class Xo:
         if self._trust_self_signed:
             sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
         self._ws = websocket.create_connection(self.url, sslopt=sslopt, timeout=self.timeout)
-        self.user = self.call("session.signInWithToken", {"token": self._token})
+        try:
+            self.user = self.call("session.signInWithToken", {"token": self._token})
+        except BaseException:
+            # The socket is open and unauthenticated at this point. __enter__ propagates
+            # this, so __exit__ never runs and nothing else will ever close it: the
+            # appliance holds the connection until it times out, and a harness that
+            # retries in a loop stacks one per attempt.
+            #
+            # A close that raises is swallowed on purpose. close() drops the handle in a
+            # finally either way, and the sign-in failure is the one the caller needs --
+            # a dying socket reporting that it is dying, on top of an error that says why,
+            # replaces the useful message with the redundant one.
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
         return self.user
 
     def close(self):

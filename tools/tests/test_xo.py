@@ -432,3 +432,90 @@ def test_a_send_that_blocks_is_a_timeout_and_not_a_traceback(xo):
         xo.call("vm.create", timeout=3.0)
     assert caught.value.message == "TIMEOUT"
     assert "sent" in str(caught.value), "a send failure must not read as an answer that never came"
+
+
+# -- a failed sign-in must not leave the socket open ------------------------
+
+def test_a_refused_sign_in_closes_the_socket_it_opened(xo, monkeypatch):
+    """connect() opens the socket and then authenticates on it. A sign-in that raises
+    used to propagate out of __enter__, so __exit__ never ran and nothing else held the
+    handle: the appliance kept an open unauthenticated connection until it timed out, and
+    a harness retrying in a loop stacked one per attempt.
+
+    The assertion on `ws.closed` is the load-bearing one. Asserting only that XoError
+    escapes passes against the leaking version, which is why it read as correct."""
+    ws = FakeWs([{"id": 1, "error": {"message": "invalid token"}}])
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with pytest.raises(XoError, match="invalid token"):
+        xo.connect()
+    assert ws.closed is True, "the unauthenticated socket was left open"
+    assert xo._ws is None, "a dead handle here sends the next call into it"
+
+
+def test_the_sign_in_failure_survives_a_socket_that_also_refuses_to_close(xo, monkeypatch):
+    """close() raising during cleanup must not replace the error that explains why. The
+    handle still has to go: close() drops it in a finally either way."""
+    class Angry(FakeWs):
+        def close(self):
+            raise OSError("already gone")
+
+    ws = Angry([{"id": 1, "error": {"message": "invalid token"}}])
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with pytest.raises(XoError, match="invalid token"):
+        xo.connect()
+    assert xo._ws is None
+
+
+def test_a_timed_out_sign_in_closes_the_socket_too(xo, monkeypatch):
+    """The timeout path raises XoError like the refusal does, but it is the shape a lab
+    run actually hits -- an appliance that accepts the upgrade and then does not answer."""
+    ws = FakeWs()
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with pytest.raises(XoError, match="TIMEOUT"):
+        xo.connect()
+    assert ws.closed is True and xo._ws is None
+
+
+def test_the_context_manager_hands_back_a_connected_client(xo, monkeypatch):
+    """The control for the three above: they all assert a socket was closed, and a
+    connect() that closed unconditionally would satisfy every one of them."""
+    ws = FakeWs([{"id": 1, "result": {"email": "lab@invalid"}}])
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with xo as client:
+        assert client.user == {"email": "lab@invalid"}
+        assert ws.closed is False
+    assert ws.closed is True, "__exit__ still closes a healthy connection"
+
+
+# -- the URL has to be able to carry the token ------------------------------
+
+def test_a_cleartext_url_is_refused_before_the_token_is_touched(monkeypatch):
+    """ws:// is the easy mistake here: the appliance serves /api/ on both schemes, so the
+    missing letter connects, signs in and works, with the token in the clear every run.
+
+    XO_TOKEN is set on purpose, so the refusal happens while the token is genuinely
+    available rather than because it is missing."""
+    monkeypatch.setenv("XO_URL", "ws://xo.invalid/api/")
+    monkeypatch.setenv("XO_TOKEN", SECRET)
+    monkeypatch.delenv("XO_ALLOW_CLEARTEXT", raising=False)
+    with pytest.raises(XoError) as caught:
+        Xo()
+    assert caught.value.message == "INSECURE_TRANSPORT"
+    assert SECRET not in str(caught.value)
+
+
+def test_a_cleartext_url_is_accepted_when_opted_into(monkeypatch, capsys):
+    monkeypatch.setenv("XO_URL", "ws://xo.invalid/api/")
+    monkeypatch.setenv("XO_TOKEN", SECRET)
+    monkeypatch.setenv("XO_ALLOW_CLEARTEXT", "1")
+    assert Xo().url == "ws://xo.invalid/api/"
+    assert "XO_ALLOW_CLEARTEXT" in capsys.readouterr().err
+
+
+def test_a_wss_url_is_built_without_a_word(monkeypatch, capsys):
+    """The control."""
+    monkeypatch.setenv("XO_URL", "wss://xo.invalid/api/")
+    monkeypatch.setenv("XO_TOKEN", SECRET)
+    monkeypatch.delenv("XO_ALLOW_CLEARTEXT", raising=False)
+    assert Xo().url == "wss://xo.invalid/api/"
+    assert capsys.readouterr().err == ""

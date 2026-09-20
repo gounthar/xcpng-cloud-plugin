@@ -1,4 +1,4 @@
-"""The two helpers both XO harnesses need, in one place rather than two.
+"""The helpers both XO harnesses need, in one place rather than two.
 
 `as_list` was already copy-pasted into `xo_probe.py` and `xo_compare.py`, identically.
 `poll` was not: `xo_compare` had it and `xo_probe` read once, so the probe reported a
@@ -6,11 +6,82 @@ successful xenstore write as a failed one. Copying `poll` across would have fixe
 instance and left the next one, since the defect was never the missing call. It was the
 rule having two homes and only one of them being kept up to date.
 
+`env_flag` and `transport_refusal` are here for the same reason rather than because the
+harnesses share them: both XO clients have to answer "is this an affirmative?" and "may
+the token go down this URL?", and two copies of a security decision drift exactly the way
+`poll` did. The clients raise their own error types on the answer, so this module decides
+and they refuse -- it has no exception of its own to force on either.
+
 Deliberately free of imports beyond the standard library, so a REST-only caller does not
 drag in websocket-client to get a sleep loop.
 """
 
+import os
+import sys
 import time
+import urllib.parse
+
+ENCRYPTED_SCHEMES = ("https", "wss")
+CLEARTEXT_SCHEMES = ("http", "ws")
+ALLOW_CLEARTEXT = "XO_ALLOW_CLEARTEXT"
+
+
+def env_flag(name, default=False):
+    """Is this environment variable set to an affirmative?
+
+    Plain truthiness is the trap: a non-empty string is true, so `XO_TRUST_SELF_SIGNED=0`
+    would disable TLS verification, which reads as the opposite of what it does. An
+    unrecognised value fails closed, which is why a typo in the variable name or its value
+    leaves the secure behaviour in place rather than the convenient one.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in ("1", "true", "yes")
+
+
+def transport_refusal(url, allow=None, stream=None):
+    """Return a reason this URL must not carry the XO token, or None when it may.
+
+    The token is a bearer credential: it goes out on every request, in a Cookie header,
+    and anyone who reads one off the wire has the appliance. `https://` and `wss://` are
+    the only two addresses that protect it, and nothing in either client checked.
+
+    Cleartext is refused by default and opt-in through XO_ALLOW_CLEARTEXT, matching the
+    shape XO_TRUST_SELF_SIGNED already set rather than inventing a second posture. A hard
+    refusal was the other candidate and is rejected deliberately: an appliance served over
+    plain http on a lab segment is a thing someone may have, and a tool that cannot be
+    told "yes, I mean it" gets worked around by editing the source, which removes the
+    warning too. Opting in prints one, every time, naming the variable that did it.
+
+    Anything that is neither encrypted nor cleartext is refused with no opt-in, because it
+    is not an address these clients can speak anyway. The case worth naming is the empty
+    scheme: `XO_BASE=192.168.1.5` reaches urlopen as ValueError("unknown url type"), which
+    is neither an OSError nor an HTTPException, so it escapes the transport guard as a raw
+    traceback through every caller that handles only XoRestError.
+    """
+    scheme = urllib.parse.urlsplit(str(url)).scheme.lower()
+    if scheme in ENCRYPTED_SCHEMES:
+        return None
+    if scheme not in CLEARTEXT_SCHEMES:
+        said = f"{scheme}:// is not a scheme these clients speak" if scheme else (
+            "it names no scheme, and a bare host reaches urlopen as an unknown url type"
+        )
+        return f"{url} cannot carry the XO token: {said}. Use https:// or wss://."
+    if allow is None:
+        allow = env_flag(ALLOW_CLEARTEXT)
+    if not allow:
+        return (
+            f"{url} would send the XO token in the clear, where anyone on the path can "
+            f"read it and reuse it. Use https:// or wss://, or set {ALLOW_CLEARTEXT}=1 "
+            f"to send it anyway."
+        )
+    print(
+        f"warning: the XO token is going to {url} in the clear ({ALLOW_CLEARTEXT}). "
+        f"Anyone on the path can read it.",
+        file=stream if stream is not None else sys.stderr,
+    )
+    return None
 
 
 def as_list(objs):

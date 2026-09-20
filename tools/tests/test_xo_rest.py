@@ -15,6 +15,7 @@ import http.client
 import json
 import ssl
 import urllib.error
+import urllib.request
 
 import pytest
 
@@ -405,3 +406,111 @@ def test_an_error_message_is_never_none(rest, monkeypatch, payload, expected, wh
     assert caught.value.message == expected, why
     assert caught.value.message is not None
     assert "None" != str(caught.value).strip(), "the exception stringifies to the word None"
+
+
+# -- the token does not follow a redirect -----------------------------------
+
+def test_the_cookie_is_sent_on_the_request_it_was_built_for(rest, capture):
+    """The control for the two below. A client that simply stopped sending the token
+    would pass both of them and authenticate against nothing."""
+    sent = capture(b"{}", status=200)
+    rest.get("/rest/v0/vms")
+    assert sent[0].get_header("Cookie") == f"authenticationToken={SECRET}"
+    assert ("Cookie", f"authenticationToken={SECRET}") in sent[0].header_items()
+
+
+def test_urllib_does_not_carry_the_token_onto_a_redirect(rest, capture):
+    """Run against urllib's own HTTPRedirectHandler rather than a description of it.
+
+    `redirect_request` copies every header except the two content ones onto the new
+    request, so `add_header("Cookie", ...)` hands the token to whatever a 302 names --
+    another host, in the case that matters, which then holds a credential for the
+    appliance and answers in its place. `add_unredirected_header` is the standard
+    library's own mechanism for a secret that must not travel, and the only way to see
+    the difference is to make urllib build the redirected request and read it.
+    """
+    sent = capture(b"{}", status=200)
+    rest.get("/rest/v0/vms")
+    original = sent[0]
+
+    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+        original, None, 302, "Found", {}, "https://evil.invalid/rest/v0/vms"
+    )
+    assert redirected is not None, "urllib declined the redirect; this test proves nothing"
+    assert redirected.get_header("Cookie") is None
+    assert SECRET not in str(dict(redirected.header_items()))
+
+
+def test_the_token_does_not_travel_on_a_same_host_redirect_either(rest, capture):
+    """Stricter than the finding asked for, and deliberately so. Stripping only on a
+    cross-origin redirect needs a custom opener, and the cost of stripping on all of them
+    is a 401 on a redirect XO genuinely wanted followed -- loud, and in the safe
+    direction. If a route here is ever found to redirect, this is the test to come and
+    argue with; the behaviour is a choice, not an accident."""
+    sent = capture(b"{}", status=200)
+    rest.get("/rest/v0/vms")
+    redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+        sent[0], None, 301, "Moved", {}, "https://xo.invalid/rest/v0/vms/"
+    )
+    assert redirected.get_header("Cookie") is None
+
+
+# -- an error body is read inside the transport guard -----------------------
+
+@pytest.mark.parametrize("exc, why", [
+    (ConnectionResetError("peer went away"), "an OSError, the common shape"),
+    (http.client.IncompleteRead(b"half"), "an HTTPException, which is not an OSError"),
+])
+def test_a_failed_read_of_an_error_body_becomes_a_transport_error(rest, monkeypatch, exc, why):
+    """`exc.read()` is a socket read like any other and sits above the transport guard,
+    so a connection dropped between the status line and the body escaped as a raw
+    exception through every caller that handles only XoRestError. #217 closed this gap on
+    the main read path and missed the one inside `except HTTPError`."""
+    import urllib.request
+
+    def boom(*args, **kwargs):
+        raise urllib.error.HTTPError("https://xo.invalid", 500, "Server Error", {}, None)
+
+    def angry_read(self):
+        raise exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    monkeypatch.setattr(urllib.error.HTTPError, "read", angry_read, raising=False)
+
+    with pytest.raises(XoRestError) as caught:
+        rest.get("/rest/v0/vms/x")
+    assert caught.value.message == "TRANSPORT", why
+    assert caught.value.status == 500, "the status that did arrive is worth keeping"
+    assert SECRET not in str(caught.value)
+
+
+# -- the base URL has to be able to carry the token -------------------------
+
+def test_a_cleartext_base_is_refused_before_the_token_is_touched(monkeypatch):
+    """XO_TOKEN is present and valid here on purpose: the refusal has to happen while the
+    token is genuinely available, or a client that simply failed to find it would pass."""
+    monkeypatch.setenv("XO_BASE", "http://xo.invalid")
+    monkeypatch.setenv("XO_TOKEN", SECRET)
+    monkeypatch.delenv("XO_ALLOW_CLEARTEXT", raising=False)
+    with pytest.raises(XoRestError) as caught:
+        XoRest()
+    assert caught.value.message == "INSECURE_TRANSPORT"
+    assert SECRET not in str(caught.value)
+
+
+def test_a_cleartext_base_is_accepted_when_opted_into(monkeypatch, capsys):
+    monkeypatch.setenv("XO_BASE", "http://xo.invalid")
+    monkeypatch.setenv("XO_TOKEN", SECRET)
+    monkeypatch.setenv("XO_ALLOW_CLEARTEXT", "1")
+    client = XoRest()
+    assert client.base == "http://xo.invalid"
+    assert "XO_ALLOW_CLEARTEXT" in capsys.readouterr().err
+
+
+def test_an_https_base_is_built_without_a_word(monkeypatch, capsys):
+    """The control. Every refusal above is worthless without it."""
+    monkeypatch.setenv("XO_BASE", "https://xo.invalid/")
+    monkeypatch.setenv("XO_TOKEN", SECRET)
+    monkeypatch.delenv("XO_ALLOW_CLEARTEXT", raising=False)
+    assert XoRest().base == "https://xo.invalid"
+    assert capsys.readouterr().err == ""
