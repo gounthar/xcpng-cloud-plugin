@@ -21,8 +21,9 @@ import sys
 import time
 import urllib.parse
 
-ENCRYPTED_SCHEMES = ("https", "wss")
-CLEARTEXT_SCHEMES = ("http", "ws")
+# Each client speaks exactly one of these, and the cleartext twin of it is the only other
+# thing it can be handed. Keyed by the secure scheme, because that is what a caller names.
+CLEARTEXT_TWIN = {"https": "http", "wss": "ws"}
 ALLOW_CLEARTEXT = "XO_ALLOW_CLEARTEXT"
 
 
@@ -40,8 +41,15 @@ def env_flag(name, default=False):
     return value.lower() in ("1", "true", "yes")
 
 
-def transport_refusal(url, allow=None, stream=None):
+def transport_refusal(url, secure, allow=None, stream=None):
     """Return a reason this URL must not carry the XO token, or None when it may.
+
+    `secure` is the one scheme the calling client speaks, "https" for the REST client and
+    "wss" for the WebSocket one. It is required rather than defaulted: a shared default of
+    "https" would silently wave `https://` past the WebSocket client and `wss://` past the
+    REST one, neither of which can use the other's scheme, and the failure would land
+    somewhere unrelated -- `urlopen` raising "unknown url type", or create_connection
+    reaching for a socket it will not get.
 
     The token is a bearer credential: it goes out on every request, in a Cookie header,
     and anyone who reads one off the wire has the appliance. `https://` and `wss://` are
@@ -54,27 +62,30 @@ def transport_refusal(url, allow=None, stream=None):
     told "yes, I mean it" gets worked around by editing the source, which removes the
     warning too. Opting in prints one, every time, naming the variable that did it.
 
-    Anything that is neither encrypted nor cleartext is refused with no opt-in, because it
-    is not an address these clients can speak anyway. The case worth naming is the empty
-    scheme: `XO_BASE=192.168.1.5` reaches urlopen as ValueError("unknown url type"), which
-    is neither an OSError nor an HTTPException, so it escapes the transport guard as a raw
-    traceback through every caller that handles only XoRestError.
+    Anything that is neither `secure` nor its cleartext twin is refused with no opt-in,
+    because this client cannot speak it whatever the operator meant. The case worth naming
+    is the empty scheme: `XO_BASE=192.168.1.5` reaches urlopen as ValueError("unknown url
+    type"), which is neither an OSError nor an HTTPException, so it escapes the transport
+    guard as a raw traceback through every caller that handles only XoRestError.
     """
+    if secure not in CLEARTEXT_TWIN:
+        raise ValueError(f"{secure!r} is not a scheme either XO client speaks")
+    cleartext = CLEARTEXT_TWIN[secure]
     scheme = urllib.parse.urlsplit(str(url)).scheme.lower()
-    if scheme in ENCRYPTED_SCHEMES:
+    if scheme == secure:
         return None
-    if scheme not in CLEARTEXT_SCHEMES:
-        said = f"{scheme}:// is not a scheme these clients speak" if scheme else (
+    if scheme != cleartext:
+        said = f"{scheme}:// is not a scheme this client speaks" if scheme else (
             "it names no scheme, and a bare host reaches urlopen as an unknown url type"
         )
-        return f"{url} cannot carry the XO token: {said}. Use https:// or wss://."
+        return f"{url} cannot carry the XO token: {said}. Use {secure}://."
     if allow is None:
         allow = env_flag(ALLOW_CLEARTEXT)
     if not allow:
         return (
             f"{url} would send the XO token in the clear, where anyone on the path can "
-            f"read it and reuse it. Use https:// or wss://, or set {ALLOW_CLEARTEXT}=1 "
-            f"to send it anyway."
+            f"read it and reuse it. Use {secure}://, or set {ALLOW_CLEARTEXT}=1 to send "
+            f"it anyway."
         )
     print(
         f"warning: the XO token is going to {url} in the clear ({ALLOW_CLEARTEXT}). "

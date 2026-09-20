@@ -6,6 +6,7 @@ conftest.py puts this directory on sys.path so both modes find it.
 """
 
 import json
+import types
 
 import websocket
 
@@ -127,11 +128,17 @@ class FakeWs:
     the client built rather than only on what the call returned.
     """
 
-    def __init__(self, frames=()):
+    def __init__(self, frames=(), status=101):
         self.frames = list(frames)
         self.sent = []
         self.timeouts = []
         self.closed = False
+        # Xo.connect refuses to send the token unless the handshake actually upgraded, so
+        # the fake has to carry a status or every test would exercise the refusal path.
+        # It defaults to 101 rather than being absent: a fake missing the attribute would
+        # make the guard untestable in the one direction that matters, and would let a
+        # guard deleted from the client keep passing here.
+        self.handshake_response = types.SimpleNamespace(status=status)
 
     def send(self, payload):
         self.sent.append(json.loads(payload))

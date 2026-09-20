@@ -46,6 +46,10 @@ except ImportError:  # pragma: no cover - dependency check, mirrors the other to
 
 DEFAULT_TIMEOUT = 120.0
 
+# The one handshake status that means a WebSocket exists. Named rather than inlined because
+# 101 appears beside a list of redirect codes below and the two must not blur together.
+SWITCHING_PROTOCOLS = 101
+
 
 class XoError(RuntimeError):
     def __init__(self, message, data=None):
@@ -73,7 +77,7 @@ class Xo:
         # REST side: the appliance serves both schemes on /api/, so a URL with the one
         # letter missing connects, signs in, and works -- while putting the token on the
         # wire in the clear on every run. Nothing downstream would ever complain.
-        refusal = transport_refusal(self.url)
+        refusal = transport_refusal(self.url, "wss")
         if refusal:
             raise XoError("INSECURE_TRANSPORT", refusal)
 
@@ -101,7 +105,36 @@ class Xo:
         sslopt = None
         if self._trust_self_signed:
             sslopt = {"cert_reqs": ssl.CERT_NONE, "check_hostname": False}
-        self._ws = websocket.create_connection(self.url, sslopt=sslopt, timeout=self.timeout)
+        # redirect_limit=0, and then check the handshake ourselves. Both halves are needed.
+        #
+        # websocket-client follows up to THREE redirects by default (_core.py, the loop over
+        # `options.pop("redirect_limit", 3)`), reconnecting to whatever `location` names, on
+        # 301/302/303/307/308 and with no check on the target's scheme or host. The token is
+        # sent after create_connection returns, so a vetted wss:// URL that redirects can put
+        # it on a socket to another host, or to plain ws://. The scheme check above vets the
+        # address we dial; it cannot vet an address the library dials for us. Same class of
+        # bug as the Cookie-on-redirect one in xo_rest.py, on the transport that carries the
+        # same token.
+        #
+        # The status check is not belt and braces. handshake() treats the five redirect codes
+        # as SUCCESS_STATUSES and returns rather than raising (_handshake.py), so with the
+        # limit at zero the loop simply does not run and `connected = True` is set on a
+        # connection that never upgraded. Read in websocket-client 1.9.0, the version CI
+        # installs; a later release added a "Redirect limit exhausted" raise, so this check is
+        # also what keeps the behaviour the same across versions the lock file does not pin.
+        self._ws = websocket.create_connection(
+            self.url, sslopt=sslopt, timeout=self.timeout, redirect_limit=0
+        )
+        handshake = getattr(self._ws, "handshake_response", None)
+        status = getattr(handshake, "status", None)
+        if status != SWITCHING_PROTOCOLS:
+            self.close()
+            raise XoError(
+                "NOT_UPGRADED",
+                f"{self.url} answered {status} rather than 101 and no token was sent. A "
+                f"redirect here is refused on purpose: following it would hand the token "
+                f"to whatever the appliance pointed at.",
+            )
         try:
             self.user = self.call("session.signInWithToken", {"token": self._token})
         except BaseException:

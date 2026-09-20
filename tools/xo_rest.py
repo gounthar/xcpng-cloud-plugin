@@ -97,7 +97,7 @@ class XoRest:
         # Before the token is read, not after. Nothing here leaks a credential the process
         # already holds, but a client that refuses the address only once it has gone
         # looking for the secret invites the next reader to move the check for tidiness.
-        refusal = transport_refusal(self.base)
+        refusal = transport_refusal(self.base, "https")
         if refusal:
             raise XoRestError("INSECURE_TRANSPORT", data=refusal)
 

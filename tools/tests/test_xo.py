@@ -519,3 +519,57 @@ def test_a_wss_url_is_built_without_a_word(monkeypatch, capsys):
     monkeypatch.delenv("XO_ALLOW_CLEARTEXT", raising=False)
     assert Xo().url == "wss://xo.invalid/api/"
     assert capsys.readouterr().err == ""
+
+
+# -- the socket must not be redirected before the token is sent -------------
+
+def test_connect_refuses_to_let_the_library_follow_a_redirect(xo, monkeypatch):
+    """websocket-client follows up to THREE redirects by default, reconnecting to whatever
+    `location` names, with no check on the target's scheme or host (`_core.py`, the loop
+    over `options.pop("redirect_limit", 3)`). The token is sent after create_connection
+    returns, so a vetted `wss://` URL that redirects can put it on a socket to another
+    host, or to plain `ws://`.
+
+    The scheme check in __init__ vets the address we dial. It cannot vet an address the
+    library dials for us, which is why this is a separate guard and not the same one.
+
+    Raised on #234 by review, after the identical bug had been fixed on the REST side in
+    the same commit. Two transports carrying one token and only one of them was looked at.
+    """
+    seen = {}
+    monkeypatch.setattr(websocket, "create_connection",
+                        lambda url, **kw: seen.update(kw) or FakeWs([{"id": 1, "result": {}}]))
+    xo.connect()
+    assert seen["redirect_limit"] == 0
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_a_handshake_that_did_not_upgrade_sends_no_token(xo, monkeypatch, status):
+    """`redirect_limit=0` alone is not enough, and this is the test that says why.
+
+    `handshake()` treats all five redirect codes as SUCCESS_STATUSES and returns rather
+    than raising (`_handshake.py`), so with the limit at zero the follow loop simply does
+    not run and websocket-client sets `connected = True` on a connection that never
+    upgraded. Read in websocket-client 1.9.0, the version CI installs.
+
+    The assertion that matters is `ws.sent == []`. A client that raised afterwards but had
+    already written the sign-in frame would pass a test that only checked for the raise.
+    """
+    ws = FakeWs([{"id": 1, "result": {}}], status=status)
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with pytest.raises(XoError) as caught:
+        xo.connect()
+    assert caught.value.message == "NOT_UPGRADED"
+    assert ws.sent == [], "the token was written to a connection that never upgraded"
+    assert ws.closed is True and xo._ws is None
+    assert SECRET not in str(caught.value)
+
+
+def test_a_handshake_that_did_upgrade_is_left_alone(xo, monkeypatch):
+    """The control for the two above. A connect() that refused every handshake would
+    satisfy both of them, and this is the only test that separates the guard from a
+    client that has simply stopped working."""
+    ws = FakeWs([{"id": 1, "result": {"email": "lab@invalid"}}], status=101)
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    assert xo.connect() == {"email": "lab@invalid"}
+    assert ws.sent[0]["method"] == "session.signInWithToken"
