@@ -128,7 +128,7 @@ class Xo:
         handshake = getattr(self._ws, "handshake_response", None)
         status = getattr(handshake, "status", None)
         if status != SWITCHING_PROTOCOLS:
-            self.close()
+            self._close_quietly()
             raise XoError(
                 "NOT_UPGRADED",
                 f"{self.url} answered {status} rather than 101 and no token was sent. A "
@@ -142,17 +142,28 @@ class Xo:
             # this, so __exit__ never runs and nothing else will ever close it: the
             # appliance holds the connection until it times out, and a harness that
             # retries in a loop stacks one per attempt.
-            #
-            # A close that raises is swallowed on purpose. close() drops the handle in a
-            # finally either way, and the sign-in failure is the one the caller needs --
-            # a dying socket reporting that it is dying, on top of an error that says why,
-            # replaces the useful message with the redundant one.
-            try:
-                self.close()
-            except Exception:
-                pass
+            self._close_quietly()
             raise
         return self.user
+
+    def _close_quietly(self):
+        """Close the socket, swallowing a close that itself fails.
+
+        Both failure paths in connect() need this, and for the same reason: the socket has
+        to go, and the error already in hand explains why the caller is here, so a dying
+        socket reporting that it is dying must not replace it. The handle goes either way,
+        because close() clears it in a finally.
+
+        It is a method rather than four inlined lines because the first version of connect()
+        inlined it on the sign-in path and left the handshake path bare, so a close that
+        raised there replaced XoError("NOT_UPGRADED") with the OSError and escaped through
+        every caller that handles only XoError. Caught by review on #234. Two paths with one
+        rule between them is the shape that stops it recurring.
+        """
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def close(self):
         if self._ws is not None:

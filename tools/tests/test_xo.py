@@ -573,3 +573,25 @@ def test_a_handshake_that_did_upgrade_is_left_alone(xo, monkeypatch):
     monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
     assert xo.connect() == {"email": "lab@invalid"}
     assert ws.sent[0]["method"] == "session.signInWithToken"
+
+
+def test_a_failed_handshake_survives_a_socket_that_also_refuses_to_close(xo, monkeypatch):
+    """The mirror of the sign-in case above, and the gap review caught on #234.
+
+    The handshake branch called `self.close()` bare while the sign-in branch ten lines
+    below wrapped the identical call. A socket the peer dropped after answering a 3xx is
+    exactly the shape that raises on close, so the OSError replaced
+    XoError("NOT_UPGRADED") and escaped through every caller that handles only XoError.
+    Both paths now go through `_close_quietly`.
+    """
+    class Angry(FakeWs):
+        def close(self):
+            raise OSError("already gone")
+
+    ws = Angry([{"id": 1, "result": {}}], status=302)
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with pytest.raises(XoError) as caught:
+        xo.connect()
+    assert caught.value.message == "NOT_UPGRADED", "the cleanup error replaced the real one"
+    assert ws.sent == [], "the token was written to a connection that never upgraded"
+    assert xo._ws is None, "a dead handle here sends the next call into it"
