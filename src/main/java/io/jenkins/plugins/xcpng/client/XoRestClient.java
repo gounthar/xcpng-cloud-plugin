@@ -123,6 +123,22 @@ public final class XoRestClient implements HypervisorClient {
      */
     @NonNull
     private JsonNode call(String method, String path, @CheckForNull ObjectNode body, Duration timeout) {
+        return call(method, path, body, timeout, null);
+    }
+
+    /**
+     * As above, with a sentence naming what a refused 202 may have left behind.
+     *
+     * <p>Only the create call passes one. Everywhere else a refused 202 leaves nothing to clean up, and a
+     * consequence that does not apply is worse than none.
+     */
+    @NonNull
+    private JsonNode call(
+            String method,
+            String path,
+            @CheckForNull ObjectNode body,
+            Duration timeout,
+            @CheckForNull String consequence) {
         RestTransport.RestResponse resp;
         try {
             resp = transport.send(method, path, body == null ? null : body.toString(), timeout);
@@ -136,7 +152,7 @@ public final class XoRestClient implements HypervisorClient {
         if (!resp.isSuccess()) {
             throw failure(method, path, resp.status(), resp.body());
         }
-        refuseAsyncAccepted(method, path, resp);
+        refuseAsyncAccepted(method, path, resp, consequence);
         return parse(method + " " + path, resp.body());
     }
 
@@ -160,14 +176,16 @@ public final class XoRestClient implements HypervisorClient {
      * operator is better served by being told their appliance is too old than by the plugin quietly
      * working one way here and another way there.
      */
-    private static void refuseAsyncAccepted(String method, String path, RestTransport.RestResponse resp) {
+    private static void refuseAsyncAccepted(
+            String method, String path, RestTransport.RestResponse resp, @CheckForNull String consequence) {
         if (resp.status() != 202) {
             return;
         }
         throw new HypervisorException(method + " " + path + ": the appliance answered 202 Accepted, so it started"
                 + " a background task instead of doing the work. This backend asks every call for"
                 + " ?sync=true and needs Xen Orchestra 6.5.0 or newer; an older appliance ignores the"
-                + " parameter. Upgrade Xen Orchestra, or use the XAPI backend.");
+                + " parameter. Upgrade Xen Orchestra, or use the XAPI backend."
+                + (consequence == null ? "" : " " + consequence));
     }
 
     @NonNull
@@ -372,8 +390,17 @@ public final class XoRestClient implements HypervisorClient {
         create.put("boot", false); // the caller starts it, after the seed is written
         // Deliberately no "vifs". See the class javadoc: this route inherits the template's, and passing
         // them adds a second NIC.
+        // The consequence matters only here. A refused 202 throws before any VM id comes back, so the
+        // self-cleanup below never runs -- and XO may still finish the task, leaving a clone with no owner
+        // tag. Jenkins retries provisioning, so that is one untagged VM per attempt, findable by nobody:
+        // the sweeps select on the marker. The operator cannot act on that unless the message says it.
         JsonNode created = call(
-                "POST", API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true", create, ACTION_TIMEOUT);
+                "POST",
+                API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true",
+                create,
+                ACTION_TIMEOUT,
+                "The task may still finish and create a VM named '" + spec.name() + "' carrying no owner tag,"
+                        + " which no sweep will find; remove it by hand.");
         String vm = created.path("id").asText("");
         if (vm.isBlank()) {
             throw new HypervisorException("create_vm answered success but named no VM: " + created);
@@ -622,7 +649,7 @@ public final class XoRestClient implements HypervisorClient {
         }
         // Checked here too, not only in call(): this verb talks to the transport directly, so it would
         // otherwise read a 202 as a completed teardown and drop the leaked-VM entry for a VM still running.
-        refuseAsyncAccepted("DELETE", path, resp);
+        refuseAsyncAccepted("DELETE", path, resp, null);
         if (resp.isSuccess()) {
             return;
         }

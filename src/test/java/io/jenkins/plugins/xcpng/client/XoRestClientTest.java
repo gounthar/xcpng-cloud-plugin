@@ -425,7 +425,10 @@ class XoRestClientTest {
 
         ScriptedRest starting = new ScriptedRest();
         starting.fail("POST", "/rest/v0/vms/" + CLONE + "/actions/start?sync=true", 202, "{\"id\":\"task-8\"}");
-        assertThrows(HypervisorException.class, () -> new XoRestClient(starting).start(new VmRef(CLONE)));
+        HypervisorException started2 =
+                assertThrows(HypervisorException.class, () -> new XoRestClient(starting).start(new VmRef(CLONE)));
+        // A consequence that does not apply is worse than none: nothing is left behind by a refused start.
+        assertFalse(started2.getMessage().contains("no owner tag"), started2.getMessage());
     }
 
     /**
@@ -447,6 +450,13 @@ class XoRestClientTest {
         assertFalse(
                 t.paths().stream().anyMatch(p -> p.contains("task-9")),
                 "a task id must never be addressed as a VM: " + t.paths());
+        // Raised in review on #239. The refusal throws before any VM id comes back, so the self-cleanup
+        // never runs and XO may still finish the task. Jenkins retries, so that is one untagged VM per
+        // attempt and the sweeps select on the marker, so nobody finds them. The message has to say it.
+        assertTrue(
+                e.getMessage().contains("agent-1"),
+                "the operator needs the name of the VM that may be left behind: " + e.getMessage());
+        assertTrue(e.getMessage().contains("no owner tag"), e.getMessage());
     }
 
     @Test
