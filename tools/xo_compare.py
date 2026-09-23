@@ -106,7 +106,7 @@ class Result:
 
 def run_jsonrpc(xo, template, name):
     r = Result("JSON-RPC")
-    print(f"\n== JSON-RPC path ==")
+    print("\n== JSON-RPC path ==")
     tid = template.get("id") or template.get("uuid")
 
     # VIFs passed explicitly, because otherwise this is not a comparison. MEASURED
@@ -181,7 +181,7 @@ def run_jsonrpc(xo, template, name):
 
 def run_rest(rest, xo_for_reads, pool_id, template, name):
     r = Result("REST")
-    print(f"\n== REST path ==")
+    print("\n== REST path ==")
     bare = template.get("uuid") or (template.get("id") or "").split("/")[-1]
 
     vm_id, elapsed = rest.create_vm(pool_id, bare, name, clone=True, boot=False)

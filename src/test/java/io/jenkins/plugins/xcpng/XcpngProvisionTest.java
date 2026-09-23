@@ -2168,6 +2168,57 @@ class XcpngProvisionTest {
     }
 
     /**
+     * The give-up line ends in a sentence of its own, so the reason it quotes must not bring a stop with it.
+     * One of the two reasons is written in the source and ends bare; the other is an exception message, and
+     * whether that ends in a stop is up to whatever threw. The seam supplies one that does.
+     *
+     * <p>The assertion is on the pair of characters rather than on the whole line, because the interesting
+     * failure is narrow: everything else about the message was already right.
+     */
+    @Test
+    void aGivenUpLeakQuotesItsReasonWithoutDoublingTheFullStop(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, certificateFingerprint, backend) -> {
+            throw new IllegalStateException("credential 'cred-old' no longer exists.");
+        });
+        cloud.recordLeakedVm(XcpngLeakedVm.of(
+                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", null));
+
+        List<String> given = new ArrayList<>();
+        Logger logger = Logger.getLogger(XcpngCloud.class.getName());
+        Handler handler = new Handler() {
+            @Override
+            public void publish(LogRecord record) {
+                String message = record.getMessage();
+                if (message != null && message.contains("Giving up")) {
+                    given.add(message);
+                }
+            }
+
+            @Override
+            public void flush() {}
+
+            @Override
+            public void close() {}
+        };
+        logger.addHandler(handler);
+        try {
+            cloud.sweepLeakedVms();
+        } finally {
+            logger.removeHandler(handler);
+        }
+
+        assertEquals(1, given.size(), "the sweep must give up on it exactly once: " + given);
+        String message = given.get(0);
+        assertFalse(message.contains(".."), "the quoted reason must not double the stop: " + message);
+        assertTrue(
+                message.contains("no longer exists. It may still exist"),
+                "and the sentence after it must still read: " + message);
+    }
+
+    /**
      * The cloud's own credential is missing, so its connection will not open either. That is live
      * configuration an operator can put back, unlike a connection the cloud has already left, so the entry
      * has to survive it. Found the hard way: giving up here dropped the entry during an ordinary UI save,

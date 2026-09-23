@@ -1131,9 +1131,17 @@ public class XcpngCloud extends Cloud {
     }
 
     private void giveUp(@NonNull XcpngLeakedVm vm, @NonNull String reason) {
+        // One reason is written here and ends without a stop; the other is an exception message, which may end
+        // with one or not depending on what threw. Trimming it here keeps the sentence right either way, rather
+        // than leaving ".." in the log whenever the message happens to be punctuated.
+        String trimmed = reason.stripTrailing();
+        while (trimmed.endsWith(".")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1).stripTrailing();
+        }
+        String sentence = trimmed;
         LOGGER.log(
                 Level.SEVERE,
-                () -> "Giving up on leaked XCP-ng VM " + vm + " for cloud " + name + ": " + reason
+                () -> "Giving up on leaked XCP-ng VM " + vm + " for cloud " + name + ": " + sentence
                         + ". It may still exist; reclaim it with tools/reaper.py");
     }
 
