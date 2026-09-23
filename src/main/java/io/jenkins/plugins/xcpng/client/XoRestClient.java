@@ -189,8 +189,10 @@ public final class XoRestClient implements HypervisorClient {
             JsonNode read = MAPPER.readTree(body == null || body.isBlank() ? "{}" : body);
             payload = read == null ? MAPPER.createObjectNode() : read;
         } catch (IOException e) {
+            // The hint belongs here too, and this is the branch that needs it most: a 401 whose body is
+            // HTML is the login-redirect case, where the excerpt on its own tells an operator nothing.
             String excerpt = body == null ? "" : body.substring(0, Math.min(body.length(), 200));
-            return new HypervisorException(method + " " + path + ": HTTP " + status + ": " + excerpt);
+            return new HypervisorException(method + " " + path + ": HTTP " + status + ": " + excerpt + hintFor(status));
         }
         String error = payload.path("error").asText("");
         String code = error.isBlank() ? null : error;
@@ -206,7 +208,43 @@ public final class XoRestClient implements HypervisorClient {
                     .forEachRemaining(
                             e -> params.add(e.getKey() + "=" + e.getValue().asText()));
         }
-        return new HypervisorException(method + " " + path + ": HTTP " + status + ": " + detail, code, params);
+        return new HypervisorException(
+                method + " " + path + ": HTTP " + status + ": " + detail + hintFor(status), code, params);
+    }
+
+    /**
+     * What an authentication or authorisation status means on this backend, appended to the failure it
+     * explains.
+     *
+     * <p>This is where the two backends are least alike, and the XO side was the poorer of the two. XAPI
+     * answers a bad credential with a named code ({@code SESSION_AUTHENTICATION_FAILED}) and re-logs in by
+     * itself when a session merely went stale, so neither case reaches an operator as a bare number. XO has
+     * no session to refresh -- the token is the credential -- and it answers every one of its distinct
+     * causes with the same status and, per {@link HttpRestTransport}'s own note, the same body. An operator
+     * reading "HTTP 401" off the Test Connection button has no way to tell a revoked token from a token
+     * sent as {@code Authorization: Bearer} instead of as a cookie.
+     *
+     * <p>403 is worth its own sentence because it is not an authentication problem at all and reads like
+     * one. Measured on the lab appliance: at plan 1 the ACL routes answer 403 while every route this client
+     * uses answers 200, with the same token. So a 403 here points at the account's plan or role, never at
+     * the token being wrong.
+     *
+     * <p>The hint is appended rather than substituted. XO's own message is the more specific of the two
+     * whenever it says anything, and dropping it to print our guess would be the worse trade.
+     */
+    @NonNull
+    private static String hintFor(int status) {
+        return switch (status) {
+            case 401 ->
+                ". The appliance did not accept the token. It may be wrong, revoked or expired;"
+                        + " note that XO expires tokens and does not renew them. A token that is otherwise"
+                        + " valid also reads as 401 if it is sent as an Authorization header rather than as"
+                        + " the authenticationToken cookie, which this client sends.";
+            case 403 ->
+                ". The token authenticated but is not allowed this route, so this is the account's"
+                        + " role or the appliance's plan rather than the credential.";
+            default -> "";
+        };
     }
 
     /**

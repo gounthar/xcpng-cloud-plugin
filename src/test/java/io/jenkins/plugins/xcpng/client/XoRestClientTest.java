@@ -387,6 +387,75 @@ class XoRestClientTest {
         assertThrows(HypervisorException.class, () -> new XoRestClient(denied).ping());
     }
 
+    /**
+     * XAPI names a bad credential ({@code SESSION_AUTHENTICATION_FAILED}) and silently re-logs in when a
+     * session has merely gone stale, so neither reaches an operator as a bare number. This backend has no
+     * session to refresh and answers each of its distinct causes with the same status and the same body,
+     * so the number is all there is unless the client says what it means.
+     *
+     * <p>Asserted on the Test Connection path specifically, because that is the button an operator presses
+     * first and the one place a bare "HTTP 401" costs the most.
+     */
+    @Test
+    void aRefusedTokenSaysWhatWouldCauseIt() {
+        ScriptedRest denied = new ScriptedRest();
+        denied.fail("GET", "/rest/v0/pools?fields=id", 401, "{\"error\":\"authentication failed\"}");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(denied).ping());
+
+        assertTrue(e.getMessage().contains("401"), e.getMessage());
+        // XO's own words survive. They are the more specific half whenever it says anything at all.
+        assertTrue(e.getMessage().contains("authentication failed"), e.getMessage());
+        assertTrue(e.getMessage().contains("revoked or expired"), e.getMessage());
+        // The header-versus-cookie mistake reads as a bad credential and is the one an operator cannot
+        // guess, so the message has to name it.
+        assertTrue(e.getMessage().contains("authenticationToken cookie"), e.getMessage());
+    }
+
+    /**
+     * 403 is not an authentication failure and reads like one. Measured on the lab appliance at plan 1: the
+     * ACL routes answer 403 while every route this client uses answers 200, on the same token. So the
+     * message has to point at the role or the plan rather than at the credential, or an operator spends the
+     * afternoon reissuing a token that was never the problem.
+     */
+    @Test
+    void aForbiddenRouteBlamesTheRoleRatherThanTheToken() {
+        ScriptedRest gated = new ScriptedRest();
+        gated.fail("GET", "/rest/v0/pools?fields=id", 403, "{\"error\":\"forbidden\"}");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(gated).ping());
+
+        assertTrue(e.getMessage().contains("403"), e.getMessage());
+        assertTrue(e.getMessage().contains("role or the appliance's plan"), e.getMessage());
+        assertFalse(
+                e.getMessage().contains("revoked or expired"),
+                "a 403 must not be explained as a bad token: " + e.getMessage());
+    }
+
+    /**
+     * A 401 whose body is HTML is the login-redirect shape, and it takes the unparseable-body branch rather
+     * than the envelope one. That branch built its message separately, so it was the one place the hint
+     * could go missing while every other test still passed.
+     */
+    @Test
+    void aRefusedTokenSaysWhatWouldCauseItEvenWhenTheBodyIsNotJson() {
+        ScriptedRest html = new ScriptedRest();
+        html.fail("GET", "/rest/v0/pools?fields=id", 401, "<html><body>Sign in</body></html>");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(html).ping());
+
+        assertTrue(e.getMessage().contains("Sign in"), "the excerpt must survive: " + e.getMessage());
+        assertTrue(e.getMessage().contains("revoked or expired"), e.getMessage());
+    }
+
+    /** An ordinary failure gains nothing: the hint is for the two statuses it can actually explain. */
+    @Test
+    void anOrdinaryFailureIsNotDecorated() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/pools?fields=id", 409, "{\"error\":\"incorrect state\"}");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertFalse(e.getMessage().contains("revoked or expired"), e.getMessage());
+        assertFalse(e.getMessage().contains("role or the appliance's plan"), e.getMessage());
+    }
+
     @Test
     void anEmptyBodyIsNotMalformed() {
         // 204 is the documented answer to both the sizing PATCH and the tag PUT, and it carries no body.
