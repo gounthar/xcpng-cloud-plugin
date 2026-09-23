@@ -136,7 +136,38 @@ public final class XoRestClient implements HypervisorClient {
         if (!resp.isSuccess()) {
             throw failure(method, path, resp.status(), resp.body());
         }
+        refuseAsyncAccepted(method, path, resp);
         return parse(method + " " + path, resp.body());
+    }
+
+    /**
+     * Refuse a 202, which is XO saying it started a task rather than doing the work.
+     *
+     * <p>Every lifecycle call here asks for {@code ?sync=true}, but that is a request and not a guarantee:
+     * an appliance that does not know the parameter ignores it, the way any HTTP API ignores an unknown
+     * query parameter, and the 6.5.0 floor this backend needs lives in {@code XcpngBackend}'s javadoc
+     * rather than in a runtime check. {@code RestResponse.isSuccess} is {@code status / 100 == 2}, so a
+     * 202 was passing as a synchronous answer.
+     *
+     * <p>What that costs is worth spelling out, because it is silent. {@code cloneFromTemplate} reads
+     * {@code id} off the body, so a 202 carrying a <em>task</em> id makes the task id the VM ref. The
+     * sizing PATCH then 404s against it, the cleanup DELETE addresses the task, and the clone that was
+     * really created is left running with no owner tag and no ref recorded anywhere. The existing test
+     * asserting {@code sync=true} is on the URL pins the request and says nothing about the response.
+     *
+     * <p>Refusing beats waiting on the task. Teaching this client XO's task-polling protocol would be a
+     * second code path exercised only against appliances the backend does not claim to support, and an
+     * operator is better served by being told their appliance is too old than by the plugin quietly
+     * working one way here and another way there.
+     */
+    private static void refuseAsyncAccepted(String method, String path, RestTransport.RestResponse resp) {
+        if (resp.status() != 202) {
+            return;
+        }
+        throw new HypervisorException(method + " " + path + ": the appliance answered 202 Accepted, so it started"
+                + " a background task instead of doing the work. This backend asks every call for"
+                + " ?sync=true and needs Xen Orchestra 6.5.0 or newer; an older appliance ignores the"
+                + " parameter. Upgrade Xen Orchestra, or use the XAPI backend.");
     }
 
     @NonNull
@@ -589,6 +620,9 @@ public final class XoRestClient implements HypervisorClient {
         } catch (IOException e) {
             throw new HypervisorException("DELETE " + path + ": transport error: " + e.getMessage(), e);
         }
+        // Checked here too, not only in call(): this verb talks to the transport directly, so it would
+        // otherwise read a 202 as a completed teardown and drop the leaked-VM entry for a VM still running.
+        refuseAsyncAccepted("DELETE", path, resp);
         if (resp.isSuccess()) {
             return;
         }

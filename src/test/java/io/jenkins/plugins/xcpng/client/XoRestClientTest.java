@@ -406,6 +406,49 @@ class XoRestClientTest {
         }
     }
 
+    /**
+     * A 202 is XO saying it started a task, not that it did the work. {@code isSuccess} is
+     * {@code status / 100 == 2}, so it was passing as a synchronous answer, and {@code ?sync=true} is a
+     * request rather than a guarantee: an appliance that does not know the parameter ignores it, and the
+     * 6.5.0 floor lives in a javadoc rather than in a runtime check.
+     *
+     * <p>The clone case is the expensive one and is asserted on its own below. This covers the rest.
+     */
+    @Test
+    void anAcceptedTaskIsRefusedRatherThanReadAsDone() {
+        ScriptedRest started = new ScriptedRest();
+        started.fail("DELETE", "/rest/v0/vms/" + CLONE, 202, "{\"id\":\"task-7\"}");
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(started).destroyWithDisks(new VmRef(CLONE)));
+        assertTrue(e.getMessage().contains("202"), e.getMessage());
+        assertTrue(e.getMessage().contains("6.5.0"), "the operator needs the version: " + e.getMessage());
+
+        ScriptedRest starting = new ScriptedRest();
+        starting.fail("POST", "/rest/v0/vms/" + CLONE + "/actions/start?sync=true", 202, "{\"id\":\"task-8\"}");
+        assertThrows(HypervisorException.class, () -> new XoRestClient(starting).start(new VmRef(CLONE)));
+    }
+
+    /**
+     * The worst shape of the 202, and the reason the guard is worth its lines. {@code cloneFromTemplate}
+     * reads {@code id} off the body, so a 202 carrying a <em>task</em> id would make the task id the VM
+     * ref: the sizing PATCH 404s against it, the cleanup DELETE addresses the task, and the clone that was
+     * really created runs on with no owner tag and no ref recorded anywhere.
+     */
+    @Test
+    void acceptedOnCreateNeverBecomesAVmRef() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true", 202, "{\"id\":\"task-9\"}");
+        XoRestClient c = new XoRestClient(t);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+
+        HypervisorException e = assertThrows(HypervisorException.class, () -> c.cloneFromTemplate(template, spec()));
+
+        assertTrue(e.getMessage().contains("202"), e.getMessage());
+        assertFalse(
+                t.paths().stream().anyMatch(p -> p.contains("task-9")),
+                "a task id must never be addressed as a VM: " + t.paths());
+    }
+
     @Test
     void destroyPropagatesAnythingThatIsNotAMissingObject() {
         ScriptedRest t = new ScriptedRest();
