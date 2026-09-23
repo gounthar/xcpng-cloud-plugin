@@ -345,6 +345,67 @@ class XoRestClientTest {
         new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)); // must not throw
     }
 
+    /**
+     * The XAPI backend refuses a handle it never minted (#223) because XAPI answers one with
+     * HANDLE_INVALID, which its already-gone rule reads as "destroyed". This direction is worse, and that
+     * is why the guard is here rather than left to the appliance: measured on the lab pool 2026-09-20, XO
+     * resolves a XAPI {@code OpaqueRef} wherever it takes a VM id, and DELETE on one answered 204. So a
+     * misrouted ref does not harmlessly 404 here, it can destroy the VM the caller did not name.
+     *
+     * <p>Asserting that nothing was sent is the point. An exception alone would still pass against a client
+     * that issued the DELETE and then threw.
+     */
+    @Test
+    void destroyRefusesAXapiHandleWithoutSendingAnything() {
+        ScriptedRest t = new ScriptedRest();
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> new XoRestClient(t).destroyWithDisks(new VmRef("OpaqueRef:9b1f-dead-beef")));
+
+        assertTrue(e.getMessage().contains("XAPI handle"), e.getMessage());
+        assertTrue(t.destroyed.isEmpty(), "nothing may reach the appliance: " + t.destroyed);
+        assertTrue(t.calls.isEmpty(), "not even a request: " + t.calls);
+    }
+
+    /**
+     * Object ids are deliberately not percent-encoded into the path, so a value carrying a slash, a query
+     * or a fragment addresses a different route. That route answers 404, which the old bare status check
+     * read as a clean teardown.
+     */
+    @Test
+    void destroyRefusesARefThatWouldAddressADifferentRoute() {
+        for (String mangled : new String[] {"abc/def", "abc?x=1", "abc#frag"}) {
+            ScriptedRest t = new ScriptedRest();
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(mangled)),
+                    "'" + mangled + "' must be refused");
+            assertTrue(e.getMessage().contains("not a VM id from this backend"), e.getMessage());
+            assertTrue(t.calls.isEmpty(), "nothing may be sent for '" + mangled + "': " + t.calls);
+        }
+    }
+
+    /**
+     * A 404 is the goal state only when XO itself said so. An appliance below the 6.5.0 floor, a reverse
+     * proxy that does not map {@code /rest/v0}, and a renamed route all answer 404 too, and every one of
+     * them was being recorded as a clean teardown. The caller stops retrying on that, so the VM becomes
+     * invisible to the plugin rather than merely un-destroyed.
+     *
+     * <p>The XAPI backend's equivalent rule checks the error parameters name the very ref being destroyed,
+     * on the stated grounds that the code alone is not enough. This is the same argument.
+     */
+    @Test
+    void aFourOhFourThatIsNotXosOwnIsNotACleanTeardown() {
+        for (String body : new String[] {"<html><body>404 Not Found</body></html>", "", "{\"message\":\"nope\"}"}) {
+            ScriptedRest t = new ScriptedRest();
+            t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, body);
+            assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)),
+                    "a 404 without XO's envelope must not be swallowed: " + body);
+        }
+    }
+
     @Test
     void destroyPropagatesAnythingThatIsNotAMissingObject() {
         ScriptedRest t = new ScriptedRest();

@@ -581,6 +581,7 @@ public final class XoRestClient implements HypervisorClient {
      */
     @Override
     public void destroyWithDisks(@NonNull VmRef vm) {
+        refuseForeignHandle(vm);
         String path = API + "/vms/" + vm.value();
         RestTransport.RestResponse resp;
         try {
@@ -591,12 +592,67 @@ public final class XoRestClient implements HypervisorClient {
         if (resp.isSuccess()) {
             return;
         }
-        if (resp.status() == 404) {
+        if (resp.status() == 404 && isXoFailure(resp.body())) {
             LOGGER.info(() ->
                     "VM " + vm.value() + " was already gone when teardown reached it;" + " treating that as destroyed");
             return;
         }
         throw failure("DELETE", path, resp.status(), resp.body());
+    }
+
+    /**
+     * Refuse a handle this backend never minted, the XO counterpart of {@link XapiClient}'s own check (#223).
+     *
+     * <p>The XAPI side refuses a foreign handle because XAPI answers one with {@code HANDLE_INVALID}, which
+     * its already-gone rule reads as "destroyed". This direction is worse, and the measurement is the reason
+     * the guard is here rather than left to the appliance: <b>XO resolves a XAPI {@code OpaqueRef} wherever
+     * it takes a VM id</b>. Measured on the lab pool 2026-09-20, {@code GET /rest/v0/vms/<OpaqueRef>}
+     * returned the VM and {@code DELETE} answered 204. So a ref misrouted into an XO client does not
+     * harmlessly 404; against the same pool it can destroy the VM the caller did not name.
+     *
+     * <p>The punctuation check is not decoration. Object ids come from XO and are deliberately not
+     * percent-encoded on the way into the path ({@link #encodeSegment}'s contract), so a value carrying a
+     * slash, a query or a fragment addresses a different route entirely. That route answers 404, and a bare
+     * status check would have read it as a clean teardown.
+     */
+    private static void refuseForeignHandle(@NonNull VmRef vm) {
+        String ref = vm.value();
+        if (ref.startsWith(XapiClient.REF_PREFIX)) {
+            throw new HypervisorException("refusing to destroy " + ref + ": that is a XAPI handle, and this is the"
+                    + " Xen Orchestra backend. A VM is only destroyable through the backend that created it;"
+                    + " this appliance would resolve it and delete whatever it names.");
+        }
+        // Blank is deliberately not checked: VmRef's own constructor refuses null and blank, so a check
+        // here would be unreachable and no test could make it fire.
+        if (ref.indexOf('/') >= 0 || ref.indexOf('?') >= 0 || ref.indexOf('#') >= 0) {
+            throw new HypervisorException("refusing to destroy '" + ref + "': not a VM id from this backend."
+                    + " It would address a different route, whose 404 reads as an already-destroyed VM.");
+        }
+    }
+
+    /**
+     * Whether a failure body is XO's own envelope rather than something else that answered.
+     *
+     * <p>Used to qualify the 404 that teardown treats as its goal state. The XAPI backend's equivalent rule
+     * checks the error <em>parameters</em> name the very ref being destroyed, on the stated grounds that the
+     * code alone is not enough. The bare status check this replaces was weaker than that: an XO below the
+     * 6.5.0 floor, a reverse proxy that does not map {@code /rest/v0}, or a renamed route all answer 404,
+     * and every one of them was being recorded as a clean teardown. The caller then stops retrying, so the
+     * VM becomes invisible to the plugin rather than merely un-destroyed.
+     *
+     * <p>Checking for the envelope rather than for a message is the narrowest thing that separates those:
+     * XO's own handler always carries {@code error}, and a proxy page carries no JSON at all.
+     */
+    private static boolean isXoFailure(@CheckForNull String body) {
+        if (body == null || body.isBlank()) {
+            return false;
+        }
+        try {
+            JsonNode parsed = MAPPER.readTree(body);
+            return parsed != null && parsed.hasNonNull("error");
+        } catch (IOException notJson) {
+            return false;
+        }
     }
 
     /**
