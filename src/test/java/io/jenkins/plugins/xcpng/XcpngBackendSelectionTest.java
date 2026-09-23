@@ -1,6 +1,7 @@
 package io.jenkins.plugins.xcpng;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -189,8 +190,7 @@ class XcpngBackendSelectionTest {
     /**
      * {@code XoRestClient}'s base URL is {@code @NonNull}, so a cloud saved with the XO backend and no URL
      * has to be answered before the constructor rather than by it: an unguarded null would surface as a
-     * bare {@code NullPointerException} naming neither the cloud nor the field. The XAPI half of this is
-     * #101 and is deliberately still failing deeper in.
+     * bare {@code NullPointerException} naming neither the cloud nor the field.
      */
     @Test
     void theXoBackendNamesTheCloudWhenTheUrlIsMissing(JenkinsRule r) throws Exception {
@@ -199,6 +199,47 @@ class XcpngBackendSelectionTest {
                 IllegalStateException.class,
                 () -> XcpngCloud.openClient("  ", XO_CREDENTIAL_ID, null, XcpngBackend.XO, "cloud 'xo-lab'"));
         assertTrue(e.getMessage().contains("cloud 'xo-lab'"), e.getMessage());
+        assertTrue(
+                e.getMessage().contains("Xen Orchestra URL"), "the field is named as XO calls it: " + e.getMessage());
+    }
+
+    /**
+     * The XAPI half, which is #101. It used to fall through to {@code HttpTransport}'s
+     * {@code requireNonNull(poolUrl)} two layers down. That guard is real and its message is not a mystery,
+     * but it names the parameter rather than the cloud, so an operator reading it has nothing to go and
+     * edit.
+     *
+     * <p>Null and blank are both asserted because they arrive by different routes: a JCasC document that
+     * omits the key, and a hand-edited {@code config.xml} with an empty element.
+     */
+    @Test
+    void theXapiBackendNamesTheCloudWhenTheUrlIsMissing(JenkinsRule r) throws Exception {
+        addPasswordCredential(XAPI_CREDENTIAL_ID);
+
+        for (String missing : new String[] {null, "", "   "}) {
+            IllegalStateException e = assertThrows(
+                    IllegalStateException.class,
+                    () -> XcpngCloud.openClient(missing, XAPI_CREDENTIAL_ID, null, XcpngBackend.XAPI, "cloud 'lab'"),
+                    "a poolUrl of " + (missing == null ? "null" : "'" + missing + "'") + " must be refused here");
+            assertTrue(e.getMessage().contains("cloud 'lab'"), e.getMessage());
+            assertTrue(e.getMessage().contains("pool URL"), "the field is named as XAPI calls it: " + e.getMessage());
+            // The credential is present and valid, so reaching the credential message instead would mean
+            // the URL guard never ran. This is what separates the fix from the pre-existing behaviour.
+            assertFalse(e.getMessage().contains("credentials"), e.getMessage());
+        }
+    }
+
+    /**
+     * The guard must not fire on a cloud that is merely missing its credential: that case has its own
+     * message, and swallowing it into a URL complaint would trade one wrong diagnosis for another.
+     */
+    @Test
+    void aMissingCredentialIsStillReportedAsThatWhenTheUrlIsFine(JenkinsRule r) {
+        IllegalStateException e = assertThrows(
+                IllegalStateException.class,
+                () -> XcpngCloud.openClient(POOL_URL, "no-such-credential", null, XcpngBackend.XAPI, "cloud 'lab'"));
+        assertTrue(e.getMessage().contains("credentials"), e.getMessage());
+        assertFalse(e.getMessage().contains("pool URL"), e.getMessage());
     }
 
     // ---- What the form says before anything is saved ----

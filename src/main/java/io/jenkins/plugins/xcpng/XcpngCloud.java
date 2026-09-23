@@ -1334,13 +1334,20 @@ public class XcpngCloud extends Cloud {
             @CheckForNull String certificateFingerprint,
             @CheckForNull XcpngBackend backend,
             @NonNull String owner) {
+        // Above the backend branch, so both answer a missing URL the same way (#101). It used to sit inside
+        // the XO branch only, because XoRestClient's base URL is @NonNull and the absence had to be answered
+        // somewhere; the XAPI branch let it fall through to HttpTransport's requireNonNull two layers down.
+        // That guard is real and its message is not a mystery, but it names the parameter rather than the
+        // cloud, and an operator reading it has nothing to go and edit.
+        //
+        // The form cannot produce this state: doCheckPoolUrl rejects a schemeless value as the administrator
+        // types and the constructor trims it. A hand-edited config.xml or a JCasC document can, since both
+        // write the field directly, and that is the route worth naming.
+        if (poolUrl == null || poolUrl.isBlank()) {
+            throw new IllegalStateException("No " + urlLabel(backend) + " configured for " + owner
+                    + ". Set it on the cloud, or" + " remove the cloud if it is no longer wanted.");
+        }
         if (XcpngBackend.resolve(backend) == XcpngBackend.XO) {
-            if (poolUrl == null || poolUrl.isBlank()) {
-                // XoRestClient's base URL is @NonNull, so the absence has to be answered here. The XAPI
-                // branch below still lets a blank URL fail two layers down; that asymmetry is #101's
-                // subject and is deliberately not changed here.
-                throw new IllegalStateException("No Xen Orchestra URL configured for " + owner + ".");
-            }
             StringCredentials token = DescriptorImpl.lookupTokenCredentials(poolUrl, credentialsId);
             if (token == null) {
                 throw new IllegalStateException("No Xen Orchestra token credential configured for " + owner
@@ -1360,6 +1367,18 @@ public class XcpngCloud extends Cloud {
         }
         return new XapiClient(
                 poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), certificateFingerprint);
+    }
+
+    /**
+     * What the URL field is called on a given backend, so a message about it uses the operator's word.
+     *
+     * <p>The field is one field and {@code poolUrl} is its name in the model, but the two backends point it
+     * at different things: a pool master on XAPI, an appliance on XO. Telling an XO operator that no pool
+     * URL is configured sends them looking for a pool.
+     */
+    @NonNull
+    private static String urlLabel(@CheckForNull XcpngBackend backend) {
+        return XcpngBackend.resolve(backend) == XcpngBackend.XO ? "Xen Orchestra URL" : "pool URL";
     }
 
     /** Test seam: replace how a client is opened with an in-memory fake. */
