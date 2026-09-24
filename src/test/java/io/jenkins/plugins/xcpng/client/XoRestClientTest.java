@@ -147,6 +147,23 @@ class XoRestClientTest {
     }
 
     @Test
+    void cloneStampsTheOwnerTagBeforeTheSizingPatch() {
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of("name", "agent-1"), "lab"));
+
+        // Order, not presence. Both calls happening says nothing about the window this closes: a clone
+        // that survives a failed sizing PATCH *and* a failed cleanup is findable only if the tag is
+        // already on it, because every sweep selects on the marker and no ref has been recorded yet.
+        assertTrue(
+                t.indexOf("PUT", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Alab")
+                        < t.indexOf("PATCH", "/rest/v0/vms/" + CLONE),
+                t.paths().toString());
+    }
+
+    @Test
     void cloneWithNoOwnerStampsNoTag() {
         ScriptedRest t = new ScriptedRest();
         XoRestClient c = new XoRestClient(t);

@@ -470,7 +470,17 @@ public final class XoRestClient implements HypervisorClient {
     }
 
     /**
-     * Size the clone and write its seed, in one PATCH, then stamp the owner tag.
+     * Stamp the owner tag, then size the clone and write its seed in one PATCH.
+     *
+     * <p><b>The tag goes first, and that is a trade rather than an accident.</b> It makes the tag PUT the
+     * first thing that can fail once the clone exists, so a failure there now costs a provision that would
+     * otherwise have succeeded. What it buys is that every clone surviving past this point carries the
+     * marker. Both backends destroy a partly configured clone on the way out, so the ordinary failure is
+     * covered either way; the window this closes is the one where that cleanup <em>also</em> fails -- an
+     * appliance blip, an interrupted thread, a 500 on the DELETE. A survivor stamped last carries no tag,
+     * {@code provisionVm} has not recorded a ref for it either, and both sweeps select on the marker, so
+     * nothing finds it but an operator's eye in the XO UI. The XAPI backend already made this trade, and
+     * stamps second, right after the template flag.
      *
      * <p>Sizing goes through {@code PATCH /vms/{id}} rather than through the create body because that is
      * the surface with a declared type ({@code EditVmProps}); the create route's own body is the
@@ -486,6 +496,7 @@ public final class XoRestClient implements HypervisorClient {
      * higher {@code VCPUs_at_startup} and XAPI would reject it.
      */
     private void configure(String vm, ProvisionSpec spec) {
+        markOwner(vm, spec.owner());
         ObjectNode patch = MAPPER.createObjectNode();
         patch.put("cpus", spec.vcpus());
         patch.put("memory", spec.memoryBytes());
@@ -498,7 +509,6 @@ public final class XoRestClient implements HypervisorClient {
         // One call, and it must be one call: the seed has to be in the VM record before the VM starts,
         // because setting xenstore-data on a running VM does not propagate to the guest.
         call("PATCH", API + "/vms/" + vm, patch, READ_TIMEOUT);
-        markOwner(vm, spec.owner());
     }
 
     /**
