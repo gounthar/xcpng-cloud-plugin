@@ -42,7 +42,14 @@ import shutil
 import subprocess
 import sys
 
-from owner import OWNER_KEY, inherited_marker, marker_values, owned_by
+from owner import (
+    OWNER_KEY,
+    ambiguous_owner,
+    inherited_marker,
+    marker_values,
+    owned_by,
+    owners,
+)
 from xapi import Xapi, XapiError
 
 # The legacy tools-era prefix, kept only as the suggested value for --prefix.
@@ -199,6 +206,7 @@ def main():
 
         doomed = []
         inherited = []
+        ambiguous = []
         for vm, rec in x.call("VM.get_all_records").items():
             # Snapshots are VM objects too, and a snapshot of jenkins-ci-agent-3 inherits a
             # matching name. It also reports power_state=Halted, so it is indistinguishable
@@ -219,8 +227,16 @@ def main():
                 # a notice they have no use for is how a useful one stops being read.
                 if args.cloud is None or args.cloud in marker_values(rec):
                     inherited.append(rec)
+            elif args.cloud is not None and ambiguous_owner(rec) and args.cloud in owners(rec):
+                # Ours, but carrying a second cloud's marker as well, so nothing in the record
+                # says which one stamped it (#250). A narrowed sweep refuses to attribute it
+                # rather than risk destroying the other cloud's VM. Report it, because a VM
+                # that visibly carries this cloud's name and is absent from the list below
+                # reads as the sweep missing it.
+                ambiguous.append(rec)
         doomed.sort(key=lambda pair: pair[1]["name_label"])
         inherited.sort(key=lambda rec: rec["name_label"])
+        ambiguous.sort(key=lambda rec: rec["name_label"])
 
         print(f"SR free before : {free_before / 2**30:.2f} GiB   VDIs: {vdis_before}")
         print(f"matching VMs {what}: {len(doomed)} VM(s)")
@@ -230,6 +246,12 @@ def main():
             print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries the "
                   f"{OWNER_KEY!r} marker ({names}) inherited from the VM it was cloned from, "
                   f"not stamped by this plugin. Destroy it by hand if it is yours.")
+
+        for rec in ambiguous:
+            names = ", ".join(sorted(repr(n) for n in owners(rec)))
+            print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries more than one "
+                  f"cloud's marker ({names}) and one uuid stamp, so nothing says which cloud "
+                  f"provisioned it. Reap it with a run that names no --cloud, or by hand.")
 
         if not doomed:
             print("\nnothing to reap." if args.apply else "\nnothing to reap (dry run).")
