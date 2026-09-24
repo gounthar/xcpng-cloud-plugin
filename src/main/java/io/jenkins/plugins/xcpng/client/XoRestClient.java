@@ -78,8 +78,26 @@ public final class XoRestClient implements HypervisorClient {
      * Tag prefix stamped on every clone this plugin provisions, with the owning cloud's name after it. The
      * XO-side counterpart of {@link XapiClient#OWNER_KEY}, and deliberately built from that constant: the
      * two markers have to be recognisable as the same thing by whatever sweeps for either.
+     *
+     * <p>Inheritable, exactly as the XAPI marker is: {@code VM.clone} copies {@code tags} as well as
+     * {@code other_config}, so a hand-made clone of a marked agent carries this tag too. {@link
+     * #SELF_TAG_PREFIX} is what separates a clone this plugin made from a copy of one.
      */
     public static final String OWNER_TAG_PREFIX = XapiClient.OWNER_KEY + ":";
+
+    /**
+     * Tag prefix holding the uuid of the VM the record belongs to, stamped beside the owner tag. The XO-side
+     * counterpart of {@link XapiClient#SELF_KEY}, built from that constant for the same reason, and note it
+     * does not collide with {@link #OWNER_TAG_PREFIX}: {@code xcpng-cloud-uuid:} does not start with
+     * {@code xcpng-cloud:}, so a sweep reading owner tags never mistakes one for the other.
+     *
+     * <p>Unlike the XAPI side, which writes both keys in one {@code set_other_config}, tags go in one PUT
+     * each, so a clone can exist carrying the owner tag and not yet this one. That ordering is deliberate
+     * and is the safe direction: such a survivor reads as an older-plugin clone and stays reapable, whereas
+     * stamping the uuid first would leave a survivor carrying neither an owner tag nor anything a sweep
+     * selects on.
+     */
+    public static final String SELF_TAG_PREFIX = XapiClient.SELF_KEY + ":";
 
     /** Xenstore path the guest agent reads its seed from. Only {@code vm-data/*} keys reach the guest. */
     private static final String GUEST_DATA_PREFIX = "vm-data/jenkins/";
@@ -559,15 +577,44 @@ public final class XoRestClient implements HypervisorClient {
     }
 
     /**
-     * Record the owning cloud on the VM so an out-of-band sweep can find this clone later. A per-tag PUT
-     * rather than the PATCH body's {@code tags} array, which is a whole-list replace and would drop
-     * whatever the template carried.
+     * Record the owning cloud, and this VM's own uuid, on the VM so an out-of-band sweep can find this clone
+     * later and tell it from a copy of it. A per-tag PUT rather than the PATCH body's {@code tags} array,
+     * which is a whole-list replace and would drop whatever the template carried.
+     *
+     * <p>The uuid is read back from the VM record rather than taken from {@code vm}, which is XO's object
+     * id. The two are widely the same string on a XAPI-backed appliance, and this code does not depend on
+     * that: the tools compare the stamp against the {@code uuid} field of the <em>XAPI</em> record, and an
+     * id that turned out to be anything else would stamp a value that matches nothing and quietly refuse
+     * every clone this backend makes. One GET buys not having to be right about it.
+     *
+     * <p>A clone whose source was itself marked arrives carrying an inherited uuid tag as well, because tags
+     * are a set and the PUT adds rather than replaces. That is why the tools ask whether <em>any</em> stamp
+     * matches rather than whether the only one does.
+     *
+     * <p><b>The read-back is immediate, measured rather than assumed.</b> The worry was that XO might answer
+     * this GET before its object cache holds the clone, since the appliance is known to lag elsewhere:
+     * {@code tools/xo_compare.py} polls for a tag it has just written rather than reading it once. Run
+     * against a freshly deployed appliance on 2026-09-24, the GET issued straight after {@code create_vm}
+     * answered <b>200 with the uuid on the first attempt, in 0.01s</b>, with a polling loop standing by that
+     * was never needed. If a slower appliance ever does lag, the symptom is loud rather than silent, a
+     * provision failing on the refusal below with the clone cleaned up, and the repair is to poll here the
+     * way xo_compare.py polls for its tag.
+     *
+     * <p>On that appliance XO's object id and the XAPI uuid were in fact the same string. This code still
+     * does not rely on it: one measurement on one appliance is not a guarantee about the id's provenance,
+     * and the cost of reading the record is a single GET.
      */
     private void markOwner(String vm, @CheckForNull String owner) {
         if (owner == null || owner.isBlank()) {
             return;
         }
         call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(OWNER_TAG_PREFIX + owner), null, READ_TIMEOUT);
+        String uuid = get(API + "/vms/" + vm).path("uuid").asText("");
+        if (uuid.isBlank()) {
+            throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
+                    + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
+        }
+        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(SELF_TAG_PREFIX + uuid), null, READ_TIMEOUT);
     }
 
     @Override

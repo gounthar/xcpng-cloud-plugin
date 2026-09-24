@@ -28,8 +28,11 @@ Credentials come from the environment, never from a file and never into git:
       python3 tools/watch_scrub.py --duration 300
 
 Start it, then queue the build. Read-only: it calls `VM.get_all_records` and nothing else, and
-selects on the plugin's owner marker rather than a name prefix, so a VM this plugin did not
-create can never appear in the output. It prints whether the secret key is set, never its value.
+selects on the plugin's owner marker rather than a name prefix, with the uuid check owner.py
+applies to it, so a VM hand-cloned off an agent does not appear in the output either -- the
+marker alone is inherited by VM.clone (#246). A clone stamped before that check carries no
+uuid, and a copy of one still reads as ours. It prints whether the secret key is set, never
+its value.
 
 Exit status is the verdict, so it can gate a lab run:
 

@@ -364,18 +364,46 @@ public final class XapiClient implements HypervisorClient {
      * {@code other_config} key stamped on every clone this plugin provisions, holding the owning cloud's
      * name. The recovery contract with {@code tools/reaper.py}, which selects on this key rather than on a
      * name prefix: names drift (they already did, silently, and the reaper matched nothing for it), whereas
-     * a VM that carries this key was provisioned by this plugin and by nothing else. A golden image, an
-     * operator's VM, and a snapshot cannot acquire it by being named unluckily.
+     * a golden image, an operator's VM and a snapshot cannot acquire this key by being named unluckily.
+     *
+     * <p><b>The marker says the plugin made this VM <em>or something in its ancestry</em>.</b> {@code VM.clone}
+     * copies {@code other_config}, so a VM an operator hand-clones off a marked agent inherits this key and
+     * reads as plugin-owned to anything selecting on it alone. {@link #SELF_KEY} is what separates the two.
      *
      * <p>Change this string and the reaper stops finding VMs the plugin leaks. Both sides must move together.
      */
     public static final String OWNER_KEY = "xcpng-cloud";
 
     /**
-     * Record the owning cloud on the VM record so an out-of-band sweep can find this clone later. Merged
-     * onto whatever the clone inherited from the template, rather than replacing {@code other_config}
-     * wholesale: XCP-ng itself keeps keys there (and a golden image may carry its own), and a clone that
-     * dropped them would be a worse citizen than one the reaper cannot see.
+     * {@code other_config} key holding the uuid of the VM the record belongs to, stamped beside
+     * {@link #OWNER_KEY} on every clone this plugin provisions.
+     *
+     * <p>It exists because the owner marker is inheritable and this is not. {@code VM.clone} copies
+     * {@code other_config} verbatim, so a hand-made clone of a marked agent carries the owner marker and
+     * <em>its source's</em> uuid, while a genuine plugin clone carries its own. A tool comparing the stamped
+     * uuid against the record's own therefore selects the clones this plugin made and refuses the copies of
+     * them, which the marker alone cannot do (#246).
+     *
+     * <p>A clone stamped by a version that predates this key carries no uuid at all. Tools treat that as
+     * ownership rather than refusing it: those VMs are real leaks and refusing them would strand exactly the
+     * disks the reaper exists to reclaim. The hazard survives for them, and only for them.
+     */
+    public static final String SELF_KEY = OWNER_KEY + "-uuid";
+
+    /**
+     * Record the owning cloud, and this VM's own uuid, on the VM record so an out-of-band sweep can find
+     * this clone later and tell it from a copy of it. Merged onto whatever the clone inherited from the
+     * template, rather than replacing {@code other_config} wholesale: XCP-ng itself keeps keys there (and a
+     * golden image may carry its own), and a clone that dropped them would be a worse citizen than one the
+     * reaper cannot see.
+     *
+     * <p>The uuid is read back with {@code VM.get_uuid} rather than derived from the ref, because an
+     * {@code OpaqueRef} is an opaque handle and the tools compare against the {@code uuid} field of the
+     * record. One extra call on a path that already takes tens of seconds.
+     *
+     * <p>Both keys go in the one {@code set_other_config}, so there is no window in which a clone carries
+     * the owner marker without its self-stamp. That ordering is what keeps the grace path in the tools
+     * meaning "stamped by an older plugin" rather than "stamped by this one, interrupted".
      */
     private void markOwner(String vm, @CheckForNull String owner) {
         if (owner == null || owner.isBlank()) {
@@ -391,6 +419,15 @@ public final class XapiClient implements HypervisorClient {
             });
         }
         merged.put(OWNER_KEY, owner);
+        String uuid = call("VM.get_uuid", vm).asText("");
+        if (uuid.isBlank()) {
+            // Refuse rather than stamp an empty string. A blank stamp matches no record's uuid, so every
+            // clone made after it would be read as somebody's inherited copy and skipped by every sweep --
+            // the marker present, the VM unreapable, and nothing saying why. Loud here beats silent there.
+            throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
+                    + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
+        }
+        merged.put(SELF_KEY, uuid);
         call("VM.set_other_config", vm, merged);
     }
 

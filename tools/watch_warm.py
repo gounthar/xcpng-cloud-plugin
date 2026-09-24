@@ -27,8 +27,11 @@ Credentials come from the environment, never from a file and never into git:
       python3 tools/watch_warm.py --duration 360
 
 Read-only: it runs one Groovy read per poll and never provisions, destroys or reconfigures
-anything. The pool side selects on the plugin's owner marker rather than a name prefix, so a
-VM this plugin did not create can never appear in the output.
+anything. The pool side selects on the plugin's owner marker rather than a name prefix, and
+owner.py checks the uuid stamped beside it, so a VM hand-cloned off an agent does not appear
+in the output either -- the marker alone is inherited by VM.clone (#246). The exception is a
+clone stamped before that check existed, which carries no uuid: a copy of one still reads as
+ours here. Read-only, so the cost is a misreading rather than a destroyed disk.
 """
 
 import argparse
