@@ -83,7 +83,7 @@ class HypervisorClientContractTest {
     }
 
     @Test
-    void stateRejectsInterruptedThreadWithoutRecordingCall() {
+    void stateRejectsInterruptedThread() {
         FakeHypervisorClient client = new FakeHypervisorClient();
         VmRef vm = new VmRef("vm/test");
 
@@ -96,7 +96,7 @@ class HypervisorClientContractTest {
     }
 
     @Test
-    void primaryIpAddressRejectsInterruptedThreadWithoutRecordingCall() {
+    void primaryIpAddressRejectsInterruptedThread() {
         FakeHypervisorClient client = new FakeHypervisorClient();
         VmRef vm = new VmRef("vm/test");
 
