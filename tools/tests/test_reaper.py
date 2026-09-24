@@ -558,6 +558,13 @@ def test_the_ambiguous_skip_is_reported_with_both_cloud_names(pool, capsys):
     assert "SKIPPING 'b-agent'" in out
     assert "more than one" in out
     assert CLOUD in out and "xcpng-other" in out
+    # The advice has to be safe as well as present. Marker mode selects every marked VM and
+    # never prompts, so telling an operator to "just drop --cloud" is how this skip notice
+    # turns into a pool-wide destroy. Found in review of the first version of this message.
+    assert "every marked VM" in out and "does not confirm" in out
+    assert "by hand" in out
+    # It must not claim a stamp count: the record carries two, and only the match is singular.
+    assert "one uuid stamp" not in out
 
 
 def test_a_single_marker_vm_is_still_reaped_by_its_cloud(pool):

@@ -249,9 +249,15 @@ def main():
 
         for rec in ambiguous:
             names = ", ".join(sorted(repr(n) for n in owners(rec)))
-            print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries more than one "
-                  f"cloud's marker ({names}) and one uuid stamp, so nothing says which cloud "
-                  f"provisioned it. Reap it with a run that names no --cloud, or by hand.")
+            # Two things this must not say, both found in review. It carries however many uuid
+            # stamps its ancestry left on it, not one, and only the count that MATCHES is one;
+            # and "just run it without --cloud" is dangerous advice, because marker mode selects
+            # every marked VM on the pool and, unlike prefix mode, never asks for confirmation.
+            print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries markers for "
+                  f"more than one cloud ({names}), and the uuid stamp matching this record does "
+                  f"not say which of them provisioned it. Destroy it by hand if it is yours. A "
+                  f"run without --cloud does reap it, but it selects every marked VM on the "
+                  f"pool and marker mode does not confirm, so read its dry run first.")
 
         if not doomed:
             print("\nnothing to reap." if args.apply else "\nnothing to reap (dry run).")
