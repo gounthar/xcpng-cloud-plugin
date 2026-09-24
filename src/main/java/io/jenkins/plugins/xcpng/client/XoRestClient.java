@@ -475,12 +475,13 @@ public final class XoRestClient implements HypervisorClient {
      * <p><b>The tag goes first, and that is a trade rather than an accident.</b> It makes the tag PUT the
      * first thing that can fail once the clone exists, so a failure there now costs a provision that would
      * otherwise have succeeded. What it buys is that every clone surviving past this point carries the
-     * marker. Both backends destroy a partly configured clone on the way out, so the ordinary failure is
-     * covered either way; the window this closes is the one where that cleanup <em>also</em> fails -- an
-     * appliance blip, an interrupted thread, a 500 on the DELETE. A survivor stamped last carries no tag,
-     * {@code provisionVm} has not recorded a ref for it either, and both sweeps select on the marker, so
-     * nothing finds it but an operator's eye in the XO UI. The XAPI backend already made this trade, and
-     * stamps second, right after the template flag.
+     * marker, whenever the spec names an owner at all: a null or blank owner is untaggable by design and
+     * {@code markOwner} returns early on it. Both backends destroy a partly configured clone on the way
+     * out, so the ordinary failure is covered either way; the window this closes is the one where that
+     * cleanup <em>also</em> fails -- an appliance blip, an interrupted thread, a 500 on the DELETE. A
+     * survivor stamped last carries no tag, {@code provisionVm} has not recorded a ref for it either, and
+     * both sweeps select on the marker, so nothing finds it but an operator's eye in the XO UI. The XAPI
+     * backend already made this trade, and stamps second, right after the template flag.
      *
      * <p>Sizing goes through {@code PATCH /vms/{id}} rather than through the create body because that is
      * the surface with a declared type ({@code EditVmProps}); the create route's own body is the
