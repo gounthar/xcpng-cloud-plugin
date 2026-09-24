@@ -32,6 +32,14 @@ class XoRestClientTest {
     private static final String TEMPLATE_UUID = "5436f445-a341-cc10-7312-e1077b0c4e69";
     private static final String CLONE = "f07ab729-c0e8-721c-45ec-f11276377030";
 
+    /**
+     * The uuid the clone's own record reports, and deliberately NOT equal to {@link #CLONE}, XO's object id
+     * for it. On a XAPI-backed appliance the two are widely the same string, and the client does not depend
+     * on that (#246): it reads the record. A fixture where they matched could not tell a client that reads
+     * the uuid from one that stamps the id, and the tools compare the stamp against the XAPI record's uuid.
+     */
+    private static final String CLONE_UUID = "b81c6d2f-40a7-4e93-8f15-6ad3c0e72b94";
+
     // -- resolveTemplate --------------------------------------------------
 
     @Test
@@ -206,6 +214,59 @@ class XoRestClientTest {
     }
 
     @Test
+    void cloneStampsItsOwnUuidBesideTheOwnerTagSoACopyCanBeToldApart() {
+        // #246. VM.clone copies tags as well as other_config, so the owner tag alone says "this VM or
+        // something in its ancestry was made by the plugin", and tools/reaper.py destroyed an operator's
+        // investigation clone with its disks on the strength of it.
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        // CLONE_UUID, never CLONE: the stamp is read from the record, because what the tools compare it
+        // against is the uuid on the XAPI record, not XO's object id.
+        assertTrue(
+                t.paths().contains("PUT /rest/v0/vms/" + CLONE + "/tags/xcpng-cloud-uuid%3A" + CLONE_UUID),
+                t.paths().toString());
+        // The owner tag first. A survivor of a failed stamp plus a failed cleanup then carries the marker
+        // and no uuid, which every sweep reads as an older-plugin clone and still reaps; stamping the uuid
+        // first would leave one carrying nothing any sweep selects on.
+        assertTrue(
+                t.indexOf("PUT", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Alab")
+                        < t.indexOf("PUT", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud-uuid%3A" + CLONE_UUID),
+                t.paths().toString());
+    }
+
+    @Test
+    void theUuidTagPrefixIsNotReadableAsACloudName() {
+        // xcpng-cloud-uuid: must not start with xcpng-cloud:, or every sweep reading owner tags would see
+        // each stamp as a cloud named "-uuid:<uuid>" and select on the stamp alone. tools/owner.py asserts
+        // the same thing from its side; this is the half that lives with the constants.
+        assertFalse(XoRestClient.SELF_TAG_PREFIX.startsWith(XoRestClient.OWNER_TAG_PREFIX));
+        assertEquals("xcpng-cloud-uuid:", XoRestClient.SELF_TAG_PREFIX);
+    }
+
+    @Test
+    void cloneRefusesToMarkAnOwnerWhenTheRecordNamesNoUuid() {
+        // A blank stamp matches no record's uuid, so the clone would read as somebody else's inherited
+        // copy: marked, unreapable, silent about why. Fail at provision instead.
+        ScriptedRest t = new ScriptedRest();
+        t.vmUuid = null;
+        XoRestClient c = new XoRestClient(t);
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(
+                        c.resolveTemplate("jenkins-agent-debian13-v7"),
+                        new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab")));
+        assertTrue(e.getMessage().contains("no uuid"), e.getMessage());
+        // The partly configured clone is destroyed on the way out, the same self-cleanup every other
+        // failure past create_vm gets. A refusal that leaked the VM would trade one hazard for a worse one.
+        assertEquals(List.of(CLONE), t.destroyed, t.paths().toString());
+    }
+
+    @Test
     void cloneWithNoOwnerStampsNoTag() {
         ScriptedRest t = new ScriptedRest();
         XoRestClient c = new XoRestClient(t);
@@ -213,6 +274,9 @@ class XoRestClientTest {
         assertTrue(
                 t.paths().stream().noneMatch(p -> p.contains("/tags/")),
                 t.paths().toString());
+        assertTrue(
+                t.paths().stream().noneMatch(p -> p.equals("GET /rest/v0/vms/" + CLONE)),
+                "nothing to stamp means nothing to read a uuid for: " + t.paths());
     }
 
     @Test
@@ -788,6 +852,11 @@ class XoRestClientTest {
         String powerState = "Halted";
         String mainIpAddress;
         boolean noContent;
+        /**
+         * What the clone's record reports as its uuid. Null stands in for a record that names none, which
+         * markOwner refuses rather than stamping an empty tag nothing can match.
+         */
+        String vmUuid = CLONE_UUID;
 
         private final Map<String, RestResponse> failures = new LinkedHashMap<>();
         private final List<String> interrupts = new ArrayList<>();
@@ -842,6 +911,9 @@ class XoRestClientTest {
             if ("GET".equals(method) && path.startsWith("/rest/v0/vms/")) {
                 Map<String, Object> vm = new LinkedHashMap<>();
                 vm.put("power_state", powerState);
+                if (vmUuid != null) {
+                    vm.put("uuid", vmUuid);
+                }
                 if (mainIpAddress != null) {
                     vm.put("mainIpAddress", mainIpAddress);
                 }

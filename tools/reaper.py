@@ -24,6 +24,13 @@ the name prefix "jenkins-ci-" while the plugin named its clones
 leaked VMs held pool memory and SR space. A marker cannot drift out of sync with
 a naming convention, and cannot be acquired by an unluckily named golden image.
 
+It CAN be acquired by being cloned from something that carries it, which is #246:
+`VM.clone` copies other_config and tags alike, so a VM an operator clones by hand off a
+failing agent inherits the marker. The plugin therefore also stamps each clone's own uuid,
+and owner.py refuses a marker whose uuid belongs to some other VM. Such a VM is reported
+as skipped rather than passed over in silence. A clone stamped by a plugin older than #246
+carries no uuid and is still reaped, because it is a real leak; the hazard survives there.
+
 --prefix still exists for the pre-plugin probe VMs (measure_clone.py names them
 "jenkins-ci-probe-N"), which carry no marker. It is opt-in and guarded: a name
 prefix cannot tell an agent from the golden image every future provision needs.
@@ -35,7 +42,7 @@ import shutil
 import subprocess
 import sys
 
-from owner import OWNER_KEY, owned_by
+from owner import OWNER_KEY, inherited_marker, marker_values, owned_by
 from xapi import Xapi, XapiError
 
 # The legacy tools-era prefix, kept only as the suggested value for --prefix.
@@ -106,9 +113,12 @@ def _live_but_halted(rec, live_names):
 def _selector(args):
     """Return (predicate, description) for what this run reaps.
 
-    Marker mode is the default and is safe by construction: only a VM the plugin stamped
-    can match. Prefix mode is opt-in, and matches on a string an operator's VM or the
-    golden image can share by accident.
+    Marker mode is the default and matches only a VM that carries the plugin's marker AND
+    its own uuid stamped beside it, so a hand-made clone that inherited the marker from a
+    plugin agent is not selected (#246). What it cannot separate is a clone stamped by a
+    plugin older than that check, which carries no uuid: those are reaped, and a copy of
+    one would be reaped with them. Prefix mode is opt-in, and matches on a string an
+    operator's VM or the golden image can share by accident.
     """
     if args.prefix is None:
         if args.cloud:
@@ -188,6 +198,7 @@ def main():
         vdis_before = x.vdi_count(sr)
 
         doomed = []
+        inherited = []
         for vm, rec in x.call("VM.get_all_records").items():
             # Snapshots are VM objects too, and a snapshot of jenkins-ci-agent-3 inherits a
             # matching name. It also reports power_state=Halted, so it is indistinguishable
@@ -197,10 +208,28 @@ def main():
                 continue
             if match(rec):
                 doomed.append((vm, rec))
+            elif args.prefix is None and inherited_marker(rec):
+                # Marked, and not ours: the marker came from whatever this was cloned from.
+                # Say so. A VM that visibly carries `xcpng-cloud` and is not in the list below
+                # otherwise looks like the sweep missing it, which is the reading that gets a
+                # --prefix run reached for next.
+                #
+                # Narrowed by --cloud the same way the sweep itself is. An operator asking about
+                # one cloud is not helped by a notice about somebody else's inherited marker, and
+                # a notice they have no use for is how a useful one stops being read.
+                if args.cloud is None or args.cloud in marker_values(rec):
+                    inherited.append(rec)
         doomed.sort(key=lambda pair: pair[1]["name_label"])
+        inherited.sort(key=lambda rec: rec["name_label"])
 
         print(f"SR free before : {free_before / 2**30:.2f} GiB   VDIs: {vdis_before}")
         print(f"matching VMs {what}: {len(doomed)} VM(s)")
+
+        for rec in inherited:
+            names = ", ".join(sorted(repr(n) for n in marker_values(rec))) or "no cloud name"
+            print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries the "
+                  f"{OWNER_KEY!r} marker ({names}) inherited from the VM it was cloned from, "
+                  f"not stamped by this plugin. Destroy it by hand if it is yours.")
 
         if not doomed:
             print("\nnothing to reap." if args.apply else "\nnothing to reap (dry run).")
@@ -225,8 +254,9 @@ def main():
                     kept.append((vm, rec))
             doomed = kept
 
-        # Prefix mode only. Marker mode cannot select a VM the plugin did not create, so there is
-        # nothing to second-guess; making it prompt too would train the operator to type through it.
+        # Prefix mode only. Marker mode selects on a marker plus a matching uuid stamp, so the VMs
+        # it can reach are the plugin's own clones and clones stamped before that check existed;
+        # making it prompt too would train the operator to type through it.
         if args.apply and args.prefix is not None and not args.force:
             for _, rec in doomed:
                 print(f"  {rec['power_state']:8} {rec['name_label']!r} uuid={rec['uuid']}")

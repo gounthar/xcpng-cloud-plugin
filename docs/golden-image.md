@@ -485,8 +485,15 @@ Step 6 is not cosmetic. `tools/reaper.py` refuses to destroy templates, which is
 not depend on what the image is called.
 
 The reaper now selects on the `xcpng-cloud` marker the plugin stamps into each clone's `other_config`,
-so a golden image cannot be caught by a default run however it is named: it carries no marker. The
-name-prefix mode still exists for the pre-plugin probe VMs, and there a golden image named
+so a golden image cannot be caught by a default run however it is named. **The template filter in step 6
+is what makes that true, not the marker.** An image built the recommended way -- install a VM, then flip
+`is-a-template` -- carries no marker and needs neither guard. But an image built *from a plugin agent*
+does carry one, because `VM.clone` copies `other_config` and `tags` alike (#246), and the marker alone
+would then select it. Two things stop that: step 6, and the uuid the plugin stamps beside the marker,
+which an inherited copy does not match. Do step 6 anyway; it is the guard that does not depend on how
+the image was built.
+
+The name-prefix mode still exists for the pre-plugin probe VMs, and there a golden image named
 `jenkins-golden-debian` is still one typo away from `reaper.py --apply --prefix jenkins-` if it is an
 ordinary VM. That path now refuses a prefix shorter than `jenkins-ci-` without `--force`, and confirms
 interactively before destroying, but making the image a template is what makes the question moot.

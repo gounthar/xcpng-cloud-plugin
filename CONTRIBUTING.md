@@ -140,8 +140,14 @@ These are decisions, not accidents, and a change that reverses one needs an argu
 Anything touching provisioning or teardown deserves a run against real hardware, and the
 maintainer can do that if you cannot. Say so in the pull request rather than describing what you
 expect would happen. `tools/reaper.py` is dry-run by default and selects on the `xcpng-cloud` owner
-marker the plugin stamps into each clone, so it can only destroy VMs the plugin provisioned; run it
-before and after anything that clones, and keep `maxInstances` low.
+marker the plugin stamps into each clone, plus the clone's own uuid stamped beside it; run it before
+and after anything that clones, and keep `maxInstances` low.
+
+The uuid is there because the marker on its own is inheritable: `VM.clone` copies it, so a VM you
+clone by hand off an agent to investigate it carries the marker too. A default run skips such a VM
+and says so by name. One case it cannot skip is a copy of a clone made before that check existed,
+which carries a marker and no uuid. If you clone an agent on the lab pool, give it a name you will
+recognise and destroy it yourself.
 
 ## Licence
 

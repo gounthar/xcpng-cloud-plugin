@@ -419,3 +419,93 @@ def test_live_domains_raises_when_ssh_fails(monkeypatch):
     with pytest.raises(XapiError) as caught:
         reaper.live_domains_on_dom0("dom0.invalid", "pw")
     assert caught.value.message == "DOM0_UNREACHABLE"
+
+
+# --- #246: an operator's hand-made clone inherits the marker and must survive ---------------
+
+
+@pytest.mark.parametrize("backend", ["owner", "owner_tag"])
+def test_a_hand_made_clone_of_an_agent_survives_while_the_agent_is_reaped(pool, backend):
+    """The sweep end to end, both backends, both outcomes in one run.
+
+    `vm-agent` is a clone the plugin made and lost. `vm-copy` is what an operator gets by
+    cloning it to investigate a failing build, and `VM.clone` copies other_config and tags
+    alike, so it carries the same marker. Before #246 a default --apply destroyed both and
+    reported both as plugin clones.
+
+    Both assertions matter and neither alone would do. Dropping the first would pass against
+    a check that refuses everything, which strands every leaked disk the tool exists for;
+    dropping the second is the bug.
+    """
+    fake = pool(
+        {
+            "vm-agent": vm_record(PLUGIN_VM, **{backend: CLOUD}),
+            "vm-copy": vm_record("investigating-a-failure", inherited_from=PLUGIN_VM,
+                                 **{backend: CLOUD}),
+        }
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-agent"], "an operator's clone was destroyed with its disks"
+
+
+def test_the_cloud_filter_does_not_reach_an_inherited_marker_either(pool):
+    """--cloud narrows the sweep; it must not widen what counts as ownership."""
+    fake = pool(
+        {"vm-copy": vm_record("copy", owner=CLOUD, inherited_from=PLUGIN_VM)},
+        argv=("reaper.py", "--apply", "--cloud", CLOUD),
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == []
+
+
+def test_a_skipped_clone_is_reported_rather_than_passed_over(pool, capsys):
+    """A marked VM absent from the list, with no word about why, reads as the sweep missing
+    it -- and the next thing reached for is --prefix, which has none of these guards."""
+    pool(
+        {"vm-copy": vm_record("investigating-a-failure", owner=CLOUD, inherited_from=PLUGIN_VM)},
+        argv=("reaper.py",),
+    )
+    reaper.main()
+    out = capsys.readouterr().out
+    assert "SKIPPING 'investigating-a-failure'" in out
+    assert "inherited" in out
+    assert CLOUD in out, "the operator needs the cloud name to know whose marker it carries"
+
+
+def test_a_clone_stamped_before_the_uuid_check_is_still_reaped(pool):
+    """The grace path at the sweep level. These are real leaks made by an older plugin, and
+    refusing them would strand exactly the disks this tool exists to reclaim."""
+    fake = pool({"vm-old": vm_record(PLUGIN_VM, owner=CLOUD, stamped=False)})
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-old"]
+
+
+def test_prefix_mode_reports_no_skips_because_it_reads_no_marker(pool, capsys):
+    """Prefix mode selects on a name and knows nothing about ownership. Printing a SKIPPING
+    line there would claim a check that run did not make.
+
+    The VM is named so the prefix does NOT match it. A name that matched would be selected
+    before the skip branch is ever reached, so the test would pass against a reaper that
+    reports skips in every mode -- which is what the first version of it did.
+    """
+    pool(
+        {"vm-copy": vm_record("investigating-a-failure", owner=CLOUD, inherited_from=PLUGIN_VM)},
+        argv=("reaper.py", "--prefix", "jenkins-ci-"),
+    )
+    reaper.main()
+    assert "SKIPPING" not in capsys.readouterr().out
+
+
+def test_the_skip_notice_is_narrowed_by_cloud_like_the_sweep_itself(pool, capsys):
+    """An operator asking about one cloud has no use for a notice about another's inherited
+    marker, and a notice nobody needs is how a useful one stops being read.
+
+    The VM here carries a marker for a cloud the run did not ask about, so a reaper that
+    reported every inherited marker regardless would still print a SKIPPING line for it.
+    """
+    pool(
+        {"vm-copy": vm_record("someone-elses", owner="xcpng-other", inherited_from=PLUGIN_VM)},
+        argv=("reaper.py", "--cloud", CLOUD),
+    )
+    reaper.main()
+    assert "SKIPPING" not in capsys.readouterr().out

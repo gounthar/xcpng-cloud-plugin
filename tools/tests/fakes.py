@@ -36,7 +36,8 @@ class FakeResponse:
 
 
 def vm_record(name, snapshot=False, template=False, control_domain=False, power="Halted",
-              owner=None, other_config=None, xenstore_data=None, owner_tag=None, tags=None):
+              owner=None, other_config=None, xenstore_data=None, owner_tag=None, tags=None,
+              stamped=True, inherited_from=None):
     """The subset of a XAPI VM record that reaper.py filters on.
 
     `owner` stamps the `xcpng-cloud` marker the plugin writes into other_config, i.e. this is
@@ -45,13 +46,28 @@ def vm_record(name, snapshot=False, template=False, control_domain=False, power=
     everything the plugin did not create: an operator's VM, the golden image, a pre-plugin
     probe. Defaulting to None matters, because a fake that marked every VM would make the
     marker filter untestable.
+
+    A marked record also carries the uuid stamp the plugin writes beside the marker (#246),
+    in whichever of the two places the marker itself went, so the default fake is a genuine
+    plugin clone. The two ways that stops being true each get a knob, because both are real
+    and neither is expressible by leaving something out:
+
+    - `stamped=False` is a clone from a plugin older than the uuid check. Marker, no stamp.
+    - `inherited_from="other"` is the #246 hazard: an operator's hand-made clone, carrying the
+      marker and the *source's* uuid. A fake without this could not tell a working check from
+      one that accepts anything, which is the failure mode this repo keeps meeting.
     """
     config = dict(other_config or {})
+    labels = list(tags or [])
+    stamp = f"uuid-{inherited_from}" if inherited_from is not None else f"uuid-{name}"
     if owner is not None:
         config["xcpng-cloud"] = owner
-    labels = list(tags or [])
+        if stamped:
+            config["xcpng-cloud-uuid"] = stamp
     if owner_tag is not None:
         labels.append(f"xcpng-cloud:{owner_tag}")
+        if stamped:
+            labels.append(f"xcpng-cloud-uuid:{stamp}")
     return {
         "name_label": name,
         "uuid": f"uuid-{name}",

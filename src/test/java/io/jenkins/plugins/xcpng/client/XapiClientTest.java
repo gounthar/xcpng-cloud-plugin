@@ -276,6 +276,47 @@ class XapiClientTest {
     }
 
     @Test
+    void cloneStampsItsOwnUuidBesideTheMarkerSoACopyCanBeToldApart() {
+        // #246. VM.clone copies other_config, so the owner marker alone says "this VM or something in its
+        // ancestry was made by the plugin" -- and tools/reaper.py destroyed an operator's investigation
+        // clone with its disks on the strength of it. The uuid is what a copy cannot inherit meaningfully.
+        ScriptedTransport t = new ScriptedTransport();
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        c.cloneFromTemplate(
+                new VmRef("OpaqueRef:tmpl"),
+                new ProvisionSpec("agent", 2, 2048L, null, null, null, Map.of(), "xcpng-lab"));
+
+        JsonNode set = paramsOf(t, "VM.set_other_config").get(2);
+        assertEquals(t.vmUuid, set.path(XapiClient.SELF_KEY).asText(), "the clone is not stamped with its own uuid");
+        // One write, not two: a clone must never exist carrying the owner marker and no stamp of its own,
+        // because the tools read that as "stamped by an older plugin" and reap it.
+        assertEquals(
+                1,
+                t.methods().stream().filter("VM.set_other_config"::equals).count(),
+                "the marker and the stamp go in one write or the grace path stops meaning what it says");
+    }
+
+    @Test
+    void cloneRefusesToMarkAnOwnerWhenThePoolNamesNoUuid() {
+        // A blank stamp matches no record's uuid, so every clone made after it would read as somebody
+        // else's inherited copy: marked, unreapable, and silent about why. Fail at provision instead.
+        ScriptedTransport t = new ScriptedTransport();
+        t.vmUuid = "";
+        XapiClient c = new XapiClient(t, "root", "pw");
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(
+                        new VmRef("OpaqueRef:tmpl"),
+                        new ProvisionSpec("agent", 2, 2048L, null, null, null, Map.of(), "xcpng-lab")));
+        assertTrue(e.getMessage().contains("no uuid"), e.getMessage());
+        assertFalse(
+                t.methods().contains("VM.set_other_config"),
+                "a refused stamp must not leave the inheritable marker behind on its own");
+    }
+
+    @Test
     void cloneWithNoOwnerTouchesNoOtherConfig() {
         ScriptedTransport t = new ScriptedTransport();
         XapiClient c = new XapiClient(t, "root", "pw");
@@ -285,6 +326,7 @@ class XapiClientTest {
 
         assertFalse(t.methods().contains("VM.get_other_config"), "no owner means no other_config read");
         assertFalse(t.methods().contains("VM.set_other_config"), "no owner means no other_config write");
+        assertFalse(t.methods().contains("VM.get_uuid"), "nothing to stamp means nothing to read it for");
     }
 
     @Test
@@ -663,6 +705,12 @@ class XapiClientTest {
         Map<String, String> otherConfig = Map.of();
         /** Interrupt the calling thread when this method is posted, standing in for an interrupt landing mid-clone. */
         String interruptOn = null;
+        /**
+         * What VM.get_uuid answers for the clone. Blank stands in for a pool that answers the call without
+         * naming a uuid, which markOwner refuses rather than stamping an empty marker nothing can match.
+         */
+        String vmUuid = "4f2e1a7c-9b3d-4e18-a05f-2c7d9e6b138a";
+
         /** The template's vCPU counts, which a clone inherits. The golden image on the lab pool has 2. */
         int vcpusMax = 2;
 
@@ -763,6 +811,10 @@ class XapiClientTest {
                             yield (sharedVdi || !vbd.contains("disk2")) ? "OpaqueRef:vdi-disk" : "OpaqueRef:vdi-disk2";
                         }
                         case "pool.get_all" -> List.of();
+                        // The uuid the clone is stamped with (#246). Deliberately not derived from the ref:
+                        // an OpaqueRef and a uuid are different things, and a fake that returned the ref
+                        // would let a client stamping the ref pass while the tools compare against uuid.
+                        case "VM.get_uuid" -> vmUuid;
                         default -> ""; // set_*, resize, destroy, task.destroy, hard_shutdown all return void-ish
                     };
             return envelope(id, result, null);
