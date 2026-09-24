@@ -136,7 +136,33 @@ def owners(record):
     return marker_values(record)
 
 
+def ambiguous_owner(record):
+    """True when this VM is the plugin's but no single cloud can be said to own it.
+
+    A record carrying two owner markers, both corroborated by the one uuid stamp it has. On XO
+    that arises from a golden image built off a marked agent: tags are a set and the plugin's
+    PUT adds to it, so a clone made by cloud B inherits cloud A's marker and keeps its own,
+    and nothing in the data says which of the two stamped it (#250).
+
+    The stamp does not name a cloud, so this is not a gap that better reading closes. It is
+    the reason `owned_by` refuses to attribute such a record to any one cloud.
+    """
+    return len(owners(record)) > 1
+
+
 def owned_by(record, cloud=None):
-    """True when the plugin made this VM, and, if `cloud` is given, that cloud did."""
+    """True when the plugin made this VM, and, if `cloud` is given, that cloud did.
+
+    With a `cloud`, a record carrying more than one owner marker answers False for every one
+    of them, because nothing in the record says which cloud stamped it. That is deliberately
+    asymmetric with the bare call, which still answers True: such a VM *is* the plugin's, so
+    an un-narrowed sweep should still reclaim it, while `--cloud A` must not be able to
+    destroy a VM cloud B is using (#250).
+
+    The cost is a real leak going unreaped by a narrowed sweep, which is a false negative in a
+    safety net rather than a destroyed VM, and a bare sweep still catches it.
+    """
     found = owners(record)
-    return bool(found) if cloud is None else cloud in found
+    if cloud is None:
+        return bool(found)
+    return len(found) == 1 and cloud in found

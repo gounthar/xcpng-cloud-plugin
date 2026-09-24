@@ -509,3 +509,68 @@ def test_the_skip_notice_is_narrowed_by_cloud_like_the_sweep_itself(pool, capsys
     )
     reaper.main()
     assert "SKIPPING" not in capsys.readouterr().out
+
+
+# --- #250: a record carrying two clouds' markers must not be reaped by --cloud --------------
+
+
+def _two_cloud_record(name, mine, theirs):
+    """A clone cloud `mine` made from a template descended from cloud `theirs`' agent.
+
+    XO tags are a set and the plugin's PUT adds to it, so the clone keeps the inherited marker
+    and stamp and gains its own. Its uuid is among the stamps, so the #246 check passes and
+    only the count of markers distinguishes it.
+    """
+    rec = vm_record(name)
+    rec["tags"] = [
+        f"xcpng-cloud:{theirs}", "xcpng-cloud-uuid:uuid-their-agent",
+        f"xcpng-cloud:{mine}", f"xcpng-cloud-uuid:uuid-{name}",
+    ]
+    return rec
+
+
+def test_cloud_filter_does_not_reap_a_vm_carrying_another_clouds_marker(pool):
+    """The #250 defect end to end. Before the fix this run destroyed the VM with its disks."""
+    fake = pool(
+        {"vm-b": _two_cloud_record("b-agent", mine=CLOUD, theirs="xcpng-other")},
+        argv=("reaper.py", "--apply", "--cloud", "xcpng-other"),
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == [], "a VM another cloud provisioned was destroyed"
+
+
+def test_an_unnarrowed_sweep_still_reaps_it(pool):
+    """The other half, and the one that stops this being a blanket refusal: the VM is still
+    the plugin's, so a sweep that names no cloud must still reclaim its disks."""
+    fake = pool({"vm-b": _two_cloud_record("b-agent", mine=CLOUD, theirs="xcpng-other")})
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-b"]
+
+
+def test_the_ambiguous_skip_is_reported_with_both_cloud_names(pool, capsys):
+    """Silence here sends the operator to --prefix, which has none of these guards."""
+    pool(
+        {"vm-b": _two_cloud_record("b-agent", mine=CLOUD, theirs="xcpng-other")},
+        argv=("reaper.py", "--cloud", CLOUD),
+    )
+    reaper.main()
+    out = capsys.readouterr().out
+    assert "SKIPPING 'b-agent'" in out
+    assert "more than one" in out
+    assert CLOUD in out and "xcpng-other" in out
+    # The advice has to be safe as well as present. Marker mode selects every marked VM and
+    # never prompts, so telling an operator to "just drop --cloud" is how this skip notice
+    # turns into a pool-wide destroy. Found in review of the first version of this message.
+    assert "every marked VM" in out and "does not confirm" in out
+    assert "by hand" in out
+    # It must not claim a stamp count: the record carries two, and only the match is singular.
+    assert "one uuid stamp" not in out
+
+
+def test_a_single_marker_vm_is_still_reaped_by_its_cloud(pool):
+    """Control. A guard that fired on every record would pass the tests above and break the
+    tool, which is exactly the failure mode the #246 mutations were written against."""
+    fake = pool({"vm-a": vm_record(PLUGIN_VM, owner_tag=CLOUD)},
+                argv=("reaper.py", "--apply", "--cloud", CLOUD))
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-a"]

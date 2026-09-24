@@ -16,6 +16,7 @@ from owner import (
     OWNER_TAG_PREFIX,
     SELF_KEY,
     SELF_TAG_PREFIX,
+    ambiguous_owner,
     inherited_marker,
     marker_values,
     owned_by,
@@ -39,11 +40,20 @@ def test_the_xo_tag_names_its_cloud():
     assert owners(vm_record("a", owner_tag="xcpng-xo")) == {"xcpng-xo"}
 
 
-def test_both_markers_are_read_and_may_disagree():
-    """Nothing stops both, and an operator can add a tag by hand in the XO UI."""
+def test_both_markers_are_read_but_neither_can_be_attributed():
+    """Nothing stops both, and an operator can add a tag by hand in the XO UI.
+
+    This test used to assert the opposite of its second half: that such a record is owned by
+    each cloud named on it. That is exactly the #250 defect, because the record carries one
+    uuid stamp and nothing says which of the two clouds wrote it, so `--cloud A` could reap a
+    VM cloud B was using. Both names are still *read*, because a skip has to be reportable.
+    """
     record = vm_record("a", owner="xcpng-lab", owner_tag="xcpng-xo")
     assert owners(record) == {"xcpng-lab", "xcpng-xo"}
-    assert owned_by(record, "xcpng-lab") and owned_by(record, "xcpng-xo")
+    assert not owned_by(record, "xcpng-lab")
+    assert not owned_by(record, "xcpng-xo")
+    assert owned_by(record), "an un-narrowed sweep must still reclaim it: it is ours"
+    assert ambiguous_owner(record)
 
 
 @pytest.mark.parametrize(
@@ -238,3 +248,57 @@ def test_the_stamp_constants_match_the_java_that_writes_them():
         'String SELF_TAG_PREFIX = XapiClient.SELF_KEY + ":";' in xo_client
     ), "XoRestClient.SELF_TAG_PREFIX changed shape; update owner.SELF_TAG_PREFIX to match"
     assert SELF_TAG_PREFIX == SELF_KEY + ":"
+
+
+# --- #250: one uuid stamp must not validate every owner marker on the record ----------------
+
+
+def test_a_clone_carrying_two_clouds_markers_is_attributed_to_neither():
+    """The #250 defect, in the shape that produces it.
+
+    Cloud A provisions an agent; a golden image is built from it, so the template carries A's
+    marker and A's stamp; cloud B then provisions from that template. XO tags are a set and
+    the plugin's PUT adds rather than replaces, so the clone ends up with all four tags. Its
+    own uuid is among the stamps, so the ownership check passes, and before this change
+    `marker_values` then handed back both cloud names: `--cloud A` would destroy B's VM.
+
+    The bare call still answers True, and that half is load-bearing. Without it the fix would
+    be a blanket refusal that strands the leak instead of misattributing it.
+    """
+    rec = vm_record("b-agent")
+    rec["tags"] = [
+        f"{OWNER_TAG_PREFIX}cloud-a",          # inherited from the template
+        f"{SELF_TAG_PREFIX}uuid-a-agent",      # inherited: cloud A's agent's uuid
+        f"{OWNER_TAG_PREFIX}cloud-b",          # stamped now, by cloud B
+        f"{SELF_TAG_PREFIX}uuid-b-agent",      # stamped now: this clone's own uuid
+    ]
+    assert rec["uuid"] == "uuid-b-agent"
+
+    assert not owned_by(rec, "cloud-a"), "cloud A never made this VM"
+    assert not owned_by(rec, "cloud-b"), "cloud B did, but nothing in the record proves it"
+    assert owned_by(rec), "an un-narrowed sweep must still reclaim it"
+    assert ambiguous_owner(rec)
+    assert owners(rec) == {"cloud-a", "cloud-b"}, "both names stay readable, for the report"
+
+
+def test_one_marker_is_still_attributed_normally():
+    """The control for the test above. A refusal that fired on every record would pass that
+    one and break every real sweep, which is the failure this repo keeps meeting."""
+    for kw in ({"owner": "xcpng-lab"}, {"owner_tag": "xcpng-lab"}):
+        rec = vm_record("agent", **kw)
+        assert owned_by(rec, "xcpng-lab")
+        assert owned_by(rec)
+        assert not ambiguous_owner(rec)
+
+
+def test_an_unmarked_vm_is_not_ambiguous():
+    assert not ambiguous_owner(vm_record("plain"))
+
+
+def test_an_inherited_marker_is_not_ambiguous_it_is_simply_not_ours():
+    """#246 and #250 are different refusals and must not be conflated. A copy carrying one
+    inherited marker has no valid stamp at all, so it is unowned rather than unattributable."""
+    copy = vm_record("copy", owner_tag="xcpng-lab", inherited_from="agent")
+    assert owners(copy) == set()
+    assert not ambiguous_owner(copy)
+    assert inherited_marker(copy)
