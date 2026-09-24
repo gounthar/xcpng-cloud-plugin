@@ -11,6 +11,7 @@ import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -395,10 +396,55 @@ public final class XoRestClient implements HypervisorClient {
         }
         if (matches.size() > 1) {
             // First-match would be non-deterministic and could clone the wrong image.
-            throw new HypervisorException(matches.size() + " templates are named '" + name
-                    + "'; rename them so the name is unique before provisioning against it");
+            throw new HypervisorException(ambiguousMessage(name, matches));
         }
         return matches.get(0).toRef();
+    }
+
+    /**
+     * Why a template name matched more than once, in terms an operator can act on.
+     *
+     * <p>Two different situations reach this line and the message used to give one answer to both.
+     * Several templates in <em>one</em> pool really are duplicates, and renaming one of them is the fix.
+     * The same name in <em>two</em> pools is not a mistake at all: it is the ordinary outcome of building
+     * a golden image twice from the same Packer recipe, and that estate provisions on {@link XapiClient},
+     * which is connected to a single pool master and so never sees the second copy. Only this backend
+     * refuses it, because one XO appliance fronts every pool its token can see. Telling that operator to
+     * rename a correctly named image sends them to fix the wrong thing.
+     *
+     * <p>So the pools are named -- {@link TemplateHandle} already carries the id -- and the advice is
+     * assembled from the two facts that are actually true of this estate rather than picked from a
+     * branch. A mixed case (two in one pool, one in another) gets both halves, which is the shape a
+     * three-way branch would have quietly dropped.
+     *
+     * <p>Choosing the pool is issue #241's larger half and is deliberately not done here; the message
+     * says what the operator can do today instead of naming an option that does not exist yet.
+     */
+    @NonNull
+    private static String ambiguousMessage(@NonNull String name, @NonNull List<TemplateHandle> matches) {
+        Map<String, Integer> byPool = new LinkedHashMap<>();
+        for (TemplateHandle match : matches) {
+            byPool.merge(match.poolId(), 1, Integer::sum);
+        }
+        StringBuilder where = new StringBuilder();
+        byPool.forEach((pool, count) -> {
+            if (where.length() > 0) {
+                where.append(", ");
+            }
+            where.append(count).append(" in pool ").append(pool);
+        });
+        List<String> advice = new ArrayList<>();
+        if (byPool.size() < matches.size()) {
+            advice.add("at least one pool holds more than one, so rename those until the name is unique"
+                    + " within its pool");
+        }
+        if (byPool.size() > 1) {
+            advice.add("the name is also carried by more than one pool, and this backend cannot yet be"
+                    + " told which pool to provision into: it lists every template the token can see,"
+                    + " unlike the XAPI backend, which is connected to one pool master. Until a cloud can"
+                    + " name its pool, scope the token to a single pool or give the images distinct names");
+        }
+        return matches.size() + " templates are named '" + name + "' (" + where + "); " + String.join("; ", advice);
     }
 
     @Override

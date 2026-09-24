@@ -27,6 +27,8 @@ class XoRestClientTest {
     private static final ObjectMapper M = new ObjectMapper();
 
     private static final String POOL = "355ee47d-ff4c-4924-3db2-fd86ae629677";
+    // A second pool behind the same appliance. XAPI never sees one of these, XO always does.
+    private static final String OTHER_POOL = "9f2c1b60-7a44-40d1-8e35-2b0c5d19ee84";
     private static final String TEMPLATE_UUID = "5436f445-a341-cc10-7312-e1077b0c4e69";
     private static final String CLONE = "f07ab729-c0e8-721c-45ec-f11276377030";
 
@@ -50,13 +52,53 @@ class XoRestClientTest {
     }
 
     @Test
-    void resolveTemplateFailsWhenTheNameIsAmbiguous() {
+    void resolveTemplateFailsWhenTheNameIsAmbiguousWithinOnePool() {
         ScriptedRest t = new ScriptedRest();
         t.templates.add(template("dup-2", "jenkins-agent-debian13-v7", POOL));
         t.templates.add(template("dup-3", "jenkins-agent-debian13-v7", POOL));
         HypervisorException e = assertThrows(
                 HypervisorException.class, () -> new XoRestClient(t).resolveTemplate("jenkins-agent-debian13-v7"));
         assertTrue(e.getMessage().contains("3 templates"), e.getMessage());
+        assertTrue(e.getMessage().contains("3 in pool " + POOL), e.getMessage());
+        // Genuinely duplicated inside one pool, so renaming really is the fix and the message still says
+        // so. The cross-pool half would be wrong here, and saying it anyway would send an operator
+        // looking for a second pool that does not exist.
+        assertTrue(e.getMessage().contains("rename those"), e.getMessage());
+        assertFalse(e.getMessage().contains("more than one pool"), e.getMessage());
+    }
+
+    @Test
+    void resolveTemplateNamesBothPoolsWhenOneNameSpansThem() {
+        // The estate #241 is about: one Packer recipe built twice, so the same correct name exists in two
+        // pools. It provisions on XAPI, which is connected to a single pool master and never sees the
+        // second copy, and refuses here. An operator told only "rename them" would go and break a name
+        // that is right.
+        ScriptedRest t = new ScriptedRest();
+        t.templates.add(template("dup-2", "jenkins-agent-debian13-v7", OTHER_POOL));
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(t).resolveTemplate("jenkins-agent-debian13-v7"));
+        assertTrue(e.getMessage().contains("1 in pool " + POOL), e.getMessage());
+        assertTrue(e.getMessage().contains("1 in pool " + OTHER_POOL), e.getMessage());
+        assertTrue(e.getMessage().contains("more than one pool"), e.getMessage());
+        // The name is unique inside each pool, so there is nothing to rename and the message must not
+        // claim otherwise.
+        assertFalse(e.getMessage().contains("rename those"), e.getMessage());
+    }
+
+    @Test
+    void resolveTemplateSaysBothHalvesWhenOnePoolAlsoHoldsADuplicate() {
+        // The mixed case, which is the one a three-way branch drops: two in one pool and one in another
+        // needs the rename advice AND the pool advice, because acting on either alone still leaves the
+        // name ambiguous.
+        ScriptedRest t = new ScriptedRest();
+        t.templates.add(template("dup-2", "jenkins-agent-debian13-v7", POOL));
+        t.templates.add(template("dup-3", "jenkins-agent-debian13-v7", OTHER_POOL));
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(t).resolveTemplate("jenkins-agent-debian13-v7"));
+        assertTrue(e.getMessage().contains("2 in pool " + POOL), e.getMessage());
+        assertTrue(e.getMessage().contains("1 in pool " + OTHER_POOL), e.getMessage());
+        assertTrue(e.getMessage().contains("rename those"), e.getMessage());
+        assertTrue(e.getMessage().contains("more than one pool"), e.getMessage());
     }
 
     @Test
