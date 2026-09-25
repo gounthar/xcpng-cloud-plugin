@@ -2109,20 +2109,21 @@ class XcpngProvisionTest {
     }
 
     /**
-     * A ref stored before #223 carries no connection, only a backend read off its shape. This cloud speaks
-     * the other one, so there is nothing here that can destroy it: XAPI would answer this uuid with
-     * HANDLE_INVALID, which reads as "already destroyed", and the VM would be dropped while it runs.
+     * A ref stored before #223 carries no connection, only a backend read off its shape. This one is an XAPI
+     * {@code OpaqueRef} and the cloud speaks XO, so there is nothing here that can destroy it safely: Xen
+     * Orchestra resolves an {@code OpaqueRef} wherever it takes a VM id (#223), so the handle is not even
+     * refused politely. It must be given up, and left to {@code tools/reaper.py}.
      */
     @Test
     void aBareRefFromTheOtherBackendIsGivenUpRatherThanSweptHere(JenkinsRule r) {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
-        XcpngCloud cloud = cloudBackedBy(fake, 2); // XAPI, the default
+        XcpngCloud cloud = cloudBackedBy(fake, 2); // XO, the default
         r.jenkins.clouds.add(cloud);
-        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("55703ef8-ca33-ee80-e0d1-f9aee081ab7e"));
+        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("OpaqueRef:legacy-1"));
 
         cloud.sweepLeakedVms();
 
-        assertTrue(fake.calls().isEmpty(), "an XO ref must never be handed to an XAPI connection: " + fake.calls());
+        assertTrue(fake.calls().isEmpty(), "an XAPI ref must never be handed to an XO connection: " + fake.calls());
         assertTrue(
                 cloud.leakedVmRefs().isEmpty(),
                 "nothing here can ever destroy it, so it must be given up rather than retried forever: "
@@ -2135,12 +2136,12 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
-        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("OpaqueRef:legacy-1"));
+        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("55703ef8-ca33-ee80-e0d1-f9aee081ab7e"));
 
         cloud.sweepLeakedVms();
 
         assertTrue(
-                fake.calls().contains("destroyWithDisks:OpaqueRef:legacy-1"),
+                fake.calls().contains("destroyWithDisks:55703ef8-ca33-ee80-e0d1-f9aee081ab7e"),
                 "a pre-#223 ref of this backend must still be swept: " + fake.calls());
         assertTrue(cloud.leakedVmRefs().isEmpty(), "and dropped once destroyed: " + cloud.leakedVmRefs());
     }
