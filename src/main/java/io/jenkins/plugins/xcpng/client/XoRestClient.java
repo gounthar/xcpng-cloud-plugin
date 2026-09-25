@@ -64,6 +64,9 @@ public final class XoRestClient implements HypervisorClient {
 
     private static final String API = "/rest/v0";
 
+    /** A VM id no VM can have, so {@link #probePatchRoute()} can address the route and touch nothing. */
+    static final String PROBE_ID = "00000000-0000-0000-0000-000000000000";
+
     /**
      * Reads answer in well under a second; the lifecycle verbs are minutes. Two constants rather than one
      * because a single timeout that suits both is either too short to clone or too long to notice an
@@ -918,10 +921,53 @@ public final class XoRestClient implements HypervisorClient {
      * it answers pong to an unauthenticated caller and would report a working connection for a token that
      * is wrong, missing, or expired. Listing pools is the cheap authenticated round trip, the same
      * reasoning as the XAPI backend's {@code pool.get_all}.
+     *
+     * <p>Then one capability probe, because authenticating proves nothing about whether the appliance can
+     * provision. {@code PATCH /vms/{id}} carries the sizing and the guest-data seed, and an xo-server too old
+     * to route it (absent on 5.192.1, present on 5.208.3, #254) passes the pools read and fails only at the
+     * first provision. See {@link #probePatchRoute()}.
+     *
+     * <p>The template-name field check also calls this and stays quiet when it throws, so on a too-old
+     * appliance that field says nothing; Test Connection on the same form is what reports it.
      */
     @Override
     public void ping() {
         get(API + "/pools?fields=id");
+        probePatchRoute();
+    }
+
+    /**
+     * Ask whether the appliance routes {@code PATCH /vms/{id}}, without being able to change anything.
+     *
+     * <p>The target is the all-zero uuid, which no VM has, and the body is empty. Measured on the lab
+     * appliance (xo-server 5.208.3) 2026-09-25: that request answers XO's own 404,
+     * {@code {"error":"no such VM 0000...","data":{"id":"0000...","type":"VM"}}}, while a method the
+     * appliance does not route on the same path answers Express's HTML page instead. The first means the
+     * route exists and only the object is missing; the second is the too-old appliance.
+     *
+     * <p>Only the first answer passes, and it has to name the zero id. Everything else is a failure, 2xx
+     * included: no real appliance can patch an object that does not exist, so a success means something
+     * other than XO answered, and saying OK on that would be the green Test Connection this probe exists to
+     * prevent. A 401 or 403 here goes through {@link #failure} and gets its usual hint, which matters because
+     * a plan or role can allow the pools read and still refuse a write.
+     */
+    private void probePatchRoute() {
+        String path = API + "/vms/" + PROBE_ID;
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("PATCH", path, "{}", READ_TIMEOUT);
+        } catch (IOException e) {
+            throw new HypervisorException("PATCH " + path + ": transport error: " + e.getMessage(), e);
+        }
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), PROBE_ID)) {
+            return;
+        }
+        if (resp.isSuccess()) {
+            throw new HypervisorException("PATCH " + path + ": HTTP " + resp.status() + " for a VM id that cannot"
+                    + " exist. Xen Orchestra answers that with 404 naming the id, so something other than"
+                    + " xo-server answered, and whether it can provision is unknown.");
+        }
+        throw failure("PATCH", path, resp.status(), resp.body());
     }
 
     /**

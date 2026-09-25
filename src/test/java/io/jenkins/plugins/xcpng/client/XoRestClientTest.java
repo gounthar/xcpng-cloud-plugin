@@ -756,6 +756,82 @@ class XoRestClientTest {
         assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
     }
 
+    private static final String PROBE = "/rest/v0/vms/" + XoRestClient.PROBE_ID;
+
+    /**
+     * Test Connection has to ask about the route provisioning needs, not only about the token (#254). The
+     * probe goes after the pools read, so a bad token is still reported as a bad token, and it addresses an
+     * id no VM has with an empty body, so it cannot change anything even on an appliance that routes it.
+     */
+    @Test
+    void pingProbesThePatchRouteWithoutTouchingAVm() {
+        ScriptedRest t = new ScriptedRest();
+        new XoRestClient(t).ping();
+
+        Call probe = t.only("PATCH", PROBE);
+        assertEquals("{}", probe.body());
+        assertTrue(
+                t.indexOf("GET", "/rest/v0/pools?fields=id") < t.indexOf("PATCH", PROBE),
+                t.paths().toString());
+        assertEquals(2, t.calls.size(), "ping must not touch anything else: " + t.paths());
+    }
+
+    /**
+     * The case the probe exists for: an appliance that authenticates and does not route {@code PATCH}. The
+     * body is Express's page, the shape measured on 5.208.3 for a method it does not route, which is also
+     * what 5.192.1 is expected to answer here; that one has not been observed directly.
+     */
+    @Test
+    void aTooOldApplianceFailsTestConnection() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 404, cannot("PATCH", PROBE));
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertTrue(e.getMessage().contains("does not serve PATCH"), e.getMessage());
+        assertTrue(e.getMessage().contains("5.192.1"), e.getMessage());
+    }
+
+    /**
+     * XO's own 404 passes only when it names the probe's id. A no-such-object body about some other id is
+     * not an answer to the question asked, and the same rule keeps teardown from reading a stranger's 404 as
+     * its own VM being gone.
+     */
+    @Test
+    void aNoSuchObjectAboutAnotherIdDoesNotPassTheProbe() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 404, noSuchVm("some-other-vm"));
+        assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+    }
+
+    /**
+     * A success on an object that cannot exist means something other than XO answered. Passing it would be a
+     * green Test Connection with nothing behind it, which is the fixture's own default and the reason this
+     * test has to script it explicitly.
+     */
+    @Test
+    void aSuccessOnTheProbeIsNotTakenAsProof() {
+        for (int status : new int[] {200, 204}) {
+            ScriptedRest t = new ScriptedRest();
+            t.fail("PATCH", PROBE, status, "");
+            HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+            assertTrue(e.getMessage().contains("cannot exist"), status + " -> " + e.getMessage());
+        }
+    }
+
+    /**
+     * A plan or role can allow the pools read and refuse a write. That is worth finding at the button too,
+     * and it must be explained as the role, not as the appliance's version.
+     */
+    @Test
+    void aRefusedWriteOnTheProbeBlamesTheRole() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 403, "{\"error\":\"forbidden\"}");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertTrue(e.getMessage().contains("role or the appliance's plan"), e.getMessage());
+        assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
+    }
+
     /** Express's page for a method and path it has no route for, as the lab appliance serves it. */
     private static String cannot(String method, String path) {
         return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n"
@@ -969,6 +1045,11 @@ class XoRestClientTest {
             RestResponse failure = failures.get(key);
             if (failure != null) {
                 return failure;
+            }
+            if (path.equals("/rest/v0/vms/" + XoRestClient.PROBE_ID)) {
+                // No VM has this id, so the appliance answers its own no-such-object 404 to any routed verb.
+                // The catch-all below would answer 204 instead, which no real appliance does.
+                return new RestResponse(404, noSuchVm(XoRestClient.PROBE_ID));
             }
             if ("DELETE".equals(method) && path.startsWith("/rest/v0/vms/")) {
                 destroyed.add(path.substring("/rest/v0/vms/".length()));
