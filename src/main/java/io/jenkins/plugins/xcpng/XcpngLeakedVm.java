@@ -2,7 +2,7 @@ package io.jenkins.plugins.xcpng;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
-import io.jenkins.plugins.xcpng.client.XapiClient;
+import io.jenkins.plugins.xcpng.client.VmRef;
 import java.util.Objects;
 
 /**
@@ -82,7 +82,7 @@ public final class XcpngLeakedVm {
      */
     @NonNull
     static XcpngLeakedVm legacy(@NonNull String vmRef) {
-        XcpngBackend inferred = vmRef.startsWith(XapiClient.REF_PREFIX) ? XcpngBackend.XAPI : XcpngBackend.XO;
+        XcpngBackend inferred = vmRef.startsWith(VmRef.XAPI_REF_PREFIX) ? XcpngBackend.XAPI : XcpngBackend.XO;
         return new XcpngLeakedVm(vmRef, inferred, null, null, null);
     }
 

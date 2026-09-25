@@ -2,7 +2,7 @@
 
 The plugin marks every clone it makes, and how depends on the backend that made it:
 
-- `XapiClient` writes `other_config["xcpng-cloud"] = <cloud>` (`XapiClient.OWNER_KEY`).
+- `XapiClient` writes `other_config["xcpng-cloud"] = <cloud>` (`OwnerMarker.OWNER_KEY`).
 - `XoRestClient` cannot, because XO's VM model has no other_config, so it adds the tag
   `xcpng-cloud:<cloud>` instead (`XoRestClient.OWNER_TAG_PREFIX`).
 
@@ -42,13 +42,13 @@ Two consequences worth knowing before trusting a sweep:
   its own. Ownership therefore asks whether *any* stamp matches, not whether the only one does.
 """
 
-# Must match XapiClient.OWNER_KEY. If they drift, every tool here silently selects nothing.
+# Must match OwnerMarker.OWNER_KEY. If they drift, every tool here silently selects nothing.
 OWNER_KEY = "xcpng-cloud"
 
 # Must match XoRestClient.OWNER_TAG_PREFIX, which the Java builds from OWNER_KEY the same way.
 OWNER_TAG_PREFIX = OWNER_KEY + ":"
 
-# Must match XapiClient.SELF_KEY, and XoRestClient.SELF_TAG_PREFIX, which the Java builds from
+# Must match OwnerMarker.SELF_KEY, and XoRestClient.SELF_TAG_PREFIX, which the Java builds from
 # it the same way. Note it is not under OWNER_TAG_PREFIX: "xcpng-cloud-uuid:" does not start
 # with "xcpng-cloud:", so the owner reader below never mistakes a uuid stamp for a cloud name.
 SELF_KEY = OWNER_KEY + "-uuid"

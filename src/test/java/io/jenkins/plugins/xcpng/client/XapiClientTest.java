@@ -267,7 +267,7 @@ class XapiClientTest {
         // Stamped on the record itself, which is the whole point: tools/reaper.py selects on this key, and
         // a name-based selector is what left it unable to see a single plugin-provisioned VM.
         JsonNode set = paramsOf(t, "VM.set_other_config").get(2);
-        assertEquals("xcpng-lab", set.get(XapiClient.OWNER_KEY).asText());
+        assertEquals("xcpng-lab", set.get(OwnerMarker.OWNER_KEY).asText());
         assertEquals("9f4d-abcd", set.get("mac_seed").asText(), "an inherited other_config key must survive");
         assertEquals("Debian Bookworm 12", set.get("base_template_name").asText());
         // Before the VM can ever run: a clone that starts, then crashes before it is marked, is exactly the
@@ -288,7 +288,7 @@ class XapiClientTest {
                 new ProvisionSpec("agent", 2, 2048L, null, null, null, Map.of(), "xcpng-lab"));
 
         JsonNode set = paramsOf(t, "VM.set_other_config").get(2);
-        assertEquals(t.vmUuid, set.path(XapiClient.SELF_KEY).asText(), "the clone is not stamped with its own uuid");
+        assertEquals(t.vmUuid, set.path(OwnerMarker.SELF_KEY).asText(), "the clone is not stamped with its own uuid");
         // One write, not two: a clone must never exist carrying the owner marker and no stamp of its own,
         // because the tools read that as "stamped by an older plugin" and reap it.
         assertEquals(

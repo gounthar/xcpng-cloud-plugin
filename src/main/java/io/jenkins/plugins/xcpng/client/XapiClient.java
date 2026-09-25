@@ -34,12 +34,6 @@ import java.util.regex.Pattern;
  */
 public final class XapiClient implements HypervisorClient {
 
-    /**
-     * XAPI's handle prefix. Every ref this backend mints carries it and no Xen Orchestra id does, which is
-     * what makes it a usable guard in {@link #destroyWithDisks}.
-     */
-    public static final String REF_PREFIX = "OpaqueRef:";
-
     private static final Logger LOGGER = Logger.getLogger(XapiClient.class.getName());
     private static final Pattern OPAQUE_REF = Pattern.compile("OpaqueRef:[0-9a-fA-F-]+");
 
@@ -361,36 +355,6 @@ public final class XapiClient implements HypervisorClient {
     }
 
     /**
-     * {@code other_config} key stamped on every clone this plugin provisions, holding the owning cloud's
-     * name. The recovery contract with {@code tools/reaper.py}, which selects on this key rather than on a
-     * name prefix: names drift (they already did, silently, and the reaper matched nothing for it), whereas
-     * a golden image, an operator's VM and a snapshot cannot acquire this key by being named unluckily.
-     *
-     * <p><b>The marker says the plugin made this VM <em>or something in its ancestry</em>.</b> {@code VM.clone}
-     * copies {@code other_config}, so a VM an operator hand-clones off a marked agent inherits this key and
-     * reads as plugin-owned to anything selecting on it alone. {@link #SELF_KEY} is what separates the two.
-     *
-     * <p>Change this string and the reaper stops finding VMs the plugin leaks. Both sides must move together.
-     */
-    public static final String OWNER_KEY = "xcpng-cloud";
-
-    /**
-     * {@code other_config} key holding the uuid of the VM the record belongs to, stamped beside
-     * {@link #OWNER_KEY} on every clone this plugin provisions.
-     *
-     * <p>It exists because the owner marker is inheritable and this is not. {@code VM.clone} copies
-     * {@code other_config} verbatim, so a hand-made clone of a marked agent carries the owner marker and
-     * <em>its source's</em> uuid, while a genuine plugin clone carries its own. A tool comparing the stamped
-     * uuid against the record's own therefore selects the clones this plugin made and refuses the copies of
-     * them, which the marker alone cannot do (#246).
-     *
-     * <p>A clone stamped by a version that predates this key carries no uuid at all. Tools treat that as
-     * ownership rather than refusing it: those VMs are real leaks and refusing them would strand exactly the
-     * disks the reaper exists to reclaim. The hazard survives for them, and only for them.
-     */
-    public static final String SELF_KEY = OWNER_KEY + "-uuid";
-
-    /**
      * Record the owning cloud, and this VM's own uuid, on the VM record so an out-of-band sweep can find
      * this clone later and tell it from a copy of it. Merged onto whatever the clone inherited from the
      * template, rather than replacing {@code other_config} wholesale: XCP-ng itself keeps keys there (and a
@@ -418,7 +382,7 @@ public final class XapiClient implements HypervisorClient {
                 }
             });
         }
-        merged.put(OWNER_KEY, owner);
+        merged.put(OwnerMarker.OWNER_KEY, owner);
         String uuid = call("VM.get_uuid", vm).asText("");
         if (uuid.isBlank()) {
             // Refuse rather than stamp an empty string. A blank stamp matches no record's uuid, so every
@@ -427,7 +391,7 @@ public final class XapiClient implements HypervisorClient {
             throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
                     + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
         }
-        merged.put(SELF_KEY, uuid);
+        merged.put(OwnerMarker.SELF_KEY, uuid);
         call("VM.set_other_config", vm, merged);
     }
 
@@ -525,14 +489,14 @@ public final class XapiClient implements HypervisorClient {
 
     @Override
     public void destroyWithDisks(@NonNull VmRef vm) {
-        if (!vm.value().startsWith(REF_PREFIX)) {
+        if (!vm.value().startsWith(VmRef.XAPI_REF_PREFIX)) {
             // A handle this backend never minted, which only a mismatched record can produce (#223). Refusing
             // it here matters because the failure downstream is silent and wrong: XAPI answers a Xen
             // Orchestra uuid with HANDLE_INVALID naming that uuid -- measured on the lab pool, 2026-09-19 --
             // and alreadyGone() below reads exactly that as "the VM is already destroyed". The caller would
             // then record a clean teardown for a VM that is still running.
             throw new HypervisorException("refusing to destroy " + vm.value() + ": not a XAPI handle, which start with "
-                    + REF_PREFIX + ". A VM is only destroyable through the backend that created it.");
+                    + VmRef.XAPI_REF_PREFIX + ". A VM is only destroyable through the backend that created it.");
         }
         ensureSession();
         // The whole VM half runs under one already-gone guard rather than each call carrying its own,

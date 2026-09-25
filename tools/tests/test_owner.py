@@ -99,16 +99,16 @@ def test_cloud_narrows_on_either_marker():
 def test_the_constants_match_the_java_that_writes_the_markers():
     """Each copy of OWNER_KEY used to carry a comment warning that drift from the Java makes
     the tool select nothing, silently. Check it instead of warning about it."""
-    xapi_client = (_CLIENT / "XapiClient.java").read_text(encoding="utf-8")
-    key = re.search(r'String OWNER_KEY = "([^"]*)";', xapi_client)
+    marker = (_CLIENT / "OwnerMarker.java").read_text(encoding="utf-8")
+    key = re.search(r'String OWNER_KEY = "([^"]*)";', marker)
     assert (
         key
-    ), "OWNER_KEY is no longer a string literal in XapiClient.java; re-read it by hand"
+    ), "OWNER_KEY is no longer a string literal in OwnerMarker.java; re-read it by hand"
     assert OWNER_KEY == key.group(1)
 
     xo_client = (_CLIENT / "XoRestClient.java").read_text(encoding="utf-8")
     assert (
-        'String OWNER_TAG_PREFIX = XapiClient.OWNER_KEY + ":";' in xo_client
+        'String OWNER_TAG_PREFIX = OwnerMarker.OWNER_KEY + ":";' in xo_client
     ), "XoRestClient.OWNER_TAG_PREFIX changed shape; update owner.OWNER_TAG_PREFIX to match"
     assert OWNER_TAG_PREFIX == OWNER_KEY + ":"
 
@@ -237,15 +237,15 @@ def test_the_stamp_constants_match_the_java_that_writes_them():
     """Same drift guard as the marker above. A stamp the Java spells differently makes every
     tool here refuse every clone, which is the loud failure rather than the silent one -- but
     it is still a failure nobody would attribute to a renamed constant."""
-    xapi_client = (_CLIENT / "XapiClient.java").read_text(encoding="utf-8")
+    marker = (_CLIENT / "OwnerMarker.java").read_text(encoding="utf-8")
     assert (
-        'String SELF_KEY = OWNER_KEY + "-uuid";' in xapi_client
-    ), "XapiClient.SELF_KEY changed shape; update owner.SELF_KEY to match"
+        'String SELF_KEY = OWNER_KEY + "-uuid";' in marker
+    ), "OwnerMarker.SELF_KEY changed shape; update owner.SELF_KEY to match"
     assert SELF_KEY == OWNER_KEY + "-uuid"
 
     xo_client = (_CLIENT / "XoRestClient.java").read_text(encoding="utf-8")
     assert (
-        'String SELF_TAG_PREFIX = XapiClient.SELF_KEY + ":";' in xo_client
+        'String SELF_TAG_PREFIX = OwnerMarker.SELF_KEY + ":";' in xo_client
     ), "XoRestClient.SELF_TAG_PREFIX changed shape; update owner.SELF_TAG_PREFIX to match"
     assert SELF_TAG_PREFIX == SELF_KEY + ":"
 
