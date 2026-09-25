@@ -37,12 +37,16 @@ public class XcpngRemovedBackendMonitor extends AdministrativeMonitor {
         return !getClouds().isEmpty() || !getAgentNames().isEmpty();
     }
 
-    /** The clouds still configured for the removed backend. The view links each to its configuration page. */
+    /**
+     * The clouds still set up for the removed backend, including one that names XO but still carries a
+     * username/password credential (see {@link XcpngCloud#isConfiguredForRemovedBackend()}). The view links
+     * each to its configuration page.
+     */
     @NonNull
     public List<XcpngCloud> getClouds() {
         List<XcpngCloud> clouds = new ArrayList<>();
         for (Cloud cloud : Jenkins.get().clouds) {
-            if (cloud instanceof XcpngCloud xcpng && !xcpng.isBackendSupported()) {
+            if (cloud instanceof XcpngCloud xcpng && xcpng.isConfiguredForRemovedBackend()) {
                 clouds.add(xcpng);
             }
         }

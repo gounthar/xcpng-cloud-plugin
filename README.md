@@ -133,8 +133,12 @@ the connection it was provisioned with, and this release cannot open it, so its 
 when the agent goes. The banner names any such agent. Remove it, then reclaim its VM with
 `tools/reaper.py`, which finds it by the `xcpng-cloud` owner marker without needing Jenkins.
 
-Under configuration as code, delete `backend: XAPI` if the document has it, and point `poolUrl` and
-`credentialsId` at the appliance and its token.
+Under configuration as code, point `poolUrl` and `credentialsId` at the appliance and its token, and
+delete `backend: XAPI` if the document has it. A document written for XAPI usually names no backend at
+all, since XAPI was the default, so after the upgrade its cloud comes up as Xen Orchestra while still
+selecting the old username/password credential. The plugin treats that the same way: Xen Orchestra
+cannot use a username and password, so such a cloud is listed in the banner and provisions nothing
+until the document is fixed.
 
 ### Through Configuration as Code
 

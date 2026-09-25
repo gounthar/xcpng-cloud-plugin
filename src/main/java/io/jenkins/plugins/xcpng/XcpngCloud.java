@@ -3,6 +3,7 @@ package io.jenkins.plugins.xcpng;
 import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
@@ -467,6 +468,29 @@ public class XcpngCloud extends Cloud {
         return getBackend().isSupported();
     }
 
+    /**
+     * True for a cloud that is still set up the way the removed XAPI backend needed, whichever way it got
+     * here. Two ways, and the second is the one that matters for configuration as code:
+     *
+     * <ul>
+     *   <li>it names XAPI, or it was saved before the backend field existed ({@link #isBackendSupported()});
+     *   <li>its credential is a username and password. Xen Orchestra can never authenticate with one, and it
+     *       is exactly what an XAPI cloud used. A configuration-as-code document written for an XAPI cloud
+     *       usually names no backend at all, because XAPI was the default, and JCasC rebuilds the cloud from
+     *       that document on every start. So such a cloud arrives as XO, pointing at a pool master with a
+     *       root password, and nothing about its backend field says anything is wrong. Measured on the lab
+     *       controller: after upgrading, its JCasC-built cloud read {@code backend=XO}, {@code canProvision}
+     *       answered true, and without this check no monitor fired.
+     * </ul>
+     *
+     * <p>Used by {@link XcpngRemovedBackendMonitor}, the configuration page, {@link #provision} and
+     * {@link #reconcileWarmPool}. It resolves a credential, so it is kept out of {@link #canProvision}, whose
+     * answer core caches per label and would therefore never revise.
+     */
+    public boolean isConfiguredForRemovedBackend() {
+        return !isBackendSupported() || DescriptorImpl.isUsernamePasswordCredential(poolUrl, credentialsId);
+    }
+
     @NonNull
     public List<XcpngTemplate> getTemplates() {
         return Collections.unmodifiableList(templates);
@@ -485,9 +509,11 @@ public class XcpngCloud extends Cloud {
     // (#162), which the replacement cloud and the old cloud's in-flight launchers all share.
     @Override
     public synchronized Collection<NodeProvisioner.PlannedNode> provision(CloudState state, int excessWorkload) {
-        if (!isBackendSupported()) {
-            // canProvision already declines, so core does not ask. Checked again because provision is public
-            // and a caller that skips canProvision would otherwise reach a clone that can only fail.
+        if (isConfiguredForRemovedBackend()) {
+            // canProvision already declines a cloud naming XAPI. Checked again here, with the credential check
+            // added, for two reasons: provision is public and a caller can skip canProvision, and core caches
+            // canProvision per label, so a credential swapped in later would not be seen there. Without it a
+            // cloud still carrying a root password registers a node every round only for its launch to fail.
             return List.of();
         }
         XcpngTemplate template = templateFor(state.getLabel());
@@ -706,7 +732,7 @@ public class XcpngCloud extends Cloud {
      * its surplus running until each spare happened to pick up a build.
      */
     synchronized void reconcileWarmPool() {
-        if (!isBackendSupported()) {
+        if (isConfiguredForRemovedBackend()) {
             // Neither half can do anything useful: a fill would clone through a backend nothing can speak,
             // and a drain would ask that same backend to destroy the spare. The spares stay where they are
             // until the cloud is reconfigured; the monitor says so.
@@ -1381,6 +1407,12 @@ public class XcpngCloud extends Cloud {
                     + " remove the cloud if it is no longer wanted.");
         }
         StringCredentials token = DescriptorImpl.lookupTokenCredentials(poolUrl, credentialsId);
+        if (token == null && DescriptorImpl.isUsernamePasswordCredential(poolUrl, credentialsId)) {
+            // A username and password is what the removed XAPI backend used, and it is how an XAPI cloud
+            // rebuilt from a configuration-as-code document that names no backend arrives here: as XO, still
+            // carrying its root password. Say that, rather than only that the kind is wrong.
+            throw new IllegalStateException(Messages.XcpngCloud_backend_removed(owner));
+        }
         if (token == null) {
             // Says which kind is wanted: the commonest way to reach here is a username/password credential
             // left selected from an older configuration, and "no credentials configured" reads as none at all
@@ -1673,6 +1705,25 @@ public class XcpngCloud extends Cloud {
                             ACL.SYSTEM2,
                             URIRequirementBuilder.fromUri(poolUrl).build()),
                     CredentialsMatchers.withId(credentialsId));
+        }
+
+        /**
+         * Whether the credential under this ID is a username and password: the kind the removed XAPI backend
+         * authenticated with, and one Xen Orchestra cannot use. Only ever a diagnostic; nothing here
+         * authenticates with it.
+         */
+        static boolean isUsernamePasswordCredential(@CheckForNull String poolUrl, @CheckForNull String credentialsId) {
+            if (credentialsId == null || credentialsId.isEmpty()) {
+                return false;
+            }
+            return CredentialsMatchers.firstOrNull(
+                            CredentialsProvider.lookupCredentialsInItemGroup(
+                                    StandardUsernamePasswordCredentials.class,
+                                    Jenkins.get(),
+                                    ACL.SYSTEM2,
+                                    URIRequirementBuilder.fromUri(poolUrl).build()),
+                            CredentialsMatchers.withId(credentialsId))
+                    != null;
         }
 
         /**

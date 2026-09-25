@@ -3,7 +3,7 @@
   <f:entry title="${%Name}" field="name">
     <f:textbox default="xcpng"/>
   </f:entry>
-  <j:if test="${instance != null and !instance.backendSupported}">
+  <j:if test="${instance != null and instance.configuredForRemovedBackend}">
     <f:entry>
       <div class="jenkins-alert jenkins-alert-warning">${%removedBackend}</div>
     </f:entry>

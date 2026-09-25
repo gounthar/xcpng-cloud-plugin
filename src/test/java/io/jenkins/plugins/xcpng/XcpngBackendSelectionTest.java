@@ -407,6 +407,49 @@ class XcpngBackendSelectionTest {
         assertEquals(XcpngBackend.XO, ((XcpngCloud) r.jenkins.clouds.getByName("xo-lab")).getBackend());
     }
 
+    // ---- A JCasC document written for XAPI, which names no backend ----
+
+    /**
+     * The upgrade path configuration as code takes. An XAPI-era document usually names no backend, because
+     * XAPI was the default, and JCasC rebuilds the cloud from it on every start, so the cloud arrives as XO
+     * with its root password still selected. Its backend field says nothing is wrong. Measured on the lab
+     * controller before this check existed: {@code backend=XO}, {@code canProvision} true, no monitor.
+     *
+     * <p>The credential is what gives it away, since Xen Orchestra can never use a username and password. The
+     * token-credential cloud beside it is the control.
+     */
+    @Test
+    void anXoCloudStillCarryingAUsernamePasswordIsTreatedAsXapi(JenkinsRule r) throws Exception {
+        addPasswordCredential(LEFTOVER_CREDENTIAL_ID);
+        addTokenCredential(XO_CREDENTIAL_ID);
+        XcpngRemovedBackendMonitor monitor =
+                r.jenkins.getExtensionList(XcpngRemovedBackendMonitor.class).get(0);
+        XcpngCloud good = cloud("xo-lab", XO_URL, XO_CREDENTIAL_ID);
+        good.setClientFactory(c -> new FakeHypervisorClient("jenkins-golden-debian"));
+        XcpngCloud rebuilt = cloud("xcpng-lab", "https://192.168.1.87", LEFTOVER_CREDENTIAL_ID);
+        rebuilt.setClientFactory(c -> new FakeHypervisorClient("jenkins-golden-debian"));
+        r.jenkins.clouds.add(good);
+        r.jenkins.clouds.add(rebuilt);
+        Cloud.CloudState linux = new Cloud.CloudState(Label.get("xcpng-linux"), 0);
+
+        assertEquals(XcpngBackend.XO, rebuilt.getBackend(), "the fixture must be the case the backend field misses");
+        assertFalse(good.isConfiguredForRemovedBackend(), "control: a token credential is a working XO cloud");
+        assertTrue(rebuilt.isConfiguredForRemovedBackend());
+        assertEquals(
+                List.of("xcpng-lab"),
+                monitor.getClouds().stream().map(c -> c.name).toList());
+        assertFalse(good.provision(linux, 1).isEmpty(), "control: the working cloud must still plan a node");
+        assertTrue(rebuilt.provision(linux, 1).isEmpty(), "a cloud that can only fail must not register nodes");
+
+        IllegalStateException e = assertThrows(
+                IllegalStateException.class,
+                () -> XcpngCloud.openClient(
+                        "https://192.168.1.87", LEFTOVER_CREDENTIAL_ID, null, XcpngBackend.XO, "cloud 'xcpng-lab'"));
+        assertTrue(
+                e.getMessage().contains("XAPI backend has been removed"),
+                "the message must say why, not only that the kind is wrong: " + e.getMessage());
+    }
+
     // ---- The monitor ----
 
     /**
