@@ -464,7 +464,7 @@ class XoRestClientTest {
     @Test
     void destroyTreatsAnAlreadyGoneVmAsDone() {
         ScriptedRest t = new ScriptedRest();
-        t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, "{\"error\":\"no such object\"}");
+        t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, noSuchVm(CLONE));
         new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)); // must not throw
     }
 
@@ -509,7 +509,7 @@ class XoRestClientTest {
     }
 
     /**
-     * A 404 is the goal state only when XO itself said so. An appliance below the 6.5.0 floor, a reverse
+     * A 404 is the goal state only when XO itself said this VM is gone. An appliance too old to route the call, a reverse
      * proxy that does not map {@code /rest/v0}, and a renamed route all answer 404 too, and every one of
      * them was being recorded as a clean teardown. The caller stops retrying on that, so the VM becomes
      * invisible to the plugin rather than merely un-destroyed.
@@ -519,7 +519,18 @@ class XoRestClientTest {
      */
     @Test
     void aFourOhFourThatIsNotXosOwnIsNotACleanTeardown() {
-        for (String body : new String[] {"<html><body>404 Not Found</body></html>", "", "{\"message\":\"nope\"}"}) {
+        for (String body : new String[] {
+            "<html><body>404 Not Found</body></html>",
+            "",
+            "{\"message\":\"nope\"}",
+            // What a catch-all JSON handler for unknown routes would plausibly send. XO has none today, and the
+            // day it adds one, an error field alone stops separating "no route" from "no VM".
+            "{\"error\":\"not found\"}",
+            // XO's own shape, about some other object. Only a 404 about this VM is this VM gone.
+            noSuchVm("some-other-vm"),
+            // The id without XO's error field is not XO's envelope either.
+            "{\"data\":{\"id\":\"" + CLONE + "\",\"type\":\"VM\"}}"
+        }) {
             ScriptedRest t = new ScriptedRest();
             t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, body);
             assertThrows(
@@ -527,6 +538,11 @@ class XoRestClientTest {
                     () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)),
                     "a 404 without XO's envelope must not be swallowed: " + body);
         }
+    }
+
+    /** XO's 404 for a VM it does not have, as the lab appliance (xo-server 5.208.3) answers it. */
+    private static String noSuchVm(String id) {
+        return "{\"error\":\"no such VM " + id + "\",\"data\":{\"id\":\"" + id + "\",\"type\":\"VM\"}}";
     }
 
     /**
