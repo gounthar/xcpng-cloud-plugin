@@ -77,8 +77,8 @@ public interface HypervisorClient extends AutoCloseable {
     /**
      * Verify connectivity and authentication against the pool. Throws on failure so a UI
      * test-connection button can report why. Does not mutate anything. A backend may also check here
-     * that the far end serves what provisioning needs, so a connection that authenticates but cannot
-     * provision is reported at the button rather than at the first build.
+     * that the far end serves the calls provisioning needs, so a connection that authenticates but
+     * whose far end lacks them is reported at the button rather than at the first build.
      */
     void ping();
 

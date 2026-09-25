@@ -858,11 +858,12 @@ class XoRestClientTest {
     }
 
     /**
-     * A plan or role can allow the pools read and refuse a write. That is worth finding at the button too,
-     * and it must be explained as the role, not as the appliance's version.
+     * Should the probe ever be answered 403, the message must blame the role or plan, not the appliance's
+     * version. This is about the wording only: the probe cannot detect a token that may not update VMs,
+     * because XO resolves the missing object before checking any privilege and {@code {}} asks for none.
      */
     @Test
-    void aRefusedWriteOnTheProbeBlamesTheRole() {
+    void aForbiddenProbeBlamesTheRoleNotTheVersion() {
         ScriptedRest t = new ScriptedRest();
         t.fail("PATCH", PROBE, 403, "{\"error\":\"forbidden\"}");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());

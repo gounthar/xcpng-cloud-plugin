@@ -937,8 +937,8 @@ public final class XoRestClient implements HypervisorClient {
      * is wrong, missing, or expired. Listing pools is the cheap authenticated round trip, the same
      * reasoning as the XAPI backend's {@code pool.get_all}.
      *
-     * <p>Then one capability probe, because authenticating proves nothing about whether the appliance can
-     * provision. {@code PATCH /vms/{id}} carries the sizing and the guest-data seed, and an xo-server too old
+     * <p>Then one route probe, because authenticating proves nothing about whether the appliance serves the
+     * call provisioning needs. {@code PATCH /vms/{id}} carries the sizing and the guest-data seed, and an xo-server too old
      * to route it (absent on 5.192.1, present on 5.208.3, #254) passes the pools read and fails only at the
      * first provision. See {@link #probePatchRoute()}.
      *
@@ -963,8 +963,14 @@ public final class XoRestClient implements HypervisorClient {
      * <p>Only the first answer passes, and it has to name the zero id. Everything else is a failure, 2xx
      * included: no real appliance can patch an object that does not exist, so a success means something
      * other than XO answered, and saying OK on that would be the green Test Connection this probe exists to
-     * prevent. A 401 or 403 here goes through {@link #failure} and gets its usual hint, which matters because
-     * a plan or role can allow the pools read and still refuse a write.
+     * prevent. Any other failure goes through {@link #failure} and keeps its usual hint.
+     *
+     * <p>This checks the route, not the token's right to use it, and cannot be made to. XO's {@code acl}
+     * middleware resolves the object before it checks any privilege ({@code acl.middleware.mts}, read at
+     * {@code db8fe8d47}), so a missing VM is a 404 whatever the token may do; and the VM {@code PATCH} derives
+     * the privileges it asks for from the fields present in the body ({@code actionsFromBody}), so
+     * {@code {}} asks for none. A token that can list pools and may not update VMs therefore passes here and
+     * meets its 403 at the first provision, which is where that is reported.
      */
     private void probePatchRoute() {
         String path = API + "/vms/" + PROBE_ID;
