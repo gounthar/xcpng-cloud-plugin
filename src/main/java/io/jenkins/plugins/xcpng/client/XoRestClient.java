@@ -36,7 +36,7 @@ import java.util.logging.Logger;
  *       guest tools report healthy on every field and the only one telling the truth is the address that
  *       never arrives.
  *   <li><b>The owner marker is a tag.</b> {@code XoVm} carries no {@code other_config} and neither does
- *       the PATCH body type, so {@link XapiClient#OWNER_KEY} has no home here. The equivalent is
+ *       the PATCH body type, so {@link OwnerMarker#OWNER_KEY} has no {@code other_config} key to sit in here. The equivalent is
  *       {@code PUT /vms/{id}/tags/{tag}}, which bottoms out on XAPI {@code add_tags}. Tags are visible in
  *       the XO UI where {@code other_config} effectively is not, so an operator will see
  *       {@code xcpng-cloud:<cloud>} on every clone. <b>While both backends exist, a sweep has to read
@@ -76,18 +76,18 @@ public final class XoRestClient implements HypervisorClient {
 
     /**
      * Tag prefix stamped on every clone this plugin provisions, with the owning cloud's name after it. The
-     * XO-side counterpart of {@link XapiClient#OWNER_KEY}, and deliberately built from that constant: the
+     * tag-shaped form of {@link OwnerMarker#OWNER_KEY}, and deliberately built from that constant: the
      * two markers have to be recognisable as the same thing by whatever sweeps for either.
      *
      * <p>Inheritable, exactly as the XAPI marker is: {@code VM.clone} copies {@code tags} as well as
      * {@code other_config}, so a hand-made clone of a marked agent carries this tag too. {@link
      * #SELF_TAG_PREFIX} is what separates a clone this plugin made from a copy of one.
      */
-    public static final String OWNER_TAG_PREFIX = XapiClient.OWNER_KEY + ":";
+    public static final String OWNER_TAG_PREFIX = OwnerMarker.OWNER_KEY + ":";
 
     /**
      * Tag prefix holding the uuid of the VM the record belongs to, stamped beside the owner tag. The XO-side
-     * counterpart of {@link XapiClient#SELF_KEY}, built from that constant for the same reason, and note it
+     * tag-shaped form of {@link OwnerMarker#SELF_KEY}, built from that constant for the same reason, and note it
      * does not collide with {@link #OWNER_TAG_PREFIX}: {@code xcpng-cloud-uuid:} does not start with
      * {@code xcpng-cloud:}, so a sweep reading owner tags never mistakes one for the other.
      *
@@ -97,7 +97,7 @@ public final class XoRestClient implements HypervisorClient {
      * stamping the uuid first would leave a survivor carrying neither an owner tag nor anything a sweep
      * selects on.
      */
-    public static final String SELF_TAG_PREFIX = XapiClient.SELF_KEY + ":";
+    public static final String SELF_TAG_PREFIX = OwnerMarker.SELF_KEY + ":";
 
     /** Xenstore path the guest agent reads its seed from. Only {@code vm-data/*} keys reach the guest. */
     private static final String GUEST_DATA_PREFIX = "vm-data/jenkins/";
@@ -820,7 +820,7 @@ public final class XoRestClient implements HypervisorClient {
      */
     private static void refuseForeignHandle(@NonNull VmRef vm) {
         String ref = vm.value();
-        if (ref.startsWith(XapiClient.REF_PREFIX)) {
+        if (ref.startsWith(VmRef.XAPI_REF_PREFIX)) {
             throw new HypervisorException("refusing to destroy " + ref + ": that is a XAPI handle, and this is the"
                     + " Xen Orchestra backend. A VM is only destroyable through the backend that created it;"
                     + " this appliance would resolve it and delete whatever it names.");
