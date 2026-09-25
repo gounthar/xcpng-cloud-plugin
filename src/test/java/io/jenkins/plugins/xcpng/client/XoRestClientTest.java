@@ -698,7 +698,71 @@ class XoRestClientTest {
         assertTrue(e.getMessage().contains("revoked or expired"), e.getMessage());
     }
 
-    /** An ordinary failure gains nothing: the hint is for the two statuses it can actually explain. */
+    /**
+     * The shape xo-server 5.192.1 gives the sizing PATCH, which it does not route (#254). The body is the
+     * one measured on 5.208.3 for a method it does not route, {@code PUT} on the same path, with the verb
+     * changed: Express's own page, not XO's envelope. Before the hint this reached the operator as a bare
+     * 404 at the first provision, saying nothing about the appliance being too old.
+     */
+    @Test
+    void anUnroutedPatchSaysTheApplianceIsTooOld() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", "/rest/v0/vms/" + CLONE, 404, cannot("PATCH", "/rest/v0/vms/" + CLONE));
+        XoRestClient c = new XoRestClient(t);
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec()));
+
+        assertTrue(e.getMessage().contains("Cannot PATCH"), "the excerpt must survive: " + e.getMessage());
+        assertTrue(e.getMessage().contains("does not serve PATCH"), e.getMessage());
+        assertTrue(e.getMessage().contains("5.192.1"), e.getMessage());
+        assertEquals(List.of(CLONE), t.destroyed, "the clone must still be reclaimed");
+    }
+
+    /**
+     * The other 404 on the same route: XO routed the PATCH and the VM is not there. That is about the object,
+     * and blaming the appliance's version for it would send an operator to upgrade something that works.
+     * Body as measured on 5.208.3 for a PATCH on an unknown id.
+     */
+    @Test
+    void aMissingVmOnARoutedPatchDoesNotBlameTheVersion() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail(
+                "PATCH",
+                "/rest/v0/vms/" + CLONE,
+                404,
+                "{\"error\":\"no such VM " + CLONE + "\",\"data\":{\"id\":\"" + CLONE + "\",\"type\":\"VM\"}}");
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> new XoRestClient(t).clearGuestSecret(new VmRef(CLONE)));
+
+        assertTrue(e.getMessage().contains("no such VM"), e.getMessage());
+        assertFalse(e.getMessage().contains("does not serve"), e.getMessage());
+        assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
+    }
+
+    /**
+     * An unrouted 404 elsewhere is still worth the route half of the hint, but not the version half: that
+     * floor was measured for PATCH on {@code /vms/{id}} alone, and quoting it against another route would
+     * state a fact nobody checked.
+     */
+    @Test
+    void anUnroutedCallElsewhereGetsNoVersionClaim() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, cannot("DELETE", "/rest/v0/vms/" + CLONE));
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)));
+
+        assertTrue(e.getMessage().contains("does not serve DELETE"), e.getMessage());
+        assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
+    }
+
+    /** Express's page for a method and path it has no route for, as the lab appliance serves it. */
+    private static String cannot(String method, String path) {
+        return "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>Error</title>\n"
+                + "</head>\n<body>\n<pre>Cannot " + method + " " + path + "</pre>\n</body>\n</html>\n";
+    }
+
+    /** An ordinary failure gains nothing: the hint is for the statuses it can actually explain. */
     @Test
     void anOrdinaryFailureIsNotDecorated() {
         ScriptedRest t = new ScriptedRest();
@@ -707,6 +771,7 @@ class XoRestClientTest {
 
         assertFalse(e.getMessage().contains("revoked or expired"), e.getMessage());
         assertFalse(e.getMessage().contains("role or the appliance's plan"), e.getMessage());
+        assertFalse(e.getMessage().contains("does not serve"), e.getMessage());
     }
 
     @Test
