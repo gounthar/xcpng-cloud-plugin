@@ -260,7 +260,8 @@ public final class XoRestClient implements HypervisorClient {
             // The hint belongs here too, and this is the branch that needs it most: a 401 whose body is
             // HTML is the login-redirect case, where the excerpt on its own tells an operator nothing.
             String excerpt = body == null ? "" : body.substring(0, Math.min(body.length(), 200));
-            return new HypervisorException(method + " " + path + ": HTTP " + status + ": " + excerpt + hintFor(status));
+            return new HypervisorException(
+                    method + " " + path + ": HTTP " + status + ": " + excerpt + hintFor(method, path, status, body));
         }
         String error = payload.path("error").asText("");
         String code = error.isBlank() ? null : error;
@@ -277,7 +278,9 @@ public final class XoRestClient implements HypervisorClient {
                             e -> params.add(e.getKey() + "=" + e.getValue().asText()));
         }
         return new HypervisorException(
-                method + " " + path + ": HTTP " + status + ": " + detail + hintFor(status), code, params);
+                method + " " + path + ": HTTP " + status + ": " + detail + hintFor(method, path, status, body),
+                code,
+                params);
     }
 
     /**
@@ -297,11 +300,23 @@ public final class XoRestClient implements HypervisorClient {
      * uses answers 200, with the same token. So a 403 here points at the account's plan or role, never at
      * the token being wrong.
      *
+     * <p>404 gets a hint only when the body is not XO's own envelope, because the two 404s mean opposite
+     * things. Measured on the lab appliance (xo-server 5.208.3) 2026-09-25: a routed {@code PATCH} on an
+     * unknown id answers JSON, {@code {"error":"no such VM ..."}}, while a method the appliance does not
+     * route ({@code PUT} on the same path) answers an HTML page reading {@code Cannot PUT ...}. The first is
+     * about the object and needs no help. The second is the appliance not serving the route at all, which is
+     * what an xo-server too old for this backend looks like: {@code PATCH /vms/{id}} answered 404 on 5.192.1
+     * and 204 on 5.208.3 (#254). Without the hint that reaches an operator as a bare 404 at the first
+     * provision, naming nothing.
+     *
      * <p>The hint is appended rather than substituted. XO's own message is the more specific of the two
      * whenever it says anything, and dropping it to print our guess would be the worse trade.
      */
     @NonNull
-    private static String hintFor(int status) {
+    private static String hintFor(String method, String path, int status, @CheckForNull String body) {
+        if (status == 404 && !isNoSuchObject(body, null)) {
+            return routeMissingHint(method, path);
+        }
         return switch (status) {
             case 401 ->
                 ". The appliance did not accept the token. It may be wrong, revoked or expired;"
@@ -313,6 +328,24 @@ public final class XoRestClient implements HypervisorClient {
                         + " role or the appliance's plan rather than the credential.";
             default -> "";
         };
+    }
+
+    /**
+     * The 404 that is not XO's: the appliance, or something in front of it, does not serve this route.
+     *
+     * <p>The version sentence is limited to the one route whose absence has been measured, rather than
+     * attached to every unrouted call, so it never claims a floor for a route nobody has checked.
+     */
+    @NonNull
+    private static String routeMissingHint(String method, String path) {
+        String hint = ". The appliance does not serve " + method + " on this route: the reply is not XO's own,"
+                + " which would name a missing object. Either xo-server is too old for this backend, or a"
+                + " proxy in front of it does not forward " + API + ".";
+        if ("PATCH".equals(method) && path.startsWith(API + "/vms/")) {
+            hint += " PATCH " + API + "/vms/{id} is absent on xo-server 5.192.1 and present on 5.208.3;"
+                    + " upgrading an XOA needs it to be registered.";
+        }
+        return hint;
     }
 
     /**
@@ -852,11 +885,14 @@ public final class XoRestClient implements HypervisorClient {
      * "<id>","type":"VM"}}}. {@code type} is not required, because {@code noSuchObject} is also called with
      * an id alone.
      *
-     * <p>The object must also be the one asked about. That is the XAPI backend's already-gone rule, which
-     * checks the error parameters name the very ref being destroyed, on the stated
-     * grounds that the code alone is not enough: a generic handler cannot echo back an id it never parsed.
+     * <p>With an {@code expectedId}, the object must also be the one asked about. That is the XAPI
+     * backend's already-gone rule, which checks the error parameters name the very ref being destroyed, on
+     * the stated grounds that the code alone is not enough: a generic handler cannot echo back an id it never parsed.
+     *
+     * <p>Without one, only the shape is asked about. That is the 404 hint's question: it has no object in
+     * mind, only whether XO routed the call at all.
      */
-    private static boolean isNoSuchObject(@CheckForNull String body, @NonNull String expectedId) {
+    private static boolean isNoSuchObject(@CheckForNull String body, @CheckForNull String expectedId) {
         if (body == null || body.isBlank()) {
             return false;
         }
@@ -869,9 +905,10 @@ public final class XoRestClient implements HypervisorClient {
         if (parsed == null || !parsed.path("error").isTextual()) {
             return false;
         }
-        // No separate blank check: VmRef refuses a blank value, so equality already rules it out.
+        // No separate blank check: VmRef refuses a blank value, so when an id is expected, equality
+        // already rules a blank one out.
         JsonNode id = parsed.path("data").path("id");
-        return id.isTextual() && expectedId.equals(id.asText());
+        return id.isTextual() && (expectedId == null || expectedId.equals(id.asText()));
     }
 
     /**
