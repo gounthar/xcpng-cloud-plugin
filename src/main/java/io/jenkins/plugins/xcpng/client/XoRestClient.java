@@ -795,7 +795,7 @@ public final class XoRestClient implements HypervisorClient {
         if (resp.isSuccess()) {
             return;
         }
-        if (resp.status() == 404 && isXoFailure(resp.body())) {
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), vm.value())) {
             LOGGER.info(() ->
                     "VM " + vm.value() + " was already gone when teardown reached it;" + " treating that as destroyed");
             return;
@@ -834,28 +834,44 @@ public final class XoRestClient implements HypervisorClient {
     }
 
     /**
-     * Whether a failure body is XO's own envelope rather than something else that answered.
+     * Whether a 404 body is XO saying it has no such object, rather than something else that answered.
      *
-     * <p>Used to qualify the 404 that teardown treats as its goal state. The XAPI backend's equivalent rule
-     * checks the error <em>parameters</em> name the very ref being destroyed, on the stated grounds that the
-     * code alone is not enough. The bare status check this replaces was weaker than that: an XO below the
-     * 6.5.0 floor, a reverse proxy that does not map {@code /rest/v0}, or a renamed route all answer 404,
-     * and every one of them was being recorded as a clean teardown. The caller then stops retrying, so the
-     * VM becomes invisible to the plugin rather than merely un-destroyed.
+     * <p>Used to qualify the 404 that teardown treats as its goal state. The bare status check this
+     * replaced was weaker than that: an appliance too old to route the call, a reverse proxy that does not
+     * map {@code /rest/v0}, or a renamed route all answer 404, and every one of them was being recorded as a
+     * clean teardown. The caller then stops retrying, so the VM becomes invisible to the plugin rather than
+     * merely un-destroyed.
      *
-     * <p>Checking for the envelope rather than for a message is the narrowest thing that separates those:
-     * XO's own handler always carries {@code error}, and a proxy page carries no JSON at all.
+     * <p>Checking only for an {@code error} field separated those today and would stop separating them the
+     * day XO adds a catch-all handler answering unknown routes in JSON. Today it has none: the REST API
+     * mounts no not-found handler, so an unrouted call falls through to Express's HTML page, measured on the
+     * lab appliance (xo-server 5.208.3) as {@code Cannot PUT ...}. So this checks the shape XO's own 404
+     * actually has. Every 404 its REST error handler produces comes from {@code noSuchObject(id, type)}
+     * ({@code @xen-orchestra/rest-api} {@code generic-error-handler.middleware.mts}), which carries
+     * {@code data: {id, type}}; measured the same way, {@code {"error":"no such VM <id>","data":{"id":
+     * "<id>","type":"VM"}}}. {@code type} is not required, because {@code noSuchObject} is also called with
+     * an id alone.
+     *
+     * <p>The object must also be the one asked about. That is the XAPI backend's already-gone rule, which
+     * checks the error parameters name the very ref being destroyed, on the stated
+     * grounds that the code alone is not enough: a generic handler cannot echo back an id it never parsed.
      */
-    private static boolean isXoFailure(@CheckForNull String body) {
+    private static boolean isNoSuchObject(@CheckForNull String body, @NonNull String expectedId) {
         if (body == null || body.isBlank()) {
             return false;
         }
+        JsonNode parsed;
         try {
-            JsonNode parsed = MAPPER.readTree(body);
-            return parsed != null && parsed.hasNonNull("error");
+            parsed = MAPPER.readTree(body);
         } catch (IOException notJson) {
             return false;
         }
+        if (parsed == null || !parsed.path("error").isTextual()) {
+            return false;
+        }
+        // No separate blank check: VmRef refuses a blank value, so equality already rules it out.
+        JsonNode id = parsed.path("data").path("id");
+        return id.isTextual() && expectedId.equals(id.asText());
     }
 
     /**
