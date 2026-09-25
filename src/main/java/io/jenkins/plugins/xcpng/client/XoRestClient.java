@@ -891,6 +891,11 @@ public final class XoRestClient implements HypervisorClient {
      * <p>With an {@code expectedId}, the object must also be the one asked about. That is the XAPI
      * backend's already-gone rule, which checks the error parameters name the very ref being destroyed, on
      * the stated grounds that the code alone is not enough: a generic handler cannot echo back an id it never parsed.
+     * The message must also be the one XO's formatter builds from that id, {@code no such ${type || 'object'}
+     * ${id}} ({@code xo-common/api-errors.js}), so a JSON 404 that happens to carry the id in {@code data}
+     * is not taken for XO's. The cost is a dependency on that wording: were XO to change it, teardown would
+     * stop recognising an already-deleted VM and report it as a failure, loudly, rather than pass something
+     * it should not.
      *
      * <p>Without one, only the shape is asked about. That is the 404 hint's question: it has no object in
      * mind, only whether XO routed the call at all.
@@ -911,7 +916,17 @@ public final class XoRestClient implements HypervisorClient {
         // No separate blank check: VmRef refuses a blank value, so when an id is expected, equality
         // already rules a blank one out.
         JsonNode id = parsed.path("data").path("id");
-        return id.isTextual() && (expectedId == null || expectedId.equals(id.asText()));
+        if (!id.isTextual()) {
+            return false;
+        }
+        if (expectedId == null) {
+            return true;
+        }
+        JsonNode type = parsed.path("data").path("type");
+        String named = type.isTextual() && !type.asText().isEmpty() ? type.asText() : "object";
+        return expectedId.equals(id.asText())
+                && ("no such " + named + " " + expectedId)
+                        .equals(parsed.path("error").asText());
     }
 
     /**

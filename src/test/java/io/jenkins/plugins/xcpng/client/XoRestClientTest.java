@@ -804,6 +804,45 @@ class XoRestClientTest {
     }
 
     /**
+     * A JSON 404 that carries the probe id but not XO's message is not XO's answer. The id alone was the
+     * whole test before, so anything echoing it in {@code data} passed as a routed PATCH.
+     */
+    @Test
+    void aJsonNotFoundThatIsNotXosWordingDoesNotPassTheProbe() {
+        ScriptedRest t = new ScriptedRest();
+        String id = XoRestClient.PROBE_ID;
+        t.fail("PATCH", PROBE, 404, "{\"error\":\"not found\",\"data\":{\"id\":\"" + id + "\",\"type\":\"VM\"}}");
+        assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+    }
+
+    /**
+     * XO's formatter falls back to {@code object} when it is given no type, so that wording has to pass as
+     * well, or the stricter check rejects a genuine answer.
+     */
+    @Test
+    void xosUntypedNoSuchObjectStillPassesTheProbe() {
+        ScriptedRest t = new ScriptedRest();
+        String id = XoRestClient.PROBE_ID;
+        t.fail("PATCH", PROBE, 404, "{\"error\":\"no such object " + id + "\",\"data\":{\"id\":\"" + id + "\"}}");
+        new XoRestClient(t).ping();
+    }
+
+    /**
+     * Teardown shares the check, so the same body must not read as an already-deleted VM there either:
+     * reporting a VM destroyed when something other than XO answered would drop the leaked-VM entry.
+     */
+    @Test
+    void aJsonNotFoundThatIsNotXosWordingIsNotAnAlreadyGoneVm() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail(
+                "DELETE",
+                "/rest/v0/vms/" + CLONE,
+                404,
+                "{\"error\":\"not found\",\"data\":{\"id\":\"" + CLONE + "\",\"type\":\"VM\"}}");
+        assertThrows(HypervisorException.class, () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)));
+    }
+
+    /**
      * A success on an object that cannot exist means something other than XO answered. Passing it would be a
      * green Test Connection with nothing behind it, which is the fixture's own default and the reason this
      * test has to script it explicitly.
