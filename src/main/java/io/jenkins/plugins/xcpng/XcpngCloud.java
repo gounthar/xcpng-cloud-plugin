@@ -3,7 +3,6 @@ package io.jenkins.plugins.xcpng;
 import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
-import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import com.cloudbees.plugins.credentials.domains.URIRequirementBuilder;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
@@ -24,7 +23,6 @@ import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
 import io.jenkins.plugins.xcpng.client.VmRef;
-import io.jenkins.plugins.xcpng.client.XapiClient;
 import io.jenkins.plugins.xcpng.client.XoRestClient;
 import java.io.IOException;
 import java.net.URI;
@@ -61,10 +59,10 @@ import org.kohsuke.stapler.interceptor.RequirePOST;
 import org.kohsuke.stapler.verb.POST;
 
 /**
- * Provisions ephemeral build agents on an XCP-ng pool.
+ * Provisions ephemeral build agents on an XCP-ng pool, through the Xen Orchestra appliance in front of it.
  *
- * <p>The plugin's {@code config.xml} holds only non-secrets and a credential ID: the pool URL, the
- * ID of the XAPI username/password credential, the pinned certificate fingerprint if the pool needs one, an
+ * <p>The plugin's {@code config.xml} holds only non-secrets and a credential ID: the appliance URL, the
+ * ID of the secret-text token credential, the pinned certificate fingerprint if the appliance needs one, an
  * instance cap, and the agent templates. The secret itself is resolved from the credentials store at
  * point of use and never written here.
  *
@@ -121,21 +119,18 @@ public class XcpngCloud extends Cloud {
     private final String certificateFingerprint;
 
     /**
-     * Which API this cloud speaks to reach its pool: XAPI straight to the pool master, or the Xen
-     * Orchestra REST API on an appliance in front of it. Optional, and a {@link DataBoundSetter} rather
-     * than a constructor parameter, so a {@code config.xml} or a configuration-as-code document written
-     * before the XO backend existed still binds and keeps the field initializer.
+     * Which API this cloud was configured against. Only {@link XcpngBackend#XO} can be spoken; the field
+     * survives so that a cloud saved by an older release, which spoke XAPI, loads with its configuration
+     * intact and is refused by name (#89) instead of failing to deserialize.
      *
-     * <p>Null on a cloud deserialized from such a config, because XStream skips the initializer. Read it
-     * through {@link #getBackend()}, never directly: that resolves the absence to
-     * {@link XcpngBackend#XAPI}, and {@link #readResolve} normalises it on the way in so the two cannot
-     * disagree.
-     *
-     * <p>Staging only, and expected to be short-lived: #89 step 3 removes {@code XapiClient} and this
-     * field with it.
+     * <p>Two absences, two meanings. A cloud built through the form or a configuration-as-code document
+     * keeps the {@link XcpngBackend#XO} initializer, because the form no longer submits this field and a
+     * document that omits it is asking for the default. A cloud deserialized from a {@code config.xml}
+     * written before the field existed arrives with null, because XStream skips the initializer, and every
+     * such config was an XAPI cloud: {@link #readResolve} records that explicitly.
      */
     @CheckForNull
-    private XcpngBackend backend = XcpngBackend.XAPI;
+    private XcpngBackend backend = XcpngBackend.XO;
 
     /**
      * The switch this field replaced, kept so an old configuration can be recognised and reported rather
@@ -179,7 +174,7 @@ public class XcpngCloud extends Cloud {
 
     /**
      * How a live client is opened. Null in production, where {@link #openClient()} builds an
-     * {@link XapiClient} from the configured credentials; a test injects an in-memory fake here.
+     * {@link XoRestClient} from the configured credentials; a test injects an in-memory fake here.
      * Transient: it is behaviour, not configuration, and must never be persisted to {@code config.xml}.
      */
     private transient HypervisorClientFactory clientFactory;
@@ -292,10 +287,14 @@ public class XcpngCloud extends Cloud {
         if (reconcileLock == null) {
             reconcileLock = new Object();
         }
-        // A config predating the XO backend deserializes this to null (XStream skips the initializer).
-        // Normalise it here as well as in the getter, so what is written back out names the backend
-        // explicitly rather than leaving the next reader to infer it from an absence.
+        // A config predating the backend field deserializes this to null (XStream skips the initializer),
+        // and every such config was written by a release that spoke only XAPI. Record that explicitly, so
+        // the cloud is refused by name rather than silently read as the new default; the operator's own
+        // save of the form is what moves it to XO.
         backend = XcpngBackend.resolve(backend);
+        if (!backend.isSupported()) {
+            LOGGER.log(Level.WARNING, () -> Messages.XcpngCloud_backend_removed("cloud '" + name + "'"));
+        }
         // A pre-#149 config carries the leaked-VM set on the cloud itself. Hand it to the store now, while
         // this object is still the one holding it: configuration-as-code may replace the cloud before
         // anything asks it for its leaks, and a migration that waited for that question would never be asked
@@ -439,9 +438,9 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Which API this cloud speaks. Never null: an absent value -- a cloud saved before the XO backend
-     * existed, or a configuration-as-code document that does not mention one -- resolves to
-     * {@link XcpngBackend#XAPI}.
+     * Which API this cloud was configured against. Never null. {@link XcpngBackend#XAPI} means a cloud
+     * carried over from an older release, which this plugin can no longer drive: see
+     * {@link #isBackendSupported()}.
      */
     @NonNull
     public XcpngBackend getBackend() {
@@ -449,13 +448,23 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Optional backend selection. Resolved rather than stored raw so the field and the getter cannot
-     * disagree about what an omitted value means, which is the shape {@code setIdleMinutes} above uses
-     * for the same reason.
+     * Optional, for configuration-as-code. An omitted or null value is the default, {@link XcpngBackend#XO},
+     * which is the opposite of what an absence means on a deserialized cloud (see {@link #backend}).
+     * {@code XAPI} is accepted rather than refused so that a document exported from an older release still
+     * applies; the cloud it builds is then refused by name like any other XAPI cloud.
      */
     @DataBoundSetter
     public void setBackend(@CheckForNull XcpngBackend backend) {
-        this.backend = XcpngBackend.resolve(backend);
+        this.backend = backend == null ? XcpngBackend.XO : backend;
+    }
+
+    /**
+     * False for a cloud still configured for the removed XAPI backend. Such a cloud provisions nothing, keeps
+     * no warm pool and cannot open a client; {@link XcpngRemovedBackendMonitor} names it to administrators.
+     * Used by the configuration page to explain why.
+     */
+    public boolean isBackendSupported() {
+        return getBackend().isSupported();
     }
 
     @NonNull
@@ -465,7 +474,7 @@ public class XcpngCloud extends Cloud {
 
     @Override
     public boolean canProvision(CloudState state) {
-        return templateFor(state.getLabel()) != null && availableCapacity() > 0;
+        return isBackendSupported() && templateFor(state.getLabel()) != null && availableCapacity() > 0;
     }
 
     // Synchronized so two concurrent provisioning rounds cannot both snapshot the same capacity before
@@ -476,6 +485,11 @@ public class XcpngCloud extends Cloud {
     // (#162), which the replacement cloud and the old cloud's in-flight launchers all share.
     @Override
     public synchronized Collection<NodeProvisioner.PlannedNode> provision(CloudState state, int excessWorkload) {
+        if (!isBackendSupported()) {
+            // canProvision already declines, so core does not ask. Checked again because provision is public
+            // and a caller that skips canProvision would otherwise reach a clone that can only fail.
+            return List.of();
+        }
         XcpngTemplate template = templateFor(state.getLabel());
         if (template == null) {
             return List.of();
@@ -692,6 +706,12 @@ public class XcpngCloud extends Cloud {
      * its surplus running until each spare happened to pick up a build.
      */
     synchronized void reconcileWarmPool() {
+        if (!isBackendSupported()) {
+            // Neither half can do anything useful: a fill would clone through a backend nothing can speak,
+            // and a drain would ask that same backend to destroy the spare. The spares stay where they are
+            // until the cloud is reconfigured; the monitor says so.
+            return;
+        }
         // Filled by the pass below, read by the drain after it: the spares this cloud holds per template, and
         // the ones whose template the administrator has removed.
         Map<String, List<XcpngAgent>> warmByTemplate = new HashMap<>();
@@ -1308,9 +1328,9 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * Open a session to the pool. In production this builds the client the configured
-     * {@link #getBackend() backend} names, from the credential that backend authenticates with; a test
-     * injects a fake via {@link #setClientFactory}. The caller owns the returned client and must close it.
+     * Open a session to the appliance. In production this builds an {@link XoRestClient} from the configured
+     * token credential, or refuses a cloud still configured for the removed XAPI backend; a test injects a
+     * fake via {@link #setClientFactory}. The caller owns the returned client and must close it.
      */
     @NonNull
     HypervisorClient openClient() {
@@ -1325,13 +1345,13 @@ public class XcpngCloud extends Cloud {
      * this moment rather than from anything persisted. Static and parameterised because
      * {@link XcpngAgent#_terminate} needs the same construction from its own connection snapshot when the
      * cloud that provisioned it has been deleted or renamed and there is no instance left to ask; keeping
-     * one implementation means the two paths cannot drift on TLS trust, credential scoping, or -- now that
-     * there are two -- which backend they speak.
+     * one implementation means the two paths cannot drift on TLS trust or credential scoping.
      *
-     * <p>The backend decides the credential kind, and the two are not interchangeable: XAPI wants a
-     * username and password, XO a secret-text token. A cloud can be saved with the wrong pairing (nothing
-     * in the form model objects to it, and {@code doCheckCredentialsId} is advisory), so the miss is
-     * reported here by name rather than as a cast failure deeper in.
+     * <p>This is also the one place the removed XAPI backend is refused (#89). Every path that talks to a
+     * hypervisor opens its client here -- provisioning, teardown from an agent's snapshot, the leaked-VM
+     * sweep, Test connection and the template-name check -- so a record still naming XAPI fails at the same
+     * point with the same message, as an {@link IllegalStateException}: the exception each of those callers
+     * already reads as "these parameters cannot build a client".
      *
      * @param owner what the parameters belong to, for the message thrown when the credential is gone.
      */
@@ -1342,51 +1362,33 @@ public class XcpngCloud extends Cloud {
             @CheckForNull String certificateFingerprint,
             @CheckForNull XcpngBackend backend,
             @NonNull String owner) {
-        // Above the backend branch, so both answer a missing URL the same way (#101). It used to sit inside
-        // the XO branch only, because XoRestClient's base URL is @NonNull and the absence had to be answered
-        // somewhere; the XAPI branch let it fall through to HttpTransport's requireNonNull two layers down.
-        // That guard is real and its message is not a mystery, but it names the parameter rather than the
-        // cloud, and an operator reading it has nothing to go and edit.
+        // Before anything else: a record naming the removed backend is refused by name whatever else it
+        // carries, so the operator is told the one thing that fixes it rather than a missing-URL message
+        // that would send them to edit a field and then meet this refusal anyway.
+        if (!XcpngBackend.resolve(backend).isSupported()) {
+            throw new IllegalStateException(Messages.XcpngCloud_backend_removed(owner));
+        }
+        // A missing URL is named rather than left to XoRestClient's @NonNull base URL (#101): that guard
+        // names the parameter rather than the cloud, and an operator reading it has nothing to go and edit.
         //
         // The form cannot produce this state: doCheckPoolUrl rejects a schemeless value as the administrator
         // types and the constructor trims it. A hand-edited config.xml or a JCasC document can, since both
         // write the field directly, and that is the route worth naming.
         if (poolUrl == null || poolUrl.isBlank()) {
-            throw new IllegalStateException("No " + urlLabel(backend) + " configured for " + owner
-                    + ". Set it on the cloud, or" + " remove the cloud if it is no longer wanted.");
+            // "Xen Orchestra URL", not "pool URL": the field is called poolUrl in the model, but it points at
+            // the appliance, and telling an operator that no pool URL is configured sends them looking for a pool.
+            throw new IllegalStateException("No Xen Orchestra URL configured for " + owner + ". Set it on the cloud, or"
+                    + " remove the cloud if it is no longer wanted.");
         }
-        if (XcpngBackend.resolve(backend) == XcpngBackend.XO) {
-            StringCredentials token = DescriptorImpl.lookupTokenCredentials(poolUrl, credentialsId);
-            if (token == null) {
-                throw new IllegalStateException("No Xen Orchestra token credential configured for " + owner
-                        + ". The XO backend authenticates with a secret-text token, not a username and"
-                        + " password.");
-            }
-            return new XoRestClient(poolUrl, token.getSecret().getPlainText(), certificateFingerprint);
+        StringCredentials token = DescriptorImpl.lookupTokenCredentials(poolUrl, credentialsId);
+        if (token == null) {
+            // Says which kind is wanted: the commonest way to reach here is a username/password credential
+            // left selected from an older configuration, and "no credentials configured" reads as none at all
+            // rather than none of the right sort.
+            throw new IllegalStateException("No Xen Orchestra token credential configured for " + owner
+                    + ". Xen Orchestra authenticates with a secret-text token, not a username and password.");
         }
-        StandardUsernamePasswordCredentials credentials = DescriptorImpl.lookupCredentials(poolUrl, credentialsId);
-        if (credentials == null) {
-            // Says which kind is wanted, for the same reason the XO branch above does: the commonest way to
-            // reach here is a credential of the other kind selected under this backend, and "no credentials
-            // configured" reads as none at all rather than none of the right sort.
-            throw new IllegalStateException("No XAPI credentials configured for " + owner
-                    + ". The XAPI backend authenticates with a username and password, not a secret-text"
-                    + " token.");
-        }
-        return new XapiClient(
-                poolUrl, credentials.getUsername(), credentials.getPassword().getPlainText(), certificateFingerprint);
-    }
-
-    /**
-     * What the URL field is called on a given backend, so a message about it uses the operator's word.
-     *
-     * <p>The field is one field and {@code poolUrl} is its name in the model, but the two backends point it
-     * at different things: a pool master on XAPI, an appliance on XO. Telling an XO operator that no pool
-     * URL is configured sends them looking for a pool.
-     */
-    @NonNull
-    private static String urlLabel(@CheckForNull XcpngBackend backend) {
-        return XcpngBackend.resolve(backend) == XcpngBackend.XO ? "Xen Orchestra URL" : "pool URL";
+        return new XoRestClient(poolUrl, token.getSecret().getPlainText(), certificateFingerprint);
     }
 
     /** Test seam: replace how a client is opened with an in-memory fake. */
@@ -1631,7 +1633,7 @@ public class XcpngCloud extends Cloud {
 
     /**
      * How {@link #openClient()} obtains a client. Production leaves this null and builds an
-     * {@link XapiClient}; a test supplies an in-memory fake. Not {@code Serializable} on purpose: it is
+     * {@link XoRestClient}; a test supplies an in-memory fake. Not {@code Serializable} on purpose: it is
      * held only in the transient {@link #clientFactory} field and never reaches {@code config.xml}.
      */
     @FunctionalInterface
@@ -1651,32 +1653,12 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * Resolve the configured XAPI credential. Scoped to the pool URL's domain so a store that
-         * partitions credentials by host returns only the relevant ones.
-         */
-        @CheckForNull
-        static StandardUsernamePasswordCredentials lookupCredentials(
-                @CheckForNull String poolUrl, @CheckForNull String credentialsId) {
-            if (credentialsId == null || credentialsId.isEmpty()) {
-                return null;
-            }
-            return CredentialsMatchers.firstOrNull(
-                    CredentialsProvider.lookupCredentialsInItemGroup(
-                            StandardUsernamePasswordCredentials.class,
-                            Jenkins.get(),
-                            ACL.SYSTEM2,
-                            URIRequirementBuilder.fromUri(poolUrl).build()),
-                    CredentialsMatchers.withId(credentialsId));
-        }
-
-        /**
-         * The XO half of the lookup above: a secret-text credential holding an authentication token.
+         * Resolve the configured Xen Orchestra token: a secret-text credential. Scoped to the URL's domain
+         * so a store that partitions credentials by host returns only the relevant ones.
          *
-         * <p>A separate method and a separate matcher rather than a widened one, because the two kinds are
-         * not substitutable. Looking up {@code StandardCredentials} and casting would find a
-         * username/password entry under the configured ID and fail at the cast, which reads as a bug in
-         * the plugin; finding nothing reads as what it is -- the wrong kind of credential selected for
-         * this backend -- and that is the message the caller turns it into.
+         * <p>Matched by type rather than looked up as {@code StandardCredentials} and cast, so a
+         * username/password credential left selected from an XAPI-era configuration resolves to nothing,
+         * which the caller reports as the wrong kind, instead of failing at a cast.
          */
         @CheckForNull
         static StringCredentials lookupTokenCredentials(
@@ -1725,9 +1707,9 @@ public class XcpngCloud extends Cloud {
                 return FormValidation.error(Messages.XcpngCloud_poolUrl_schemeMissing());
             }
             if (scheme.equalsIgnoreCase("http")) {
-                // Plain http sends the XAPI credential (typically the pool's root password) and every
-                // session token in cleartext. XAPI speaks TLS out of the box, and a self-signed pool
-                // certificate is already handled by pinning its fingerprint, so no ordinary setup needs http.
+                // Plain http sends the authentication token in cleartext on every request. The appliance
+                // speaks TLS out of the box, and a self-signed certificate is already handled by pinning its
+                // fingerprint, so no ordinary setup needs http.
                 return FormValidation.error(Messages.XcpngCloud_poolUrl_http());
             }
             if (uri.getHost() == null) {
@@ -1742,16 +1724,10 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * Offer both credential kinds, whichever backend is selected.
-         *
-         * <p>Filtering to the selected backend's kind is the obvious alternative and was rejected on the
-         * strength of what {@code c:select} declares: it wraps an {@code f:select} and passes no
-         * {@code fillDependsOn} through, so nothing tells the list to refill when another field changes.
-         * An operator who switched the backend after the page loaded would then be shown the other
-         * backend's credentials and reasonably conclude they had none of the right kind. That is read
-         * from {@code lib/credentials/select.jelly} rather than measured in a browser, which is enough
-         * to prefer the predictable option: listing both costs nothing, and the pairing is checked by
-         * {@link #doCheckCredentialsId} and, authoritatively, by Test connection.
+         * Offer secret-text credentials, the only kind Xen Orchestra authenticates with, plus whatever is
+         * currently selected. Keeping the current value matters on a cloud carried over from the XAPI
+         * backend: its username/password credential stays visible, and {@link #doCheckCredentialsId} says
+         * why it no longer works, rather than the field silently reading as empty.
          */
         @POST
         public ListBoxModel doFillCredentialsIdItems(
@@ -1765,12 +1741,6 @@ public class XcpngCloud extends Cloud {
                     .includeMatchingAs(
                             ACL.SYSTEM2,
                             jenkins,
-                            StandardUsernamePasswordCredentials.class,
-                            URIRequirementBuilder.fromUri(poolUrl).build(),
-                            CredentialsMatchers.always())
-                    .includeMatchingAs(
-                            ACL.SYSTEM2,
-                            jenkins,
                             StringCredentials.class,
                             URIRequirementBuilder.fromUri(poolUrl).build(),
                             CredentialsMatchers.always())
@@ -1778,47 +1748,24 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * The backend choices, as a filled select rather than a hand-written option list in the jelly, so
-         * the constant names the form submits are the enum's own and cannot drift from it.
-         */
-        @POST
-        public ListBoxModel doFillBackendItems() {
-            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
-            ListBoxModel items = new ListBoxModel();
-            items.add(Messages.XcpngCloud_backend_xapi(), XcpngBackend.XAPI.name());
-            items.add(Messages.XcpngCloud_backend_xo(), XcpngBackend.XO.name());
-            return items;
-        }
-
-        /**
-         * Warn when the selected credential is not the kind the selected backend authenticates with.
+         * Warn when the selected credential is not a secret-text token. The case this exists for is a cloud
+         * carried over from the XAPI backend, whose username/password credential is still selected.
          *
-         * <p>Advisory, and it says so: this fires when the credential field changes, not when the backend
-         * one does, so an operator who picks the credential first and the backend second sees nothing. It
-         * catches the common ordering and no more. The pairing is enforced where it is used -- Test
-         * connection, and {@code openClient} at provision time -- which is why this is a warning rather
-         * than an error that would block a save the plugin cannot actually guarantee is wrong.
+         * <p>A warning rather than an error: the kind is enforced where it is used -- Test connection, and
+         * {@code openClient} at provision time -- and an error here would block a save the operator may be
+         * making in several steps.
          */
         @POST
-        public FormValidation doCheckCredentialsId(
-                @QueryParameter String value, @QueryParameter String poolUrl, @QueryParameter String backend) {
+        public FormValidation doCheckCredentialsId(@QueryParameter String value, @QueryParameter String poolUrl) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
                 // A fresh form should not nag; the missing credential is reported by Test connection and
                 // by the provisioning path, both of which name the cloud.
                 return FormValidation.ok();
             }
-            XcpngBackend selected = XcpngBackend.parse(backend);
-            boolean found = selected == XcpngBackend.XO
-                    ? lookupTokenCredentials(poolUrl, value) != null
-                    : lookupCredentials(poolUrl, value) != null;
-            if (found) {
-                return FormValidation.ok();
-            }
-            return FormValidation.warning(
-                    selected == XcpngBackend.XO
-                            ? Messages.XcpngCloud_credentials_notSecretText()
-                            : Messages.XcpngCloud_credentials_notUsernamePassword());
+            return lookupTokenCredentials(poolUrl, value) != null
+                    ? FormValidation.ok()
+                    : FormValidation.warning(Messages.XcpngCloud_credentials_notSecretText());
         }
 
         /**
@@ -1847,10 +1794,8 @@ public class XcpngCloud extends Cloud {
         public FormValidation doTestConnection(
                 @QueryParameter String poolUrl,
                 @QueryParameter String credentialsId,
-                @QueryParameter String certificateFingerprint,
-                @QueryParameter String backend) {
+                @QueryParameter String certificateFingerprint) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
-            final XcpngBackend selected = XcpngBackend.parse(backend);
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.error(Messages.XcpngCloud_poolUrl_required());
             }
@@ -1860,7 +1805,7 @@ public class XcpngCloud extends Cloud {
             FormValidation urlCheck = validatePoolUrlFormat(url);
             if (urlCheck.kind != FormValidation.Kind.OK) {
                 // Reject a malformed URL with the same message the field validator gives, rather than
-                // letting it fail deeper in XapiClient as a less actionable transport error.
+                // letting it fail deeper in the client as a less actionable transport error.
                 return urlCheck;
             }
             final String pin;
@@ -1873,20 +1818,19 @@ public class XcpngCloud extends Cloud {
             }
             if (credentialsId == null || credentialsId.isBlank()) {
                 // Distinguished from a credential that is selected but of the wrong kind: that one gets
-                // openClient's message below, which names the kind this backend needs.
+                // openClient's message below, which names the kind Xen Orchestra needs.
                 return FormValidation.error(Messages.XcpngCloud_credentials_required());
             }
             // Built inside the try, not before it. Constructing a client is not merely a credential lookup:
-            // both backends reach TrustedHttpClients, which throws HypervisorException when it cannot build
-            // a pinning SSL context. Constructed outside, that escapes this method and the administrator
-            // gets a 500 page instead of a message on the form -- which is what the pre-backend code
-            // avoided by having `new XapiClient(...)` inside the resource clause.
-            try (HypervisorClient session = openClient(url, credentialsId, pin, selected, "this cloud")) {
+            // it reaches TrustedHttpClients, which throws HypervisorException when it cannot build a pinning
+            // SSL context. Constructed outside, that escapes this method and the administrator gets a 500
+            // page instead of a message on the form.
+            try (HypervisorClient session = openClient(url, credentialsId, pin, XcpngBackend.XO, "this cloud")) {
                 session.ping();
                 return connectedResult(pin);
             } catch (IllegalStateException missingCredential) {
-                // No credential of the kind this backend needs resolves under the selected ID. Its message
-                // already names which kind, which is the actionable half when the pairing is what is wrong.
+                // No secret-text credential resolves under the selected ID. Its message already names the
+                // kind, which is the actionable half when a leftover username/password is what is selected.
                 return FormValidation.error(missingCredential.getMessage());
             } catch (RuntimeException e) {
                 // The button is admin-only and the message carries no secret, so it is returned to the

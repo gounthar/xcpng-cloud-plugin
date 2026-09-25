@@ -15,7 +15,7 @@ import java.util.logging.Logger;
  * Scrubs the per-clone JNLP secret from a VM's guest-data record as soon as its agent connects.
  *
  * <p>The secret has to be seeded into the VM record for the guest to read it at boot (see
- * {@link io.jenkins.plugins.xcpng.client.XapiClient#clearGuestSecret}), where it is readable by any pool
+ * {@link io.jenkins.plugins.xcpng.client.HypervisorClient#clearGuestSecret}), where it is readable by any pool
  * session with read access to VM objects. Nothing consumes it after the guest has read it once and
  * connected, so removing it here shrinks its exposure from the whole build down to the
  * boot-until-connect window. A pool-side reader can still impersonate the agent during that window; that

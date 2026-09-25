@@ -1,7 +1,8 @@
 # XCP-ng Cloud
 
 A Jenkins [Cloud](https://www.jenkins.io/doc/book/using/using-agents/) plugin that provisions
-ephemeral build agents on an [XCP-ng](https://xcp-ng.org/) pool. When the build queue needs
+ephemeral build agents on an [XCP-ng](https://xcp-ng.org/) pool, through the
+[Xen Orchestra](https://xen-orchestra.com/) appliance in front of it. When the build queue needs
 capacity, the plugin fast-clones a golden-image VM, the agent connects back to the controller,
 one build runs on a pristine machine, and the VM and its disks are destroyed when it goes idle.
 
@@ -35,7 +36,7 @@ for the deliberate scope cuts.
 3. The clone starts. The plugin writes the agent name and the JNLP connection secret into the VM
    record's `xenstore-data`, where the guest reads them at first boot. This keeps the secret off any
    command line and out of the golden image, but `xenstore-data` is part of the VM record: until the
-   agent connects, the secret is readable by anyone with XAPI read access to the pool. The plugin
+   agent connects, the secret is readable by anyone with read access to the VM record. The plugin
    removes it as soon as the agent comes online. See [Security notes](#security-notes) for the
    scoping of that window.
 4. A systemd unit baked into the golden image reads the secret from xenstore and launches the
@@ -84,65 +85,56 @@ restart, old spare destroyed 10 min 45 s after it reconnected.
 
 ## Requirements
 
-- An XCP-ng pool reachable over XAPI (developed against XCP-ng 8.3, XAPI 26.1).
+- An XCP-ng pool with a **Xen Orchestra** appliance in front of it (developed against XCP-ng 8.3 and
+  xo-server 5.208.3). The plugin speaks only the Xen Orchestra REST API, never XAPI directly, so a pool
+  without an appliance is not supported. The appliance must route `PATCH /rest/v0/vms/{id}`, which the
+  plugin uses to seed each clone: it is absent on xo-server 5.192.1, which is what a freshly deployed
+  appliance ran when this was measured, and present on 5.208.3. **Test connection** checks for it.
 - A golden-image VM on that pool, prepared as described below.
 - A Jenkins controller on the 2.555.x line or newer. The controller and the agent must run the same
   Java major version; the baseline here is Java 21 (Temurin on the agent side).
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
   the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
   unreachable, a clone never connects and is destroyed after the connect timeout.
-- XAPI credentials stored in Jenkins as a username/password credential.
-
-The plugin can also talk to the pool through a **Xen Orchestra** appliance instead of XAPI. That
-backend is selectable per cloud, needs **XO 6.5.0 or newer**, and authenticates with a secret-text
-credential holding an XO authentication token rather than a username and password. It is new: it has
-not yet been through the lab scenarios the XAPI backend was released on, and XAPI remains the default.
-See [Backends](#backends).
+- A Xen Orchestra authentication token stored in Jenkins as a **secret-text** credential.
 
 ## Configuration
 
 ### Through the UI
 
 1. **Manage Jenkins** then **Clouds**, and add a new **XCP-ng Cloud**.
-2. Leave **Backend** on `XAPI (direct to the pool)` unless you are deliberately exercising the Xen
-   Orchestra one; see [Backends](#backends).
-3. Set the **Pool URL** (for example `https://192.168.1.87`) and select the XAPI **Credentials**.
-4. Leave **Certificate fingerprint** empty and press **Test connection**. If the pool's certificate is
-   signed by a CA the controller already trusts, it connects and there is nothing more to do. XCP-ng
-   ships a self-signed certificate, so the usual answer is that the result shows you the SHA-256
-   fingerprint the pool presented. Check it against the pool itself, then paste it into the field. See
-   [Security notes](#security-notes).
-5. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
+2. Set the **Xen Orchestra URL** to the appliance (for example `https://xo.example.com`) and select
+   the secret-text **Credentials** holding its token.
+3. Leave **Certificate fingerprint** empty and press **Test connection**. If the appliance's certificate
+   is signed by a CA the controller already trusts, it connects and there is nothing more to do. An
+   appliance still on the certificate it generated for itself is not, so the usual answer is that the
+   result shows you the SHA-256 fingerprint it presented. Check it against the appliance, then paste it
+   into the field. See [Security notes](#security-notes).
+4. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
    the shape of the agents cloned from it. At least one label is required, and labels are how builds
    reach these agents: give the jobs you want on XCP-ng a matching label expression.
-6. Use **Test connection** to confirm the controller can authenticate against the pool.
+5. Use **Test connection** to confirm the controller can authenticate against the appliance.
 
-### Backends
+### Upgrading from a release that spoke XAPI
 
-A cloud speaks one of two APIs, chosen by its **Backend** field:
+Earlier releases could talk to a pool master directly over XAPI, and that was the default. **This
+release removed the XAPI backend.** A cloud configured for it, including one saved before the backend
+field existed, still loads with its settings intact, but it provisions nothing, keeps no warm pool,
+and says why on its configuration page and in a banner under **Manage Jenkins**. To move it:
 
-| Backend | Symbol | Talks to | Credential |
-| --- | --- | --- | --- |
-| XAPI (direct to the pool) | `XAPI` | A pool master, over JSON-RPC. No appliance needed. | Username/password |
-| Xen Orchestra REST API | `XO` | An XO appliance's `/rest/v0`, which reaches the pool for you. | Secret text (an XO authentication token) |
+1. Open the cloud. Set **Xen Orchestra URL** to the appliance in front of the same pool.
+2. Select a secret-text credential holding a Xen Orchestra token. The username/password credential it
+   used before cannot authenticate against the appliance.
+3. Press **Test connection** and pin the appliance's certificate if it asks.
+4. Save. Saving is what moves the cloud to Xen Orchestra; nothing is migrated behind your back.
 
-`XAPI` is the default and is what every existing configuration keeps, including one that names no
-backend at all.
+**Drain XAPI-provisioned agents before upgrading if you can.** An agent provisioned over XAPI keeps
+the connection it was provisioned with, and this release cannot open it, so its VM is not destroyed
+when the agent goes. The banner names any such agent. Remove it, then reclaim its VM with
+`tools/reaper.py`, which finds it by the `xcpng-cloud` owner marker without needing Jenkins.
 
-Three things to know before switching a cloud to `XO`:
-
-- **Pool URL means the appliance**, not the pool master.
-- **The credential kind changes with the backend.** A username/password credential cannot authenticate
-  against XO, and a token cannot authenticate against XAPI. The credential dropdown deliberately offers
-  both kinds whichever backend is selected, so that changing the backend can never leave you looking at
-  a list with none of the right kind in it. Picking the wrong one is caught by **Test connection**,
-  which names the kind the backend needs, and by the first provision.
-- **XO 6.5.0 or newer is required.** That release added `PATCH /vms/{id}`, the route the plugin uses to
-  seed a clone. Against an older appliance the seed fails as a 404.
-
-The XO backend is staging for a migration rather than a permanent second option: the intent is for it
-to become the only backend and for the XAPI client to be removed. Until it has been through the lab
-scenarios the XAPI backend was released on, prefer XAPI.
+Under configuration as code, delete `backend: XAPI` if the document has it, and point `poolUrl` and
+`credentialsId` at the appliance and its token.
 
 ### Through Configuration as Code
 
@@ -154,8 +146,8 @@ jenkins:
   clouds:
     - xcpng:
         name: "xcpng-lab"
-        poolUrl: "https://192.168.1.87"
-        credentialsId: "xcpng-root"
+        poolUrl: "https://xo.example.com"
+        credentialsId: "xo-token"
         certificateFingerprint: ""
         maxInstances: 3
         idleMinutes: 10
@@ -183,18 +175,16 @@ stick:
   through the UI would be overwritten on the next reload.
 
 Leave `certificateFingerprint` empty when the certificate chains to a CA the controller trusts.
-Otherwise set it to the SHA-256 fingerprint of whichever host `poolUrl` names. On a stock XCP-ng pool
-you can read it on the host with
-`openssl x509 -in /etc/xensource/xapi-ssl.pem -noout -fingerprint -sha256`; under the `XO` backend it
-is the appliance's certificate, and **Test connection** reports whatever the host actually presented
-either way. Colons are optional and case does not matter. See [Security notes](#security-notes).
+Otherwise set it to the SHA-256 fingerprint of the appliance's certificate; **Test connection**
+reports whatever the appliance actually presented. Colons are optional and case does not matter. See
+[Security notes](#security-notes).
 
-A document that names no `backend` gets `XAPI`, so an existing configuration needs no edit. To select
-the other one, add `backend: XO` beside `poolUrl` and point `credentialsId` at a secret-text
-credential; see [Backends](#backends).
+The `backend` key is optional and defaults to `XO`, the only value that works. It exists so a document
+exported from an older release still loads; see
+[Upgrading from a release that spoke XAPI](#upgrading-from-a-release-that-spoke-xapi).
 
-The exported configuration never contains the XAPI password or the XO token; it holds only the
-credential ID, which the controller resolves at the point of use.
+The exported configuration never contains the token; it holds only the credential ID, which the
+controller resolves at the point of use.
 
 ### Configuration reference
 
@@ -203,10 +193,10 @@ Cloud fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Name | `name` | Display name for this cloud. |
-| Backend | `backend` | Which API this cloud speaks: `XAPI` (the default, direct to a pool master) or `XO` (a Xen Orchestra appliance's REST API, requiring XO 6.5.0 or newer). Optional; an absent value is `XAPI`. See [Backends](#backends). |
-| Pool URL | `poolUrl` | Base URL of the XCP-ng pool master, for example `https://192.168.1.87`. With the `XO` backend this is the appliance's URL instead. Do not embed credentials in the URL. |
-| Credentials | `credentialsId` | ID of the credential used to authenticate: a username/password credential for `XAPI`, a secret-text credential holding an XO authentication token for `XO`. |
-| Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the host at **Pool URL** is expected to present, with or without colons: the XCP-ng pool under the `XAPI` backend, the Xen Orchestra appliance under `XO`. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; a stock XCP-ng pool is self-signed and needs its fingerprint here. Once set, only that exact certificate is accepted. |
+| Xen Orchestra URL | `poolUrl` | Base URL of the Xen Orchestra appliance, for example `https://xo.example.com`. The symbol keeps its old name so existing configurations bind. Do not embed credentials in the URL. |
+| Credentials | `credentialsId` | ID of a secret-text credential holding a Xen Orchestra authentication token. |
+| Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the appliance is expected to present, with or without colons. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; an appliance on its self-generated certificate needs its fingerprint here. Once set, only that exact certificate is accepted. |
+| Backend | `backend` | Optional, and `XO` is the only value that works; it defaults to that. `XAPI` still loads, so a document from an older release does not fail, but a cloud carrying it provisions nothing. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
 | Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
 | Templates | `templates` | One or more agent templates (see below). |
@@ -246,28 +236,28 @@ table, the Packer workflow and its honest status, and the produced template name
 ## Security notes
 
 - **Credentials are never stored in the plugin configuration.** Only the credential ID is persisted;
-  the XAPI password is resolved from the Jenkins credentials store when a connection is opened.
+  the token is resolved from the Jenkins credentials store when a connection is opened.
 - **The JNLP secret is delivered through the VM record's `xenstore-data`.** It is not hidden from the
-  pool: until the agent connects, anyone with XAPI read access (an RBAC read-only role, Xen Orchestra,
-  a metadata export or a backup) can read it through `xe vm-param-get param-name=xenstore-data` or the
+  pool: until the agent connects, anyone with read access to the VM record (an XAPI read-only role, a
+  Xen Orchestra user who can see the VM, a metadata export or a backup) can read it through `xe vm-param-get param-name=xenstore-data` or the
   XO advanced tab. The plugin scrubs the secret from the VM record the moment the agent comes online,
   so the exposure is the boot-until-connect window (seconds on the lab pool), not the life of the
   build. The secret is an HMAC bound to a single node name on a short-lived, single-use VM, so reading
   it in that window lets an attacker impersonate that one agent, not the controller. The optional SSH
   key is seeded the same way and is not scrubbed; because it is a public key, its presence in the VM
   record is not a secret disclosure.
-- **A pool certificate is either trusted by the JVM or pinned by fingerprint.** There is no setting
-  that accepts an unrecognised certificate, because the first thing sent over that connection is the
-  XAPI credential. A pinned connection succeeds only against the exact certificate whose fingerprint
+- **The appliance's certificate is either trusted by the JVM or pinned by fingerprint.** There is no
+  setting that accepts an unrecognised certificate, because every request over that connection carries
+  the token. A pinned connection succeeds only against the exact certificate whose fingerprint
   was confirmed, and it does not also require that certificate to name the host being dialled: the
   certificate a Xen Orchestra appliance generates for itself names no host at all, and pinning is how
   such a certificate is trusted. Without a pin, the JVM trust store and the ordinary hostname check
-  both apply. If the pool's certificate is later replaced, connections fail until an administrator
+  both apply. If the appliance's certificate is later replaced, connections fail until an administrator
   confirms the new fingerprint — that failure is the feature, since a replaced certificate is either
   routine maintenance or an interception and only a human can tell which.
 - **Reading a fingerprint does not trust it.** `Test connection` inspects the certificate an unknown
-  pool presents and then refuses the connection, so the credential is never offered to a host nobody
-  has confirmed. Check the fingerprint it reports against the pool before pasting it in.
+  appliance presents and then refuses the connection, so the token is never offered to a host nobody
+  has confirmed. Check the fingerprint it reports against the appliance before pasting it in.
 - **Only public SSH keys belong in `sshAuthorizedKey`.** The field seeds a public key into each
   clone; the form rejects anything that looks like a private key. The private half must never reach
   an agent.
@@ -308,25 +298,25 @@ with nothing ever connecting. The default of 10 is fine; a value like 1 is not.
 
 ## Known limitations
 
-- **Teardown trusts XAPI's `power_state`, which can occasionally lie.** The plugin destroys a VM by
-  reading its power state, shutting the domain down only if it is not already `Halted`, then
-  destroying the VM and its disks. A VM has been observed on the lab pool reading `Halted` (with
-  `domid -1`) from XAPI while the domain was still running on dom0. Trusting that record skips the
-  shutdown and destroys a live domain's disk, leaving an orphan that holds memory. The plugin speaks
-  only XAPI (JSON-RPC) and, by the inbound/JNLP design, holds no SSH credential, so it has no
-  independent second opinion; asking XAPI to re-check the same record inherits the same lie. This is
-  a rare, accepted risk for this version rather than a fixable bug in the plugin. The root cause,
+- **Teardown trusts XAPI's `power_state`, which can occasionally lie.** The plugin destroys a VM with
+  Xen Orchestra's `DELETE /rest/v0/vms/{id}`, which shuts the domain down only if XAPI does not already
+  report it `Halted` (`@xen-orchestra/xapi/vm.mjs`, read at `master` on 2026-09-04), then destroys the
+  VM and its disks. A VM has been observed on the lab pool reading `Halted` (with `domid -1`) from XAPI
+  while the domain was still running on dom0. Trusting that record skips the shutdown and destroys a
+  live domain's disk, leaving an orphan that holds memory. The check runs inside Xen Orchestra, and the
+  plugin, by the inbound/JNLP design, holds no SSH credential, so it has no independent second opinion.
+  This is a rare, accepted risk for this version rather than a fixable bug in the plugin. The root cause,
   frequency, and a reliable reproduction are unknown (observed once). The operator-side safety net is
   `tools/reaper.py --dom0-check`, which reads `xl list` directly from dom0 and refuses to reap any VM
   that XAPI reports `Halted` while Xen still has a live domain for it; run it before and after a batch
   of provisioning on a shared pool.
 
 - **Deleting a cloud whose credential is also gone leaves its VMs to the reaper.** An agent snapshots
-  its cloud's pool URL, credential ID and TLS-trust setting when it is provisioned, so deleting or
+  its cloud's appliance URL, credential ID and TLS-trust setting when it is provisioned, so deleting or
   renaming a cloud while its agents run no longer strands their VMs: teardown resolves the credential
   from the store and destroys the VM anyway. Two cases still cannot be recovered automatically, and
   both are logged at SEVERE with the VM reference. If the referenced credential has itself been
-  deleted, or the pool is unreachable at that moment, there is no cloud left to hold the reference for
+  deleted, or the appliance is unreachable at that moment, there is no cloud left to hold the reference for
   a later retry — the durable leaked-VM sweep lives on the cloud that was removed. The same applies to
   an agent provisioned by a version of the plugin older than the snapshot, which reloads with no
   connection details at all. In both cases `tools/reaper.py` is the recovery path: it selects on the
@@ -346,8 +336,8 @@ mvn -B -ntp verify
 ```
 
 `verify` compiles the plugin, runs the test suite, runs SpotBugs, and packages the `.hpi`. The
-tests use an in-memory fake of the hypervisor client and recorded XAPI fixtures, so they need no
-live pool. To run a local Jenkins with the plugin loaded:
+tests use an in-memory fake of the hypervisor client and recorded Xen Orchestra responses, so they
+need no live appliance. To run a local Jenkins with the plugin loaded:
 
 ```sh
 mvn hpi:run

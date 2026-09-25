@@ -53,9 +53,12 @@ import org.junit.jupiter.api.Test;
  * why the fingerprint comparison is the thing to mutate before believing any of this: breaking it must
  * take {@link #aDifferentCertificateIsRejected} down and leave the rest standing.
  */
-class HttpTransportPinningTest {
+class HttpRestTransportPinningTest {
 
-    private static final String BODY = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    private static final String BODY = "[{\"id\":\"pool\"}]";
+
+    /** The route the served body stands in for. Any path works; this one is what Test connection reads. */
+    private static final String PATH = "/rest/v0/pools";
 
     /** OpenSSL's placeholder subject, which is all a Xen Orchestra appliance's own certificate carries. */
     private static final String XO_DEFAULT_DN = "C=AU,ST=Some-State,O=Internet Widgits Pty Ltd";
@@ -73,7 +76,7 @@ class HttpTransportPinningTest {
 
         server = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.setHttpsConfigurator(new HttpsConfigurator(serverContext(keyPair, served)));
-        server.createContext("/jsonrpc", exchange -> {
+        server.createContext(PATH, exchange -> {
             byte[] bytes = BODY.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, bytes.length);
             try (OutputStream out = exchange.getResponseBody()) {
@@ -97,8 +100,8 @@ class HttpTransportPinningTest {
      */
     @Test
     void aSelfSignedCertificateIsRejectedWithoutAPin() {
-        HttpTransport transport = new HttpTransport(poolUrl, null);
-        IOException failure = assertThrows(IOException.class, () -> transport.post(BODY));
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", null);
+        IOException failure = assertThrows(IOException.class, () -> get(transport));
         assertTrue(
                 isTlsFailure(failure),
                 "an untrusted certificate must fail as a TLS error, not as something else: " + failure);
@@ -111,8 +114,8 @@ class HttpTransportPinningTest {
      */
     @Test
     void thePinnedCertificateIsAccepted() throws Exception {
-        HttpTransport transport = new HttpTransport(poolUrl, servedFingerprint);
-        assertEquals(BODY, transport.post(BODY), "a pinned certificate must complete the handshake");
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", servedFingerprint);
+        assertEquals(BODY, get(transport), "a pinned certificate must complete the handshake");
     }
 
     /** The same fingerprint typed the way an operator pastes it: no colons, lower case. */
@@ -120,8 +123,8 @@ class HttpTransportPinningTest {
     void thePinIsAcceptedInTheFormOperatorsPasteIt() throws Exception {
         String asPasted = servedFingerprint.replace(":", "").toLowerCase(java.util.Locale.ROOT);
         assertNotEquals(servedFingerprint, asPasted, "the fixture must really differ, or it proves nothing");
-        HttpTransport transport = new HttpTransport(poolUrl, asPasted);
-        assertEquals(BODY, transport.post(BODY));
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", asPasted);
+        assertEquals(BODY, get(transport));
     }
 
     /**
@@ -135,8 +138,8 @@ class HttpTransportPinningTest {
         String otherFingerprint = CertificateFingerprint.of(other);
         assertNotEquals(servedFingerprint, otherFingerprint, "two generated certificates must differ");
 
-        HttpTransport transport = new HttpTransport(poolUrl, otherFingerprint);
-        IOException failure = assertThrows(IOException.class, () -> transport.post(BODY));
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", otherFingerprint);
+        IOException failure = assertThrows(IOException.class, () -> get(transport));
         assertTrue(isTlsFailure(failure), "a mismatched pin must fail the handshake: " + failure);
     }
 
@@ -153,8 +156,8 @@ class HttpTransportPinningTest {
         X509Certificate xoDefault = selfSigned(keyPair, XO_DEFAULT_DN, null);
 
         withServer(keyPair, xoDefault, url -> {
-            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(xoDefault));
-            assertEquals(BODY, transport.post(BODY), "the pin alone must identify the server");
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(xoDefault));
+            assertEquals(BODY, get(transport), "the pin alone must identify the server");
         });
     }
 
@@ -171,8 +174,8 @@ class HttpTransportPinningTest {
         assertNotEquals(CertificateFingerprint.of(served), CertificateFingerprint.of(pinned));
 
         withServer(keyPair, served, url -> {
-            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(pinned));
-            IOException failure = assertThrows(IOException.class, () -> transport.post(BODY));
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(pinned));
+            IOException failure = assertThrows(IOException.class, () -> get(transport));
             assertTrue(isTlsFailure(failure), "a mismatched pin must fail the handshake: " + failure);
         });
     }
@@ -258,8 +261,8 @@ class HttpTransportPinningTest {
                 false);
 
         withServer(leafKeys.getPrivate(), new Certificate[] {leaf, ca}, url -> {
-            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(leaf));
-            assertEquals(BODY, transport.post(BODY), "a CA-issued pinned leaf served with its chain must connect");
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(leaf));
+            assertEquals(BODY, get(transport), "a CA-issued pinned leaf served with its chain must connect");
         });
 
         // The cost, on the same leaf: served alone, its signature cannot be checked, and the refusal says why.
@@ -312,8 +315,8 @@ class HttpTransportPinningTest {
                 CertificateAuthority.root("CN=Unrelated", generateKeyPair(), "SHA256withRSA").certificate;
 
         withServer(keyPair.getPrivate(), new Certificate[] {leaf, unrelated}, url -> {
-            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(leaf));
-            assertEquals(BODY, transport.post(BODY), "an unrelated extra certificate must not refuse the pin");
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(leaf));
+            assertEquals(BODY, get(transport), "an unrelated extra certificate must not refuse the pin");
         });
     }
 
@@ -326,8 +329,8 @@ class HttpTransportPinningTest {
         X509Certificate leaf = intermediate.issueLeaf(leafKeys.getPublic());
 
         withServer(leafKeys.getPrivate(), new Certificate[] {leaf, root.certificate, intermediate.certificate}, url -> {
-            HttpTransport transport = new HttpTransport(url, CertificateFingerprint.of(leaf));
-            assertEquals(BODY, transport.post(BODY), "a chain served out of order must still be checked and accepted");
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(leaf));
+            assertEquals(BODY, get(transport), "a chain served out of order must still be checked and accepted");
         });
     }
 
@@ -392,8 +395,8 @@ class HttpTransportPinningTest {
     private static void assertRefusedByPolicy(PrivateKey key, Certificate[] chain, String expected) throws Exception {
         String pin = CertificateFingerprint.of((X509Certificate) chain[0]);
         withServer(key, chain, url -> {
-            HttpTransport transport = new HttpTransport(url, pin);
-            IOException failure = assertThrows(IOException.class, () -> transport.post(BODY));
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", pin);
+            IOException failure = assertThrows(IOException.class, () -> get(transport));
             assertTrue(isTlsFailure(failure), "the refusal must be a TLS failure: " + failure);
             String messages = messages(failure);
             assertTrue(
@@ -429,7 +432,7 @@ class HttpTransportPinningTest {
     private static void withServer(PrivateKey key, Certificate[] chain, ServerBody body) throws Exception {
         HttpsServer other = HttpsServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         other.setHttpsConfigurator(new HttpsConfigurator(serverContext(key, chain)));
-        other.createContext("/jsonrpc", exchange -> {
+        other.createContext(PATH, exchange -> {
             byte[] bytes = BODY.getBytes(StandardCharsets.UTF_8);
             exchange.sendResponseHeaders(200, bytes.length);
             try (OutputStream out = exchange.getResponseBody()) {
@@ -442,6 +445,11 @@ class HttpTransportPinningTest {
         } finally {
             other.stop(0);
         }
+    }
+
+    /** One request through the transport under test, returning the body the server served. */
+    private static String get(HttpRestTransport transport) throws IOException {
+        return transport.send("GET", PATH, null, Duration.ofSeconds(10)).body();
     }
 
     @FunctionalInterface

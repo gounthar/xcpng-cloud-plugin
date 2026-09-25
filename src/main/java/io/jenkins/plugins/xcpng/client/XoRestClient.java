@@ -20,11 +20,10 @@ import java.util.Optional;
 import java.util.logging.Logger;
 
 /**
- * {@link HypervisorClient} over Xen Orchestra's REST API, the second backend beside {@link XapiClient}
- * (#89 step 1). XAPI remains the default; this exists so the XO path can be exercised against a real pool
- * while the plugin still works, and step 3 flips the default and removes the XAPI client.
+ * {@link HypervisorClient} over Xen Orchestra's REST API, the plugin's only backend since #89 removed the
+ * XAPI client it was first written beside.
  *
- * <p>What changes relative to the XAPI backend, all of it measured on the lab appliance or read from
+ * <p>What changed relative to the XAPI backend, all of it measured on the lab appliance or read from
  * {@code vatesfr/xen-orchestra} rather than assumed:
  *
  * <ul>
@@ -39,8 +38,8 @@ import java.util.logging.Logger;
  *       the PATCH body type, so {@link OwnerMarker#OWNER_KEY} has no {@code other_config} key to sit in here. The equivalent is
  *       {@code PUT /vms/{id}/tags/{tag}}, which bottoms out on XAPI {@code add_tags}. Tags are visible in
  *       the XO UI where {@code other_config} effectively is not, so an operator will see
- *       {@code xcpng-cloud:<cloud>} on every clone. <b>While both backends exist, a sweep has to read
- *       both markers</b>, or a clone leaked by one is invisible to it: {@code tools/reaper.py} read
+ *       {@code xcpng-cloud:<cloud>} on every clone. <b>A sweep still has to read both markers</b>, because
+ *       VMs the XAPI backend leaked carry only the {@code other_config} one: {@code tools/reaper.py} read
  *       only {@code other_config} until #231, and {@code tools/owner.py} now reads either.
  *   <li><b>Teardown captures no disks.</b> {@code DELETE /vms/{id}} deletes them unconditionally and
  *       offers no way to ask it not to, so the capture-before-destroy ordering this interface documents
@@ -55,7 +54,7 @@ import java.util.logging.Logger;
  *       first non-empty value gets the link-local.
  * </ul>
  *
- * <p>Not thread-safe by the same rule as {@link XapiClient}: one client per operation.
+ * <p>Not thread-safe: one client per operation.
  */
 public final class XoRestClient implements HypervisorClient {
 
@@ -70,8 +69,8 @@ public final class XoRestClient implements HypervisorClient {
     /**
      * Reads answer in well under a second; the lifecycle verbs are minutes. Two constants rather than one
      * because a single timeout that suits both is either too short to clone or too long to notice an
-     * appliance that has gone away. The long one matches {@link XapiClient}'s task deadline, so a slow
-     * clone fails at the same point on both backends.
+     * appliance that has gone away. The long one kept the removed XAPI client's task deadline, so a slow
+     * clone fails where it always has.
      */
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(30);
 
@@ -183,8 +182,8 @@ public final class XoRestClient implements HypervisorClient {
      *
      * <p>Every lifecycle call here asks for {@code ?sync=true}, but that is a request and not a guarantee:
      * an appliance that does not know the parameter ignores it, the way any HTTP API ignores an unknown
-     * query parameter, and the 6.5.0 floor this backend needs lives in {@code XcpngBackend}'s javadoc
-     * rather than in a runtime check. {@code RestResponse.isSuccess} is {@code status / 100 == 2}, so a
+     * query parameter, and the only runtime check of the appliance's age is {@link #probePatchRoute()},
+     * which asks about a different route. {@code RestResponse.isSuccess} is {@code status / 100 == 2}, so a
      * 202 was passing as a synchronous answer.
      *
      * <p>What that costs is worth spelling out, because it is silent. {@code cloneFromTemplate} reads
@@ -461,8 +460,8 @@ public final class XoRestClient implements HypervisorClient {
      * <p>Two different situations reach this line and the message used to give one answer to both.
      * Several templates in <em>one</em> pool really are duplicates, and renaming one of them is the fix.
      * The same name in <em>two</em> pools is not a mistake at all: it is the ordinary outcome of building
-     * a golden image twice from the same Packer recipe, and that estate provisions on {@link XapiClient},
-     * which is connected to a single pool master and so never sees the second copy. Only this backend
+     * a golden image twice from the same Packer recipe, and that estate provisioned fine on the removed XAPI
+     * client, which was connected to a single pool master and so never saw the second copy. This backend
      * refuses it, because one XO appliance fronts every pool its token can see. Telling that operator to
      * rename a correctly named image sends them to fix the wrong thing.
      *
@@ -840,10 +839,10 @@ public final class XoRestClient implements HypervisorClient {
     }
 
     /**
-     * Refuse a handle this backend never minted, the XO counterpart of {@link XapiClient}'s own check (#223).
+     * Refuse a handle this backend never minted (#223). The removed XAPI client had the mirror of this check.
      *
-     * <p>The XAPI side refuses a foreign handle because XAPI answers one with {@code HANDLE_INVALID}, which
-     * its already-gone rule reads as "destroyed". This direction is worse, and the measurement is the reason
+     * <p>The XAPI side refused a foreign handle because XAPI answers one with {@code HANDLE_INVALID}, which
+     * its already-gone rule read as "destroyed". This direction is worse, and the measurement is the reason
      * the guard is here rather than left to the appliance: <b>XO resolves a XAPI {@code OpaqueRef} wherever
      * it takes a VM id</b>. Measured on the lab pool 2026-09-20, {@code GET /rest/v0/vms/<OpaqueRef>}
      * returned the VM and {@code DELETE} answered 204. So a ref misrouted into an XO client does not

@@ -5,8 +5,9 @@ import java.util.Optional;
 
 /**
  * The lifecycle verbs the plugin needs from a hypervisor, named in plugin terms rather than XAPI
- * terms. {@code XapiClient} implements this today; a Xen Orchestra REST backend can sit beside it
- * later without the provisioning code changing.
+ * terms. {@link XoRestClient} implements it over the Xen Orchestra REST API. It used to have a XAPI
+ * implementation beside it, removed in #89, and the seam is why that removal did not touch the
+ * provisioning code.
  *
  * <p>The interface deliberately absorbs where backends diverge, rather than leaking it:
  * <ul>

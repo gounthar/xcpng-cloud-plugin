@@ -36,9 +36,10 @@ import javax.net.ssl.X509TrustManager;
  * "trust every certificate in the world" were the same switch, and only the second of those is what the
  * code did.
  *
- * <p>Extracted from {@code HttpTransport} when a second transport ({@link HttpRestTransport}, speaking to
- * Xen Orchestra) needed the same decision. Two transports each building their own trust would be two places
- * to get it wrong, and only one of them would be covered by {@code HttpTransportPinningTest}.
+ * <p>Extracted from the XAPI backend's JSON-RPC transport when {@link HttpRestTransport} needed the same
+ * decision, and kept separate now that the REST transport is the only one: the trust decision is covered by
+ * {@code HttpRestTransportPinningTest} on its own terms, apart from anything the transport does with a
+ * response.
  */
 final class TrustedHttpClients {
 

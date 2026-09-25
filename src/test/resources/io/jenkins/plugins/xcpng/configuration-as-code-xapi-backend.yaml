@@ -1,0 +1,19 @@
+# A document exported from a release that still had the XAPI backend. The backend is an ordinary
+# @DataBoundSetter, so nothing plugin-specific binds it; this fixture is here because XO is now the default
+# and JCasC omits a default on export, so only the non-default value, XAPI, can show that the field crosses
+# the YAML boundary in both directions.
+#
+# The value is quoted here deliberately: a quoted scalar has to bind to the enum as well, and export emits
+# it bare either way.
+jenkins:
+  clouds:
+    - xcpng:
+        name: "old-pool"
+        backend: "XAPI"
+        poolUrl: "https://192.168.1.87"
+        credentialsId: "xcpng-root"
+        certificateFingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"  # yamllint disable-line rule:line-length
+        maxInstances: 3
+        templates:
+          - templateName: "jenkins-agent-debian13"
+            labelString: "xcpng-linux"
