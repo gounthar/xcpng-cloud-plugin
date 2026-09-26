@@ -4,8 +4,10 @@ package io.jenkins.plugins.xcpng.client;
  * The strings this plugin stamps on every clone it provisions, so an out-of-band sweep can find the VMs it
  * leaks. Backend-neutral on purpose: each backend writes them in its own shape ({@code other_config} keys on
  * XAPI, tags on Xen Orchestra, see {@link XoRestClient#OWNER_TAG_PREFIX}), and both shapes are built from the
- * two constants here so they stay recognisable as the same thing. They used to live on {@link XapiClient},
- * which meant the Xen Orchestra backend depended on the class it is replacing (#89).
+ * two constants here so they stay recognisable as the same thing. They used to live on {@code XapiClient},
+ * which meant the Xen Orchestra backend depended on the class it replaced (#89). Only the tag shape is
+ * written now; the {@code other_config} shape still exists on VMs the XAPI backend provisioned, and
+ * {@code tools/owner.py} reads both.
  *
  * <p>{@code tools/owner.py} carries its own copy of these strings, and
  * {@code tools/tests/test_owner.py} reads them out of this file to check the two agree. Change one here and

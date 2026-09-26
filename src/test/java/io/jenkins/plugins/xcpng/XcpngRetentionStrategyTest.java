@@ -830,6 +830,9 @@ class XcpngRetentionStrategyTest {
     void terminateDestroysTheVmFromTheSnapshotWhenTheCloudIsGone(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(r, fake);
+        // XAPI rather than the XO default, so the backend assertion below reads a value that had to be
+        // carried. Production would refuse to open it; the recording factory is what this test exercises.
+        cloud.setBackend(XcpngBackend.XAPI);
         XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
         r.jenkins.addNode(agent);
         RecordingConnectionFactory connections = new RecordingConnectionFactory(fake);
@@ -856,7 +859,7 @@ class XcpngRetentionStrategyTest {
 
     /**
      * The same fallback on an XO-backed cloud has to reach XO, and this is the assertion the backend
-     * snapshot exists for. XAPI is the default, so a snapshot that dropped the field, or a fallback that
+     * snapshot exists for. A missing field reads as XAPI, so a snapshot that dropped the field, or a fallback that
      * ignored it, would open an XAPI session -- against an appliance URL, with a token credential XAPI
      * cannot authenticate with. Teardown would fail and the clone and its disks would stay on the pool.
      *

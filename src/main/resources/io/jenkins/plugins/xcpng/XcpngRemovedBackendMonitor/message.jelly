@@ -1,0 +1,22 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+  <div class="jenkins-alert jenkins-alert-warning">
+    <p>${%intro}</p>
+    <j:if test="${!it.clouds.isEmpty()}">
+      <p>${%clouds}</p>
+      <ul>
+        <j:forEach var="cloud" items="${it.clouds}">
+          <li><a href="${rootURL}/${cloud.url}configure">${cloud.name}</a></li>
+        </j:forEach>
+      </ul>
+    </j:if>
+    <j:if test="${!it.agentNames.isEmpty()}">
+      <p>${%agents}</p>
+      <ul>
+        <j:forEach var="name" items="${it.agentNames}">
+          <li>${name}</li>
+        </j:forEach>
+      </ul>
+    </j:if>
+  </div>
+</j:jelly>

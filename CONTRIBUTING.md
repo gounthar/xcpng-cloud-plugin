@@ -120,9 +120,10 @@ plausible-sounding descriptions in prose is how that kind of thing survives revi
 These are decisions, not accidents, and a change that reverses one needs an argument:
 
 - **`HypervisorClient` is a small interface of lifecycle verbs**, named in plugin terms rather than
-  XAPI terms, so a Xen Orchestra REST backend can sit beside `XapiClient` later. Backend-specific
-  behaviour — task polling, session re-login, master redirects — stays inside the implementation
-  and never reaches the interface. No capability negotiation, no generic `execute()`.
+  in the terms of any one API. `XoRestClient`, over the Xen Orchestra REST API, is the only
+  implementation; the XAPI one it replaced was removed without the provisioning code changing, which
+  is what the seam is for. Backend-specific behaviour, such as waiting on a task or refusing a handle
+  another backend minted, stays inside the implementation and never reaches the interface. No capability negotiation, no generic `execute()`.
 - **The agent connects inbound over JNLP**, so the plugin needs no route from controller to agent
   and no SSH credential. `SSHLauncher` remains a documented later option, not a replacement.
 - **Configuration stores credential IDs, never secrets.** Credentials are resolved at point of use

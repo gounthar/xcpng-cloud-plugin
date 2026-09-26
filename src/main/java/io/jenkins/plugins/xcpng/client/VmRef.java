@@ -17,7 +17,7 @@ public record VmRef(@NonNull String value) {
      * makes it the one fact about a ref's shape worth knowing outside a backend: a ref handed to the wrong
      * backend reads as already destroyed on both (#223), so each refuses the other's shape up front.
      *
-     * <p>It lives here rather than on {@link XapiClient} because it outlives that class. Refs recorded
+     * <p>It lives here rather than on {@code XapiClient} because it outlived that class. Refs recorded
      * before the move to Xen Orchestra stay {@code OpaqueRef:} shaped in stored state, and the guard that
      * recognises them has to keep working after the backend that minted them is gone (#89).
      */

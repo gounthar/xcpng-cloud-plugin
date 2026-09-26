@@ -9,10 +9,9 @@ import java.time.Duration;
  * The one line that actually touches the network for the Xen Orchestra backend: send a request, return
  * the status and the body. Split out from {@link XoRestClient} so the route and error-envelope logic can
  * be tested against recorded responses without an appliance, and so the HTTP concerns live in one small
- * place. The sibling of {@link JsonRpcTransport}, which does the same job for XAPI.
+ * place.
  *
- * <p>Wider than its sibling by exactly what REST needs and JSON-RPC does not: a method, a path, and the
- * response <em>status</em>. The status is not decoration. XO answers a request for an object that is gone
+ * <p>It carries a method, a path, and the response <em>status</em>. The status is not decoration. XO answers a request for an object that is gone
  * with a 404 and a body that names nothing in particular, and a teardown reaching an already-destroyed VM
  * has to tell that from a genuine failure; matching on the message text instead would also match a 404
  * quoted inside some other failure.

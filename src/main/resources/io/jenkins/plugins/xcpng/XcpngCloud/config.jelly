@@ -3,10 +3,12 @@
   <f:entry title="${%Name}" field="name">
     <f:textbox default="xcpng"/>
   </f:entry>
-  <f:entry title="${%Backend}" field="backend">
-    <f:select default="XAPI"/>
-  </f:entry>
-  <f:entry title="${%Pool URL}" field="poolUrl">
+  <j:if test="${instance != null and instance.configuredForRemovedBackend}">
+    <f:entry>
+      <div class="jenkins-alert jenkins-alert-warning">${%removedBackend}</div>
+    </f:entry>
+  </j:if>
+  <f:entry title="${%Xen Orchestra URL}" field="poolUrl">
     <f:textbox/>
   </f:entry>
   <f:entry title="${%Credentials}" field="credentialsId">
@@ -25,5 +27,5 @@
     <f:repeatableHeteroProperty field="templates" hasHeader="true" addCaption="${%Add template}"/>
   </f:entry>
   <f:validateButton title="${%Test connection}" progress="${%Testing...}"
-                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint,backend"/>
+                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint"/>
 </j:jelly>

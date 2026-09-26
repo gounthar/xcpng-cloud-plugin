@@ -1,6 +1,13 @@
 <div>
-  Base URL of the XCP-ng pool master, for example <code>https://192.168.1.87</code>. The plugin speaks
-  XAPI (JSON-RPC) to this address. Use an <code>https</code> URL; a plain <code>http</code> URL is
-  rejected, because the XAPI session it carries includes the pool credential. Do not embed a username or
-  password in the URL.
+  Base URL of the Xen Orchestra appliance in front of the pool, for example <code>https://xo.example.com</code>.
+  The plugin speaks the Xen Orchestra REST API (<code>/rest/v0</code>) to this address, never XAPI to a pool
+  master, so this is the appliance and not the pool. Use an <code>https</code> URL. This form refuses a plain <code>http</code> URL, because every request
+  carries the authentication token. A URL set through configuration as code or a hand-edited
+  <code>config.xml</code> bypasses the form: an <code>http</code> one is only warned about in the system log,
+  and the token is then sent in cleartext. Do not embed a username or password in the URL.
+  <p>
+    The appliance has to route <code>PATCH /rest/v0/vms/{id}</code>, which the plugin needs to seed each
+    clone. It is absent on xo-server 5.192.1, what a freshly deployed appliance ran when this was measured,
+    and present on 5.208.3. <em>Test connection</em> checks for it and says so if it is missing.
+  </p>
 </div>

@@ -611,7 +611,7 @@ even if the agent is flapping.
 
 The SSH key is **per-clone and opt-in**. The operator supplies a **public** key on the agent
 template; the private half never touches the plugin or any guest. It is delivered on the same
-xenstore channel as the JNLP secret, so `XapiClient` needs no special handling. To revoke, clear the
+xenstore channel as the JNLP secret, so the client needs no special handling. To revoke, clear the
 template field: the next clones read no key and trust nothing (the managed `authorized_keys` is
 rewritten each boot). An inbound-only fleet sets no key and stays SSH-closed.
 
