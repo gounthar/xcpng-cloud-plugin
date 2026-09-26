@@ -11,12 +11,14 @@ import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.logging.Logger;
 
 /**
@@ -104,7 +106,24 @@ public final class XoRestClient implements HypervisorClient {
     /** Xenstore path the guest agent reads its seed from. Only {@code vm-data/*} keys reach the guest. */
     private static final String GUEST_DATA_PREFIX = "vm-data/jenkins/";
 
+    /**
+     * How many times {@code markOwner} reads the clone's tags looking for a clean set before it gives up, with
+     * {@link #STRIP_POLL} between reads: about ten seconds. XO's cache showed a deleted tag for about half a
+     * second on the lab appliance (one measurement, #255), so this is generous on purpose.
+     */
+    static final int STRIP_READS = 20;
+
+    static final Duration STRIP_POLL = Duration.ofMillis(500);
+
+    /** A wait between two reads. A seam so tests do not sleep; production is {@link Thread#sleep}. */
+    @FunctionalInterface
+    interface Pause {
+        void pause(Duration duration) throws InterruptedException;
+    }
+
     private final RestTransport transport;
+
+    private final Pause pause;
 
     /**
      * @param baseUrl base URL of the appliance, e.g. {@code https://192.168.1.5}
@@ -128,7 +147,13 @@ public final class XoRestClient implements HypervisorClient {
 
     /** For tests: inject a transport that replays recorded responses. */
     XoRestClient(@NonNull RestTransport transport) {
+        this(transport, d -> Thread.sleep(d.toMillis()));
+    }
+
+    /** For tests: as above, with the wait between tag reads replaced. */
+    XoRestClient(@NonNull RestTransport transport, @NonNull Pause pause) {
         this.transport = Objects.requireNonNull(transport, "transport");
+        this.pause = Objects.requireNonNull(pause, "pause");
     }
 
     // -- plumbing ---------------------------------------------------------
@@ -622,9 +647,35 @@ public final class XoRestClient implements HypervisorClient {
      * id that turned out to be anything else would stamp a value that matches nothing and quietly refuse
      * every clone this backend makes. One GET buys not having to be right about it.
      *
-     * <p>A clone whose source was itself marked arrives carrying an inherited uuid tag as well, because tags
-     * are a set and the PUT adds rather than replaces. That is why the tools ask whether <em>any</em> stamp
-     * matches rather than whether the only one does.
+     * <p><b>Inherited markers are stripped once this clone's own are on (#255).</b> Tags are a set: {@code
+     * VM.clone} copies the source's, and the PUT adds rather than replaces, so a clone of a marked source
+     * used to carry two owner tags and two uuid stamps. {@code tools/owner.py} refuses to attribute such a
+     * VM (#251), so a sweep narrowed to one cloud skips it. The strip comes <em>after</em> both stamps,
+     * never before: deleting first opens a window where the clone carries no marker, and a crash there
+     * leaves a VM no sweep selects on. Stamping first means that at every point it carries at least one.
+     * A failed DELETE fails the provision like a failed PUT does, and the clone is destroyed on the way out.
+     *
+     * <p><b>A strip is only done once a read shows it done.</b> One read cannot be trusted either way: a
+     * DELETE answers 204 while XO's cache still lists the tag for about half a second, and a first read that
+     * came back stale would list nothing to delete at all. So after the first pass the tags are read again,
+     * every {@link #STRIP_POLL}, until a read carries no foreign marker. Any marker a later read turns up is
+     * deleted then; one already deleted is not deleted again, since a stale read still showing it is the
+     * lag. After {@link #STRIP_READS} reads the provision fails and the clone is destroyed, rather than a
+     * VM the narrowed sweeps skip being handed to Jenkins.
+     *
+     * <p>What a clean read proves depends on whether anything was deleted. Where something was, it is
+     * sound: a stale read would still show the deleted tag, so a read without it is a read that has caught
+     * up. Where nothing was, a clean confirming read is a second sample taken later than the first, and
+     * nothing stronger; XO offers no read that proves its tag list complete. On a clean template that
+     * second read is the whole cost: one GET, no wait.
+     *
+     * <p>A template is normally clean, so where do inherited markers come from? A golden image made from a
+     * marked agent, or a hand-made copy of one used as the source (#246 measured the latter). Rare, not
+     * impossible, which is why this is code and not a comment saying it cannot happen.
+     *
+     * <p>The inherited set is read off the same GET as the uuid. Whatever this clone was just stamped with
+     * is kept by value, so the strip does not depend on whether XO has caught up with that PUT yet; only
+     * tags that differ from this clone's own two are deleted.
      *
      * <p><b>The read-back is immediate, measured rather than assumed.</b> The worry was that XO might answer
      * this GET before its object cache holds the clone, since the appliance is known to lag elsewhere:
@@ -643,13 +694,55 @@ public final class XoRestClient implements HypervisorClient {
         if (owner == null || owner.isBlank()) {
             return;
         }
-        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(OWNER_TAG_PREFIX + owner), null, READ_TIMEOUT);
-        String uuid = get(API + "/vms/" + vm).path("uuid").asText("");
+        String ownerTag = OWNER_TAG_PREFIX + owner;
+        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(ownerTag), null, READ_TIMEOUT);
+        JsonNode record = get(API + "/vms/" + vm);
+        String uuid = record.path("uuid").asText("");
         if (uuid.isBlank()) {
             throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
                     + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
         }
-        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(SELF_TAG_PREFIX + uuid), null, READ_TIMEOUT);
+        String selfTag = SELF_TAG_PREFIX + uuid;
+        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(selfTag), null, READ_TIMEOUT);
+        stripInheritedMarkers(vm, ownerTag, selfTag, record.path("tags"));
+    }
+
+    /** Delete every marker in {@code tags} that is not this clone's own, then read until none is left. */
+    private void stripInheritedMarkers(String vm, String ownerTag, String selfTag, JsonNode tags) {
+        Set<String> deleted = new HashSet<>();
+        for (int read = 1; ; read++) {
+            List<String> foreign = new ArrayList<>();
+            for (JsonNode node : tags) {
+                String tag = node.asText("");
+                boolean marker = tag.startsWith(OWNER_TAG_PREFIX) || tag.startsWith(SELF_TAG_PREFIX);
+                if (marker && !tag.equals(ownerTag) && !tag.equals(selfTag)) {
+                    foreign.add(tag);
+                }
+            }
+            // The first pass has only deleted; nothing has confirmed anything yet.
+            if (read > 1 && foreign.isEmpty()) {
+                return;
+            }
+            if (read >= STRIP_READS) {
+                throw new HypervisorException("clone " + vm + " still carries inherited owner markers " + foreign
+                        + " after " + read + " reads; refusing it rather than handing Jenkins a VM that a"
+                        + " sweep narrowed to one cloud would skip");
+            }
+            for (String tag : foreign) {
+                if (deleted.add(tag)) {
+                    call("DELETE", API + "/vms/" + vm + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+                }
+            }
+            if (read > 1) {
+                try {
+                    pause.pause(STRIP_POLL);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new HypervisorException("interrupted while confirming the owner markers on clone " + vm, e);
+                }
+            }
+            tags = get(API + "/vms/" + vm).path("tags");
+        }
     }
 
     @Override
