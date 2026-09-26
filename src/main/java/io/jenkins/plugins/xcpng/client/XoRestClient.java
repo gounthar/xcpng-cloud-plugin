@@ -622,9 +622,21 @@ public final class XoRestClient implements HypervisorClient {
      * id that turned out to be anything else would stamp a value that matches nothing and quietly refuse
      * every clone this backend makes. One GET buys not having to be right about it.
      *
-     * <p>A clone whose source was itself marked arrives carrying an inherited uuid tag as well, because tags
-     * are a set and the PUT adds rather than replaces. That is why the tools ask whether <em>any</em> stamp
-     * matches rather than whether the only one does.
+     * <p><b>Inherited markers are stripped once this clone's own are on (#255).</b> Tags are a set: {@code
+     * VM.clone} copies the source's, and the PUT adds rather than replaces, so a clone of a marked source
+     * used to carry two owner tags and two uuid stamps. {@code tools/owner.py} refuses to attribute such a
+     * VM (#251), so a sweep narrowed to one cloud skips it. The strip comes <em>after</em> both stamps,
+     * never before: deleting first opens a window where the clone carries no marker, and a crash there
+     * leaves a VM no sweep selects on. Stamping first means that at every point it carries at least one.
+     * A failed DELETE fails the provision like a failed PUT does, and the clone is destroyed on the way out.
+     *
+     * <p>A template is normally clean, so where do inherited markers come from? A golden image made from a
+     * marked agent, or a hand-made copy of one used as the source (#246 measured the latter). Rare, not
+     * impossible, which is why this is code and not a comment saying it cannot happen.
+     *
+     * <p>The inherited set is read off the same GET as the uuid. Whatever this clone was just stamped with
+     * is kept by value, so the strip does not depend on whether XO has caught up with that PUT yet; only
+     * tags that differ from this clone's own two are deleted.
      *
      * <p><b>The read-back is immediate, measured rather than assumed.</b> The worry was that XO might answer
      * this GET before its object cache holds the clone, since the appliance is known to lag elsewhere:
@@ -643,13 +655,23 @@ public final class XoRestClient implements HypervisorClient {
         if (owner == null || owner.isBlank()) {
             return;
         }
-        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(OWNER_TAG_PREFIX + owner), null, READ_TIMEOUT);
-        String uuid = get(API + "/vms/" + vm).path("uuid").asText("");
+        String ownerTag = OWNER_TAG_PREFIX + owner;
+        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(ownerTag), null, READ_TIMEOUT);
+        JsonNode record = get(API + "/vms/" + vm);
+        String uuid = record.path("uuid").asText("");
         if (uuid.isBlank()) {
             throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
                     + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
         }
-        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(SELF_TAG_PREFIX + uuid), null, READ_TIMEOUT);
+        String selfTag = SELF_TAG_PREFIX + uuid;
+        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(selfTag), null, READ_TIMEOUT);
+        for (JsonNode node : record.path("tags")) {
+            String tag = node.asText("");
+            boolean marker = tag.startsWith(OWNER_TAG_PREFIX) || tag.startsWith(SELF_TAG_PREFIX);
+            if (marker && !tag.equals(ownerTag) && !tag.equals(selfTag)) {
+                call("DELETE", API + "/vms/" + vm + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+            }
+        }
     }
 
     @Override

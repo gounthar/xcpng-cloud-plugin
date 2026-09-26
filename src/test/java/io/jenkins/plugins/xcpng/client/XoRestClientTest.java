@@ -267,6 +267,93 @@ class XoRestClientTest {
     }
 
     @Test
+    void cloneStripsTheMarkersItInheritedAfterStampingItsOwn() {
+        // #255. Tags are a set: VM.clone copies the source's, and the PUT adds rather than replaces, so a
+        // clone of a marked source carried two owner tags and two uuid stamps. tools/owner.py then refuses
+        // to attribute it (#251), and a narrowed reaper sweep skips it for good.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.addAll(List.of("xcpng-cloud:other", "xcpng-cloud-uuid:0d4e1a5c-source", "operator-note"));
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        String tags = "/rest/v0/vms/" + CLONE + "/tags/";
+        List<String> deletes =
+                t.paths().stream().filter(p -> p.startsWith("DELETE " + tags)).toList();
+        assertEquals(
+                List.of(
+                        "DELETE " + tags + "xcpng-cloud%3Aother",
+                        "DELETE " + tags + "xcpng-cloud-uuid%3A0d4e1a5c-source"),
+                deletes,
+                t.paths().toString());
+        // Stamp first, strip second: at no point does the clone carry no marker at all, so a crash between
+        // the two leaves a VM some sweep still selects on rather than one none can find.
+        int lastStamp = t.indexOf("PUT", tags + "xcpng-cloud-uuid%3A" + CLONE_UUID);
+        assertTrue(
+                t.indexOf("PUT", tags + "xcpng-cloud%3Alab") < lastStamp,
+                t.paths().toString());
+        assertTrue(
+                lastStamp < t.indexOf("DELETE", tags + "xcpng-cloud%3Aother"),
+                t.paths().toString());
+        // Each stamp exactly once: a repeated PUT is harmless on a set, which is how a duplicated call
+        // survived every other assertion here while this was being written.
+        t.only("PUT", tags + "xcpng-cloud%3Alab");
+        t.only("PUT", tags + "xcpng-cloud-uuid%3A" + CLONE_UUID);
+        // A tag DELETE is not a VM destroy, and the clone is still there.
+        assertEquals(List.of(), t.destroyed, t.paths().toString());
+    }
+
+    @Test
+    void cloneKeepsAnInheritedMarkerThatIsAlreadyItsOwn() {
+        // Same cloud, or a source whose stamp the record already shows as ours: deleting it would delete the
+        // tag this clone was just stamped with, since the set holds it once.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.addAll(List.of("xcpng-cloud:lab", "xcpng-cloud-uuid:" + CLONE_UUID));
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        assertTrue(
+                t.paths().stream().noneMatch(p -> p.startsWith("DELETE /rest/v0/vms/" + CLONE + "/tags/")),
+                t.paths().toString());
+    }
+
+    @Test
+    void cloneLeavesTagsThatOnlyLookLikeMarkers() {
+        // Prefix match on the full prefix, colon included. "xcpng-cloudy" is somebody's tag, not a cloud
+        // named "y", and a bare "xcpng-cloud" is not a marker this plugin ever writes.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.addAll(List.of("xcpng-cloudy", "xcpng-cloud", "xcpng-cloud-uuid", "build"));
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        assertTrue(
+                t.paths().stream().noneMatch(p -> p.startsWith("DELETE /rest/v0/vms/" + CLONE + "/tags/")),
+                t.paths().toString());
+    }
+
+    @Test
+    void aFailedStripFailsTheProvisionAndDestroysTheClone() {
+        // The same treatment a failed stamp gets. Carrying on would hand Jenkins an agent that every
+        // narrowed sweep skips, and the one thing that keeps it from leaking is a ref held in memory.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.add("xcpng-cloud:other");
+        t.fail("DELETE", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Aother", 500, "{\"error\":\"boom\"}");
+        XoRestClient c = new XoRestClient(t);
+
+        assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(
+                        c.resolveTemplate("jenkins-agent-debian13-v7"),
+                        new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab")));
+        assertEquals(List.of(CLONE), t.destroyed, t.paths().toString());
+    }
+
+    @Test
     void cloneWithNoOwnerStampsNoTag() {
         ScriptedRest t = new ScriptedRest();
         XoRestClient c = new XoRestClient(t);
@@ -1054,6 +1141,11 @@ class XoRestClientTest {
          * markOwner refuses rather than stamping an empty tag nothing can match.
          */
         String vmUuid = CLONE_UUID;
+        /**
+         * The clone's {@code tags} as its record reports them: what {@code VM.clone} copied off the source.
+         * Empty by default, which is the realistic case for a clean template.
+         */
+        List<String> vmTags = new ArrayList<>();
 
         private final Map<String, RestResponse> failures = new LinkedHashMap<>();
         private final List<String> interrupts = new ArrayList<>();
@@ -1091,7 +1183,7 @@ class XoRestClientTest {
                 // The catch-all below would answer 204 instead, which no real appliance does.
                 return new RestResponse(404, noSuchVm(XoRestClient.PROBE_ID));
             }
-            if ("DELETE".equals(method) && path.startsWith("/rest/v0/vms/")) {
+            if ("DELETE".equals(method) && path.startsWith("/rest/v0/vms/") && !path.contains("/tags/")) {
                 destroyed.add(path.substring("/rest/v0/vms/".length()));
                 return new RestResponse(204, "");
             }
@@ -1116,6 +1208,7 @@ class XoRestClientTest {
                 if (vmUuid != null) {
                     vm.put("uuid", vmUuid);
                 }
+                vm.put("tags", vmTags);
                 if (mainIpAddress != null) {
                     vm.put("mainIpAddress", mainIpAddress);
                 }
