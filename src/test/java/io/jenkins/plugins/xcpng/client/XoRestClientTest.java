@@ -8,8 +8,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -351,6 +355,109 @@ class XoRestClientTest {
                         c.resolveTemplate("jenkins-agent-debian13-v7"),
                         new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab")));
         assertEquals(List.of(CLONE), t.destroyed, t.paths().toString());
+    }
+
+    @Test
+    void aStripIsConfirmedByPollingUntilTheMarkersAreGone() {
+        // #255 review. The DELETE answers 204 before XO's cache shows it: two reads after the strip still
+        // list the inherited tags. Confirmed means a read without them, so the client waits for one.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.add("xcpng-cloud:other");
+        List<String> stale = List.of("xcpng-cloud:other");
+        t.tagViews.addAll(List.of(stale, stale, stale));
+        List<Duration> pauses = new ArrayList<>();
+        XoRestClient c = new XoRestClient(t, pauses::add);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        assertEquals(
+                List.of(XoRestClient.STRIP_POLL, XoRestClient.STRIP_POLL),
+                pauses,
+                t.paths().toString());
+        // Once. A stale read still listing a tag already deleted is the lag, not a reason to DELETE again.
+        t.only("DELETE", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Aother");
+    }
+
+    @Test
+    void aMarkerTheFirstReadMissedIsStillStripped() {
+        // The review's case: the first read comes back without the inherited marker, so there is nothing to
+        // delete on the strength of it. The confirming read sees the marker and strips it anyway.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.add("xcpng-cloud:other");
+        t.tagViews.add(List.of());
+        XoRestClient c = new XoRestClient(t, d -> {});
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        t.only("DELETE", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Aother");
+        assertFalse(t.vmTags.contains("xcpng-cloud:other"), t.vmTags.toString());
+    }
+
+    @Test
+    void aStripThatNeverTakesFailsTheProvisionAndDestroysTheClone() {
+        // Every DELETE answers 204 and the tag stays. Carrying on would hand Jenkins an agent the narrowed
+        // sweeps skip, which is the leak #255 exists to stop, so the provision fails instead.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.add("xcpng-cloud:other");
+        t.tagDeletesIgnored = true;
+        List<Duration> pauses = new ArrayList<>();
+        XoRestClient c = new XoRestClient(t, pauses::add);
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(
+                        c.resolveTemplate("jenkins-agent-debian13-v7"),
+                        new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab")));
+        assertTrue(e.getMessage().contains("xcpng-cloud:other"), e.getMessage());
+        // Bounded. The first confirming read follows the deletes at once, so that it costs a clean template
+        // no wait; every later read waits first. Then it gives up.
+        assertEquals(XoRestClient.STRIP_READS - 2, pauses.size(), t.paths().toString());
+        assertEquals(List.of(CLONE), t.destroyed, t.paths().toString());
+    }
+
+    @Test
+    void anInterruptedStripFailsTheProvisionAndKeepsTheInterrupt() {
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.add("xcpng-cloud:other");
+        t.tagViews.addAll(List.of(List.of("xcpng-cloud:other"), List.of("xcpng-cloud:other")));
+        XoRestClient c = new XoRestClient(t, d -> {
+            throw new InterruptedException();
+        });
+
+        try {
+            assertThrows(
+                    HypervisorException.class,
+                    () -> c.cloneFromTemplate(
+                            c.resolveTemplate("jenkins-agent-debian13-v7"),
+                            new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab")));
+            // The caller (the provisioning thread) must still see it was interrupted.
+            assertTrue(Thread.currentThread().isInterrupted());
+            // And the clone is still destroyed: cloneFromTemplate's cleanup runs with the flag cleared.
+            assertEquals(List.of(CLONE), t.destroyed, t.paths().toString());
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void aCleanCloneCostsOneConfirmingReadAndNoWait() {
+        // The common case, a clean template: one extra GET and no pause at all.
+        ScriptedRest t = new ScriptedRest();
+        List<Duration> pauses = new ArrayList<>();
+        XoRestClient c = new XoRestClient(t, pauses::add);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        assertEquals(
+                2,
+                t.paths().stream()
+                        .filter(p -> p.equals("GET /rest/v0/vms/" + CLONE))
+                        .count(),
+                t.paths().toString());
+        assertEquals(List.of(), pauses);
     }
 
     @Test
@@ -1146,6 +1253,15 @@ class XoRestClientTest {
          * Empty by default, which is the realistic case for a clean template.
          */
         List<String> vmTags = new ArrayList<>();
+        /**
+         * What successive GETs of the clone report as its tags, ahead of the truth: each read takes the next
+         * view, and once they run out a read reports {@link #vmTags} as it now stands. XO's object cache lags
+         * a tag write by about half a second (measured on the lab XOA for #255), so a view is how a test
+         * says "this read was stale".
+         */
+        final Deque<List<String>> tagViews = new ArrayDeque<>();
+        /** A tag DELETE that answers 204 and changes nothing: a strip that never takes. */
+        boolean tagDeletesIgnored;
 
         private final Map<String, RestResponse> failures = new LinkedHashMap<>();
         private final List<String> interrupts = new ArrayList<>();
@@ -1183,7 +1299,16 @@ class XoRestClientTest {
                 // The catch-all below would answer 204 instead, which no real appliance does.
                 return new RestResponse(404, noSuchVm(XoRestClient.PROBE_ID));
             }
-            if ("DELETE".equals(method) && path.startsWith("/rest/v0/vms/") && !path.contains("/tags/")) {
+            if (path.startsWith("/rest/v0/vms/") && path.contains("/tags/")) {
+                String tag = URLDecoder.decode(path.substring(path.indexOf("/tags/") + 6), StandardCharsets.UTF_8);
+                if ("PUT".equals(method) && !vmTags.contains(tag)) {
+                    vmTags.add(tag);
+                } else if ("DELETE".equals(method) && !tagDeletesIgnored) {
+                    vmTags.remove(tag);
+                }
+                return new RestResponse(204, "");
+            }
+            if ("DELETE".equals(method) && path.startsWith("/rest/v0/vms/")) {
                 destroyed.add(path.substring("/rest/v0/vms/".length()));
                 return new RestResponse(204, "");
             }
@@ -1208,7 +1333,7 @@ class XoRestClientTest {
                 if (vmUuid != null) {
                     vm.put("uuid", vmUuid);
                 }
-                vm.put("tags", vmTags);
+                vm.put("tags", tagViews.isEmpty() ? List.copyOf(vmTags) : tagViews.poll());
                 if (mainIpAddress != null) {
                     vm.put("mainIpAddress", mainIpAddress);
                 }
