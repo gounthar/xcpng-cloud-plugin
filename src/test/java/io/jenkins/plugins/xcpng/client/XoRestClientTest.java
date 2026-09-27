@@ -132,6 +132,75 @@ class XoRestClientTest {
         assertThrows(HypervisorException.class, () -> new XoRestClient(t).resolveTemplate("anything"));
     }
 
+    // -- resolveTemplate scoped to a pool (#247) ---------------------------
+
+    private static XoRestClient inPool(ScriptedRest t, String pool) {
+        return new XoRestClient(t, d -> {}, pool);
+    }
+
+    @Test
+    void aPoolScopedClientResolvesTheCopyInItsPoolAndIgnoresTheOther() {
+        // The estate #247 is for: the same image in two pools. Scoped to either, the name is unique again,
+        // and the handle has to carry that pool's uuid, since the create route hangs off /pools/{pool}.
+        ScriptedRest t = new ScriptedRest();
+        t.templates.add(template("t-other", "jenkins-agent-debian13-v7", OTHER_POOL));
+        assertEquals(
+                OTHER_POOL + "/t-other",
+                inPool(t, OTHER_POOL)
+                        .resolveTemplate("jenkins-agent-debian13-v7")
+                        .value());
+        assertEquals(
+                POOL + "/" + TEMPLATE_UUID,
+                inPool(t, POOL).resolveTemplate("jenkins-agent-debian13-v7").value());
+    }
+
+    @Test
+    void aPoolScopedClientSaysWhichPoolsCarryANameItsOwnPoolLacks() {
+        // The likely story when a set pool finds nothing: the image was built on the other pool. "No
+        // template named" alone would send the operator to check a spelling that is right.
+        ScriptedRest t = new ScriptedRest();
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> inPool(t, OTHER_POOL).resolveTemplate("jenkins-agent-debian13-v7"));
+        assertTrue(
+                e.getMessage().contains("no template named 'jenkins-agent-debian13-v7' in pool " + OTHER_POOL),
+                e.getMessage());
+        assertTrue(e.getMessage().contains("1 in pool " + POOL), e.getMessage());
+    }
+
+    @Test
+    void aPoolScopedClientStillNamesADuplicateInsideItsPool() {
+        // Scoping narrows across pools, not within one: two copies in the chosen pool are still ambiguous,
+        // and the advice is the rename, never the pool setting the operator has already used.
+        ScriptedRest t = new ScriptedRest();
+        t.templates.add(template("dup-2", "jenkins-agent-debian13-v7", POOL));
+        t.templates.add(template("t-other", "jenkins-agent-debian13-v7", OTHER_POOL));
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> inPool(t, POOL).resolveTemplate("jenkins-agent-debian13-v7"));
+        assertTrue(e.getMessage().contains("2 in pool " + POOL), e.getMessage());
+        assertFalse(e.getMessage().contains(OTHER_POOL), e.getMessage());
+        assertTrue(e.getMessage().contains("rename those"), e.getMessage());
+        assertFalse(e.getMessage().contains("more than one pool"), e.getMessage());
+    }
+
+    @Test
+    void anUnscopedClientPointsAtThePoolSettingWhenANameSpansPools() {
+        ScriptedRest t = new ScriptedRest();
+        t.templates.add(template("t-other", "jenkins-agent-debian13-v7", OTHER_POOL));
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(t).resolveTemplate("jenkins-agent-debian13-v7"));
+        assertTrue(e.getMessage().contains("set this cloud's pool"), e.getMessage());
+    }
+
+    @Test
+    void aBlankPoolIsNoPool() {
+        // The form submits an empty string for an untouched field. Read as a pool, it would match nothing
+        // and every template would be absent.
+        ScriptedRest t = new ScriptedRest();
+        assertEquals(
+                POOL + "/" + TEMPLATE_UUID,
+                inPool(t, "  ").resolveTemplate("jenkins-agent-debian13-v7").value());
+    }
+
     // -- cloneFromTemplate ------------------------------------------------
 
     @Test
@@ -827,10 +896,12 @@ class XoRestClientTest {
         assertFalse(
                 t.paths().stream().anyMatch(p -> p.endsWith("/rest/v0/ping")),
                 t.paths().toString());
-        assertTrue(t.paths().contains("GET /rest/v0/pools?fields=id"), t.paths().toString());
+        assertTrue(
+                t.paths().contains("GET /rest/v0/pools?fields=id,name_label"),
+                t.paths().toString());
 
         ScriptedRest denied = new ScriptedRest();
-        denied.fail("GET", "/rest/v0/pools?fields=id", 401, "{\"error\":\"invalid credentials\"}");
+        denied.fail("GET", "/rest/v0/pools?fields=id,name_label", 401, "{\"error\":\"invalid credentials\"}");
         assertThrows(HypervisorException.class, () -> new XoRestClient(denied).ping());
     }
 
@@ -846,7 +917,7 @@ class XoRestClientTest {
     @Test
     void aRefusedTokenSaysWhatWouldCauseIt() {
         ScriptedRest denied = new ScriptedRest();
-        denied.fail("GET", "/rest/v0/pools?fields=id", 401, "{\"error\":\"authentication failed\"}");
+        denied.fail("GET", "/rest/v0/pools?fields=id,name_label", 401, "{\"error\":\"authentication failed\"}");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(denied).ping());
 
         assertTrue(e.getMessage().contains("401"), e.getMessage());
@@ -867,7 +938,7 @@ class XoRestClientTest {
     @Test
     void aForbiddenRouteBlamesTheRoleRatherThanTheToken() {
         ScriptedRest gated = new ScriptedRest();
-        gated.fail("GET", "/rest/v0/pools?fields=id", 403, "{\"error\":\"forbidden\"}");
+        gated.fail("GET", "/rest/v0/pools?fields=id,name_label", 403, "{\"error\":\"forbidden\"}");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(gated).ping());
 
         assertTrue(e.getMessage().contains("403"), e.getMessage());
@@ -885,7 +956,7 @@ class XoRestClientTest {
     @Test
     void aRefusedTokenSaysWhatWouldCauseItEvenWhenTheBodyIsNotJson() {
         ScriptedRest html = new ScriptedRest();
-        html.fail("GET", "/rest/v0/pools?fields=id", 401, "<html><body>Sign in</body></html>");
+        html.fail("GET", "/rest/v0/pools?fields=id,name_label", 401, "<html><body>Sign in</body></html>");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(html).ping());
 
         assertTrue(e.getMessage().contains("Sign in"), "the excerpt must survive: " + e.getMessage());
@@ -958,6 +1029,34 @@ class XoRestClientTest {
      * id no VM has with an empty body, so it cannot change anything even on an appliance that routes it.
      */
     @Test
+    void pingRefusesAPoolTheTokenCannotSeeAndListsTheOnesItCan() {
+        // A mistyped pool would otherwise show up only as every template being absent, which blames the
+        // template field. Test Connection calls ping, so this is where it is named.
+        ScriptedRest t = new ScriptedRest();
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> inPool(t, OTHER_POOL).ping());
+        assertTrue(e.getMessage().contains("pool " + OTHER_POOL + " is not visible"), e.getMessage());
+        assertTrue(e.getMessage().contains("lab (" + POOL + ")"), e.getMessage());
+    }
+
+    @Test
+    void pingPassesForAPoolTheTokenCanSee() {
+        ScriptedRest t = new ScriptedRest();
+        inPool(t, POOL).ping();
+        assertEquals(2, t.calls.size(), "a pool check must not cost a request of its own: " + t.paths());
+    }
+
+    @Test
+    void visiblePoolsReadsIdAndNameInTheAppliancesOrder() {
+        ScriptedRest t = new ScriptedRest();
+        t.poolsBody = "[{\"id\":\"" + OTHER_POOL + "\",\"name_label\":\"b\"},{\"id\":\"" + POOL
+                + "\",\"name_label\":\"a\"},{\"name_label\":\"no id\"}]";
+        Map<String, String> pools = new XoRestClient(t).visiblePools();
+        assertEquals(List.of(OTHER_POOL, POOL), new ArrayList<>(pools.keySet()));
+        assertEquals("b (" + OTHER_POOL + "), a (" + POOL + ")", XoRestClient.describePools(pools));
+    }
+
+    @Test
     void pingProbesThePatchRouteWithoutTouchingAVm() {
         ScriptedRest t = new ScriptedRest();
         new XoRestClient(t).ping();
@@ -965,7 +1064,7 @@ class XoRestClientTest {
         Call probe = t.only("PATCH", PROBE);
         assertEquals("{}", probe.body());
         assertTrue(
-                t.indexOf("GET", "/rest/v0/pools?fields=id") < t.indexOf("PATCH", PROBE),
+                t.indexOf("GET", "/rest/v0/pools?fields=id,name_label") < t.indexOf("PATCH", PROBE),
                 t.paths().toString());
         assertEquals(2, t.calls.size(), "ping must not touch anything else: " + t.paths());
     }
@@ -1076,7 +1175,7 @@ class XoRestClientTest {
     @Test
     void anOrdinaryFailureIsNotDecorated() {
         ScriptedRest t = new ScriptedRest();
-        t.fail("GET", "/rest/v0/pools?fields=id", 409, "{\"error\":\"incorrect state\"}");
+        t.fail("GET", "/rest/v0/pools?fields=id,name_label", 409, "{\"error\":\"incorrect state\"}");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
 
         assertFalse(e.getMessage().contains("revoked or expired"), e.getMessage());
@@ -1100,7 +1199,7 @@ class XoRestClientTest {
         // HTML are the real shapes here, and "malformed response" for either reads as our bug rather
         // than as something in the way.
         ScriptedRest t = new ScriptedRest();
-        t.fail("GET", "/rest/v0/pools?fields=id", 502, "<html><body>Bad Gateway</body></html>");
+        t.fail("GET", "/rest/v0/pools?fields=id,name_label", 502, "<html><body>Bad Gateway</body></html>");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
         assertTrue(e.getMessage().contains("502"), e.getMessage());
         assertTrue(e.getMessage().contains("Bad Gateway"), e.getMessage());
@@ -1119,14 +1218,15 @@ class XoRestClientTest {
         // left "HTTP 502: {}", which names the status and throws away the only line saying what refused.
         for (String body : new String[] {"[\"Bad Gateway\"]", "\"Bad Gateway\"", "{\"detail\":\"Bad Gateway\"}"}) {
             ScriptedRest t = new ScriptedRest();
-            t.fail("GET", "/rest/v0/pools?fields=id", 502, body);
+            t.fail("GET", "/rest/v0/pools?fields=id,name_label", 502, body);
             HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
             assertTrue(e.getMessage().contains("502"), e.getMessage());
             assertTrue(e.getMessage().contains("Bad Gateway"), body + " -> " + e.getMessage());
         }
         // The envelope shape must still win, or the above could pass by reporting every body verbatim.
         ScriptedRest enveloped = new ScriptedRest();
-        enveloped.fail("GET", "/rest/v0/pools?fields=id", 409, "{\"error\":\"incorrect state\",\"data\":[\"VM\"]}");
+        enveloped.fail(
+                "GET", "/rest/v0/pools?fields=id,name_label", 409, "{\"error\":\"incorrect state\",\"data\":[\"VM\"]}");
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(enveloped).ping());
         assertEquals("incorrect state", e.getErrorCode());
         assertEquals(List.of("VM"), e.getErrorParams());
@@ -1240,6 +1340,10 @@ class XoRestClientTest {
         final List<Map<String, Object>> templates = new ArrayList<>();
 
         String templatesBody;
+
+        /** What {@code GET /pools} answers; null means the one lab pool, {@link #POOL}. */
+        String poolsBody;
+
         String powerState = "Halted";
         String mainIpAddress;
         boolean noContent;
@@ -1325,7 +1429,8 @@ class XoRestClientTest {
                 return new RestResponse(201, "{\"id\":\"" + CLONE + "\"}");
             }
             if (path.startsWith("/rest/v0/pools")) {
-                return new RestResponse(200, "[{\"id\":\"" + POOL + "\"}]");
+                return new RestResponse(
+                        200, poolsBody != null ? poolsBody : "[{\"id\":\"" + POOL + "\",\"name_label\":\"lab\"}]");
             }
             if ("GET".equals(method) && path.startsWith("/rest/v0/vms/")) {
                 Map<String, Object> vm = new LinkedHashMap<>();

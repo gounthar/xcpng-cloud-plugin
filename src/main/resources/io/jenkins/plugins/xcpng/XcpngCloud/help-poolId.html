@@ -1,0 +1,14 @@
+<div>
+  The uuid of the pool this cloud provisions into. Optional: leave it empty to resolve template names in every
+  pool the token can see, which is right when the Xen Orchestra appliance fronts a single pool.
+  <p>
+    Set it when the appliance fronts more than one pool and the same golden image exists in several of them,
+    which is what building an image from one recipe on two pools produces. Without it, such a template name
+    is ambiguous and nothing is provisioned. With it, only templates in this pool are considered.
+  </p>
+  <p>
+    <strong>To find it:</strong> leave this empty and press <em>Test connection</em>. When the token sees more
+    than one pool, the result lists each one with its uuid. Test connection also checks a uuid entered here,
+    and fails if the token cannot see that pool.
+  </p>
+</div>

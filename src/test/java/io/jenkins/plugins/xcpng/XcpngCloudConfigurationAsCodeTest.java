@@ -66,6 +66,7 @@ class XcpngCloudConfigurationAsCodeTest {
                 cloud.getCertificateFingerprint());
         assertEquals(3, cloud.getMaxInstances());
         assertEquals(15, cloud.getIdleMinutes());
+        assertEquals("36f8ba18-927e-3ec5-06d2-1de822394115", cloud.getPoolId());
         assertEquals(1, cloud.getTemplates().size());
 
         XcpngTemplate template = cloud.getTemplates().get(0);

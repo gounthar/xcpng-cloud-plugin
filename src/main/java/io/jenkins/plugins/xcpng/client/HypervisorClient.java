@@ -1,6 +1,7 @@
 package io.jenkins.plugins.xcpng.client;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -82,6 +83,16 @@ public interface HypervisorClient extends AutoCloseable {
      * whose far end lacks them is reported at the button rather than at the first build.
      */
     void ping();
+
+    /**
+     * The pools this connection can provision into, uuid to name, in the order the backend lists them. A
+     * diagnostic for Test Connection, so an operator can pick a pool without leaving the form; nothing on
+     * the provisioning path reads it. Empty when the backend cannot say.
+     */
+    @NonNull
+    default Map<String, String> visiblePools() {
+        return Map.of();
+    }
 
     /** Release the session. Overridden to not throw the checked exception {@link AutoCloseable} declares. */
     @Override

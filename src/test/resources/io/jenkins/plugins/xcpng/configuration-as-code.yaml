@@ -5,6 +5,9 @@ jenkins:
         poolUrl: "https://192.168.1.87"
         credentialsId: "xcpng-root"
         certificateFingerprint: "AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99"
+        # Upper case and padded on purpose: the setter normalises to the form XO reports, and the export below
+        # proves the normalised value is what was stored.
+        poolId: " 36F8BA18-927E-3EC5-06D2-1DE822394115 "
         maxInstances: 3
         idleMinutes: 15
         templates:

@@ -35,6 +35,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -46,6 +47,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Pattern;
 import jenkins.model.Jenkins;
 import jenkins.slaves.JnlpAgentReceiver;
 import org.jenkinsci.Symbol;
@@ -157,6 +159,15 @@ public class XcpngCloud extends Cloud {
      * boots but never connects. Not final: {@link #readResolve} re-applies the clamp on deserialization.
      */
     private int idleMinutes = DEFAULT_IDLE_MINUTES;
+
+    /**
+     * The pool templates are resolved in, by uuid, or null for any pool the token can see (#247). One Xen
+     * Orchestra appliance fronts several pools, and the same golden image built on two of them is
+     * ambiguous without this. Optional, a {@link DataBoundSetter}, so a config written before it existed
+     * loads with null and keeps provisioning exactly as it did.
+     */
+    @CheckForNull
+    private String poolId;
 
     /**
      * Where a pre-#149 {@code config.xml} kept the leaked-VM set, read on the way in and never written again.
@@ -436,6 +447,27 @@ public class XcpngCloud extends Cloud {
     @DataBoundSetter
     public void setIdleMinutes(int idleMinutes) {
         this.idleMinutes = idleMinutes <= 0 ? DEFAULT_IDLE_MINUTES : idleMinutes;
+    }
+
+    @CheckForNull
+    public String getPoolId() {
+        return poolId;
+    }
+
+    /**
+     * Optional pool uuid. Trimmed and lower-cased, the form Xen Orchestra reports it in; blank means any pool.
+     * A value that is not a uuid is kept rather than dropped: dropping it would widen the cloud to every
+     * pool without a word, whereas keeping it fails closed at Test connection and at the first provision,
+     * both of which name it.
+     */
+    @DataBoundSetter
+    public void setPoolId(@CheckForNull String poolId) {
+        this.poolId = normalizePoolId(poolId);
+    }
+
+    @CheckForNull
+    static String normalizePoolId(@CheckForNull String raw) {
+        return raw == null || raw.isBlank() ? null : raw.trim().toLowerCase(Locale.ROOT);
     }
 
     /**
@@ -1363,7 +1395,7 @@ public class XcpngCloud extends Cloud {
         if (clientFactory != null) {
             return clientFactory.open(this);
         }
-        return openClient(poolUrl, credentialsId, certificateFingerprint, getBackend(), "cloud '" + name + "'");
+        return openClient(poolUrl, credentialsId, certificateFingerprint, poolId, getBackend(), "cloud '" + name + "'");
     }
 
     /**
@@ -1386,6 +1418,21 @@ public class XcpngCloud extends Cloud {
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
             @CheckForNull String certificateFingerprint,
+            @CheckForNull XcpngBackend backend,
+            @NonNull String owner) {
+        return openClient(poolUrl, credentialsId, certificateFingerprint, null, backend, owner);
+    }
+
+    /**
+     * As above, scoped to one pool for template resolution. Teardown and the leaked-VM sweep use the form
+     * without one: they act on VMs they already hold a handle to, and a handle carries its own pool.
+     */
+    @NonNull
+    static HypervisorClient openClient(
+            @CheckForNull String poolUrl,
+            @CheckForNull String credentialsId,
+            @CheckForNull String certificateFingerprint,
+            @CheckForNull String poolId,
             @CheckForNull XcpngBackend backend,
             @NonNull String owner) {
         // Before anything else: a record naming the removed backend is refused by name whatever else it
@@ -1420,7 +1467,7 @@ public class XcpngCloud extends Cloud {
             throw new IllegalStateException("No Xen Orchestra token credential configured for " + owner
                     + ". Xen Orchestra authenticates with a secret-text token, not a username and password.");
         }
-        return new XoRestClient(poolUrl, token.getSecret().getPlainText(), certificateFingerprint);
+        return new XoRestClient(poolUrl, token.getSecret().getPlainText(), certificateFingerprint, poolId);
     }
 
     /** Test seam: replace how a client is opened with an in-memory fake. */
@@ -1841,11 +1888,29 @@ public class XcpngCloud extends Cloud {
             }
         }
 
+        /**
+         * Validate a pool uuid's shape. Whether the pool exists, and whether the token can see it, only the
+         * appliance can say, which is what Test connection is for.
+         */
+        @POST
+        public FormValidation doCheckPoolId(@QueryParameter String value) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+            String pool = normalizePoolId(value);
+            if (pool == null || POOL_UUID.matcher(pool).matches()) {
+                return FormValidation.ok();
+            }
+            return FormValidation.error(Messages.XcpngCloud_poolId_malformed(pool));
+        }
+
+        private static final Pattern POOL_UUID =
+                Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
+
         @RequirePOST
         public FormValidation doTestConnection(
                 @QueryParameter String poolUrl,
                 @QueryParameter String credentialsId,
-                @QueryParameter String certificateFingerprint) {
+                @QueryParameter String certificateFingerprint,
+                @QueryParameter String poolId) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.error(Messages.XcpngCloud_poolUrl_required());
@@ -1876,9 +1941,10 @@ public class XcpngCloud extends Cloud {
             // it reaches TrustedHttpClients, which throws HypervisorException when it cannot build a pinning
             // SSL context. Constructed outside, that escapes this method and the administrator gets a 500
             // page instead of a message on the form.
-            try (HypervisorClient session = openClient(url, credentialsId, pin, XcpngBackend.XO, "this cloud")) {
+            final String pool = normalizePoolId(poolId);
+            try (HypervisorClient session = openClient(url, credentialsId, pin, pool, XcpngBackend.XO, "this cloud")) {
                 session.ping();
-                return connectedResult(pin);
+                return connectedResult(pin, pool, session.visiblePools());
             } catch (IllegalStateException missingCredential) {
                 // No secret-text credential resolves under the selected ID. Its message already names the
                 // kind, which is the actionable half when a leftover username/password is what is selected.
@@ -1941,9 +2007,33 @@ public class XcpngCloud extends Cloud {
          * link with verification switched off -- no longer has a case that can produce it.
          */
         static FormValidation connectedResult(@CheckForNull String certificateFingerprint) {
-            return certificateFingerprint == null
-                    ? FormValidation.ok(Messages.XcpngCloud_testConnection_ok())
-                    : FormValidation.ok(Messages.XcpngCloud_testConnection_okPinned());
+            return connectedResult(certificateFingerprint, null, Map.of());
+        }
+
+        /**
+         * As above, followed by which pools this cloud provisions into (#247). With a pool set, ping has
+         * already refused one the token cannot see, so it is named here. With none set and more than one
+         * visible, they are listed, since that is when a template name carried by two pools is ambiguous and
+         * the operator needs a uuid to paste.
+         */
+        static FormValidation connectedResult(
+                @CheckForNull String certificateFingerprint,
+                @CheckForNull String poolId,
+                @NonNull Map<String, String> pools) {
+            String trust = certificateFingerprint == null
+                    ? Messages.XcpngCloud_testConnection_ok()
+                    : Messages.XcpngCloud_testConnection_okPinned();
+            if (poolId != null) {
+                String label = pools.get(poolId);
+                return FormValidation.ok(trust + " "
+                        + Messages.XcpngCloud_testConnection_pool(
+                                label == null || label.isBlank() ? poolId : label + " (" + poolId + ")"));
+            }
+            if (pools.size() > 1) {
+                return FormValidation.ok(trust + " "
+                        + Messages.XcpngCloud_testConnection_pools(pools.size(), XoRestClient.describePools(pools)));
+            }
+            return FormValidation.ok(trust);
         }
     }
 }

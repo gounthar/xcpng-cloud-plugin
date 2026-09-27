@@ -2372,15 +2372,16 @@ class XcpngProvisionTest {
     void aTemplateNameIsResolvedAgainstThePoolWhenTheFormCanReachIt(JenkinsRule r) {
         XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
         FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName());
-        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> fake);
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> fake);
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null)
+                        .kind,
                 "a template the pool has must pass");
 
         FormValidation missing =
-                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null);
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null, null);
         assertEquals(FormValidation.Kind.ERROR, missing.kind, "a template the pool does not have must be named here");
         assertTrue(
                 missing.getMessage().contains("no-such-golden-image"),
@@ -2400,24 +2401,24 @@ class XcpngProvisionTest {
     void anIncompleteConnectionLeavesTheNameUncheckedRatherThanRejected(JenkinsRule r) {
         XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
         FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName());
-        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> fake);
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> fake);
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("anything", null, null, null).kind,
+                d.doCheckTemplateName("anything", null, null, null, null).kind,
                 "no pool URL means nothing to check against");
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("anything", "   ", "cred", null).kind,
+                d.doCheckTemplateName("anything", "   ", "cred", null, null).kind,
                 "a blank pool URL means nothing to check against");
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("anything", "192.168.1.87", "cred", null).kind,
+                d.doCheckTemplateName("anything", "192.168.1.87", "cred", null, null).kind,
                 "a malformed pool URL is doCheckPoolUrl's to report, not this field's");
         assertEquals(List.of(), fake.calls(), "an unusable connection must not open a session at all");
 
         // And the name is still required, whatever the connection looks like.
-        assertEquals(FormValidation.Kind.ERROR, d.doCheckTemplateName("  ", null, null, null).kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckTemplateName("  ", null, null, null, null).kind);
     }
 
     /**
@@ -2430,24 +2431,24 @@ class XcpngProvisionTest {
     void anUnreachablePoolDoesNotBlameTheTemplateName(JenkinsRule r) {
         XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
         FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failPing();
-        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> fake);
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> fake);
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null).kind,
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null, null).kind,
                 "a pool that never answered cannot condemn a template name");
         assertFalse(
                 fake.calls().stream().anyMatch(c -> c.startsWith("resolveTemplate")),
                 "the name must not be resolved before ping has succeeded: " + fake.calls());
 
         // A probe that cannot even open a session is the same case, and must not throw out of the form.
-        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> {
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> {
             throw new IllegalStateException(
                     "No Xen Orchestra token credential configured for the template name check.");
         });
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "", null).kind,
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "", null, null).kind,
                 "a missing credential is Test connection's to report, not this field's");
     }
 
@@ -2492,7 +2493,7 @@ class XcpngProvisionTest {
         // substring assertion would pass at every depth and pin nothing. The level is the whole claim —
         // one ../ reaches the cloud, two overshoot it — so the tokens have to match exactly.
         assertEquals(
-                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint"),
+                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint", "../poolId"),
                 Set.of(declared.group(1).trim().split("\\s+")),
                 "the check must depend on exactly the cloud's four connection fields, one level up");
     }
@@ -2514,11 +2515,12 @@ class XcpngProvisionTest {
         FakeHypervisorClient dropping = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName())
                 .failPingAfter(1)
                 .failResolveAtTransport();
-        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> dropping);
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> dropping);
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null)
+                        .kind,
                 "a connection lost mid-check must not be reported as an unresolvable name");
         assertEquals(
                 2,
@@ -2529,10 +2531,11 @@ class XcpngProvisionTest {
         // really did answer about the name and the error stands.
         FakeHypervisorClient healthy =
                 new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failResolveAtTransport();
-        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint) -> healthy);
+        d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> healthy);
         assertEquals(
                 FormValidation.Kind.ERROR,
-                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null).kind,
+                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null)
+                        .kind,
                 "a pool that is still answering has answered about the name");
     }
 
