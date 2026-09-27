@@ -2493,7 +2493,7 @@ class XcpngProvisionTest {
         // substring assertion would pass at every depth and pin nothing. The level is the whole claim —
         // one ../ reaches the cloud, two overshoot it — so the tokens have to match exactly.
         assertEquals(
-                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint"),
+                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint", "../poolId"),
                 Set.of(declared.group(1).trim().split("\\s+")),
                 "the check must depend on exactly the cloud's four connection fields, one level up");
     }
