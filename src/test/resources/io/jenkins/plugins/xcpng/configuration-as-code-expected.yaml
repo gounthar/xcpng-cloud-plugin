@@ -4,6 +4,7 @@
     idleMinutes: 15
     maxInstances: 3
     name: "xcpng-lab"
+    poolId: "36f8ba18-927e-3ec5-06d2-1de822394115"
     poolUrl: "https://192.168.1.87"
     templates:
     - labelString: "xcpng-linux"

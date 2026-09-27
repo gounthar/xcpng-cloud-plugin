@@ -358,7 +358,7 @@ class XcpngBackendSelectionTest {
         addPasswordCredential(LEFTOVER_CREDENTIAL_ID);
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
 
-        FormValidation v = d.doTestConnection(XO_URL, LEFTOVER_CREDENTIAL_ID, null);
+        FormValidation v = d.doTestConnection(XO_URL, LEFTOVER_CREDENTIAL_ID, null, null);
 
         assertEquals(FormValidation.Kind.ERROR, v.kind);
         assertTrue(v.getMessage().contains("secret-text"), "the message must name the kind needed: " + v.getMessage());

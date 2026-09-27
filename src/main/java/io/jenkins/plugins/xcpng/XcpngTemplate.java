@@ -257,11 +257,17 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             HypervisorClient open(
                     @CheckForNull String poolUrl,
                     @CheckForNull String credentialsId,
-                    @CheckForNull String certificateFingerprint);
+                    @CheckForNull String certificateFingerprint,
+                    @CheckForNull String poolId);
         }
 
-        private PoolProbe poolProbe = (poolUrl, credentialsId, certificateFingerprint) -> XcpngCloud.openClient(
-                poolUrl, credentialsId, certificateFingerprint, XcpngBackend.XO, "the template name check");
+        private PoolProbe poolProbe = (poolUrl, credentialsId, certificateFingerprint, poolId) -> XcpngCloud.openClient(
+                poolUrl,
+                credentialsId,
+                certificateFingerprint,
+                XcpngCloud.normalizePoolId(poolId),
+                XcpngBackend.XO,
+                "the template name check");
 
         /** Test seam: resolve template names against an in-memory fake instead of a real pool. */
         void setPoolProbe(@NonNull PoolProbe poolProbe) {
@@ -278,26 +284,27 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * <p>The connection fields come from the enclosing cloud through {@link RelativePath}, not from a
          * saved {@code XcpngCloud}, because the operator may be typing them right now and the value being
          * checked has to be the one they can see. Core infers {@code checkDependsOn} from this signature,
-         * so editing any of the three re-runs the check as well, which is what makes this validator ask
+         * so editing any of the four re-runs the check as well, which is what makes this validator ask
          * the appliance the operator is currently pointing at rather than the one they were pointing at
          * when the page loaded.
          *
          * <p>This does not remove the runtime case — a golden image can be deleted after the cloud is
          * saved, and #157's retry-forever half is still open — it moves the common case to where it is
          * cheap. The validator fires on page load, on this field's own change, and on a change to any of
-         * the three it depends on, so the cost is roughly a Test connection rather than one per keystroke.
+         * the four it depends on, so the cost is roughly a Test connection rather than one per keystroke.
          */
         @POST
         public FormValidation doCheckTemplateName(
                 @QueryParameter String value,
                 @RelativePath("..") @QueryParameter String poolUrl,
                 @RelativePath("..") @QueryParameter String credentialsId,
-                @RelativePath("..") @QueryParameter String certificateFingerprint) {
+                @RelativePath("..") @QueryParameter String certificateFingerprint,
+                @RelativePath("..") @QueryParameter String poolId) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
                 return FormValidation.error(Messages.XcpngTemplate_templateName_required());
             }
-            return resolveAgainstPool(value.trim(), poolUrl, credentialsId, certificateFingerprint);
+            return resolveAgainstPool(value.trim(), poolUrl, credentialsId, certificateFingerprint, poolId);
         }
 
         /**
@@ -316,7 +323,8 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                 @NonNull String name,
                 @CheckForNull String poolUrl,
                 @CheckForNull String credentialsId,
-                @CheckForNull String certificateFingerprint) {
+                @CheckForNull String certificateFingerprint,
+                @CheckForNull String poolId) {
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.ok();
             }
@@ -328,7 +336,7 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             }
             HypervisorClient client;
             try {
-                client = poolProbe.open(url, credentialsId, certificateFingerprint);
+                client = poolProbe.open(url, credentialsId, certificateFingerprint, poolId);
             } catch (RuntimeException e) {
                 LOGGER.log(Level.FINE, e, () -> "Could not open a session to " + url + " to check a template name");
                 return FormValidation.ok();

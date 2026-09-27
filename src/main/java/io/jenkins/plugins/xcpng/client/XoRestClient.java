@@ -126,14 +126,28 @@ public final class XoRestClient implements HypervisorClient {
     private final Pause pause;
 
     /**
+     * The pool templates are resolved in, or null for every pool the token can see (#247). One appliance
+     * fronts several pools, so the same image name in two of them is ambiguous unless the cloud names one.
+     * Only {@link #resolveTemplate} and {@link #ping} read it: every other verb takes a handle that already
+     * carries its pool.
+     */
+    @CheckForNull
+    private final String poolId;
+
+    /**
      * @param baseUrl base URL of the appliance, e.g. {@code https://192.168.1.5}
      * @param token XO authentication token (a credential the plugin resolves at point of use, never
      *     stored here)
      * @param certificateFingerprint SHA-256 fingerprint of the certificate the appliance is expected to
      *     present. Null or blank means ordinary verification against the JVM trust store.
+     * @param poolId uuid of the pool to resolve templates in, or null for any pool the token can see
      */
-    public XoRestClient(@NonNull String baseUrl, @NonNull String token, @CheckForNull String certificateFingerprint) {
-        this(new HttpRestTransport(baseUrl, token, certificateFingerprint));
+    public XoRestClient(
+            @NonNull String baseUrl,
+            @NonNull String token,
+            @CheckForNull String certificateFingerprint,
+            @CheckForNull String poolId) {
+        this(new HttpRestTransport(baseUrl, token, certificateFingerprint), d -> Thread.sleep(d.toMillis()), poolId);
         // The form validator rejects http, but it is advisory: a JCasC document or a hand-edited
         // config.xml can still persist an http base URL. Warn here so the cleartext exposure is not
         // silent. It matters more than it does for XAPI: the token is sent on every single request as a
@@ -152,8 +166,14 @@ public final class XoRestClient implements HypervisorClient {
 
     /** For tests: as above, with the wait between tag reads replaced. */
     XoRestClient(@NonNull RestTransport transport, @NonNull Pause pause) {
+        this(transport, pause, null);
+    }
+
+    /** For tests: as above, scoped to one pool. */
+    XoRestClient(@NonNull RestTransport transport, @NonNull Pause pause, @CheckForNull String poolId) {
         this.transport = Objects.requireNonNull(transport, "transport");
         this.pause = Objects.requireNonNull(pause, "pause");
+        this.poolId = poolId == null || poolId.isBlank() ? null : poolId;
     }
 
     // -- plumbing ---------------------------------------------------------
@@ -468,6 +488,24 @@ public final class XoRestClient implements HypervisorClient {
             }
             matches.add(new TemplateHandle(pool, uuid));
         }
+        if (poolId != null) {
+            List<TemplateHandle> inPool = new ArrayList<>();
+            for (TemplateHandle match : matches) {
+                if (match.poolId().equals(poolId)) {
+                    inPool.add(match);
+                }
+            }
+            if (inPool.isEmpty()) {
+                // Name the pools that do carry it: a template built on the other pool is the likely story, and
+                // "no template named" alone would send the operator to check a spelling that is right.
+                throw new HypervisorException("no template named '" + name + "' in pool " + poolId
+                        + (matches.isEmpty()
+                                ? " (" + templates.size() + " template(s) visible to this token, none by that name)"
+                                : "; " + countByPool(matches) + " carry that name. Change this cloud's pool,"
+                                        + " or copy the image to pool " + poolId));
+            }
+            matches = inPool;
+        }
         if (matches.isEmpty()) {
             throw new HypervisorException("no template named '" + name + "' on this appliance" + " (" + templates.size()
                     + " template(s) visible to this token)");
@@ -495,11 +533,31 @@ public final class XoRestClient implements HypervisorClient {
      * branch. A mixed case (two in one pool, one in another) gets both halves, which is the shape a
      * three-way branch would have quietly dropped.
      *
-     * <p>Choosing the pool is issue #241's larger half and is deliberately not done here; the message
-     * says what the operator can do today instead of naming an option that does not exist yet.
+     * <p>The cross-pool advice is to name the pool on the cloud (#247). It can only reach this line with no
+     * pool set, since a set pool has already narrowed the matches to one pool.
      */
     @NonNull
     private static String ambiguousMessage(@NonNull String name, @NonNull List<TemplateHandle> matches) {
+        Map<String, Integer> byPool = new LinkedHashMap<>();
+        for (TemplateHandle match : matches) {
+            byPool.merge(match.poolId(), 1, Integer::sum);
+        }
+        String where = countByPool(matches);
+        List<String> advice = new ArrayList<>();
+        if (byPool.size() < matches.size()) {
+            advice.add("at least one pool holds more than one, so rename those until the name is unique"
+                    + " within its pool");
+        }
+        if (byPool.size() > 1) {
+            advice.add("the name is also carried by more than one pool, and this appliance fronts all of"
+                    + " them, so set this cloud's pool to the one it should provision into");
+        }
+        return matches.size() + " templates are named '" + name + "' (" + where + "); " + String.join("; ", advice);
+    }
+
+    /** {@code "2 in pool a, 1 in pool b"}, in the order the appliance listed them. */
+    @NonNull
+    private static String countByPool(@NonNull List<TemplateHandle> matches) {
         Map<String, Integer> byPool = new LinkedHashMap<>();
         for (TemplateHandle match : matches) {
             byPool.merge(match.poolId(), 1, Integer::sum);
@@ -511,18 +569,7 @@ public final class XoRestClient implements HypervisorClient {
             }
             where.append(count).append(" in pool ").append(pool);
         });
-        List<String> advice = new ArrayList<>();
-        if (byPool.size() < matches.size()) {
-            advice.add("at least one pool holds more than one, so rename those until the name is unique"
-                    + " within its pool");
-        }
-        if (byPool.size() > 1) {
-            advice.add("the name is also carried by more than one pool, and this backend cannot yet be"
-                    + " told which pool to provision into: it lists every template the token can see,"
-                    + " unlike the XAPI backend, which is connected to one pool master. Until a cloud can"
-                    + " name its pool, scope the token to a single pool or give the images distinct names");
-        }
-        return matches.size() + " templates are named '" + name + "' (" + where + "); " + String.join("; ", advice);
+        return where.toString();
     }
 
     @Override
@@ -1039,8 +1086,51 @@ public final class XoRestClient implements HypervisorClient {
      */
     @Override
     public void ping() {
-        get(API + "/pools?fields=id");
+        Map<String, String> pools = visiblePools();
         probePatchRoute();
+        if (poolId != null && !pools.containsKey(poolId)) {
+            // Checked here so Test Connection reports it. A typo in the pool would otherwise surface only as
+            // every template name being absent, which blames the template field for the pool field's mistake.
+            throw new HypervisorException("pool " + poolId + " is not visible to this token; it sees "
+                    + describePools(pools) + ". Pick one of those, or leave the pool empty to use any of them.");
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * <p>{@code GET /pools}, which is also the cheap authenticated round trip {@link #ping} needs. A pool's
+     * {@code id} is its uuid on this route, and it is the same value a template reports as {@code $pool}
+     * (read on the lab appliance, 2026-09-27), which is what makes a pool read here usable as the filter
+     * {@link #resolveTemplate} applies.
+     */
+    @Override
+    @NonNull
+    public Map<String, String> visiblePools() {
+        JsonNode pools = get(API + "/pools?fields=id,name_label");
+        if (!pools.isArray()) {
+            throw new HypervisorException(
+                    "GET " + API + "/pools: expected a list of pools, got " + pools.getNodeType());
+        }
+        Map<String, String> out = new LinkedHashMap<>();
+        for (JsonNode pool : pools) {
+            String id = pool.path("id").asText("");
+            if (!id.isBlank()) {
+                out.put(id, pool.path("name_label").asText(""));
+            }
+        }
+        return out;
+    }
+
+    /** {@code "lab (23ac...), other (36f8...)"}, or {@code "no pools"}. */
+    @NonNull
+    public static String describePools(@NonNull Map<String, String> pools) {
+        if (pools.isEmpty()) {
+            return "no pools";
+        }
+        List<String> parts = new ArrayList<>();
+        pools.forEach((id, label) -> parts.add(label.isBlank() ? id : label + " (" + id + ")"));
+        return String.join(", ", parts);
     }
 
     /**
