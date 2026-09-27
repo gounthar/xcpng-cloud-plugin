@@ -501,8 +501,8 @@ public final class XoRestClient implements HypervisorClient {
                 throw new HypervisorException("no template named '" + name + "' in pool " + poolId
                         + (matches.isEmpty()
                                 ? " (" + templates.size() + " template(s) visible to this token, none by that name)"
-                                : "; " + countByPool(matches) + " carry that name. Change this cloud's pool,"
-                                        + " or copy the image to pool " + poolId));
+                                : "; the name is carried by " + countByPool(matches) + ". Change this cloud's"
+                                        + " pool, or copy the image to pool " + poolId));
             }
             matches = inPool;
         }
