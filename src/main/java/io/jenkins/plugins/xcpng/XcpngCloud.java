@@ -1475,6 +1475,48 @@ public class XcpngCloud extends Cloud {
         this.clientFactory = clientFactory;
     }
 
+    /**
+     * Whether a build with {@code label} is one this cloud could ever provision for, ignoring capacity.
+     *
+     * <p>{@link #canProvision} without the headroom check, for {@link XcpngNoDelayProvisionerStrategy}'s
+     * queue listener. That listener runs under the queue lock, and {@code availableCapacity} takes the
+     * name-keyed capacity lock, so asking {@link #canProvision} there would add a queue-then-capacity lock
+     * order nothing else in this plugin uses. This reads only the cloud's own configuration.
+     */
+    boolean servesLabel(@CheckForNull Label label) {
+        return isBackendSupported() && templateFor(label) != null;
+    }
+
+    /**
+     * Executors core counts as connecting for {@code label} that {@link #plan} will subtract itself: this
+     * cloud's agents for the template {@code label} resolves to, still being launched.
+     *
+     * <p>{@link XcpngNoDelayProvisionerStrategy} subtracts every other connecting executor for the label
+     * before asking this cloud, and leaves these to {@link #alreadyBuilding}, so each booting agent is
+     * counted exactly once. The test is core's own ({@code LoadStatistics}: offline and connecting), not
+     * {@link #isBeingBuilt}, which also counts an agent with no computer yet that core does not see.
+     */
+    int connectingExecutorsFor(@CheckForNull Label label) {
+        XcpngTemplate template = templateFor(label);
+        if (template == null) {
+            return 0;
+        }
+        int connecting = 0;
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                ProvisioningActivity.Id id = agent.getId();
+                if (id != null
+                        && template.getTemplateName().equals(id.getTemplateName())
+                        && agent.toComputer() instanceof SlaveComputer computer
+                        && computer.isOffline()
+                        && computer.isConnecting()) {
+                    connecting += computer.getNumExecutors();
+                }
+            }
+        }
+        return connecting;
+    }
+
     /** The first template whose labels satisfy {@code label}; null if none does. */
     @CheckForNull
     private XcpngTemplate templateFor(@CheckForNull Label label) {

@@ -58,10 +58,45 @@ put two builds on one VM, and the reap fires when a build completes, so the firs
 destroy the VM under the other. Scale throughput with `maxInstances` (more clones), not with executors
 per clone.
 
+### When provisioning starts
+
+A clone is requested as soon as a build is waiting for one of the cloud's labels and nothing can take
+it: no free executor, no agent already booting for it, no clone already planned. Jenkins' default
+provisioning waits instead. It averages the queue length and the free executors over time, in the hope
+that a busy executor frees up first, and only asks a cloud for a node once the averaged demand crosses a
+threshold. It skips that wait when a label has no executors at all, so the first build is served at
+once, but a build queued behind one that is already running can wait well over a minute. Here that bet
+never pays off, because an agent that is running a build is single-use and will never take the next one.
+
+An agent that is still booting counts as capacity, warm spares included, whichever cloud it belongs to.
+A build that arrives while one is booting for its template gets its own clone only if there are more
+waiting builds than booting agents. Every clone still counts against `maxInstances`; once the cloud is at
+its cap, a waiting build is served when a slot frees up.
+
+An agent running its build refuses new work at once, so it is never counted as a free executor. An agent
+reloaded after a controller restart is told to refuse new work at its first retention check, which can
+come up to 60 seconds after startup (the default interval). Until then it can still take a queued build.
+An idle reloaded agent keeps its `maxInstances` slot until that check reclaims it.
+
+If a label is also served by another kind of cloud, the XCP-ng cloud is asked first, whatever the order
+of the clouds in the configuration, and the other cloud only gets the builds XCP-ng cannot cover, for
+example once it is at `maxInstances`.
+
+To go back to Jenkins' default behaviour, start the controller with
+`-Dio.jenkins.plugins.xcpng.XcpngNoDelayProvisionerStrategy.disabled=true`. The property is read on every
+provisioning round, so setting it from the script console also takes effect without a restart:
+
+```groovy
+System.setProperty('io.jenkins.plugins.xcpng.XcpngNoDelayProvisionerStrategy.disabled', 'true')
+```
+
 ### Warm pool
 
 A template with a **Warm pool size** above 0 keeps that many pre-booted, idle agents ready, so a queued
-build lands on a live executor instead of waiting for a cold clone. A background task reconciles the pool
+build lands on a live executor instead of waiting for a cold clone. Without a spare, a waiting build still gets
+its clone straight away (see [When provisioning starts](#when-provisioning-starts)), so what a spare saves
+is the time the clone takes to boot and connect. A build that arrives while a spare is still booting waits
+for that spare rather than getting a second clone. A background task reconciles the pool
 roughly once a minute, so a spare appears up to a minute after you save the configuration, and after a
 spare is consumed by a build its replacement is cloned within about a minute. Warm agents are still
 single-use and count against `maxInstances`. A spare that boots but never connects is still reclaimed by
@@ -69,19 +104,18 @@ the idle timeout.
 
 The "warm" marker is intentionally not persisted, so a controller restart costs every existing spare its
 exemption. That churn is deliberate: it guarantees a VM that has already run a build can never be revived
-as a spare. It does not happen all at once, though, and the order is worth knowing before you size a
-pool. The old spare reconnects as an ordinary agent, the maintainer sees no warm spares and clones a
-replacement within about a minute, and only then does the idle net reclaim the old one, after
-`idleMinutes` has elapsed. Both run at the same time in between.
+as a spare. Every agent the controller reloads, spare or not, is therefore reclaimed at its first
+retention check instead of being kept: from that check on it refuses new work, and if it is idle its VM
+is destroyed. A build from the restored queue that reached it first keeps it, and the agent is destroyed
+when that build completes. The maintainer clones replacement spares on its first pass, about 10 seconds
+after startup, and again as soon as a reclaimed agent frees a slot. The old agent counts against
+`maxInstances` until it is gone, so a cloud at its cap waits for it instead of going over, and a cloud
+with room can briefly hold both.
 
-**So a restart can temporarily hold twice the VMs a template is configured for, for up to the length of
-the idle timeout.** Two things bound that. The replacement is only cloned if `maxInstances` has room for
-it, so a cloud already at its cap simply waits instead of doubling. And the old spare is an ordinary
-single-use agent, so a build landing on it destroys it and frees the slot early; the full idle timeout is
-the worst case, not the normal one. While the window is open a cloud sitting at `maxInstances` provisions
-nothing new, though builds still run, since both agents are idle and carry the template's labels.
-Measured on the lab pool with `maxInstances` 2 and `idleMinutes` 10: replacement cloned 65 s after the
-restart, old spare destroyed 10 min 45 s after it reconnected.
+Measured on the lab pool across four restarts (#115): the reloaded agent reappeared 12 to 15 s after the
+restart, and its VM was destroyed 3 to 5 s after that. The retention check can come later than that, up to
+a minute after startup at the default interval. Before #115 the same spare was kept for the whole idle
+timeout, 10 min 45 s with `idleMinutes` 10.
 
 ## Requirements
 
@@ -216,6 +250,12 @@ Template fields:
 | Warm pool size | `minInstances` | Pre-booted idle agents of this template to keep hot, so a queued build connects to a ready executor instead of waiting for a cold clone. Defaults to 0 (off). Warm agents are still single-use (one build each) and count against `maxInstances`. See [Warm pool](#warm-pool). |
 | SSH authorized key | `sshAuthorizedKey` | A public key seeded into the clone over xenstore. Paste a public key only; a pasted private key is rejected. |
 
+System property:
+
+| Property | Description |
+| --- | --- |
+| `io.jenkins.plugins.xcpng.XcpngNoDelayProvisionerStrategy.disabled` | `true` goes back to Jenkins' default provisioning, which waits for its load averages before requesting a clone. Defaults to `false`. See [When provisioning starts](#when-provisioning-starts). |
+
 ## Preparing a golden image
 
 The plugin clones an existing VM or template on the pool. That image must be able to run a Jenkins
@@ -299,6 +339,14 @@ is up.
 exceeds the time a clone takes to boot and connect. An agent that has never come online holds no idle
 exemption, so a short timeout reclaims it mid-boot, the queue asks for another, and the cycle repeats
 with nothing ever connecting. The default of 10 is fine; a value like 1 is not.
+
+**A build waits in the queue and no agent is requested.** Check, in order: that the build's label
+expression matches a template's labels; that the cloud is not already at `maxInstances` (a reloaded agent
+holds its slot until the next retention check); and that
+`io.jenkins.plugins.xcpng.XcpngNoDelayProvisionerStrategy.disabled` is not set. To see each provisioning
+decision, add a logger for `io.jenkins.plugins.xcpng.XcpngNoDelayProvisionerStrategy` at `FINE` under
+**Manage Jenkins** then **System Log**; each round in which a build waits with no free executor logs the
+number of waiting builds and what was planned for them.
 
 ## Known limitations
 
