@@ -30,7 +30,7 @@ import java.util.Map;
  * normal path, but a controller that crashes mid-provision, or a {@code destroyWithDisks} that throws,
  * leaves a VM only an out-of-band sweep will ever find. Matching such VMs by name is what left
  * {@code tools/reaper.py} unable to see a single one of them, so the mark is a property of the record
- * rather than a naming convention. Each backend picks the field: the Xen Orchestra backend uses tags
+ * rather than a naming convention. The backend picks the field: the Xen Orchestra backend uses tags
  * ({@link XoRestClient#OWNER_TAG_PREFIX}); the removed XAPI backend used {@code other_config}.
  */
 public record ProvisionSpec(

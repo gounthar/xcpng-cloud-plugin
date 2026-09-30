@@ -334,7 +334,7 @@ public final class XoRestClient implements HypervisorClient {
      * What an authentication or authorisation status means on this backend, appended to the failure it
      * explains.
      *
-     * <p>This is where the two backends were least alike, and the XO side is the poorer of the two. XAPI
+     * <p>This is where the two backends were least alike, and the XO side was the poorer of the two. XAPI
      * answers a bad credential with a named code ({@code SESSION_AUTHENTICATION_FAILED}), and the removed
      * XAPI backend re-logged in by itself when a session merely went stale, so neither case reached an
      * operator as a bare number. XO has

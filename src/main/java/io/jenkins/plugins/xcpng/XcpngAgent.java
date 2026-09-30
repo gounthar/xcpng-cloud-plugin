@@ -473,12 +473,12 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         XcpngCloud cloud = getCloud();
         // The connection snapshot, not the live cloud, decides how this VM is reached. The two agree in the
         // ordinary case and the snapshot is right whenever they do not: a VM belongs to the configuration it
-        // was created under, and an administrator editing a running cloud does not move it. The backend is
-        // where that matters most, because the handle itself is backend-shaped -- XapiClient's refs were
-        // OpaqueRef strings and XoRestClient's are uuids -- so while both backends existed, a cloud flipped
-        // from XO to XAPI mid-build would have handed an XO handle to XAPI, failed, and stranded the VM. The
-        // same reasoning covers poolUrl and credentialsId: a cloud repointed at another pool must not have this
-        // VM's destroy aimed at it.
+        // was created under, and an administrator editing a running cloud does not move it. The backend was
+        // where that mattered most while both existed, because the handle itself is backend-shaped --
+        // XapiClient's refs were OpaqueRef strings and XoRestClient's are uuids -- so a cloud flipped from XO to
+        // XAPI mid-build would have handed an XO handle to XAPI, failed, and stranded the VM. The same reasoning
+        // still covers poolUrl and credentialsId: a cloud repointed at another pool must not have this VM's
+        // destroy aimed at it.
         //
         // The cloud is still consulted for one thing, and only when it exists: recording the leak.
         boolean fromSnapshot = poolUrl != null;
