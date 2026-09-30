@@ -108,11 +108,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * configuration, or renamed, which is the same thing to an agent holding a name.
      *
      * <p>Non-secret by construction, and deliberately the same three values the cloud persists: the pool URL,
-     * the <em>ID</em> of the XAPI credential, and the pinned certificate fingerprint, if there is one. The
-     * credential itself is still resolved from the store at point of use, so nothing secret reaches the node's
-     * {@code config.xml}. Null on an agent persisted before this snapshot existed; {@link #_terminate} treats
-     * that absence as "no fallback available" rather than normalising it, since there is nothing to normalise
-     * it to.
+     * the <em>ID</em> of the Xen Orchestra token credential, and the pinned certificate fingerprint, if there
+     * is one. The credential itself is still resolved from the store at point of use, so nothing secret reaches
+     * the node's {@code config.xml}. Null on an agent persisted before this snapshot existed; {@link
+     * #_terminate} treats that absence as "no fallback available" rather than normalising it, since there is
+     * nothing to normalise it to.
      */
     @CheckForNull
     private final String poolUrl;
@@ -290,7 +290,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         return poolUrl;
     }
 
-    /** ID of the XAPI credential snapshotted from the owning cloud, never the credential itself. */
+    /** ID of the credential snapshotted from the owning cloud, never the credential itself. */
     @CheckForNull
     public String getCredentialsId() {
         return credentialsId;
@@ -473,11 +473,12 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         XcpngCloud cloud = getCloud();
         // The connection snapshot, not the live cloud, decides how this VM is reached. The two agree in the
         // ordinary case and the snapshot is right whenever they do not: a VM belongs to the configuration it
-        // was created under, and an administrator editing a running cloud does not move it. The backend is
-        // where that matters most, because the handle itself is backend-shaped -- XapiClient's refs are
-        // OpaqueRef strings and XoRestClient's are uuids -- so a cloud flipped from XO to XAPI mid-build
-        // would hand an XO handle to XAPI, fail, and strand the VM. The same reasoning covers poolUrl and
-        // credentialsId: a cloud repointed at another pool must not have this VM's destroy aimed at it.
+        // was created under, and an administrator editing a running cloud does not move it. The backend was
+        // where that mattered most while both existed, because the handle itself is backend-shaped --
+        // XapiClient's refs were OpaqueRef strings and XoRestClient's are uuids -- so a cloud flipped from XO to
+        // XAPI mid-build would have handed an XO handle to XAPI, failed, and stranded the VM. The same reasoning
+        // still covers poolUrl and credentialsId: a cloud repointed at another pool must not have this VM's
+        // destroy aimed at it.
         //
         // The cloud is still consulted for one thing, and only when it exists: recording the leak.
         boolean fromSnapshot = poolUrl != null;

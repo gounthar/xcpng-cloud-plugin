@@ -14,14 +14,14 @@ import java.util.Map;
  * the disk is larger).
  *
  * <p>{@code placementHint} is an opaque string; null means "let the pool schedule". {@code userData}
- * (a cloud-init NoCloud payload) is optional and the XAPI backend ignores it in v0 (the seed is
+ * (a cloud-init NoCloud payload) is optional and no backend reads it in v0 (the seed is
  * attached as a separate concern, not through this field).
  *
  * <p>{@code guestData} carries per-clone key/value pairs the guest reads on first boot to launch its
  * inbound agent (the controller URL, the node name, and the JNLP secret). It is backend-neutral: the
  * keys are plain logical names ({@code url}, {@code name}, {@code secret}) and each backend chooses how
- * to deliver them. The XAPI backend writes them into the clone's xenstore (under {@code vm-data/jenkins/})
- * before the VM starts; a Xen Orchestra backend could deliver the same map via cloud-init instead. Empty
+ * to deliver them. The Xen Orchestra backend writes them into the clone's xenstore data (under
+ * {@code vm-data/jenkins/}) in the same call that sizes the clone, before the VM starts. Empty
  * when no seed is needed. Distinct from {@code userData}, which is an opaque cloud-init blob v0 ignores.
  *
  * <p>{@code owner} names the cloud this clone belongs to, and asks the backend to record it <em>on the VM
@@ -30,7 +30,8 @@ import java.util.Map;
  * normal path, but a controller that crashes mid-provision, or a {@code destroyWithDisks} that throws,
  * leaves a VM only an out-of-band sweep will ever find. Matching such VMs by name is what left
  * {@code tools/reaper.py} unable to see a single one of them, so the mark is a property of the record
- * rather than a naming convention. Each backend picks the field: the XAPI backend uses {@code other_config}.
+ * rather than a naming convention. The backend picks the field: the Xen Orchestra backend uses tags
+ * ({@link XoRestClient#OWNER_TAG_PREFIX}); the removed XAPI backend used {@code other_config}.
  */
 public record ProvisionSpec(
         @NonNull String name,

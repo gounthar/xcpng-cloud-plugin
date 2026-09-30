@@ -9,8 +9,8 @@ import java.util.List;
  *
  * <p>Unchecked on purpose: the lifecycle verbs are called from Jenkins provisioning callbacks that
  * cannot usefully recover mid-clone, so a failure aborts the attempt and Jenkins retries the queue
- * item later. Backend-specific error handling (XAPI {@code SESSION_INVALID} re-login, master
- * redirect) stays inside the implementation and never surfaces as this exception.
+ * item later. Backend-specific error handling (the removed XAPI backend's {@code SESSION_INVALID} re-login
+ * and master redirect were the examples) stays inside the implementation and never surfaces as this exception.
  *
  * <p>{@link #getErrorCode()} and {@link #getErrorParams()} carry the backend's own error envelope
  * when there was one, so a caller can branch on a specific failure without reading the human-facing
@@ -23,11 +23,15 @@ public class HypervisorException extends RuntimeException {
 
     private static final long serialVersionUID = 1L;
 
-    /** The backend's error code (XAPI puts it in the JSON-RPC {@code error.message}), or null if there was none. */
+    /**
+     * The backend's error code (Xen Orchestra's {@code error} field, which is the XAPI code itself when the
+     * failure came from XAPI), or null if there was none.
+     */
     private final String errorCode;
 
     /**
-     * The backend's error parameters (XAPI's {@code error.data}), empty when there were none. Declared as
+     * The backend's error parameters (Xen Orchestra's {@code data}: an array's elements, or an object's
+     * {@code key=value} pairs), empty when there were none. Declared as
      * {@link ArrayList} rather than {@link List} because this class is serializable and the interface is
      * not: a non-transient field of a type SpotBugs cannot prove serializable is an SE_BAD_FIELD finding,
      * and CI fails on those.

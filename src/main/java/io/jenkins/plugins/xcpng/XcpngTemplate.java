@@ -187,7 +187,7 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         return memoryMb;
     }
 
-    /** Clone memory in bytes, as {@code ProvisionSpec} and the XAPI backend expect it. */
+    /** Clone memory in bytes, as {@code ProvisionSpec} expects it. */
     public long getMemoryBytes() {
         return memoryMb * 1024L * 1024L;
     }
