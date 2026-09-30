@@ -171,6 +171,8 @@ class XcpngNoDelayProvisionerStrategyTest {
 
     @Test
     void aBuildWaitingBehindABusyAgentGetsItsCloneWithinSeconds(JenkinsRule r) throws Exception {
+        // Static, so a rerun in the same JVM would otherwise start with the previous run's entries.
+        StartedRecorder.nodes.clear();
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         r.jenkins.clouds.add(bootingCloudBackedBy(fake, 2));
         try {
@@ -310,6 +312,10 @@ class XcpngNoDelayProvisionerStrategyTest {
 
     @Test
     void aLabelNoXcpngCloudServesIsLeftToTheOtherStrategies(JenkinsRule r) throws Exception {
+        // Static, so reset: a count left over from an earlier run would let the first-round wait below
+        // pass before any round ran, and the recorder would then see the label for the wrong reason.
+        NeverDeliveringCloud.provisioned.set(0);
+        ConsultedRecorder.labels.clear();
         // A label only another cloud serves, with its demand already covered by a node that cloud is still
         // planning. This strategy must not answer PROVISIONING_COMPLETED for it: that would end the round
         // before any lower-ordinal strategy, another plugin's included, is consulted.
