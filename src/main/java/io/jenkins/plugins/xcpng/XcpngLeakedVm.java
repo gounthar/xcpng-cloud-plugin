@@ -10,11 +10,12 @@ import java.util.Objects;
  *
  * <p>The connection travels with the ref because a ref is only meaningful to the connection that minted it,
  * and handing it to any other is worse than useless: it can come back as a false success. Both backends read
- * "no such object" as "already destroyed" -- {@code HANDLE_INVALID} on XAPI, 404 on Xen Orchestra -- which is
- * right for the race it was written for (#145) and wrong for a ref the connection has never heard of.
+ * "no such object" as "already destroyed" -- 404 on Xen Orchestra, and {@code HANDLE_INVALID} on the removed
+ * XAPI backend -- which is right for the race it was written for (#145) and wrong for a ref the connection has
+ * never heard of.
  * Measured on the lab pool on 2026-09-19 (#223): XAPI answers a Xen Orchestra uuid with
- * {@code HANDLE_INVALID ["VM", "<uuid>"]}, exactly the shape {@code XapiClient} treats as already gone, so a
- * sweep aimed at the wrong backend drops the ref as reclaimed while the VM keeps running. A ref handed to a
+ * {@code HANDLE_INVALID ["VM", "<uuid>"]}, exactly the shape {@code XapiClient} treated as already gone, so a
+ * sweep aimed at the wrong backend dropped the ref as reclaimed while the VM kept running. A ref handed to a
  * different pool fails the same way. So {@link XcpngCloud#sweepLeakedVms} only ever hands a ref back to the
  * connection recorded here.
  *

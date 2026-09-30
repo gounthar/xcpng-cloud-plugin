@@ -42,7 +42,7 @@ public class XcpngComputerListener extends ComputerListener {
      *
      * <p>{@code onOnline} runs inside the computer's connection sequence, and the scrub is an optimization
      * of exposure rather than a prerequisite for the agent working — the guest has already read the seed by
-     * the time this fires. Doing the XAPI calls here would pin the connecting thread for the transport
+     * the time this fires. Doing the Xen Orchestra calls here would pin the connecting thread for the transport
      * timeouts whenever the pool is slow or unreachable, which is likeliest exactly when several clones are
      * connecting at once, and that delay eats into the online wait the provisioning task is counting down.
      */

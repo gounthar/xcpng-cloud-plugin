@@ -19,8 +19,8 @@ import java.util.Objects;
  * not authenticated, and XO answers 401 with the same body it gives a wrong token, so the mistake reads
  * as a bad credential rather than as a wrong header.
  *
- * <p>TLS trust is {@link TrustedHttpClients}', shared with the XAPI transport. There is no third mode
- * that accepts an unrecognised certificate.
+ * <p>TLS trust is {@link TrustedHttpClients}', which it used to share with the removed XAPI transport. There
+ * is no third mode that accepts an unrecognised certificate.
  */
 final class HttpRestTransport implements RestTransport {
 

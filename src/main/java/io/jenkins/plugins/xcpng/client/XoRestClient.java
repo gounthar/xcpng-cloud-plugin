@@ -95,7 +95,7 @@ public final class XoRestClient implements HypervisorClient {
      * does not collide with {@link #OWNER_TAG_PREFIX}: {@code xcpng-cloud-uuid:} does not start with
      * {@code xcpng-cloud:}, so a sweep reading owner tags never mistakes one for the other.
      *
-     * <p>Unlike the XAPI side, which writes both keys in one {@code set_other_config}, tags go in one PUT
+     * <p>Unlike the XAPI side, which wrote both keys in one {@code set_other_config}, tags go in one PUT
      * each, so a clone can exist carrying the owner tag and not yet this one. That ordering is deliberate
      * and is the safe direction: such a survivor reads as an older-plugin clone and stays reapable, whereas
      * stamping the uuid first would leave a survivor carrying neither an owner tag nor anything a sweep
@@ -150,7 +150,7 @@ public final class XoRestClient implements HypervisorClient {
         this(new HttpRestTransport(baseUrl, token, certificateFingerprint), d -> Thread.sleep(d.toMillis()), poolId);
         // The form validator rejects http, but it is advisory: a JCasC document or a hand-edited
         // config.xml can still persist an http base URL. Warn here so the cleartext exposure is not
-        // silent. It matters more than it does for XAPI: the token is sent on every single request as a
+        // silent. It matters more than it did for XAPI: the token is sent on every single request as a
         // cookie, so one plaintext round trip hands it over, and it does not expire on its own.
         if (baseUrl.regionMatches(true, 0, "http://", 0, "http://".length())) {
             LOGGER.warning("Xen Orchestra URL " + baseUrl + " uses plain http; the authentication token is"
@@ -334,9 +334,10 @@ public final class XoRestClient implements HypervisorClient {
      * What an authentication or authorisation status means on this backend, appended to the failure it
      * explains.
      *
-     * <p>This is where the two backends are least alike, and the XO side was the poorer of the two. XAPI
-     * answers a bad credential with a named code ({@code SESSION_AUTHENTICATION_FAILED}) and re-logs in by
-     * itself when a session merely went stale, so neither case reaches an operator as a bare number. XO has
+     * <p>This is where the two backends were least alike, and the XO side is the poorer of the two. XAPI
+     * answers a bad credential with a named code ({@code SESSION_AUTHENTICATION_FAILED}), and the removed
+     * XAPI backend re-logged in by itself when a session merely went stale, so neither case reached an
+     * operator as a bare number. XO has
      * no session to refresh -- the token is the credential -- and it answers every one of its distinct
      * causes with the same status and, per {@link HttpRestTransport}'s own note, the same body. An operator
      * reading "HTTP 401" off the Test Connection button has no way to tell a revoked token from a token
@@ -577,7 +578,7 @@ public final class XoRestClient implements HypervisorClient {
     public VmRef cloneFromTemplate(@NonNull VmRef template, @NonNull ProvisionSpec spec) {
         if (spec.placementHint() != null) {
             // Rejected before anything is created, so a bad spec fails with this local message rather than
-            // as a connection or auth error, and leaves no VM behind. Same rule as the XAPI backend:
+            // as a connection or auth error, and leaves no VM behind. Same rule the XAPI backend had:
             // reject rather than silently ignore, so a caller cannot believe it placed a VM when it did not.
             throw new HypervisorException("placementHint is not honoured in v0 (single-host pool); leave it null");
         }
@@ -617,7 +618,7 @@ public final class XoRestClient implements HypervisorClient {
 
         // The clone exists now, so anything past this point that throws would leave a VM and its disks
         // behind. Destroy it on any such failure before rethrowing, the same self-cleanup the XAPI backend
-        // owes its own partial clones.
+        // did for its own partial clones.
         try {
             configure(vm, spec);
         } catch (RuntimeException e) {
@@ -647,12 +648,12 @@ public final class XoRestClient implements HypervisorClient {
      * first thing that can fail once the clone exists, so a failure there now costs a provision that would
      * otherwise have succeeded. What it buys is that every clone surviving past this point carries the
      * marker, whenever the spec names an owner at all: a null or blank owner is untaggable by design and
-     * {@code markOwner} returns early on it. Both backends destroy a partly configured clone on the way
-     * out, so the ordinary failure is covered either way; the window this closes is the one where that
-     * cleanup <em>also</em> fails -- an appliance blip, an interrupted thread, a 500 on the DELETE. A
-     * survivor stamped last carries no tag, {@code provisionVm} has not recorded a ref for it either, and
-     * both sweeps select on the marker, so nothing finds it but an operator's eye in the XO UI. The XAPI
-     * backend already made this trade, and stamps second, right after the template flag.
+     * {@code markOwner} returns early on it. This backend destroys a partly configured clone on the way
+     * out, as the XAPI one did, so the ordinary failure is covered either way; the window this closes is the
+     * one where that cleanup <em>also</em> fails -- an appliance blip, an interrupted thread, a 500 on the
+     * DELETE. A survivor stamped last carries no tag, {@code provisionVm} has not recorded a ref for it
+     * either, and both sweeps select on the marker, so nothing finds it but an operator's eye in the XO UI.
+     * The XAPI backend had already made this trade, and stamped second, right after the template flag.
      *
      * <p>Sizing goes through {@code PATCH /vms/{id}} rather than through the create body because that is
      * the surface with a declared type ({@code EditVmProps}); the create route's own body is the
@@ -661,7 +662,7 @@ public final class XoRestClient implements HypervisorClient {
      *
      * <p><b>{@code cpus} is sent and {@code cpusStaticMax} is not, and that is not an omission.</b> XAPI
      * enforces {@code 0 < VCPUs_at_startup <= VCPUs_max} on every write, which is why the XAPI backend
-     * hand-orders the pair. XO's edit machinery already does that: {@code cpus} declares a
+     * hand-ordered the pair. XO's edit machinery already does that: {@code cpus} declares a
      * {@code cpusStaticMax: gte} constraint, and when the current max does not satisfy it the max is
      * raised first. Sending both instead would fire two setters <em>concurrently</em> ({@code
      * Promise.all} over the values), so shrinking would race a {@code VCPUs_max} write against a still
@@ -948,7 +949,7 @@ public final class XoRestClient implements HypervisorClient {
      * it is a capability lost rather than a setting chosen, and the ordering trap this interface warns
      * about is now XO's to get right.
      *
-     * <p>The already-gone rule is the same as the XAPI backend's and exists for the same race (#145): two
+     * <p>The already-gone rule is the one the XAPI backend had, and exists for the same race (#145): two
      * teardowns can reach one VM, and an operator deleting it by hand beats both. XO answers a request for
      * an object it cannot resolve with <b>404</b>, which reports this method's goal state rather than a
      * failure. The status is what is matched, not the message, so a 404 quoted inside some other failure
@@ -1027,8 +1028,8 @@ public final class XoRestClient implements HypervisorClient {
      * "<id>","type":"VM"}}}. {@code type} is not required, because {@code noSuchObject} is also called with
      * an id alone.
      *
-     * <p>With an {@code expectedId}, the object must also be the one asked about. That is the XAPI
-     * backend's already-gone rule, which checks the error parameters name the very ref being destroyed, on
+     * <p>With an {@code expectedId}, the object must also be the one asked about. That was the XAPI
+     * backend's already-gone rule too, which checked the error parameters name the very ref being destroyed, on
      * the stated grounds that the code alone is not enough: a generic handler cannot echo back an id it never parsed.
      * The message must also be the one XO's formatter builds from that id, {@code no such ${type || 'object'}
      * ${id}} ({@code xo-common/api-errors.js}), so a JSON 404 that happens to carry the id in {@code data}
@@ -1074,7 +1075,7 @@ public final class XoRestClient implements HypervisorClient {
      * <p>Deliberately not {@code GET /rest/v0/ping}: that route is declared {@code @Security('none')}, so
      * it answers pong to an unauthenticated caller and would report a working connection for a token that
      * is wrong, missing, or expired. Listing pools is the cheap authenticated round trip, the same
-     * reasoning as the XAPI backend's {@code pool.get_all}.
+     * reasoning that had the XAPI backend call {@code pool.get_all}.
      *
      * <p>Then one route probe, because authenticating proves nothing about whether the appliance serves the
      * call provisioning needs. {@code PATCH /vms/{id}} carries the sizing and the guest-data seed, and an xo-server too old

@@ -131,7 +131,7 @@ public final class CertificateFingerprint {
      * <p>This is the half of trust-on-first-use that a human completes: the operator is shown a
      * fingerprint and decides whether it is their pool. The trust manager used here records the leaf
      * certificate and then <em>refuses</em> it, so the handshake never completes and not one byte of the
-     * XAPI credential is offered to a peer nobody has vouched for. That is the difference between this
+     * Xen Orchestra token is offered to a peer nobody has vouched for. That is the difference between this
      * and the trust-all context it replaced, which accepted every certificate and then talked to it.
      *
      * @param poolUrl the pool's base URL; its host and port are used, the path is ignored.
