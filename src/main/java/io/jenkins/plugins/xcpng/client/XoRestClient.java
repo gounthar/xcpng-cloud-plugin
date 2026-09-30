@@ -250,7 +250,7 @@ public final class XoRestClient implements HypervisorClient {
         throw new HypervisorException(method + " " + path + ": the appliance answered 202 Accepted, so it started"
                 + " a background task instead of doing the work. This backend asks every call for"
                 + " ?sync=true and needs Xen Orchestra 6.5.0 or newer; an older appliance ignores the"
-                + " parameter. Upgrade Xen Orchestra, or use the XAPI backend."
+                + " parameter. Upgrade Xen Orchestra."
                 + (consequence == null ? "" : " " + consequence));
     }
 
@@ -588,7 +588,7 @@ public final class XoRestClient implements HypervisorClient {
             // userdevice read first and refuses to shrink. The plugin passes null here on every path, so
             // this is unreached today; wiring it blind and untested would be worse than refusing it.
             throw new HypervisorException("diskBytes is not honoured by the Xen Orchestra backend yet;"
-                    + " size the golden image's disk instead, or use the XAPI backend");
+                    + " size the golden image's disk instead");
         }
         TemplateHandle handle = TemplateHandle.parse(template);
 
