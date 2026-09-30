@@ -7,7 +7,8 @@
   and the token is then sent in cleartext. Do not embed a username or password in the URL.
   <p>
     The appliance has to route <code>PATCH /rest/v0/vms/{id}</code>, which the plugin needs to seed each
-    clone. It is absent on xo-server 5.192.1, what a freshly deployed appliance ran when this was measured,
-    and present on 5.208.3. <em>Test connection</em> checks for it and says so if it is missing.
+    clone. It first shipped in Xen Orchestra 6.5.0 (xo-server 5.202.1), so a freshly deployed appliance may
+    need updating first. <em>Test connection</em> checks for it; when it is missing, it names the REST API
+    version the appliance reports and says whether the appliance or a proxy in front of it is the cause.
   </p>
 </div>

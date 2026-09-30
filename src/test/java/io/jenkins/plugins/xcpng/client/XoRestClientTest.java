@@ -980,7 +980,7 @@ class XoRestClientTest {
 
         assertTrue(e.getMessage().contains("Cannot PATCH"), "the excerpt must survive: " + e.getMessage());
         assertTrue(e.getMessage().contains("does not serve PATCH"), e.getMessage());
-        assertTrue(e.getMessage().contains("5.192.1"), e.getMessage());
+        assertTrue(e.getMessage().contains("5.202.1"), e.getMessage());
         assertEquals(List.of(CLONE), t.destroyed, "the clone must still be reclaimed");
     }
 
@@ -1002,7 +1002,7 @@ class XoRestClientTest {
 
         assertTrue(e.getMessage().contains("no such VM"), e.getMessage());
         assertFalse(e.getMessage().contains("does not serve"), e.getMessage());
-        assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
+        assertFalse(e.getMessage().contains("5.202.1"), e.getMessage());
     }
 
     /**
@@ -1018,7 +1018,7 @@ class XoRestClientTest {
                 assertThrows(HypervisorException.class, () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)));
 
         assertTrue(e.getMessage().contains("does not serve DELETE"), e.getMessage());
-        assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
+        assertFalse(e.getMessage().contains("5.202.1"), e.getMessage());
     }
 
     private static final String PROBE = "/rest/v0/vms/" + XoRestClient.PROBE_ID;
@@ -1081,7 +1081,106 @@ class XoRestClientTest {
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
 
         assertTrue(e.getMessage().contains("does not serve PATCH"), e.getMessage());
-        assertTrue(e.getMessage().contains("5.192.1"), e.getMessage());
+        assertTrue(e.getMessage().contains("5.202.1"), e.getMessage());
+    }
+
+    /**
+     * An API description in the shape the lab appliance serves (#258), trimmed to what the verdict reads.
+     * Measured 2026-09-30 on Xen Orchestra 6.8.2: {@code info.version} {@code 0.39.0}, and {@code get},
+     * {@code patch} and {@code delete} under {@code /vms/{id}}.
+     */
+    private static String apiSpec(String version, String... vmIdVerbs) {
+        StringBuilder verbs = new StringBuilder();
+        for (String verb : vmIdVerbs) {
+            verbs.append(verbs.isEmpty() ? "" : ",").append('"').append(verb).append("\":{}");
+        }
+        return "{\"openapi\":\"3.0.0\",\"info\":{\"title\":\"@xen-orchestra/rest-api\",\"version\":\"" + version
+                + "\"},\"paths\":{\"/vms/{id}\":{" + verbs + "}}}";
+    }
+
+    /**
+     * An appliance whose own spec has no PATCH on {@code /vms/{id}} is the too-old one, and the message names
+     * the version it reported next to the floor. 0.32.0 is the rest-api version just before #9835.
+     */
+    @Test
+    void aTooOldApplianceIsNamedByItsOwnSpec() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 404, cannot("PATCH", PROBE));
+        t.specBody = apiSpec("0.32.0", "get", "delete");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertTrue(e.getMessage().contains("does not serve PATCH"), e.getMessage());
+        assertTrue(e.getMessage().contains("reports REST API 0.32.0"), e.getMessage());
+        assertTrue(e.getMessage().contains("needs upgrading"), e.getMessage());
+        assertFalse(e.getMessage().contains("proxy between"), e.getMessage());
+    }
+
+    /**
+     * The same probe answer from an appliance whose spec does list the route. That appliance is new enough,
+     * so sending the operator to upgrade it would be wrong; what is left is something in front of it.
+     */
+    @Test
+    void aCurrentApplianceBehindAProxyIsNotToldToUpgrade() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 404, cannot("PATCH", PROBE));
+        t.specBody = apiSpec("0.39.0", "get", "patch", "delete");
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertTrue(e.getMessage().contains("reports REST API 0.39.0"), e.getMessage());
+        assertTrue(e.getMessage().contains("proxy between"), e.getMessage());
+        assertFalse(e.getMessage().contains("needs upgrading"), e.getMessage());
+    }
+
+    /**
+     * No spec to read, and the probe's own failure still stands, saying that the version was looked for.
+     */
+    @Test
+    void anUnreadableSpecStillFailsWithTheProbesMessage() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 404, cannot("PATCH", PROBE));
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertTrue(e.getMessage().contains("does not serve PATCH"), e.getMessage());
+        assertTrue(e.getMessage().contains("could not be read either"), e.getMessage());
+        assertTrue(e.getMessage().contains("HTTP 404"), e.getMessage());
+    }
+
+    /** A spec answered 200 that is not an API description gets named as such, not parsed into a verdict. */
+    @Test
+    void aSpecThatIsNotOneGivesNoVerdict() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", PROBE, 404, cannot("PATCH", PROBE));
+        t.specBody = "<html>login</html>";
+        HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
+
+        assertTrue(e.getMessage().contains("not one this client can read"), e.getMessage());
+        assertFalse(e.getMessage().contains("needs upgrading"), e.getMessage());
+        assertFalse(e.getMessage().contains("proxy between"), e.getMessage());
+    }
+
+    /**
+     * The spec is read only to explain a failed probe: a passing Test Connection does not fetch it, and
+     * neither does an unrouted PATCH at clone time, which is not the probe.
+     */
+    @Test
+    void theSpecIsReadOnlyWhenTheProbeFails() {
+        ScriptedRest passing = new ScriptedRest();
+        passing.specBody = apiSpec("0.39.0", "get", "patch", "delete");
+        new XoRestClient(passing).ping();
+        assertFalse(
+                passing.paths().contains("GET " + XoRestClient.SPEC_PATH),
+                passing.paths().toString());
+
+        ScriptedRest cloning = new ScriptedRest();
+        cloning.fail("PATCH", "/rest/v0/vms/" + CLONE, 404, cannot("PATCH", "/rest/v0/vms/" + CLONE));
+        cloning.specBody = apiSpec("0.32.0", "get", "delete");
+        XoRestClient c = new XoRestClient(cloning);
+        assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec()));
+        assertFalse(
+                cloning.paths().contains("GET " + XoRestClient.SPEC_PATH),
+                cloning.paths().toString());
     }
 
     /**
@@ -1162,7 +1261,8 @@ class XoRestClientTest {
         HypervisorException e = assertThrows(HypervisorException.class, () -> new XoRestClient(t).ping());
 
         assertTrue(e.getMessage().contains("role or the appliance's plan"), e.getMessage());
-        assertFalse(e.getMessage().contains("5.192.1"), e.getMessage());
+        assertFalse(e.getMessage().contains("5.202.1"), e.getMessage());
+        assertFalse(t.paths().contains("GET " + XoRestClient.SPEC_PATH), "a 403 is not about the route: " + t.paths());
     }
 
     /** Express's page for a method and path it has no route for, as the lab appliance serves it. */
@@ -1366,6 +1466,11 @@ class XoRestClientTest {
         final Deque<List<String>> tagViews = new ArrayDeque<>();
         /** A tag DELETE that answers 204 and changes nothing: a strip that never takes. */
         boolean tagDeletesIgnored;
+        /**
+         * What {@code GET /docs/swagger.json} answers. Null stands in for an appliance that does not serve it,
+         * which gets Express's page like any other unrouted path.
+         */
+        String specBody;
 
         private final Map<String, RestResponse> failures = new LinkedHashMap<>();
         private final List<String> interrupts = new ArrayList<>();
@@ -1397,6 +1502,9 @@ class XoRestClientTest {
             RestResponse failure = failures.get(key);
             if (failure != null) {
                 return failure;
+            }
+            if ("GET".equals(method) && path.equals(XoRestClient.SPEC_PATH)) {
+                return specBody == null ? new RestResponse(404, cannot(method, path)) : new RestResponse(200, specBody);
             }
             if (path.equals("/rest/v0/vms/" + XoRestClient.PROBE_ID)) {
                 // No VM has this id, so the appliance answers its own no-such-object 404 to any routed verb.

@@ -69,6 +69,22 @@ public final class XoRestClient implements HypervisorClient {
     static final String PROBE_ID = "00000000-0000-0000-0000-000000000000";
 
     /**
+     * The appliance's own description of its REST API, served without a token. Its {@code info.version} is
+     * the {@code @xen-orchestra/rest-api} package version, not xo-server's: no REST route reports xo-server's
+     * version, only the JSON-RPC {@code system.getServerVersion}, which is reachable over a WebSocket alone
+     * ({@code xo-server/src/index.mjs}, read at {@code db8fe8d47}). Measured on the lab appliance (Xen
+     * Orchestra 6.8.2, xo-server 5.208.3) 2026-09-30: {@code 0.39.0}, which the release notes pair with it.
+     */
+    static final String SPEC_PATH = API + "/docs/swagger.json";
+
+    /**
+     * Where {@code PATCH /vms/{id}} first shipped, looked up rather than observed: vatesfr/xen-orchestra
+     * #9835 ({@code 5089be9998}) is listed under Xen Orchestra 6.5.0 in its CHANGELOG, beside xo-server
+     * 5.202.1 and {@code @xen-orchestra/rest-api} 0.33.0.
+     */
+    private static final String PATCH_FLOOR = "Xen Orchestra 6.5.0 (2026-05-28: xo-server 5.202.1, REST API 0.33.0)";
+
+    /**
      * Reads answer in well under a second; the lifecycle verbs are minutes. Two constants rather than one
      * because a single timeout that suits both is either too short to clone or too long to notice an
      * appliance that has gone away. The long one kept the removed XAPI client's task deadline, so a slow
@@ -354,7 +370,7 @@ public final class XoRestClient implements HypervisorClient {
      * route ({@code PUT} on the same path) answers an HTML page reading {@code Cannot PUT ...}. The first is
      * about the object and needs no help. The second is the appliance not serving the route at all, which is
      * what an xo-server too old for this backend looks like: {@code PATCH /vms/{id}} answered 404 on 5.192.1
-     * and 204 on 5.208.3 (#254). Without the hint that reaches an operator as a bare 404 at the first
+     * and 204 on 5.208.3 (#254), and first shipped in xo-server 5.202.1 (#258). Without the hint that reaches an operator as a bare 404 at the first
      * provision, naming nothing.
      *
      * <p>The hint is appended rather than substituted. XO's own message is the more specific of the two
@@ -390,8 +406,8 @@ public final class XoRestClient implements HypervisorClient {
                 + " which would name a missing object. Either xo-server is too old for this backend, or a"
                 + " proxy in front of it does not forward " + API + ".";
         if ("PATCH".equals(method) && path.startsWith(API + "/vms/")) {
-            hint += " PATCH " + API + "/vms/{id} is absent on xo-server 5.192.1 and present on 5.208.3;"
-                    + " upgrading an XOA needs it to be registered.";
+            hint += " PATCH " + API + "/vms/{id} first shipped in " + PATCH_FLOOR
+                    + "; upgrading an XOA needs it to be registered.";
         }
         return hint;
     }
@@ -1171,7 +1187,57 @@ public final class XoRestClient implements HypervisorClient {
                     + " exist. Xen Orchestra answers that with 404 naming the id, so something other than"
                     + " xo-server answered, and whether it can provision is unknown.");
         }
-        throw failure("PATCH", path, resp.status(), resp.body());
+        HypervisorException refused = failure("PATCH", path, resp.status(), resp.body());
+        if (resp.status() == 404 && !isNoSuchObject(resp.body(), null)) {
+            throw new HypervisorException(
+                    refused.getMessage() + specVerdict(), refused.getErrorCode(), refused.getErrorParams());
+        }
+        throw refused;
+    }
+
+    /**
+     * Once the probe has found {@code PATCH} unrouted, say which appliance answered and why, from its own API
+     * description (#258).
+     *
+     * <p>The version alone cannot say which of the two causes it is, because a proxy in front of a current
+     * appliance and an old appliance give the probe the same answer. The spec can: it lists the routes this
+     * appliance serves. If it lists {@code patch} on {@code /vms/{id}}, xo-server has the route and the
+     * request was lost on the way. If it does not, the appliance predates the floor. That verdict does not
+     * depend on comparing version strings, so a rest-api version we have never seen cannot mislead it.
+     *
+     * <p>Best effort. The probe has already failed and says why; a spec that cannot be read only costs the
+     * extra sentence, and says so rather than leaving the reader to wonder whether it was looked for.
+     */
+    @NonNull
+    private String specVerdict() {
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("GET", SPEC_PATH, null, READ_TIMEOUT);
+        } catch (IOException e) {
+            return " Its API description could not be read either (" + SPEC_PATH + ": " + e.getMessage() + ").";
+        }
+        if (!resp.isSuccess()) {
+            return " Its API description could not be read either (" + SPEC_PATH + ": HTTP " + resp.status() + ").";
+        }
+        JsonNode spec;
+        try {
+            spec = MAPPER.readTree(resp.body());
+        } catch (IOException e) {
+            spec = null;
+        }
+        if (spec == null || !spec.path("paths").isObject()) {
+            return " Its API description at " + SPEC_PATH + " is not one this client can read.";
+        }
+        String version = spec.path("info").path("version").asText("");
+        String reports = version.isBlank()
+                ? "The appliance's API description names no version"
+                : "The appliance reports REST API " + version;
+        if (spec.path("paths").path("/vms/{id}").has("patch")) {
+            return " " + reports + " and lists PATCH on /vms/{id}, so xo-server has the route: the likelier"
+                    + " cause is a proxy between here and the appliance that does not forward PATCH.";
+        }
+        return " " + reports + " and does not list PATCH on /vms/{id}, so it predates " + PATCH_FLOOR
+                + " and needs upgrading.";
     }
 
     /**
