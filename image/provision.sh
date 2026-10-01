@@ -401,8 +401,15 @@ harden_credentials() {
     #
     # Locking does not disable the account: systemd still starts services as `debian`, and SSH key
     # auth still works if a key is ever added. It disables only password login.
+    #
+    # The lock is the one step here whose failure must stop the build: a template sealed with it
+    # unlocked ships debian:debian, over SSH with Debian's default password auth, on every clone. So
+    # it is checked twice, once on passwd's exit status and once by reading the state back. A missing
+    # `debian` user is an error too, not a skip: the agent and seed units chown their files to it.
     log "locking the build-time debian password and removing passwordless sudo"
-    passwd -l debian 2>/dev/null || true
+    id debian >/dev/null 2>&1 || die "no debian user to lock; the agent service runs as debian"
+    passwd -l debian || die "could not lock the debian password; the image would ship debian:debian"
+    passwd -S debian | grep -q '^debian L ' || die "debian password is not locked after passwd -l"
     rm -f /etc/sudoers.d/debian
 }
 
