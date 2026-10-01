@@ -339,6 +339,84 @@ jobs:
           cp /tmp/cacerts.bak "$cacerts"
           exit $rc
 
+  # The image job above skips template cleanup, so harden_credentials never ran in CI: a lock that
+  # failed would have shipped debian:debian on every clone with nothing red anywhere (#80). This job
+  # runs the cleanup path for real, in its own container because cleanup resets machine identity
+  # and the image job's later steps leave the truststore broken on purpose.
+  image-cleanup:
+    name: golden image cleanup locks the build password
+    runs-on: ubuntu-latest
+    container:
+      image: debian:13
+    env:
+      SKIP_GUEST_TOOLS: '1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Bootstrap the container, with the user the preseed creates
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq curl ca-certificates passwd
+          useradd -m debian
+          echo debian:debian | chpasswd
+
+      - name: Cleanup locks the debian password
+        run: |
+          passwd -S debian | grep -q '^debian P ' \
+            || { echo "::error::fixture: the password is not usable before the run"; exit 1; }
+          bash image/provision.sh
+          passwd -S debian | grep -q '^debian L ' \
+            || { echo "::error::provision.sh went green and left: $(passwd -S debian)"; exit 1; }
+
+      # Each case starts from a usable password: a fixture that is already locked would let the
+      # read-back check pass for the wrong reason. The failure is injected with a passwd ahead of
+      # the real one on PATH, which is what provision.sh resolves.
+      - name: A lock that fails, or claims success without locking, fails the build
+        run: |
+          rc=0
+          refuses() {
+            echo debian:debian | chpasswd
+            if bash image/provision.sh >/tmp/provision.out 2>&1; then
+              echo "::error::$1: provision.sh succeeded and must not have"; rc=1
+            elif ! grep -qF "$2" /tmp/provision.out; then
+              echo "::error::$1: expected \"$2\", got: $(tail -1 /tmp/provision.out)"; rc=1
+            elif ! passwd -S debian | grep -q '^debian P '; then
+              echo "::error::$1: the fixture did not hold: $(passwd -S debian)"; rc=1
+            else
+              echo "ok, refused: $1"
+            fi
+          }
+          shim=/usr/local/sbin/passwd
+          test "$(command -v passwd)" = "$shim" && { echo "::error::a shim is already installed"; exit 1; }
+
+          cat > "$shim" <<'SHIM'
+          #!/bin/sh
+          [ "$1" = -l ] && { echo "passwd: injected failure" >&2; exit 1; }
+          exec /usr/bin/passwd "$@"
+          SHIM
+          chmod 755 "$shim"
+          test "$(command -v passwd)" = "$shim" || { echo "::error::the shim is not first on PATH"; exit 1; }
+          refuses "passwd -l exits non-zero" "could not lock the debian password"
+
+          cat > "$shim" <<'SHIM'
+          #!/bin/sh
+          [ "$1" = -l ] && exit 0
+          exec /usr/bin/passwd "$@"
+          SHIM
+          refuses "passwd -l exits 0 without locking" "debian password is not locked after passwd -l"
+
+          rm -f "$shim"
+          exit $rc
+
+      - name: A missing debian user fails the build instead of being skipped
+        run: |
+          userdel -r debian
+          if bash image/provision.sh >/tmp/provision.out 2>&1; then
+            echo "::error::provision.sh succeeded with no debian user"; exit 1
+          fi
+          grep -qF 'no debian user to lock' /tmp/provision.out \
+            || { echo "::error::failed for another reason: $(tail -1 /tmp/provision.out)"; exit 1; }
+
   packer:
     name: packer validate
     runs-on: ubuntu-latest
