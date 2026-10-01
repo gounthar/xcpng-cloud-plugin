@@ -3,17 +3,24 @@ package io.jenkins.plugins.xcpng;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.Node;
 import hudson.model.TaskListener;
+import hudson.remoting.Channel;
+import hudson.remoting.VirtualChannel;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProperty;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.HypervisorException;
 import io.jenkins.plugins.xcpng.client.VmRef;
+import io.jenkins.plugins.xcpng.client.VmState;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Collections;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -194,6 +201,26 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * and never persisted.
      */
     private transient ConnectionClientFactory connectionClientFactory;
+
+    /**
+     * How long teardown keeps re-reading a {@code Halted} it has reason to disbelieve before it gives up on
+     * this attempt (#48). The one disagreement measured, right after a host reboot, cleared by itself within
+     * about 30 s (n=1), so this is that window doubled rather than a figure with a distribution behind it.
+     */
+    static final Duration HALTED_WHILE_CONNECTED_WAIT = Duration.ofSeconds(60);
+
+    /** Interval between those re-reads. */
+    static final Duration HALTED_WHILE_CONNECTED_POLL = Duration.ofSeconds(5);
+
+    /**
+     * Whether this agent's channel is open, as teardown sees it. Null in production, which asks the computer;
+     * a test supplies the answer, because an agent backed by the in-memory client never connects. Transient
+     * for the same reason as {@link #connectionClientFactory}.
+     */
+    private transient BooleanSupplier channelProbe;
+
+    /** How teardown waits between those re-reads. Null in production, which sleeps; a test records instead. */
+    private transient Sleeper sleeper;
 
     /**
      * Build a single-use inbound agent for a VM that does not exist yet. Called from
@@ -506,6 +533,13 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
             listener.getLogger().println("Destroying XCP-ng VM " + vmRef + " and its disks.");
         }
         try (HypervisorClient client = openClientForVm(cloud)) {
+            refuseIfHaltedWhileConnected(
+                    client,
+                    new VmRef(vmRef),
+                    agentChannelOpen(),
+                    sleeper != null ? sleeper : d -> Thread.sleep(d.toMillis()),
+                    HALTED_WHILE_CONNECTED_WAIT,
+                    HALTED_WHILE_CONNECTED_POLL);
             client.destroyWithDisks(new VmRef(vmRef));
         } catch (RuntimeException e) {
             if (cloud == null) {
@@ -602,6 +636,116 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @NonNull
     public XcpngBackend getBackend() {
         return XcpngBackend.resolve(backend);
+    }
+
+    /**
+     * Refuse to destroy a VM the pool reports {@code Halted} while its agent is still connected (#48).
+     *
+     * <p>{@code DELETE /vms/{id}} ends in Xen Orchestra's {@code VM_destroy}, which runs {@code hard_shutdown}
+     * only when XAPI's {@code power_state} is not {@code Halted} and then destroys the disks. That field has
+     * been seen reading {@code Halted} for a running domain, and a destroy that trusted it took a live disk.
+     * The gate is in Xen Orchestra, out of this plugin's reach, and asking for a stop first does not help:
+     * XAPI decides whether to allow {@code hard_shutdown} from the same record.
+     *
+     * <p>What the plugin has that the pool cannot give it is a second opinion. An open channel means the
+     * agent JVM inside the VM is talking to the controller, so the VM is running whatever the record says.
+     * When the two disagree this re-reads for up to {@code wait}. If the disagreement outlasts that, it
+     * throws, the caller records the VM as leaked, and the maintainer reissues the destroy on a later tick,
+     * by which time the record has had minutes rather than seconds to catch up.
+     *
+     * <p>No channel means no second opinion, and neither does a first read that fails, so both fall through
+     * to the destroy exactly as before: this must never make an ordinary teardown fail. Once a contradiction
+     * has been seen, though, only a clean read that is not {@code Halted} releases the destroy, so a re-read
+     * that fails keeps waiting rather than letting the delete through.
+     *
+     * <p>A channel that is open on the controller's side but whose VM really did stop (a guest crash the
+     * pinger has not noticed yet) costs one delayed teardown and a leaked-VM entry that the next sweep clears.
+     */
+    static void refuseIfHaltedWhileConnected(
+            @NonNull HypervisorClient client,
+            @NonNull VmRef vm,
+            boolean agentConnected,
+            @NonNull Sleeper sleeper,
+            @NonNull Duration wait,
+            @NonNull Duration poll) {
+        if (!agentConnected) {
+            return;
+        }
+        VmState state;
+        try {
+            state = client.state(vm);
+        } catch (HypervisorException e) {
+            LOGGER.log(
+                    Level.FINE,
+                    e,
+                    () -> "Could not read the power state of VM " + vm.value() + " before destroying it; going ahead");
+            return;
+        }
+        if (state != VmState.HALTED) {
+            return;
+        }
+        LOGGER.log(
+                Level.WARNING,
+                () -> "VM " + vm.value() + " reads Halted while its agent is still connected; waiting up to "
+                        + wait.toSeconds() + " s for the pool to agree before destroying it (#48)");
+        long rereads = wait.toMillis() / poll.toMillis();
+        for (long i = 1; i <= rereads; i++) {
+            try {
+                sleeper.sleep(poll);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new HypervisorException(
+                        "Interrupted while VM " + vm.value()
+                                + " read Halted under a connected agent; not destroying it now (#48)",
+                        e);
+            }
+            try {
+                state = client.state(vm);
+            } catch (HypervisorException e) {
+                continue;
+            }
+            if (state != VmState.HALTED) {
+                long waited = i * poll.toSeconds();
+                VmState settled = state;
+                LOGGER.log(
+                        Level.INFO,
+                        () -> "VM " + vm.value() + " read " + settled + " after " + waited
+                                + " s; the earlier Halted was stale, destroying it now");
+                return;
+            }
+        }
+        throw new HypervisorException("VM " + vm.value() + " still reads Halted after " + wait.toSeconds()
+                + " s while its agent is connected. Destroying it now would skip the shutdown and remove a"
+                + " running domain's disks (#48), so the destroy is left for a later retry.");
+    }
+
+    /** Whether this agent's channel to the controller is open right now. */
+    private boolean agentChannelOpen() {
+        if (channelProbe != null) {
+            return channelProbe.getAsBoolean();
+        }
+        Computer computer = toComputer();
+        VirtualChannel channel = computer == null ? null : computer.getChannel();
+        if (channel instanceof Channel c) {
+            return !c.isClosingOrClosed();
+        }
+        return channel != null;
+    }
+
+    /** Test seam: answer whether the channel is open, since an agent backed by the fake never connects. */
+    void setChannelProbe(BooleanSupplier channelProbe) {
+        this.channelProbe = channelProbe;
+    }
+
+    /** Test seam: record the waits between power-state reads instead of sleeping through them. */
+    void setSleeper(Sleeper sleeper) {
+        this.sleeper = sleeper;
+    }
+
+    /** How {@link #refuseIfHaltedWhileConnected} waits between reads. */
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(@NonNull Duration duration) throws InterruptedException;
     }
 
     /** Test seam: replace how the cloud-gone fallback opens a client with an in-memory fake. */

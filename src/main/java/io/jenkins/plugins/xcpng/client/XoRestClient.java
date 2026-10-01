@@ -48,7 +48,9 @@ import java.util.logging.Logger;
  *       is XO's problem now rather than ours. It gets it right ({@code VM_getDisks} before
  *       {@code VM.destroy}). It also carries #48 verbatim: it gates {@code hard_shutdown} on
  *       {@code power_state !== 'Halted'}, the one field we have observed lying. Migrating does not retire
- *       that issue, it moves it into a codebase we cannot patch.
+ *       that issue, it moves it into a codebase we cannot patch; the plugin's side of it is the check in
+ *       {@code XcpngAgent.refuseIfHaltedWhileConnected}, which holds the delete while a connected agent's
+ *       VM reads {@code Halted}.
  *   <li><b>{@code primaryIpAddress} needs a link-local filter.</b> {@code mainIpAddress} is computed for
  *       us, so the {@code guest_metrics} round trip and the stale-husk check go away -- but it can carry
  *       an address nothing can connect to. Measured n=3 and not deterministic: {@code fe80::} at 25.3s;
