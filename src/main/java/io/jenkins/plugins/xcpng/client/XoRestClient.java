@@ -686,18 +686,21 @@ public final class XoRestClient implements HypervisorClient {
      * Promise.all} over the values), so shrinking would race a {@code VCPUs_max} write against a still
      * higher {@code VCPUs_at_startup} and XAPI would reject it.
      *
-     * <p><b>{@code memory} sizes the clone, and on its own it does not do what the XAPI backend's
-     * {@code VM.set_memory_limits(m, m, m, m)} did</b> (#242). XO dispatches it on the VM's current limits
-     * ({@code vm.mjs}, xo-server at {@code db8fe8d47}). When dynamic min, dynamic max and static max are
-     * equal (static min is not compared), it calls {@code set_memory_limits(static_min, m, m, m)}: the static
-     * max moves with the request, but the static min stays where the template left it. A request below it is
-     * refused with a 422 naming that minimum, and nothing in the REST API can change it, because XO marks it
-     * read-only. Otherwise XO sets the dynamic max to the request, raises the static max to fit, and lowers the
-     * dynamic min only if it is above the request; if XAPI refuses that, XO falls back to pinning all three at
-     * {@code m}. Measured on the lab pool on 2026-10-01 (XO rest-api 0.40.2, a 2 GiB fixed-size template;
-     * limits as static min, dynamic min, dynamic max, static max): 4 GiB gave (2, 4, 4, 4) GiB, 1 GiB was
-     * refused with the VM unchanged, and 4 GiB on a 1/1/2/2 GiB range gave (1, 1, 4, 4) GiB. The lowering and
-     * the fallback are read from the source, not measured.
+     * <p><b>{@code memory} sizes the clone, and on its own it does not do what the XAPI backend's {@code
+     * VM.set_memory_limits(m, m, m, m)} did</b> (#242). XO dispatches it on the VM's current limits ({@code vm.mjs} in
+     * xo-server). When dynamic min, dynamic max and static max are equal (static min is not compared), it calls {@code
+     * set_memory_limits(static_min, m, m, m)}: the static max moves with the request, but the static min stays where
+     * the template left it. What happens below the static min depends on the appliance. Since xen-orchestra {@code
+     * 13480c345} (#10285, 2026-09-18; first released in XO 6.9.0 by date, the changelog does not list it) XO treats the
+     * static min as read-only and refuses such a request with a 422 naming it, whatever the template's shape. Before
+     * that (read at {@code db8fe8d47}, not measured), a fixed-size template sends XAPI a static min above the static
+     * max, which it should refuse, and a dynamic-range one has its static min lowered to the request. Either way the
+     * REST API has no field that sets it directly. For a dynamic-range template XO otherwise sets the dynamic max to
+     * the request, raises the static max to fit, and lowers the dynamic min only if it is above the request; if XAPI
+     * refuses that, XO falls back to pinning all three at {@code m}. Measured on the lab pool on 2026-10-01 (XO
+     * rest-api 0.40.2, which has the guard; a 2 GiB fixed-size template; limits as static min, dynamic min, dynamic
+     * max, static max): 4 GiB gave (2, 4, 4, 4) GiB, 1 GiB was refused with the VM unchanged, and 4 GiB on a 1/1/2/2
+     * GiB range gave (1, 1, 4, 4) GiB. The lowering and the fallback are read from the source, not measured.
      *
      * <p><b>So a second PATCH pins the dynamic min at the request</b>, which gives a clone of a
      * dynamic-range template the fixed allocation the XAPI backend gave it, rather than letting the host

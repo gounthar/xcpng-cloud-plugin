@@ -1,9 +1,11 @@
 <div>
   Memory for each agent, in MiB. It is applied to the clone before it boots.
   <p>
-  It cannot go below the template's <b>static minimum memory</b>, which the appliance treats as
-  read-only: asking for less fails the provision with an error naming that minimum. To run smaller
-  agents, lower the static minimum on the template itself.
+  Asking for less than the template's <b>static minimum memory</b> fails the provision on Xen Orchestra
+  6.9.0 and later, with an error naming that minimum: the appliance treats it as read-only. Older
+  appliances behave differently: a template with a fixed memory size should be refused by the hypervisor, and
+  one with a dynamic range has its static minimum lowered to fit. To run smaller agents, lower the static
+  minimum on the template itself.
   <p>
   At or above it, every clone gets exactly the amount asked for, as a fixed allocation: if the template has a
   <b>dynamic</b> memory range, the clone's dynamic minimum and maximum are both set to this value, so the
