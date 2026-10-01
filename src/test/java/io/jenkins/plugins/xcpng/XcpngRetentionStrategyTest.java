@@ -11,7 +11,10 @@ import hudson.model.Executor;
 import hudson.slaves.AbstractCloudComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.VmState;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -770,6 +773,62 @@ class XcpngRetentionStrategyTest {
         assertTrue(
                 cloud.leakedVmRefs().contains(agent.getVmRef()),
                 "a failed destroy must record the VM as leaked for later reclamation: " + cloud.leakedVmRefs());
+    }
+
+    /**
+     * #48 end to end: a connected agent whose VM the pool reports {@code Halted} for longer than the guard
+     * waits is not destroyed, and the VM is recorded as leaked so the maintainer retries the destroy later.
+     * The node is removed regardless, as for any teardown that fails. The guard's own branches are in
+     * {@link XcpngHaltedWhileConnectedTest}; this pins that {@code _terminate} calls it before the delete and
+     * routes its refusal into the leaked-VM record rather than losing the VM.
+     */
+    @Test
+    void terminateDoesNotDestroyAVmThatReadsHaltedUnderAConnectedAgent(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        VmState[] alwaysHalted = new VmState[20];
+        Arrays.fill(alwaysHalted, VmState.HALTED);
+        fake.scriptStates(agent.getVmRef(), alwaysHalted);
+        agent.setChannelProbe(() -> true);
+        FakeSleeper time = new FakeSleeper();
+        List<Duration> sleeps = time.sleeps;
+        agent.setSleeper(time);
+        r.jenkins.addNode(agent);
+
+        assertDoesNotThrow(agent::terminate, "a refused destroy must not propagate out of teardown");
+
+        assertEquals(0, destroyCount(fake), "the delete must not be sent: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().contains(agent.getVmRef()),
+                "the refused VM must be recorded for a later retry: " + cloud.leakedVmRefs());
+        assertFalse(r.jenkins.getNodes().contains(agent), "the node must be removed as for any failed teardown");
+        assertEquals(12, sleeps.size(), "the guard must have waited the whole window before refusing");
+    }
+
+    /**
+     * The same connected agent, but the pool agrees the VM is running: the destroy goes ahead at once and
+     * nothing is recorded as leaked. The control for the test above, so a guard that refused everything
+     * under a connected agent would show here.
+     */
+    @Test
+    void terminateDestroysARunningVmUnderAConnectedAgent(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        fake.scriptStates(agent.getVmRef(), VmState.RUNNING);
+        agent.setChannelProbe(() -> true);
+        FakeSleeper time = new FakeSleeper();
+        List<Duration> sleeps = time.sleeps;
+        agent.setSleeper(time);
+        r.jenkins.addNode(agent);
+
+        agent.terminate();
+
+        assertEquals(1, destroyCount(fake), "the delete must be sent: " + fake.calls());
+        assertEquals(1, fake.stateReads(), "the guard must have read the state, or this control proves nothing");
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "nothing is leaked: " + cloud.leakedVmRefs());
+        assertEquals(List.of(), sleeps);
     }
 
     /**

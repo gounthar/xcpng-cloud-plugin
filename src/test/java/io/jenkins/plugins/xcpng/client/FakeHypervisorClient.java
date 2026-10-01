@@ -1,6 +1,8 @@
 package io.jenkins.plugins.xcpng.client;
 
+import java.util.ArrayDeque;
 import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -41,6 +43,15 @@ public final class FakeHypervisorClient implements HypervisorClient {
      * for the different reason given above: a caller iterates the list it is handed outside this monitor.
      */
     private final Map<String, VmState> states = new HashMap<>();
+
+    /**
+     * Answers {@link #state} gives before it falls back to {@link #states}, per VM, consumed in order. An
+     * empty entry makes that read throw. Kept apart from the tracked state so a test can make the pool lie
+     * about a VM without the lie leaking into what the other verbs see.
+     */
+    private final Map<String, Deque<Optional<VmState>>> scriptedStates = new HashMap<>();
+
+    private int stateReads = 0;
 
     private int cloneCounter = 0;
     private boolean pingFails = false;
@@ -109,6 +120,24 @@ public final class FakeHypervisorClient implements HypervisorClient {
     public synchronized FakeHypervisorClient recoverDestroy() {
         this.destroyFails = false;
         return this;
+    }
+
+    /**
+     * Have the next {@link #state} reads of {@code vm} answer {@code answers} in order, then go back to the
+     * state this fake tracks. A null answer makes that read throw, the way a dropped connection would. Used
+     * to model #48: a running VM whose record says {@code Halted} for a while.
+     */
+    public synchronized FakeHypervisorClient scriptStates(String vm, VmState... answers) {
+        Deque<Optional<VmState>> queue = scriptedStates.computeIfAbsent(vm, k -> new ArrayDeque<>());
+        for (VmState answer : answers) {
+            queue.add(Optional.ofNullable(answer));
+        }
+        return this;
+    }
+
+    /** How many times {@link #state} has been called, scripted or not. */
+    public synchronized int stateReads() {
+        return stateReads;
     }
 
     /** The verbs invoked so far, in order. */
@@ -184,6 +213,11 @@ public final class FakeHypervisorClient implements HypervisorClient {
     @Override
     public synchronized VmState state(VmRef vm) {
         checkNotInterrupted("state");
+        stateReads++;
+        Deque<Optional<VmState>> scripted = scriptedStates.get(vm.value());
+        if (scripted != null && !scripted.isEmpty()) {
+            return scripted.poll().orElseThrow(() -> new HypervisorException("state: transport error"));
+        }
         return states.getOrDefault(vm.value(), VmState.UNKNOWN);
     }
 

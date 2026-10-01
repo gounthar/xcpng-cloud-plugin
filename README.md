@@ -352,15 +352,19 @@ number of waiting builds and what was planned for them.
 
 ## Known limitations
 
-- **Teardown trusts XAPI's `power_state`, which can occasionally lie.** The plugin destroys a VM with
-  Xen Orchestra's `DELETE /rest/v0/vms/{id}`, which shuts the domain down only if XAPI does not already
-  report it `Halted` (`@xen-orchestra/xapi/vm.mjs`, read at `master` on 2026-09-04), then destroys the
-  VM and its disks. A VM has been observed on the lab pool reading `Halted` (with `domid -1`) from XAPI
-  while the domain was still running on dom0. Trusting that record skips the shutdown and destroys a
-  live domain's disk, leaving an orphan that holds memory. The check runs inside Xen Orchestra, and the
-  plugin, by the inbound/JNLP design, holds no SSH credential, so it has no independent second opinion.
-  This is a rare, accepted risk for this version rather than a fixable bug in the plugin. The root cause,
-  frequency, and a reliable reproduction are unknown (observed once). The operator-side safety net is
+- **Teardown trusts XAPI's `power_state` unless the agent is still connected.** The plugin destroys a
+  VM with Xen Orchestra's `DELETE /rest/v0/vms/{id}`, which shuts the domain down only if XAPI does not
+  already report it `Halted` (`@xen-orchestra/xapi/vm.mjs`, read at `master` on 2026-10-01), then
+  destroys the VM and its disks. XAPI has twice been seen on the lab pool reporting `Halted` (with
+  `domid -1`) for a domain still running on dom0; the second time, the record corrected itself within
+  about 30 seconds. Trusting that record skips the shutdown and destroys a live domain's disk. When the
+  agent's channel is still open at teardown, the plugin takes that as evidence the VM is running: if the
+  pool reports `Halted` anyway, it re-reads every 5 seconds for up to a minute, and if the record never
+  agrees it does not send the delete, logs the VM at SEVERE and records it as leaked. The leaked-VM
+  sweep retries the destroy on its next pass, which can be anywhere from at once to a minute later, and
+  without this check, since the node and its channel are gone by then; the minute of re-reads is the
+  only hold that is guaranteed. An agent that was not connected gives no such evidence, so its VM is
+  destroyed on XAPI's word as before. The root cause and frequency are unknown. The operator-side safety net is
   `tools/reaper.py --dom0-check`, which reads `xl list` directly from dom0 and refuses to reap any VM
   that XAPI reports `Halted` while Xen still has a live domain for it; run it before and after a batch
   of provisioning on a shared pool.
