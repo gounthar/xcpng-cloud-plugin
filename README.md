@@ -122,8 +122,10 @@ timeout, 10 min 45 s with `idleMinutes` 10.
 - An XCP-ng pool with a **Xen Orchestra** appliance in front of it (developed against XCP-ng 8.3 and
   xo-server 5.208.3). The plugin speaks only the Xen Orchestra REST API, never XAPI directly, so a pool
   without an appliance is not supported. The appliance must route `PATCH /rest/v0/vms/{id}`, which the
-  plugin uses to seed each clone: it is absent on xo-server 5.192.1, which is what a freshly deployed
-  appliance ran when this was measured, and present on 5.208.3. **Test connection** checks for it.
+  plugin uses to seed each clone. That route first shipped in Xen Orchestra 6.5.0 (xo-server 5.202.1,
+  2026-05-28), so a freshly deployed appliance may need updating first. **Test connection** checks for
+  it, and when it is missing says which REST API version the appliance reports and whether the appliance
+  itself lacks the route or something in front of it is not forwarding it.
 - A golden-image VM on that pool, prepared as described below.
 - A Jenkins controller on the 2.555.x line or newer. The controller and the agent must run the same
   Java major version; the baseline here is Java 21 (Temurin on the agent side).
