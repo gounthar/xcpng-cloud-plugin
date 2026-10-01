@@ -226,13 +226,33 @@ class XoRestClientTest {
         XoRestClient c = new XoRestClient(t);
         c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec());
 
-        Call patch = t.only("PATCH", "/rest/v0/vms/" + CLONE);
+        Call patch = t.all("PATCH", "/rest/v0/vms/" + CLONE).get(0);
         assertEquals(2, patch.json().path("cpus").asInt());
         assertEquals(2048L, patch.json().path("memory").asLong());
         // XO fires the setters for the values it is given concurrently, and its own constraint machinery
         // already raises the max when cpus needs more room. Sending both would race a VCPUs_max write
         // against a still-higher VCPUs_at_startup on the shrinking case, which XAPI rejects.
         assertFalse(patch.json().has("cpusStaticMax"), "sizing must leave the max to XO: " + patch.body);
+    }
+
+    @Test
+    void clonePinsTheDynamicMinInASecondPatchAfterTheSizingOneAndBeforeStart() {
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        VmRef vm = c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec());
+        c.start(vm);
+
+        List<Call> patches = t.all("PATCH", "/rest/v0/vms/" + CLONE);
+        assertEquals(2, patches.size(), "sizing, then the pin: " + t.paths());
+        // In the sizing body, memoryMin would fire concurrently with memory, against a dynamic max that only
+        // memory raises (#242). It has to wait for the first call to land.
+        assertFalse(
+                patches.get(0).json().has("memoryMin"), "the pin must not ride with memory: " + patches.get(0).body);
+        JsonNode pin = patches.get(1).json();
+        assertEquals(2048L, pin.path("memoryMin").asLong());
+        assertEquals(1, pin.size(), "the pin writes the dynamic min and nothing else: " + patches.get(1).body);
+        int lastPatch = t.paths().lastIndexOf("PATCH /rest/v0/vms/" + CLONE);
+        assertTrue(lastPatch < t.indexOf("POST", "/rest/v0/vms/" + CLONE + "/actions/start?sync=true"));
     }
 
     @Test
@@ -244,7 +264,7 @@ class XoRestClientTest {
                 spec(Map.of("url", "http://controller/", "name", "agent-1", "secret", "s3cr3t")));
         c.start(vm);
 
-        Call patch = t.only("PATCH", "/rest/v0/vms/" + CLONE);
+        Call patch = t.all("PATCH", "/rest/v0/vms/" + CLONE).get(0);
         JsonNode seed = patch.json().path("xenStoreData");
         assertEquals("s3cr3t", seed.path("vm-data/jenkins/secret").asText());
         assertEquals("agent-1", seed.path("vm-data/jenkins/name").asText());
@@ -1563,6 +1583,12 @@ class XoRestClientTest {
             int at = paths().indexOf(method + " " + path);
             assertTrue(at >= 0, method + " " + path + " was never called: " + paths());
             return at;
+        }
+
+        List<Call> all(String method, String path) {
+            return calls.stream()
+                    .filter(c -> c.method().equals(method) && c.path().equals(path))
+                    .toList();
         }
 
         Call only(String method, String path) {
