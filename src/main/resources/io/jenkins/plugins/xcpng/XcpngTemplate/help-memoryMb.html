@@ -1,0 +1,13 @@
+<div>
+  Memory for each agent, in MiB. It is applied to the clone before it boots.
+  <p>
+  It cannot go below the template's <b>static minimum memory</b>, which the appliance treats as
+  read-only: asking for less fails the provision with an error naming that minimum. To run smaller
+  agents, lower the static minimum on the template itself.
+  <p>
+  With a template of fixed memory size, the clone gets exactly the amount asked for. If the template
+  has a <b>dynamic</b> memory range (dynamic minimum below dynamic maximum), the amount asked for becomes
+  the clone's dynamic maximum, and its dynamic minimum stays at the template's value unless that is
+  higher, in which case it drops to the amount asked for. The host may balloon the clone down to that minimum; use a template
+  with a fixed memory size if every agent must hold its full allocation.
+</div>
