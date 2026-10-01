@@ -537,7 +537,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     client,
                     new VmRef(vmRef),
                     agentChannelOpen(),
-                    sleeper != null ? sleeper : d -> Thread.sleep(d.toMillis()),
+                    sleeper != null ? sleeper : Sleeper.REAL,
                     HALTED_WHILE_CONNECTED_WAIT,
                     HALTED_WHILE_CONNECTED_POLL);
             client.destroyWithDisks(new VmRef(vmRef));
@@ -690,8 +690,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 Level.WARNING,
                 () -> "VM " + vm.value() + " reads Halted while its agent is still connected; waiting up to "
                         + wait.toSeconds() + " s for the pool to agree before destroying it (#48)");
-        long rereads = wait.toMillis() / poll.toMillis();
-        for (long i = 1; i <= rereads; i++) {
+        // Bounded by elapsed time, not by a count of reads: each read can take up to the client's own read
+        // timeout against a pool that hangs, and a count of twelve would then hold this thread for minutes.
+        long start = sleeper.nanoTime();
+        long deadline = start + wait.toNanos();
+        while (sleeper.nanoTime() - deadline < 0) {
             try {
                 sleeper.sleep(poll);
             } catch (InterruptedException e) {
@@ -707,7 +710,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 continue;
             }
             if (state != VmState.HALTED) {
-                long waited = i * poll.toSeconds();
+                long waited = Duration.ofNanos(sleeper.nanoTime() - start).toSeconds();
                 VmState settled = state;
                 LOGGER.log(
                         Level.INFO,
@@ -744,10 +747,27 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.sleeper = sleeper;
     }
 
-    /** How {@link #refuseIfHaltedWhileConnected} waits between reads. */
-    @FunctionalInterface
+    /**
+     * How {@link #refuseIfHaltedWhileConnected} waits between reads and measures how long it has waited. One
+     * seam for both, so a test's fake time moves the clock when it "sleeps" and a slow read can move it too.
+     */
     interface Sleeper {
         void sleep(@NonNull Duration duration) throws InterruptedException;
+
+        /** A monotonic reading in nanoseconds, compared only with other readings from the same sleeper. */
+        long nanoTime();
+
+        Sleeper REAL = new Sleeper() {
+            @Override
+            public void sleep(@NonNull Duration duration) throws InterruptedException {
+                Thread.sleep(duration.toMillis());
+            }
+
+            @Override
+            public long nanoTime() {
+                return System.nanoTime();
+            }
+        };
     }
 
     /** Test seam: replace how the cloud-gone fallback opens a client with an in-memory fake. */

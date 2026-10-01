@@ -791,8 +791,9 @@ class XcpngRetentionStrategyTest {
         Arrays.fill(alwaysHalted, VmState.HALTED);
         fake.scriptStates(agent.getVmRef(), alwaysHalted);
         agent.setChannelProbe(() -> true);
-        List<Duration> sleeps = new ArrayList<>();
-        agent.setSleeper(sleeps::add);
+        FakeSleeper time = new FakeSleeper();
+        List<Duration> sleeps = time.sleeps;
+        agent.setSleeper(time);
         r.jenkins.addNode(agent);
 
         assertDoesNotThrow(agent::terminate, "a refused destroy must not propagate out of teardown");
@@ -817,8 +818,9 @@ class XcpngRetentionStrategyTest {
         XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
         fake.scriptStates(agent.getVmRef(), VmState.RUNNING);
         agent.setChannelProbe(() -> true);
-        List<Duration> sleeps = new ArrayList<>();
-        agent.setSleeper(sleeps::add);
+        FakeSleeper time = new FakeSleeper();
+        List<Duration> sleeps = time.sleeps;
+        agent.setSleeper(time);
         r.jenkins.addNode(agent);
 
         agent.terminate();
