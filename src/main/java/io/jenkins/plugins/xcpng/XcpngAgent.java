@@ -650,8 +650,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * <p>What the plugin has that the pool cannot give it is a second opinion. An open channel means the
      * agent JVM inside the VM is talking to the controller, so the VM is running whatever the record says.
      * When the two disagree this re-reads for up to {@code wait}. If the disagreement outlasts that, it
-     * throws, the caller records the VM as leaked, and the maintainer reissues the destroy on a later tick,
-     * by which time the record has had minutes rather than seconds to catch up.
+     * throws, the caller records the VM as leaked, and the maintainer reissues the destroy on its next tick.
+     * That tick runs about once a minute at any phase and the sweep has no minimum age, so the retry can come
+     * anywhere from at once to a minute later, without this check. The hold this guarantees is {@code wait}
+     * itself, not the retry's delay.
      *
      * <p>No channel means no second opinion, and neither does a first read that fails, so both fall through
      * to the destroy exactly as before: this must never make an ordinary teardown fail. Once a contradiction

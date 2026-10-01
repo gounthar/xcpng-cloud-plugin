@@ -361,8 +361,9 @@ number of waiting builds and what was planned for them.
   agent's channel is still open at teardown, the plugin takes that as evidence the VM is running: if the
   pool reports `Halted` anyway, it re-reads every 5 seconds for up to a minute, and if the record never
   agrees it does not send the delete, logs the VM at SEVERE and records it as leaked. The leaked-VM
-  sweep, which runs about once a minute, retries the destroy without this check, since the node and its
-  channel are gone by then. An agent that was not connected gives no such evidence, so its VM is
+  sweep retries the destroy on its next pass, which can be anywhere from at once to a minute later, and
+  without this check, since the node and its channel are gone by then; the minute of re-reads is the
+  only hold that is guaranteed. An agent that was not connected gives no such evidence, so its VM is
   destroyed on XAPI's word as before. The root cause and frequency are unknown. The operator-side safety net is
   `tools/reaper.py --dom0-check`, which reads `xl list` directly from dom0 and refuses to reap any VM
   that XAPI reports `Halted` while Xen still has a live domain for it; run it before and after a batch
