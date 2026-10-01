@@ -24,8 +24,9 @@ import org.junit.jupiter.api.Test;
  * build than the boundary is worth. This test enforces it instead.
  *
  * <p>It reads the source, not the bytecode, so it also catches a fully qualified name used without an import.
- * The {@code package} line is skipped; everything else, comments included, is checked, since a Javadoc
- * {@code {@link hudson.model.Node}} is a dependency too, on the javadoc classpath.
+ * Every line is checked, comments included, since a Javadoc {@code {@link hudson.model.Node}} is a dependency
+ * too, on the javadoc classpath; and every file must declare a package under {@code client}, since one that
+ * declared the parent package would reach its classes with no name for the pattern to find.
  */
 class ClientPackageBoundaryTest {
 
@@ -33,15 +34,21 @@ class ClientPackageBoundaryTest {
 
     /**
      * A reference to Jenkins core ({@code hudson.} or {@code jenkins.} not preceded by a dot, so
-     * {@code io.jenkins.} does not count), or to a class in the plugin package outside {@code client}.
+     * {@code io.jenkins.} does not count), or to anything in the plugin package outside {@code client},
+     * a wildcard import of the parent package included: {@code *} is not a word character, so the class-name
+     * check alone let {@code import io.jenkins.plugins.xcpng.*;} through.
      */
     private static final Pattern FORBIDDEN =
-            Pattern.compile("(?<![\\w.])(hudson|jenkins)\\.|io\\.jenkins\\.plugins\\.xcpng\\.(?!client\\b)\\w");
+            Pattern.compile("(?<![\\w.])(hudson|jenkins)\\.|io\\.jenkins\\.plugins\\.xcpng\\.(?!client\\b)[\\w*]");
+
+    private static final Pattern CLIENT_PACKAGE =
+            Pattern.compile("package io\\.jenkins\\.plugins\\.xcpng\\.client(\\.\\w+)*;\\s*");
 
     @Test
     void theClientPackageReferencesNeitherJenkinsNorThePluginPackage() throws IOException {
         List<Path> sources;
-        try (Stream<Path> files = Files.list(CLIENT)) {
+        // Recursive, so a subpackage added under client later is scanned too.
+        try (Stream<Path> files = Files.walk(CLIENT)) {
             sources = files.filter(p -> p.toString().endsWith(".java")).sorted().toList();
         }
         // The denominator: a wrong path would list nothing and pass every time.
@@ -50,13 +57,16 @@ class ClientPackageBoundaryTest {
         List<String> violations = new ArrayList<>();
         for (Path source : sources) {
             List<String> lines = Files.readAllLines(source, StandardCharsets.UTF_8);
+            // Every file must sit in client or below. A file here declaring the parent package could use its
+            // classes by simple name, with no import and no qualified name for the pattern to find.
+            if (lines.stream().noneMatch(l -> CLIENT_PACKAGE.matcher(l).matches())) {
+                violations.add(CLIENT.relativize(source) + ": does not declare a package under "
+                        + "io.jenkins.plugins.xcpng.client");
+            }
             for (int i = 0; i < lines.size(); i++) {
                 String line = lines.get(i);
-                if (line.startsWith("package ")) {
-                    continue;
-                }
                 if (FORBIDDEN.matcher(line).find()) {
-                    violations.add(source.getFileName() + ":" + (i + 1) + ": " + line.strip());
+                    violations.add(CLIENT.relativize(source) + ":" + (i + 1) + ": " + line.strip());
                 }
             }
         }
@@ -85,5 +95,10 @@ class ClientPackageBoundaryTest {
                 .matcher("import com.fasterxml.jackson.databind.JsonNode;")
                 .find());
         assertFalse(FORBIDDEN.matcher(" * the Jenkins half of the plugin").find());
+
+        // Wildcards: the parent package's is a dependency on all of it, the client's own is not.
+        assertTrue(FORBIDDEN.matcher("import io.jenkins.plugins.xcpng.*;").find());
+        assertFalse(
+                FORBIDDEN.matcher("import io.jenkins.plugins.xcpng.client.*;").find());
     }
 }
