@@ -359,6 +359,11 @@ class XcpngCloudTest {
 
     /** Collect everything {@link XcpngCloud} logs while {@code body} runs. */
     private static List<LogRecord> whileCapturingCloudLog(ThrowingRunnable body) throws Exception {
+        return whileCapturingLog(XcpngCloud.class, body);
+    }
+
+    /** Collect everything the logger named after {@code source} records while {@code body} runs. */
+    private static List<LogRecord> whileCapturingLog(Class<?> source, ThrowingRunnable body) throws Exception {
         List<LogRecord> records = Collections.synchronizedList(new ArrayList<>());
         Handler handler = new Handler() {
             @Override
@@ -372,7 +377,7 @@ class XcpngCloudTest {
             @Override
             public void close() {}
         };
-        Logger logger = Logger.getLogger(XcpngCloud.class.getName());
+        Logger logger = Logger.getLogger(source.getName());
         logger.addHandler(handler);
         try {
             body.run();
@@ -475,6 +480,33 @@ class XcpngCloudTest {
                 hudson.model.Node.Mode.EXCLUSIVE,
                 agent.getMode(),
                 "NORMAL would make every unlabeled build eligible for a single-use VM");
+    }
+
+    /**
+     * Core's {@code Slave#warnPlugin} blames a plugin whose {@code readResolve} skips super, and it fires on
+     * one condition: the cached label set read while still null outside {@code readResolve}. The deprecated
+     * nine-argument {@code Slave} constructor trips it by itself, because it reads the assigned labels before
+     * it has computed them, so an agent built through it logged that warning on every provision even though
+     * its {@code readResolve} does call super (#58). A reload goes through {@code readResolve}, which core
+     * exempts, so construction is the case to pin; the reload is checked too so a regression there shows.
+     */
+    @Test
+    void buildingOrReloadingAnAgentDoesNotTripCoresReadResolveWarning(JenkinsRule r) throws Exception {
+        List<LogRecord> records = whileCapturingLog(hudson.model.Slave.class, () -> {
+            XcpngAgent agent = new XcpngAgent(
+                    "xcpng-warn-1",
+                    new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 1, List.of()),
+                    new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048),
+                    10,
+                    new ProvisioningActivity.Id("xcpng", "jenkins-golden-debian", "xcpng-warn-1"),
+                    false);
+            jenkins.model.Jenkins.XSTREAM2.fromXML(jenkins.model.Jenkins.XSTREAM2.toXML(agent));
+        });
+
+        assertFalse(
+                records.stream().anyMatch(rec -> messageOf(rec).contains("without calling super")),
+                "core blamed this plugin's readResolve: "
+                        + records.stream().map(XcpngCloudTest::messageOf).toList());
     }
 
     /**

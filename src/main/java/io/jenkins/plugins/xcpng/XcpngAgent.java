@@ -19,7 +19,6 @@ import io.jenkins.plugins.xcpng.client.VmRef;
 import io.jenkins.plugins.xcpng.client.VmState;
 import java.io.IOException;
 import java.time.Duration;
-import java.util.Collections;
 import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -253,16 +252,15 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
             @NonNull ProvisioningActivity.Id activityId,
             boolean warm)
             throws Descriptor.FormException, IOException {
-        super(
-                name,
-                "XCP-ng ephemeral agent",
-                REMOTE_FS,
-                EXECUTORS_PER_AGENT,
-                USAGE_MODE,
-                template.getLabelString(),
-                new XcpngLauncher(template),
-                new XcpngRetentionStrategy(idleMinutes),
-                Collections.emptyList());
+        // The three-argument constructor plus setters, not the deprecated all-in-one one: that one reads the
+        // assigned labels before computing them, which trips core's "overrides readResolve() without calling
+        // super" warning on every provision (#58).
+        super(name, REMOTE_FS, new XcpngLauncher(template));
+        setNodeDescription("XCP-ng ephemeral agent");
+        setNumExecutors(EXECUTORS_PER_AGENT);
+        setMode(USAGE_MODE);
+        setLabelString(template.getLabelString());
+        setRetentionStrategy(new XcpngRetentionStrategy(idleMinutes));
         this.cloudName = cloud.name;
         this.activityId = activityId;
         this.warm = warm;
