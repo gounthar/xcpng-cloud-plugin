@@ -1,0 +1,14 @@
+<div>
+  Optional. The name of the network each clone's network interface is connected to, as the pool lists it
+  (for example <code>Pool-wide network associated with eth0</code>). Leave it blank to keep whatever
+  network the template's interface is on, which is what every clone did before this field existed.
+  <p>
+  The name is looked up in the template's own pool when each agent is created, so the same name works on
+  every pool a golden image is copied to, even though each pool's network is a different object. This
+  selects an existing network; it does not create one, and it does not tag traffic with a VLAN by itself.
+  The template must have at most one network interface.
+  </p>
+  <p>
+  Warm-pool agents created on the previous network are replaced after this field changes.
+  </p>
+</div>

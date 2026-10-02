@@ -99,6 +99,14 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
      */
     private int minInstances;
 
+    /**
+     * Optional: the name-label of the network each clone's NIC is cabled to, resolved in the template's pool
+     * at clone time (#243). Null, the norm, keeps the template's own NIC. A name rather than an id so the same
+     * configuration works on every pool a golden image is copied to.
+     */
+    @CheckForNull
+    private String networkName;
+
     @DataBoundConstructor
     public XcpngTemplate(String templateName, String labelString, int numCpus, int memoryMb) {
         this.templateName = templateName;
@@ -146,6 +154,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                 }
             }
         }
+        // XStream bypasses the setter, so a hand-edited blank would otherwise ask the pool for a network
+        // named "" and fail every provision.
+        networkName = normalizeNetworkName(networkName);
         // A config predating this field deserializes it to 0, which is already the "off" default; this
         // only floors a hand-edited negative, mirroring the setter's clamp.
         if (minInstances < 0) {
@@ -233,6 +244,27 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
     @DataBoundSetter
     public void setMinInstances(int minInstances) {
         this.minInstances = Math.max(0, minInstances);
+    }
+
+    /**
+     * The network each clone's NIC is cabled to, by name-label in the template's pool, or null to keep the
+     * template's own. Stored trimmed.
+     */
+    @CheckForNull
+    public String getNetworkName() {
+        return networkName;
+    }
+
+    @DataBoundSetter
+    public void setNetworkName(@CheckForNull String networkName) {
+        this.networkName = normalizeNetworkName(networkName);
+    }
+
+    /** Trimmed, with blank collapsed to null: an untouched form field means "inherit", not a network named "". */
+    @CheckForNull
+    private static String normalizeNetworkName(@CheckForNull String value) {
+        String trimmed = value == null ? null : value.trim();
+        return trimmed == null || trimmed.isEmpty() ? null : trimmed;
     }
 
     @Extension

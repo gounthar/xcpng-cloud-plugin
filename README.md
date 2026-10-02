@@ -246,6 +246,7 @@ Template fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Template name | `templateName` | Name of the golden-image VM or template on the pool to clone. |
+| Network | `networkName` | Optional. Name of the network each clone's interface is connected to, looked up in the template's own pool, so one name works on every pool the golden image is copied to. Blank keeps the template's own network. Selects an existing network; it does not create one or add a VLAN tag. The template must have at most one network interface. Changing it replaces the warm-pool spares built on the old network. Needs the Xen Orchestra token to be allowed to create VIFs when the network differs from the template's. |
 | Labels | `labelString` | Space-separated labels the agents cloned from this template will carry. A build is matched to this template when its label expression is satisfied by them. Required: agents are exclusive to their labels, so a template without any is unreachable. |
 | vCPUs | `numCpus` | Virtual CPUs for the cloned VM. Defaults to 2. |
 | Memory (MiB) | `memoryMb` | Memory for the cloned VM in mebibytes (MiB). Defaults to 2048. |

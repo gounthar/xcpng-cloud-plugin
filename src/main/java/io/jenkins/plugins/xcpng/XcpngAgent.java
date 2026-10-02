@@ -152,6 +152,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     private final XcpngBackend backend;
 
+    /** See {@link #getNetworkName()}. Persisted with the node; an agent saved before #243 reads null, i.e. inherit. */
+    @CheckForNull
+    private String networkName;
+
     /**
      * The cloud-stats provisioning activity this agent belongs to. Serialisable and persisted with the
      * node so a controller restart keeps the correlation; {@link #getId()} hands it to cloud-stats.
@@ -268,6 +272,18 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.credentialsId = cloud.getCredentialsId();
         this.certificateFingerprint = cloud.getCertificateFingerprint();
         this.backend = cloud.getBackend();
+        this.networkName = template.getNetworkName();
+    }
+
+    /**
+     * The network this agent's clone is cabled to, by name, or null for the template's own NIC. Read from the
+     * template when the agent is built and never again: the launcher holds the cloud's template object
+     * itself, which a setter can change under a running spare, and the warm pool decides whether a spare is
+     * stale by comparing this against the template's current value (#243).
+     */
+    @CheckForNull
+    public String getNetworkName() {
+        return networkName;
     }
 
     /** The VM this agent runs on, as an opaque backend handle, or null while it has none yet. */

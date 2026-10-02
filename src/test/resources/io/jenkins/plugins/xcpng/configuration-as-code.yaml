@@ -12,6 +12,8 @@ jenkins:
         idleMinutes: 15
         templates:
           - templateName: "jenkins-golden-debian"
+            # Padded on purpose: the setter trims, and the export below proves the trimmed value was stored.
+            networkName: " Build agents (VLAN 30) "
             labelString: "xcpng-linux"
             numCpus: 4
             memoryMb: 8192

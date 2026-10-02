@@ -10,6 +10,7 @@
     - labelString: "xcpng-linux"
       memoryMb: 8192
       minInstances: 1
+      networkName: "Build agents (VLAN 30)"
       numCpus: 4
       sshAuthorizedKey: "ssh-ed25519 AAAAExampleKeyForRoundTripTest lab"
       templateName: "jenkins-golden-debian"
