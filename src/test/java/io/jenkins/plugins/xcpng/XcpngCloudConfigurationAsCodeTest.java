@@ -76,6 +76,7 @@ class XcpngCloudConfigurationAsCodeTest {
         assertEquals(8192, template.getMemoryMb());
         assertEquals(1, template.getMinInstances());
         assertEquals("ssh-ed25519 AAAAExampleKeyForRoundTripTest lab", template.getSshAuthorizedKey());
+        assertEquals("Build agents (VLAN 30)", template.getNetworkName());
     }
 
     /**

@@ -37,6 +37,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -692,7 +693,8 @@ public class XcpngCloud extends Cloud {
                     // Stamp the owning cloud onto the VM record. The plugin's own teardown is the normal
                     // path; this is what lets tools/reaper.py find a clone the plugin lost track of, after
                     // a crash mid-provision or a destroy that threw.
-                    name);
+                    name,
+                    template.getNetworkName());
             listener.getLogger().println("Cloning XCP-ng template " + template.getTemplateName() + " for this agent.");
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
             agent.setVmRef(clone.value());
@@ -823,9 +825,9 @@ public class XcpngCloud extends Cloud {
         // One pass over the node list feeds both halves: count this cloud's agents (for the cap) and bucket
         // its unused warm spares by template, rather than rescanning the list per template. The spares
         // themselves are collected, not just counted, because the drain needs the agents to reap.
-        Set<String> configuredTemplates = new HashSet<>();
+        Map<String, XcpngTemplate> configuredTemplates = new HashMap<>();
         for (XcpngTemplate template : templates) {
-            configuredTemplates.add(template.getTemplateName());
+            configuredTemplates.putIfAbsent(template.getTemplateName(), template);
         }
         Set<String> registered = new HashSet<>();
         for (Node node : Jenkins.get().getNodes()) {
@@ -836,8 +838,12 @@ public class XcpngCloud extends Cloud {
                     if (id != null) {
                         // A spare whose template no longer resolves belongs to a template the administrator
                         // removed: nothing will ever want it, so it is drained outright rather than counted
-                        // against a target that no longer exists.
-                        if (configuredTemplates.contains(id.getTemplateName())) {
+                        // against a target that no longer exists. A spare cabled to a network the template no
+                        // longer names is drained the same way (#243): it would otherwise count as valid and
+                        // serve builds on the old network until it happened to be used or idled out, and the
+                        // fill below replaces it on the new one.
+                        XcpngTemplate current = configuredTemplates.get(id.getTemplateName());
+                        if (current != null && sameNetwork(agent, current)) {
                             warmByTemplate
                                     .computeIfAbsent(id.getTemplateName(), k -> new ArrayList<>())
                                     .add(agent);
@@ -887,6 +893,16 @@ public class XcpngCloud extends Cloud {
             }
         }
         return true;
+    }
+
+    /**
+     * Whether {@code spare} was cloned onto the network {@code template} names now. A spare's launcher holds
+     * the template it was built from, a snapshot of the configuration at the time, so the two differ exactly
+     * when the network was changed since. A launcher of another type cannot say, and reads as the same.
+     */
+    private static boolean sameNetwork(@NonNull XcpngAgent spare, @NonNull XcpngTemplate template) {
+        return !(spare.getLauncher() instanceof XcpngLauncher launcher)
+                || Objects.equals(launcher.getTemplate().getNetworkName(), template.getNetworkName());
     }
 
     /**

@@ -2,6 +2,7 @@ package io.jenkins.plugins.xcpng.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -43,6 +44,16 @@ class XoRestClientTest {
      * the uuid from one that stamps the id, and the tools compare the stamp against the XAPI record's uuid.
      */
     private static final String CLONE_UUID = "b81c6d2f-40a7-4e93-8f15-6ad3c0e72b94";
+
+    /** The template's one NIC, and the networks the appliance lists, as the lab appliance shapes them. */
+    private static final String TEMPLATE_VIF = "a56f951c-0f09-d766-a188-756237b0e0c4";
+
+    private static final String ETH0 = "Pool-wide network associated with eth0";
+    private static final String NET_ETH0 = "b334b7c5-72ca-e0b7-a110-0bd0e174d40c";
+    // The same name on the other pool: every pool's default network carries it, which is the whole case.
+    private static final String NET_ETH0_OTHER_POOL = "cec60901-71ab-ca0d-d2bf-edafc63baf91";
+    private static final String AGENTS = "Build agents (VLAN 30)";
+    private static final String NET_AGENTS = "d9fd5835-d172-d9eb-9c4f-091334a69a18";
 
     // -- resolveTemplate --------------------------------------------------
 
@@ -218,6 +229,149 @@ class XoRestClientTest {
         // them is additive, so a clone that was handed its own network comes up with two NICs.
         assertFalse(create.json().has("vifs"), "create_vm must not be passed vifs: " + create.body);
         assertFalse(create.json().has("VIFs"), "nor under the JSON-RPC spelling: " + create.body);
+    }
+
+    @Test
+    void cloneWithNoNetworkAsksNothingAboutNetworks() {
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec());
+
+        // Inheriting is today's behaviour, so it must cost nothing new: not a request, and not a VIF the
+        // token needs the right to create.
+        assertTrue(
+                t.paths().stream().noneMatch(p -> p.contains("/networks") || p.contains("/vifs")), t.paths()::toString);
+    }
+
+    // -- cloneFromTemplate onto a named network (#243) ---------------------
+
+    @Test
+    void aNetworkNameReplacesTheTemplatesNicRatherThanAddingOne() {
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec(AGENTS));
+
+        JsonNode vifs = t.only("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true")
+                .json()
+                .path("vifs");
+        assertEquals(1, vifs.size(), vifs::toString);
+        assertEquals(NET_AGENTS, vifs.get(0).path("network").asText());
+        // The device is what makes the route replace the inherited NIC. Without it the entry is additive and
+        // the clone comes up with two, which is the measured failure this backend's javadoc opens with.
+        assertEquals("0", vifs.get(0).path("device").asText(), vifs::toString);
+    }
+
+    @Test
+    void theDeviceReplacedIsTheTemplateNicsOwn() {
+        ScriptedRest t = new ScriptedRest();
+        t.vifs.get(TEMPLATE_VIF).put("device", "1");
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec(AGENTS));
+
+        // Device 0 here would leave the template's NIC on device 1 untouched and add a second one.
+        assertEquals(
+                "1",
+                t.only("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true")
+                        .json()
+                        .path("vifs")
+                        .get(0)
+                        .path("device")
+                        .asText());
+    }
+
+    @Test
+    void theNetworkIsResolvedInTheTemplatesPoolNotTheFirstByThatName() {
+        ScriptedRest t = new ScriptedRest();
+        t.vifs.get(TEMPLATE_VIF).put("$network", NET_AGENTS);
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec(ETH0));
+
+        // The other pool's network is listed first, so a first-match lookup would hand create_vm a network
+        // from a pool the clone does not live in.
+        assertEquals(
+                NET_ETH0,
+                t.only("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true")
+                        .json()
+                        .path("vifs")
+                        .get(0)
+                        .path("network")
+                        .asText());
+    }
+
+    @Test
+    void aTemplateAlreadyOnTheNetworkIsClonedWithNoVifs() {
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec(ETH0));
+
+        Call create = t.only("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true");
+        assertFalse(create.json().has("vifs"), "nothing to move, so nothing to pass: " + create.body);
+    }
+
+    @Test
+    void aTemplateWithNoNicGetsOneAtDeviceZero() {
+        ScriptedRest t = new ScriptedRest();
+        t.templateVifs.clear();
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec(AGENTS));
+
+        JsonNode vifs = t.only("POST", "/rest/v0/pools/" + POOL + "/actions/create_vm?sync=true")
+                .json()
+                .path("vifs");
+        assertEquals(1, vifs.size(), vifs::toString);
+        assertEquals("0", vifs.get(0).path("device").asText());
+    }
+
+    @Test
+    void anUnknownNetworkFailsBeforeAnythingIsCreated() {
+        ScriptedRest t = new ScriptedRest();
+        t.networks.add(network("only-elsewhere", "Storage", OTHER_POOL));
+        XoRestClient c = new XoRestClient(t);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> c.cloneFromTemplate(template, spec("Storage")));
+
+        assertTrue(e.getMessage().contains("no network named 'Storage' in pool " + POOL), e.getMessage());
+        // What the pool does have, so the operator can pick without leaving the log, and where the name is.
+        assertTrue(e.getMessage().contains(AGENTS), e.getMessage());
+        assertTrue(e.getMessage().contains("Pool " + OTHER_POOL), e.getMessage());
+        assertNoCloneAttempted(t);
+    }
+
+    @Test
+    void aNameCarriedByTwoNetworksInThePoolIsRefused() {
+        ScriptedRest t = new ScriptedRest();
+        t.networks.add(network("dup", AGENTS, POOL));
+        XoRestClient c = new XoRestClient(t);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> c.cloneFromTemplate(template, spec(AGENTS)));
+
+        assertTrue(e.getMessage().contains("2 networks are named"), e.getMessage());
+        assertNoCloneAttempted(t);
+    }
+
+    @Test
+    void aTemplateWithTwoNicsIsRefused() {
+        ScriptedRest t = new ScriptedRest();
+        t.templateVifs.add("second-vif");
+        XoRestClient c = new XoRestClient(t);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+        HypervisorException e =
+                assertThrows(HypervisorException.class, () -> c.cloneFromTemplate(template, spec(AGENTS)));
+
+        assertTrue(e.getMessage().contains("2 network interfaces"), e.getMessage());
+        assertNoCloneAttempted(t);
+    }
+
+    @Test
+    void aBlankNetworkNameIsNoNetworkName() {
+        assertNull(new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), null, "  ").networkName());
+    }
+
+    private static void assertNoCloneAttempted(ScriptedRest t) {
+        assertTrue(t.paths().stream().noneMatch(p -> p.contains("create_vm")), t.paths()::toString);
+        assertTrue(t.destroyed.isEmpty(), t.destroyed::toString);
     }
 
     @Test
@@ -1422,6 +1576,18 @@ class XoRestClientTest {
         return new ProvisionSpec("agent-1", 2, 2048L, null, null, null, guestData);
     }
 
+    private static ProvisionSpec spec(String networkName) {
+        return new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), null, networkName);
+    }
+
+    private static Map<String, Object> network(String id, String nameLabel, String pool) {
+        Map<String, Object> n = new LinkedHashMap<>();
+        n.put("id", id);
+        n.put("name_label", nameLabel);
+        n.put("$pool", pool);
+        return n;
+    }
+
     private static Map<String, Object> template(String id, String nameLabel, String pool) {
         Map<String, Object> t = new LinkedHashMap<>();
         t.put("id", id);
@@ -1493,12 +1659,27 @@ class XoRestClientTest {
          */
         String specBody;
 
+        /** What {@code GET /networks} lists. The other pool's same-named network comes first, on purpose. */
+        final List<Map<String, Object>> networks = new ArrayList<>();
+        /** The template record's {@code VIFs}: ids, each answered from {@link #vifs}. */
+        final List<String> templateVifs = new ArrayList<>(List.of(TEMPLATE_VIF));
+        /** VIF records by id, as {@code GET /vifs/{id}} answers them. */
+        final Map<String, Map<String, Object>> vifs = new LinkedHashMap<>();
+
         private final Map<String, RestResponse> failures = new LinkedHashMap<>();
         private final List<String> interrupts = new ArrayList<>();
 
         ScriptedRest() {
             templates.add(template("t-1", "jenkins-agent-debian13-v7", POOL));
             templates.add(template("t-2", "Debian Trixie 13", POOL));
+            networks.add(network(NET_ETH0_OTHER_POOL, ETH0, OTHER_POOL));
+            networks.add(network(NET_ETH0, ETH0, POOL));
+            networks.add(network("xenapi-net", "Host internal management network", POOL));
+            networks.add(network(NET_AGENTS, AGENTS, POOL));
+            Map<String, Object> vif = new LinkedHashMap<>();
+            vif.put("device", "0");
+            vif.put("$network", NET_ETH0);
+            vifs.put(TEMPLATE_VIF, vif);
         }
 
         void fail(String method, String path, int status, String body) {
@@ -1550,6 +1731,36 @@ class XoRestClientTest {
                 // them: it answers 201 with the new VM's id, so blanking that here would test nothing
                 // except this fixture.
                 return new RestResponse(204, "");
+            }
+            if ("GET".equals(method) && path.startsWith("/rest/v0/vm-templates/")) {
+                // One template's record. The appliance ignores `fields` on this route and answers the whole
+                // record (read on the lab appliance), so the fixture keys on the id alone.
+                String id = path.substring("/rest/v0/vm-templates/".length()).split("\\?")[0];
+                if (!id.equals(TEMPLATE_UUID)) {
+                    return new RestResponse(
+                            404,
+                            "{\"error\":\"no such VM-template " + id + "\",\"data\":{\"id\":\"" + id
+                                    + "\",\"type\":\"VM-template\"}}");
+                }
+                Map<String, Object> record = new LinkedHashMap<>();
+                record.put("id", id);
+                record.put("uuid", id);
+                record.put("$pool", POOL);
+                record.put("VIFs", List.copyOf(templateVifs));
+                return new RestResponse(200, json(record));
+            }
+            if ("GET".equals(method) && path.startsWith("/rest/v0/networks")) {
+                return new RestResponse(200, json(networks));
+            }
+            if ("GET".equals(method) && path.startsWith("/rest/v0/vifs/")) {
+                String id = path.substring("/rest/v0/vifs/".length()).split("\\?")[0];
+                Map<String, Object> vif = vifs.get(id);
+                if (vif == null) {
+                    return new RestResponse(
+                            404,
+                            "{\"error\":\"no such VIF " + id + "\",\"data\":{\"id\":\"" + id + "\",\"type\":\"VIF\"}}");
+                }
+                return new RestResponse(200, json(vif));
             }
             if (path.startsWith("/rest/v0/vm-templates")) {
                 return new RestResponse(200, templatesBody != null ? templatesBody : json(templates));

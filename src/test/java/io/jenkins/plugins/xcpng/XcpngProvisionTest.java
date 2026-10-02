@@ -1758,6 +1758,50 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void changingATemplatesNetworkReplacesItsWarmSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate onA = warmTemplate("jenkins-golden-debian", 1);
+        onA.setNetworkName("net-a");
+        XcpngCloud first = warmCloudOver(fake, 4, onA);
+        r.jenkins.clouds.add(first);
+        reconcileAndSettle(first);
+        assertEquals(1, warmNodeCount(r), "the pool should fill its one spare");
+        assertEquals("net-a", fake.lastSpec().networkName(), "the clone must be asked for the template's network");
+
+        // Saving the cloud again with the network unchanged rebuilds every object, and must not churn the spare.
+        XcpngTemplate stillA = warmTemplate("jenkins-golden-debian", 1);
+        stillA.setNetworkName("net-a");
+        XcpngCloud resaved = warmCloudOver(fake, 4, stillA);
+        r.jenkins.clouds.remove(first);
+        r.jenkins.clouds.add(resaved);
+        reconcileAndSettle(resaved);
+        assertEquals(0, destroyCount(fake), "an unchanged network must leave the spare alone: " + fake.calls());
+
+        // The template name, labels and target are all unchanged, so only the network says this spare is stale.
+        // Kept, it would serve the next build on the old network.
+        XcpngTemplate onB = warmTemplate("jenkins-golden-debian", 1);
+        onB.setNetworkName("net-b");
+        XcpngCloud moved = warmCloudOver(fake, 4, onB);
+        r.jenkins.clouds.remove(resaved);
+        r.jenkins.clouds.add(moved);
+        reconcileAndSettle(moved);
+        assertEquals(1, destroyCount(fake), "the spare on the old network must be drained: " + fake.calls());
+
+        reconcileAndSettle(moved);
+        assertEquals(1, warmNodeCount(r), "and replaced by one on the new network");
+        assertEquals("net-b", fake.lastSpec().networkName());
+    }
+
+    @Test
+    void aBlankNetworkNameMeansInheritTheTemplatesNic() {
+        XcpngTemplate template = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
+        template.setNetworkName("   ");
+        assertNull(template.getNetworkName(), "an untouched form field must not ask for a network named \"\"");
+        template.setNetworkName("  Build agents  ");
+        assertEquals("Build agents", template.getNetworkName());
+    }
+
+    @Test
     void warmMaintainerExtensionIsRegistered(JenkinsRule r) {
         assertEquals(
                 1,

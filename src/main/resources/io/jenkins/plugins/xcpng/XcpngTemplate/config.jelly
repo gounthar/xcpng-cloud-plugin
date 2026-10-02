@@ -3,6 +3,9 @@
   <f:entry title="${%Template name}" field="templateName">
     <f:textbox/>
   </f:entry>
+  <f:entry title="${%Network (optional)}" field="networkName">
+    <f:textbox/>
+  </f:entry>
   <f:entry title="${%Labels}" field="labelString">
     <f:textbox/>
   </f:entry>
