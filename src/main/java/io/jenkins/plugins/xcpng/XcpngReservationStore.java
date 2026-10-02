@@ -1,11 +1,13 @@
 package io.jenkins.plugins.xcpng;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.ExtensionList;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -126,14 +128,28 @@ public class XcpngReservationStore {
         });
     }
 
-    /** Commit a slot to an agent that does not exist as a node yet. */
+    /** Commit a slot to an agent that does not exist as a node yet, on the template's own NIC. */
     void reserve(
             String cloudName, @NonNull String nodeName, @NonNull String templateName, boolean warm, long expiresAt) {
+        reserve(cloudName, nodeName, templateName, null, warm, expiresAt);
+    }
+
+    /**
+     * Commit a slot to an agent that does not exist as a node yet. {@code networkName} is the network the clone
+     * will be cabled to, null for the template's own NIC; warm spares are counted per template and network.
+     */
+    void reserve(
+            String cloudName,
+            @NonNull String nodeName,
+            @NonNull String templateName,
+            @CheckForNull String networkName,
+            boolean warm,
+            long expiresAt) {
         if (unkeyable(cloudName, "reserve a slot for " + nodeName)) {
             return;
         }
         byCloud.computeIfAbsent(cloudName, key -> new ConcurrentHashMap<>())
-                .put(nodeName, new Reservation(templateName, warm, expiresAt));
+                .put(nodeName, new Reservation(templateName, networkName, warm, expiresAt));
     }
 
     /** Give a slot back: to the node it was taken for, or because the commitment will never become one. */
@@ -202,9 +218,25 @@ public class XcpngReservationStore {
         return count(cloudName, templateName, false);
     }
 
-    /** How many of those are warm spares for one template, so repeated ticks do not stack provisions. */
-    int countWarmForTemplate(String cloudName, @NonNull String templateName) {
-        return count(cloudName, templateName, true);
+    /**
+     * How many of those are warm spares for one template on one network, so repeated ticks do not stack
+     * provisions. Keyed by the network as well (#243): two entries for one golden image on two networks are
+     * two warm pools, and one's reservation must not satisfy the other's target.
+     */
+    int countWarmForTemplate(String cloudName, @NonNull String templateName, @CheckForNull String networkName) {
+        Map<String, Reservation> forCloud = cloudName == null ? null : byCloud.get(cloudName);
+        if (forCloud == null) {
+            return 0;
+        }
+        int count = 0;
+        for (Reservation reservation : forCloud.values()) {
+            if (reservation.warm()
+                    && reservation.templateName().equals(templateName)
+                    && Objects.equals(reservation.networkName(), networkName)) {
+                count++;
+            }
+        }
+        return count;
     }
 
     private int count(String cloudName, @NonNull String templateName, boolean warmOnly) {
@@ -234,8 +266,8 @@ public class XcpngReservationStore {
     }
 
     /**
-     * One committed-but-unregistered agent: which template it is for, whether it is a warm spare, and when
-     * its cloud stops believing in it.
+     * One committed-but-unregistered agent: which template and network it is for, whether it is a warm spare,
+     * and when its cloud stops believing in it.
      */
-    private record Reservation(String templateName, boolean warm, long expiresAt) {}
+    private record Reservation(String templateName, String networkName, boolean warm, long expiresAt) {}
 }
