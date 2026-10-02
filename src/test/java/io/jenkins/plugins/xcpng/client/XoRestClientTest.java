@@ -244,8 +244,9 @@ class XoRestClientTest {
 
         List<Call> patches = t.all("PATCH", "/rest/v0/vms/" + CLONE);
         assertEquals(2, patches.size(), "sizing, then the pin: " + t.paths());
-        // In the sizing body, memoryMin would fire concurrently with memory, against a dynamic max that only
-        // memory raises (#242). It has to wait for the first call to land.
+        // In the sizing body, XO would apply memoryMin concurrently with memory, whose setter writes a dynamic
+        // min computed from the record read before either write; if it lands last, the template's floor comes
+        // back (#242). The pin has to wait for the first call to land.
         assertFalse(
                 patches.get(0).json().has("memoryMin"), "the pin must not ride with memory: " + patches.get(0).body);
         JsonNode pin = patches.get(1).json();

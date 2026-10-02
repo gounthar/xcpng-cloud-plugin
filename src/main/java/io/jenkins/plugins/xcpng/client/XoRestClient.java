@@ -705,10 +705,13 @@ public final class XoRestClient implements HypervisorClient {
      * <p><b>So a second PATCH pins the dynamic min at the request</b>, which gives a clone of a
      * dynamic-range template the fixed allocation the XAPI backend gave it, rather than letting the host
      * balloon it down to the template's floor. It is a second call, not a second field in the first body,
-     * because of the {@code cpus} race above: {@code memoryMin} carries a {@code memoryMax: gte} constraint
-     * against a dynamic max that only the first call raises, and both setters in one body would fire
-     * concurrently. After the first call the dynamic max already equals the request, so the constraint holds
-     * and only {@code memory_dynamic_min} is written. On a fixed-size template it rewrites the value the
+     * because XO applies one body's fields concurrently ({@code makeEditObject} in xo-server's
+     * {@code xapi/utils.mjs}). In one body, the {@code memory} setter and the {@code memoryMin} write (chained
+     * behind a {@code memoryMax} update when its {@code gte} constraint fails, otherwise on its own) run side by
+     * side, and the {@code memory} setter writes a dynamic min computed from the VM record read before either
+     * write. Whichever lands last wins, so the template's floor can come back. After the first call the dynamic
+     * max already equals the request, so the constraint holds and only {@code memory_dynamic_min} is
+     * written. On a fixed-size template it rewrites the value the
      * first call already set. Measured the same day with both calls: the 1/1/2/2 GiB range asked for 4 GiB
      * ended at (1, 4, 4, 4) GiB and started, and the fixed-size template answered the pin with 204 and kept
      * (2, 4, 4, 4) GiB. {@code memoryMin} has been in the body type since the route shipped, so it
