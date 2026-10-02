@@ -1452,8 +1452,9 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * As above, scoped to one pool for template resolution. Teardown and the leaked-VM sweep use the form
-     * without one: they act on VMs they already hold a handle to, and a handle carries its own pool.
+     * As above, scoped to one pool for template resolution. The leaked-VM sweep uses the form without one:
+     * it acts on VMs it already holds a handle to, and a handle carries its own pool. An agent's snapshot
+     * uses this one, because provisioning clones through that snapshot (#282).
      */
     @NonNull
     static HypervisorClient openClient(
