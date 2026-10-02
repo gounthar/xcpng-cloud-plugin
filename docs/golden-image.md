@@ -150,50 +150,54 @@ One image serves both launchers. What differs is the per-clone xenstore data, no
 up, and `dhcpcd` leases in the background. Measured 2026-10-02 inside a clone of
 `jenkins-agent-debian13-v7`, from unit timestamps and process start times, one boot:
 
-| | seconds after kernel start |
+| event | seconds after kernel start |
 |---|---|
 | `network-online.target` reached | 3.2 |
 | global IPv6 address (SLAAC) | 6.9 |
 | IPv4 lease bound | about 13 |
 
-So for roughly ten seconds the agent runs on a host that has IPv6 and no IPv4. Nothing breaks,
-because the launcher fails and is restarted until the address arrives: `curl` for `agent.jar`
-retries five times, the script exits non-zero, and `Restart=on-failure` brings it back every 5 s.
-The same clone restarted the unit 37 times in its first three minutes of one boot below without
-tripping systemd's start limit. That was the branch that exits fastest (no xenstore seed).
+So the agent starts about ten seconds before the host has IPv4, and for the last six of those it
+has a global IPv6 address. Against an IPv4-only controller URL, as on the lab, that is harmless:
+the launcher's `curl` for `agent.jar` makes five attempts with a three-second pause between them,
+which should outlast a ten-second gap (inferred from the script: the unblocked boot above carried no
+seed, so no `curl` ran in it). If it does not, the script exits non-zero and `Restart=on-failure`
+runs it again 5 s later. That loop does not trip systemd's start limit: a clone with no xenstore seed, whose launcher
+exits at once and so restarts as fast as the unit allows, restarted 37 times in the 201 s between
+boot and the reading.
 
-A seeded agent was then taken through the same outage. A `-v7` clone was seeded with a real inbound
-node's URL, name and secret on the lab controller, and its DHCPv4 was dropped from first boot for
-two minutes. The node stayed offline throughout, the unit restarted twice (each attempt now spends
-its time in `curl`'s retries), and once the block was lifted the lease landed about 22 s later.
-`agent.jar` was fetched and `java` started within a second of the lease, and the node read online
-about 5 s after that. No manual step was involved.
+**A two-minute DHCP outage does not strand the clone, provided DHCP comes back.** Each run below
+dropped the VM's DHCPv4 traffic on the host's Open vSwitch bridge (a flow matching its MAC, `udp`
+`68 -> 67`, with the flow's packet counter as the check that it matched anything), held it for two
+minutes, then removed it. A DHCP server that never answers is a different case: the clone keeps an
+IPv4 link-local address and never reaches an IPv4 controller.
 
-**A late or absent DHCP server does not strand the clone.** Dropping this VM's DHCPv4 traffic on the
-host's Open vSwitch bridge for two minutes after a reboot (a flow matching its MAC, `udp`
-`68 -> 67`, with the flow's packet counter as the check that it matched anything):
-
-- **With router adverts still reaching it**: a global IPv6 address within seconds, then an IPv4
+- **Seeded agent, blocked from first boot.** A `-v7` clone was seeded with a real inbound node's
+  URL, name and secret on the lab controller. The node stayed offline throughout and the unit
+  restarted twice, each attempt spending its time in `curl`'s retries. The lease landed about
+  22 s after the block was lifted, `agent.jar` was fetched and `java` started within a second of
+  it, and the node read online about 5 s later, with no manual step.
+- **Router adverts still reaching it.** A global IPv6 address within seconds, then an IPv4
   link-local address (`169.254.x.x`) once DHCPv4 had failed. The `dhcpcd` daemon started at boot
-  kept retrying, and leased the real address **39 s after** the block was lifted.
-- **With its router solicitations and DHCPv6 dropped too**, as on a network with no IPv6 router:
-  no global IPv6 address at any point, only the two link-local addresses, and the same `dhcpcd`
-  process leased **35 s after** the block was lifted. It never exited.
+  kept retrying and leased the real address 39 s after the block was lifted.
+- **Router solicitations and DHCPv6 dropped too**, approximating a network with no IPv6 router. No
+  global IPv6 address at any point, only the two link-local addresses, and the same `dhcpcd`
+  process leased 35 s after the block was lifted.
 
-One run of each, on one lab network. Read the 22-39 s as `dhcpcd`'s retry back-off, not as a
-latency figure.
+One run of each, on one lab network. The 22-39 s is most likely `dhcpcd`'s retry back-off rather
+than a latency: in one run the drop counter's increments spread from seconds apart at first to
+about 30 s apart by the end of the block. The interval between retries was not measured directly.
 
-Two things look wrong from outside the guest and are not:
+Two things look wrong from outside the guest and are not, on this image and this network:
 
-- **XAPI's `networks` field lags the guest.** Between the guest's lease file being written and
-  `networks` showing the address: 19 s, 25 s and 49 s across the three boots. The first boot reported
-  only `fe80::` from 26 s to 56 s after `VM.start`, while the guest had leased at about 13 s of its
-  own uptime. A reading that shows IPv6 alone is usually a reading taken too early, not an
-  IPv6-only guest.
-- **During a DHCP failure, `networks` reports the IPv4 link-local address as `0/ip`.** Anything
-  that reads the VM's primary address has to discard `169.254.0.0/16`. The plugin does not gate on
-  the address at all, since the agent dials out; `XoRestClient.primaryIpAddress` already filters
-  link-local for the same reason.
+- **XAPI's `networks` field lags the guest.** From the guest writing its lease file to `networks`
+  showing the address: about 25 s on the unblocked boot, 49 s and 19 s on the two outage reboots
+  (polled every 5 s, so each figure is good to about that). The unblocked boot reported only
+  `fe80::` for its first readings. So a reading that shows IPv6 alone may simply be early. It
+  is not proof of an IPv6-only guest, though a guest whose DHCPv4 never answers looks the same.
+- **During a DHCP failure, `networks` reports the IPv4 link-local address as `0/ip`**, and kept
+  reporting it for a while after the real lease. Anything that connects *to* the VM by its primary
+  address has to discard `169.254.0.0/16`, which is why `XoRestClient.primaryIpAddress` filters
+  link-local. The plugin itself does not gate on the address, since the agent dials out.
 
 ## Building it with Packer (recommended)
 
