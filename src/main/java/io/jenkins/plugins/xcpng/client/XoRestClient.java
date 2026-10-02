@@ -685,6 +685,39 @@ public final class XoRestClient implements HypervisorClient {
      * raised first. Sending both instead would fire two setters <em>concurrently</em> ({@code
      * Promise.all} over the values), so shrinking would race a {@code VCPUs_max} write against a still
      * higher {@code VCPUs_at_startup} and XAPI would reject it.
+     *
+     * <p><b>{@code memory} sizes the clone, and on its own it does not do what the XAPI backend's {@code
+     * VM.set_memory_limits(m, m, m, m)} did</b> (#242). XO dispatches it on the VM's current limits ({@code vm.mjs} in
+     * xo-server). When dynamic min, dynamic max and static max are equal (static min is not compared), it calls {@code
+     * set_memory_limits(static_min, m, m, m)}: the static max moves with the request, but the static min stays where
+     * the template left it. What happens below the static min depends on the appliance. Since xen-orchestra {@code
+     * 13480c345} (#10285, 2026-09-18; first released in XO 6.9.0 by date, the changelog does not list it) XO treats the
+     * static min as read-only and refuses such a request with a 422 naming it, whatever the template's shape. Before
+     * that (read at {@code db8fe8d47}, not measured), a fixed-size template sends XAPI a static min above the static
+     * max, which it should refuse, and a dynamic-range one has its static min lowered to the request. Either way the
+     * REST API has no field that sets it directly. For a dynamic-range template XO otherwise sets the dynamic max to
+     * the request, raises the static max to fit, and lowers the dynamic min only if it is above the request; if XAPI
+     * refuses that, XO falls back to pinning all three at {@code m}. Measured on the lab pool on 2026-10-01 (XO
+     * rest-api 0.40.2, which has the guard; a 2 GiB fixed-size template; limits as static min, dynamic min, dynamic
+     * max, static max): 4 GiB gave (2, 4, 4, 4) GiB, 1 GiB was refused with the VM unchanged, and 4 GiB on a 1/1/2/2
+     * GiB range gave (1, 1, 4, 4) GiB. The lowering and the fallback are read from the source, not measured.
+     *
+     * <p><b>So a second PATCH pins the dynamic min at the request</b>, which gives a clone of a
+     * dynamic-range template the fixed allocation the XAPI backend gave it, rather than letting the host
+     * balloon it down to the template's floor. It is a second call, not a second field in the first body,
+     * because XO applies one body's fields concurrently ({@code makeEditObject} in xo-server's
+     * {@code xapi/utils.mjs}). In one body, the {@code memory} setter and the {@code memoryMin} write (chained
+     * behind a {@code memoryMax} update when its {@code gte} constraint fails, otherwise on its own) run side by
+     * side, and the {@code memory} setter writes a dynamic min computed from the VM record read before either
+     * write. Whichever lands last wins, so the template's floor can come back. By the second call the dynamic
+     * max already equals the request, so normally the constraint holds and only {@code memory_dynamic_min} is
+     * written. XO checks it against its object cache, though, which can lag a write by about half a second (the
+     * same lag the tag handling below works around); if it still shows the old max, XO repeats the max update
+     * and then sets the min, in sequence, which ends in the same limits. On a fixed-size template it rewrites the value the
+     * first call already set. Measured the same day with both calls: the 1/1/2/2 GiB range asked for 4 GiB
+     * ended at (1, 4, 4, 4) GiB and started, and the fixed-size template answered the pin with 204 and kept
+     * (2, 4, 4, 4) GiB. {@code memoryMin} has been in the body type since the route shipped, so it
+     * needs no newer appliance than the PATCH itself.
      */
     private void configure(String vm, ProvisionSpec spec) {
         markOwner(vm, spec.owner());
@@ -697,9 +730,13 @@ public final class XoRestClient implements HypervisorClient {
                 xenstore.put(GUEST_DATA_PREFIX + e.getKey(), e.getValue());
             }
         }
-        // One call, and it must be one call: the seed has to be in the VM record before the VM starts,
+        // The seed rides in this one call: it has to be in the VM record before the VM starts,
         // because setting xenstore-data on a running VM does not propagate to the guest.
         call("PATCH", API + "/vms/" + vm, patch, READ_TIMEOUT);
+        // Separate, and after: see the javadoc for why the dynamic min cannot ride in the body above.
+        ObjectNode pin = MAPPER.createObjectNode();
+        pin.put("memoryMin", spec.memoryBytes());
+        call("PATCH", API + "/vms/" + vm, pin, READ_TIMEOUT);
     }
 
     /**
