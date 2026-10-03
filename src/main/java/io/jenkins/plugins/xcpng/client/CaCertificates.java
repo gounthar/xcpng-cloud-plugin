@@ -92,13 +92,32 @@ public final class CaCertificates {
             throw new IllegalArgumentException(
                     "No PEM certificate found. Expected a block starting with -----BEGIN CERTIFICATE-----.");
         }
+        // The matcher only sees complete pairs, so a truncated last block, or a block of some other kind, would
+        // otherwise be skipped in silence and the rest trusted. Every armour line has to belong to a certificate.
+        int begins = count(text, "-----BEGIN ");
+        int ends = count(text, "-----END ");
+        if (begins != certificates.size() || ends != certificates.size()) {
+            throw new IllegalArgumentException("Found " + certificates.size() + " complete certificate block(s), but "
+                    + begins + " BEGIN and " + ends + " END line(s). A block is truncated, or is not a certificate;"
+                    + " paste only complete BEGIN CERTIFICATE ... END CERTIFICATE blocks.");
+        }
         return certificates;
+    }
+
+    private static int count(String text, String marker) {
+        int n = 0;
+        for (int i = text.indexOf(marker); i >= 0; i = text.indexOf(marker, i + marker.length())) {
+            n++;
+        }
+        return n;
     }
 
     private static X509Certificate decode(CertificateFactory factory, String body, int index) {
         byte[] der;
         try {
-            der = Base64.getMimeDecoder().decode(body);
+            // Whitespace is the only thing PEM allows between base64 characters. The MIME decoder would also skip
+            // any other junk, so a corrupted body could decode to a certificate that is not what was pasted.
+            der = Base64.getDecoder().decode(body.replaceAll("\\s", ""));
         } catch (IllegalArgumentException e) {
             throw new IllegalArgumentException("Certificate " + index + " is not valid base64: " + e.getMessage(), e);
         }

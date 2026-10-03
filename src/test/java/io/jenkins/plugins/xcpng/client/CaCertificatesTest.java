@@ -104,6 +104,32 @@ class CaCertificatesTest {
         assertThrows(IllegalArgumentException.class, () -> CaCertificates.parse(notBase64));
     }
 
+    /** A truncated block after a valid CA is refused, not skipped while the valid one is trusted. */
+    @Test
+    void aTruncatedBlockAfterAValidCaIsRefused() throws Exception {
+        String truncated = pem(rootCa) + "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\n";
+        IllegalArgumentException e =
+                assertThrows(IllegalArgumentException.class, () -> CaCertificates.parse(truncated));
+        assertTrue(e.getMessage().contains("truncated"), e.getMessage());
+
+        String otherKind = pem(rootCa) + "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
+        assertThrows(IllegalArgumentException.class, () -> CaCertificates.parse(otherKind));
+    }
+
+    /**
+     * A non-base64 character inside a body is refused. The lenient decoder skipped it, and an inserted
+     * character then decoded to exactly the original certificate, so the corruption was never seen.
+     */
+    @Test
+    void aBodyWithACharacterThatIsNotBase64IsRefused() throws Exception {
+        String clean = pem(rootCa);
+        int at = clean.indexOf('\n', "-----BEGIN CERTIFICATE-----\n".length() + 10);
+        String corrupted = clean.substring(0, at - 5) + "%" + clean.substring(at - 5);
+        IllegalArgumentException e =
+                assertThrows(IllegalArgumentException.class, () -> CaCertificates.parse(corrupted));
+        assertTrue(e.getMessage().contains("not valid base64"), e.getMessage());
+    }
+
     @Test
     void normalizeUnifiesLineEndingsAndDropsBlank() throws Exception {
         assertEquals("a\nb\nc", CaCertificates.normalize("  a\r\nb\rc\n\n"));
