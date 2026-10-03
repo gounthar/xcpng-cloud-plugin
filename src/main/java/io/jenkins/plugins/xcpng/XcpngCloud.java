@@ -20,17 +20,21 @@ import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
+import io.jenkins.plugins.xcpng.client.CaCertificates;
 import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import io.jenkins.plugins.xcpng.client.XoRestClient;
 import java.io.IOException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -168,6 +172,24 @@ public class XcpngCloud extends Cloud {
      */
     @CheckForNull
     private String poolId;
+
+    /**
+     * PEM certificates of the authorities this appliance's certificate is checked against, or null (#172).
+     * The third trust mode beside {@link #certificateFingerprint}, and an alternative to it: setting both
+     * refuses to connect. Optional, a {@link DataBoundSetter}, so a config written before it existed loads
+     * with null and verifies exactly as it did.
+     *
+     * <p>Inline in {@code config.xml} rather than held as a credential, deliberately. A CA certificate is
+     * public, so the credential store's protection buys nothing, and none of the credential kinds fits it:
+     * the certificate kind is a client key pair for authenticating <em>to</em> a server, which is the
+     * opposite job, and a file or secret-text credential would hide a public value behind an ID the agent's
+     * snapshot then has to resolve at teardown. Inline, the agent carries it the way it carries the
+     * fingerprint, configuration-as-code sets it as a plain string, and an administrator reading the cloud
+     * can see which authority it trusts. The one thing a secret store would have stopped, a private key
+     * pasted here by mistake, {@link CaCertificates#parse} refuses on the form instead.
+     */
+    @CheckForNull
+    private String caCertificates;
 
     /**
      * Where a pre-#149 {@code config.xml} kept the leaked-VM set, read on the way in and never written again.
@@ -466,6 +488,32 @@ public class XcpngCloud extends Cloud {
     }
 
     @CheckForNull
+    public String getCaCertificates() {
+        return caCertificates;
+    }
+
+    /**
+     * Optional CA certificates, in PEM. Line endings are normalised and surrounding whitespace dropped; blank
+     * means none.
+     *
+     * <p>A value that does not parse is kept, not dropped, which is the opposite of what the constructor does
+     * with a malformed fingerprint and for the same reason as {@link #setPoolId}. Dropping it would fall back to
+     * the JVM trust store, and for an appliance whose CA was also imported into the controller's {@code cacerts}
+     * that is a silent widening rather than a failure. Kept, it fails closed at Test connection and at every
+     * connection after, each naming what is wrong with it.
+     */
+    @DataBoundSetter
+    public void setCaCertificates(@CheckForNull String caCertificates) {
+        this.caCertificates = CaCertificates.normalize(caCertificates);
+    }
+
+    /** How this cloud verifies the appliance: the fingerprint and CA certificates, together. */
+    @NonNull
+    PoolTrust getTrust() {
+        return new PoolTrust(certificateFingerprint, caCertificates);
+    }
+
+    @CheckForNull
     static String normalizePoolId(@CheckForNull String raw) {
         return raw == null || raw.isBlank() ? null : raw.trim().toLowerCase(Locale.ROOT);
     }
@@ -656,8 +704,7 @@ public class XcpngCloud extends Cloud {
             // reconcileWarmPool, where no test can reach in and wire one up afterwards. Null in production,
             // and the field it lands in is transient, so nothing about this is persisted.
             HypervisorClientFactory seam = clientFactory;
-            agent.setConnectionClientFactory(
-                    (poolUrl, credentialsId, certificateFingerprint, backend) -> seam.open(this));
+            agent.setConnectionClientFactory((poolUrl, credentialsId, trust, backend) -> seam.open(this));
         }
         return agent;
     }
@@ -1223,15 +1270,12 @@ public class XcpngCloud extends Cloud {
     private HypervisorClient openRecordedClient(@NonNull XcpngLeakedVm.Connection connection) {
         if (recordedConnectionClientFactory != null) {
             return recordedConnectionClientFactory.open(
-                    connection.poolUrl(),
-                    connection.credentialsId(),
-                    connection.certificateFingerprint(),
-                    connection.backend());
+                    connection.poolUrl(), connection.credentialsId(), connection.trust(), connection.backend());
         }
         return openClient(
                 connection.poolUrl(),
                 connection.credentialsId(),
-                connection.certificateFingerprint(),
+                connection.trust(),
                 connection.backend(),
                 "the connection a leaked VM of cloud '" + name + "' was provisioned over");
     }
@@ -1423,7 +1467,7 @@ public class XcpngCloud extends Cloud {
         if (clientFactory != null) {
             return clientFactory.open(this);
         }
-        return openClient(poolUrl, credentialsId, certificateFingerprint, poolId, getBackend(), "cloud '" + name + "'");
+        return openClient(poolUrl, credentialsId, getTrust(), poolId, getBackend(), "cloud '" + name + "'");
     }
 
     /**
@@ -1445,10 +1489,10 @@ public class XcpngCloud extends Cloud {
     static HypervisorClient openClient(
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
-            @CheckForNull String certificateFingerprint,
+            @NonNull PoolTrust trust,
             @CheckForNull XcpngBackend backend,
             @NonNull String owner) {
-        return openClient(poolUrl, credentialsId, certificateFingerprint, null, backend, owner);
+        return openClient(poolUrl, credentialsId, trust, null, backend, owner);
     }
 
     /**
@@ -1460,7 +1504,7 @@ public class XcpngCloud extends Cloud {
     static HypervisorClient openClient(
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
-            @CheckForNull String certificateFingerprint,
+            @NonNull PoolTrust trust,
             @CheckForNull String poolId,
             @CheckForNull XcpngBackend backend,
             @NonNull String owner) {
@@ -1496,7 +1540,7 @@ public class XcpngCloud extends Cloud {
             throw new IllegalStateException("No Xen Orchestra token credential configured for " + owner
                     + ". Xen Orchestra authenticates with a secret-text token, not a username and password.");
         }
-        return new XoRestClient(poolUrl, token.getSecret().getPlainText(), certificateFingerprint, poolId);
+        return new XoRestClient(poolUrl, token.getSecret().getPlainText(), trust, poolId);
     }
 
     /** Test seam: replace how a client is opened with an in-memory fake. */
@@ -1961,6 +2005,41 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
+         * Validate pasted CA certificates: that they parse, that each is a CA, that no private key came with
+         * them, and that the fingerprint is not also set. Whether the appliance's certificate actually chains
+         * to them only the appliance can say, which is what Test connection is for.
+         *
+         * <p>An expired authority is a warning rather than an error: the JDK does not check an anchor's own
+         * dates, so it may still verify, but whatever it issued is likely to stop doing so.
+         */
+        @POST
+        public FormValidation doCheckCaCertificates(
+                @QueryParameter String value, @QueryParameter String certificateFingerprint) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+            if (CaCertificates.normalize(value) == null) {
+                return FormValidation.ok();
+            }
+            if (certificateFingerprint != null && !certificateFingerprint.isBlank()) {
+                return FormValidation.error(Messages.XcpngCloud_caCertificates_bothSet());
+            }
+            List<X509Certificate> anchors;
+            try {
+                anchors = CaCertificates.parse(value);
+            } catch (IllegalArgumentException e) {
+                return FormValidation.error(e.getMessage());
+            }
+            Date now = new Date();
+            for (X509Certificate anchor : anchors) {
+                if (anchor.getNotAfter().before(now)) {
+                    return FormValidation.warning(Messages.XcpngCloud_caCertificates_expired(
+                            anchor.getSubjectX500Principal().getName(),
+                            anchor.getNotAfter().toInstant().toString()));
+                }
+            }
+            return FormValidation.ok();
+        }
+
+        /**
          * Validate a pool uuid's shape. Whether the pool exists, and whether the token can see it, only the
          * appliance can say, which is what Test connection is for.
          */
@@ -1982,6 +2061,7 @@ public class XcpngCloud extends Cloud {
                 @QueryParameter String poolUrl,
                 @QueryParameter String credentialsId,
                 @QueryParameter String certificateFingerprint,
+                @QueryParameter String caCertificates,
                 @QueryParameter String poolId) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (poolUrl == null || poolUrl.isBlank()) {
@@ -2004,6 +2084,21 @@ public class XcpngCloud extends Cloud {
             } catch (IllegalArgumentException e) {
                 return FormValidation.error(Messages.XcpngCloud_certificateFingerprint_malformed(e.getMessage()));
             }
+            final String ca = CaCertificates.normalize(caCertificates);
+            if (ca != null) {
+                // The same checks the field's own validator makes, repeated so the button never builds a client
+                // from a value the form is already marking red; the client would refuse it too, but in words
+                // written for a log rather than for this form.
+                if (pin != null) {
+                    return FormValidation.error(Messages.XcpngCloud_caCertificates_bothSet());
+                }
+                try {
+                    CaCertificates.parse(ca);
+                } catch (IllegalArgumentException e) {
+                    return FormValidation.error(e.getMessage());
+                }
+            }
+            final PoolTrust trust = new PoolTrust(pin, ca);
             if (credentialsId == null || credentialsId.isBlank()) {
                 // Distinguished from a credential that is selected but of the wrong kind: that one gets
                 // openClient's message below, which names the kind Xen Orchestra needs.
@@ -2014,9 +2109,10 @@ public class XcpngCloud extends Cloud {
             // SSL context. Constructed outside, that escapes this method and the administrator gets a 500
             // page instead of a message on the form.
             final String pool = normalizePoolId(poolId);
-            try (HypervisorClient session = openClient(url, credentialsId, pin, pool, XcpngBackend.XO, "this cloud")) {
+            try (HypervisorClient session =
+                    openClient(url, credentialsId, trust, pool, XcpngBackend.XO, "this cloud")) {
                 session.ping();
-                return connectedResult(pin, pool, session.visiblePools());
+                return connectedResult(trust, pool, session.visiblePools());
             } catch (IllegalStateException missingCredential) {
                 // No secret-text credential resolves under the selected ID. Its message already names the
                 // kind, which is the actionable half when a leftover username/password is what is selected.
@@ -2027,11 +2123,17 @@ public class XcpngCloud extends Cloud {
                 // RuntimeException with no message (a bare NPE) would render as "Connection failed: null",
                 // so fall back to a generic line and let the logged trace carry the detail.
                 LOGGER.log(Level.WARNING, e, () -> "XCP-ng test connection to " + url + " failed");
-                if (pin == null && isTlsFailure(e)) {
+                if (pin == null && ca == null && isTlsFailure(e)) {
                     // The pool presented a certificate the JVM will not vouch for, which is the normal
                     // state of a stock XCP-ng host. This is the half of trust-on-first-use a human
                     // completes: show what was presented and let the operator confirm it is their pool.
                     return untrustedResult(url);
+                }
+                if (ca != null && isTlsFailure(e)) {
+                    // Not offered a fingerprint: an operator who configured a CA has said how they want the
+                    // appliance verified, and steering them to a pin would undo that. Say which two things
+                    // the CA mode checks, since either can be what failed and the JDK's wording names neither.
+                    return FormValidation.error(Messages.XcpngCloud_testConnection_caRefused(tlsDetail(e)));
                 }
                 String detail = e.getMessage();
                 return detail == null || detail.isBlank()
@@ -2057,6 +2159,21 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
+         * The deepest message on the cause chain, which for a refused handshake is the validator's own
+         * ("No subject alternative names matching IP address ...", "PKIX path building failed ...") rather
+         * than the transport's wrapping of it.
+         */
+        private static String tlsDetail(Throwable failure) {
+            String detail = String.valueOf(failure.getMessage());
+            for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
+                if (cause.getMessage() != null && !cause.getMessage().isBlank()) {
+                    detail = cause.getMessage();
+                }
+            }
+            return detail;
+        }
+
+        /**
          * The pool's certificate is not trusted and nothing is pinned yet: read what it presents and offer
          * that fingerprint for the operator to confirm. Read with a trust manager that records the
          * certificate and then refuses it, so this diagnostic never itself completes a handshake with an
@@ -2073,13 +2190,14 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * The result of a successful {@code Test connection}. Both outcomes are secure, so both are a
-         * plain OK: either the pool's certificate chained to a CA the JVM trusts, or it matched the
-         * fingerprint the operator pinned. The warning this method used to return -- connected, but over a
-         * link with verification switched off -- no longer has a case that can produce it.
+         * The result of a successful {@code Test connection}. Every outcome is secure, so every one is a
+         * plain OK: the pool's certificate chained to a CA the JVM trusts, or matched the fingerprint the
+         * operator pinned, or chained to the CA certificates configured on the cloud. The warning this method
+         * used to return -- connected, but over a link with verification switched off -- no longer has a case
+         * that can produce it.
          */
-        static FormValidation connectedResult(@CheckForNull String certificateFingerprint) {
-            return connectedResult(certificateFingerprint, null, Map.of());
+        static FormValidation connectedResult(@NonNull PoolTrust trust) {
+            return connectedResult(trust, null, Map.of());
         }
 
         /**
@@ -2089,12 +2207,12 @@ public class XcpngCloud extends Cloud {
          * the operator needs a uuid to paste.
          */
         static FormValidation connectedResult(
-                @CheckForNull String certificateFingerprint,
-                @CheckForNull String poolId,
-                @NonNull Map<String, String> pools) {
-            String trust = certificateFingerprint == null
-                    ? Messages.XcpngCloud_testConnection_ok()
-                    : Messages.XcpngCloud_testConnection_okPinned();
+                @NonNull PoolTrust poolTrust, @CheckForNull String poolId, @NonNull Map<String, String> pools) {
+            String trust = poolTrust.isPinned()
+                    ? Messages.XcpngCloud_testConnection_okPinned()
+                    : poolTrust.isAnchored()
+                            ? Messages.XcpngCloud_testConnection_okAnchored()
+                            : Messages.XcpngCloud_testConnection_ok();
             if (poolId != null) {
                 String label = pools.get(poolId);
                 return FormValidation.ok(trust + " "

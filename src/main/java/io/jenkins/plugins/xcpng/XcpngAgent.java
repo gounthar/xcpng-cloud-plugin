@@ -15,6 +15,7 @@ import hudson.slaves.Cloud;
 import hudson.slaves.NodeProperty;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import io.jenkins.plugins.xcpng.client.VmState;
 import java.io.IOException;
@@ -135,6 +136,15 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     @CheckForNull
     private final String certificateFingerprint;
+
+    /**
+     * The CA certificates the owning cloud verified the appliance against, in PEM, or null (#172). Snapshotted
+     * beside {@link #certificateFingerprint} for the same reason: a teardown after the cloud is deleted has to
+     * trust the appliance the way provisioning did. An agent persisted before this field existed reloads with
+     * null, which is correct for every such agent: none of their clouds could have set one.
+     */
+    @CheckForNull
+    private final String caCertificates;
 
     /**
      * Which API the owning cloud spoke, snapshotted for the same reason as the three fields above: an
@@ -281,6 +291,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.poolUrl = cloud.getPoolUrl();
         this.credentialsId = cloud.getCredentialsId();
         this.certificateFingerprint = cloud.getCertificateFingerprint();
+        this.caCertificates = cloud.getCaCertificates();
         this.backend = cloud.getBackend();
         this.poolId = cloud.getPoolId();
         this.networkName = template.getNetworkName();
@@ -355,6 +366,18 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     public String getCertificateFingerprint() {
         return certificateFingerprint;
+    }
+
+    /** The CA certificates the owning cloud trusted, or null. Part of the connection snapshot, like the fingerprint. */
+    @CheckForNull
+    public String getCaCertificates() {
+        return caCertificates;
+    }
+
+    /** The snapshotted fingerprint and CA certificates, together. */
+    @NonNull
+    PoolTrust getTrust() {
+        return new PoolTrust(certificateFingerprint, caCertificates);
     }
 
     /** The pool snapshotted from the owning cloud, or null if that cloud resolved templates in every pool. */
@@ -602,7 +625,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     .println("Failed to destroy VM " + vmRef + "; recorded for later cleanup: " + e.getMessage());
             // With this agent's connection, not the cloud's: the sweep must reach the VM the way it was made,
             // even after the cloud is edited (#223). An agent predating the snapshot records none.
-            cloud.recordLeakedVm(XcpngLeakedVm.of(vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint));
+            cloud.recordLeakedVm(XcpngLeakedVm.of(
+                    vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates));
         }
     }
 
@@ -646,7 +670,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @NonNull
     private HypervisorClient openClientFromSnapshot(boolean cloudIsGone) {
         if (connectionClientFactory != null) {
-            return connectionClientFactory.open(poolUrl, credentialsId, certificateFingerprint, getBackend());
+            return connectionClientFactory.open(poolUrl, credentialsId, getTrust(), getBackend());
         }
         // The label reaches an administrator in the failure message, so it has to be true. This method used
         // to run only when the cloud had been deleted and said so unconditionally; it runs on every teardown
@@ -658,7 +682,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         return XcpngCloud.openClient(
                 poolUrl,
                 credentialsId,
-                certificateFingerprint,
+                getTrust(),
                 poolId,
                 getBackend(),
                 (cloudIsGone ? "the removed cloud '" : "cloud '") + cloudName + "'");
@@ -826,8 +850,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
          *
          * @param poolUrl the snapshotted pool URL, null on an agent predating the snapshot.
          * @param credentialsId the snapshotted credential ID, resolved against the store by the caller.
-         * @param certificateFingerprint the pinned certificate fingerprint the removed cloud used, or
-         *     null for ordinary verification against the JVM trust store.
+         * @param trust the fingerprint and CA certificates the cloud verified the appliance with, both null
+         *     for ordinary verification against the JVM trust store.
          * @param backend which API the removed cloud spoke. Resolved before it gets here, so it is never
          *     null: a test asserting the snapshot survived provisioning can compare it directly.
          */
@@ -835,7 +859,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         HypervisorClient open(
                 @CheckForNull String poolUrl,
                 @CheckForNull String credentialsId,
-                @CheckForNull String certificateFingerprint,
+                @NonNull PoolTrust trust,
                 @NonNull XcpngBackend backend);
     }
 

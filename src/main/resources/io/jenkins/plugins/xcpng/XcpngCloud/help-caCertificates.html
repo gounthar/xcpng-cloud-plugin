@@ -1,0 +1,22 @@
+<div>
+  The certificate of the authority that issued the Xen Orchestra appliance's certificate, in PEM: the block
+  from <code>-----BEGIN CERTIFICATE-----</code> to <code>-----END CERTIFICATE-----</code>. Paste several
+  blocks to trust several authorities, for instance an old and a new root during a CA migration.
+  <p>
+    Use this when the appliance's certificate comes from your organisation's own CA. The appliance is then
+    accepted when its certificate was issued by one of these authorities, directly or through an intermediate
+    the appliance serves with it, and names the host in the <em>Xen Orchestra URL</em>. When that URL
+    uses an IP address, the certificate has to list the address as an IP subjectAltName. Only the authorities pasted here are trusted for this cloud, not the
+    public ones the controller's JVM knows, and nothing is added to the JVM itself.
+  </p>
+  <p>
+    Unlike <em>Certificate fingerprint</em>, this survives the appliance's certificate being renewed: a new
+    certificate from the same authority is accepted with no change here. The two fields are alternatives;
+    set one or the other.
+  </p>
+  <p>
+    Each block must be a CA certificate. A server certificate is refused here, because pinning one
+    certificate is what the fingerprint field is for. Never paste a private key: this value is saved in the
+    controller's configuration in the clear, and the form refuses a paste that contains one.
+  </p>
+</div>

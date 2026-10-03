@@ -5,7 +5,9 @@
   <p>
     Leave it empty if the appliance's certificate is signed by a certificate authority the controller's JVM
     already trusts. An appliance still on the certificate it generated for itself is not that case and needs
-    its fingerprint pinned here.
+    its fingerprint pinned here. If the certificate was issued by your organisation's own CA, use
+    <em>CA certificate</em> instead, and leave this empty: the two are alternatives, and a cloud with both
+    set refuses to connect.
   </p>
   <p>
     <strong>To find it:</strong> leave this empty and press <em>Test connection</em>. If the certificate is

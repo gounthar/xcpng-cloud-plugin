@@ -519,4 +519,32 @@ class XcpngCloudConfigurationAsCodeTest {
             return new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
         }
     }
+
+    /**
+     * CA certificates are a multi-line value (#172), unlike the single-key {@code sshAuthorizedKey} above,
+     * and must bind from a YAML block scalar, keep their line breaks, and export under their own key. Not
+     * parsed on the way in: the fixture's body is not a real certificate, and binding must not care, because
+     * a malformed value fails closed at connect time rather than failing the whole document.
+     */
+    @Test
+    void caCertificatesBindFromABlockScalarAndExport(JenkinsRule r) throws Exception {
+        ConfigurationAsCode.get()
+                .configure(
+                        getClass().getResource("configuration-as-code-ca.yaml").toExternalForm());
+
+        XcpngCloud cloud = (XcpngCloud) r.jenkins.clouds.getByName("xcpng-ca");
+        assertNotNull(cloud, "the cloud must be created from YAML");
+        assertEquals(
+                "-----BEGIN CERTIFICATE-----\n"
+                        + "MIIBszCCAVmgAwIBAgIUExampleOnlyNotARealCertificateBody\n"
+                        + "-----END CERTIFICATE-----",
+                cloud.getCaCertificates());
+        assertNull(cloud.getCertificateFingerprint());
+
+        String exported = exportedClouds();
+        assertTrue(exported.contains("caCertificates"), "the CA certificates must export: " + exported);
+        assertTrue(
+                exported.contains("MIIBszCCAVmgAwIBAgIUExampleOnlyNotARealCertificateBody"),
+                "the exported value must carry the certificate itself: " + exported);
+    }
 }

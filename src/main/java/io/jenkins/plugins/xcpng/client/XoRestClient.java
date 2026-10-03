@@ -159,23 +159,22 @@ public final class XoRestClient implements HypervisorClient {
      * @param baseUrl base URL of the appliance, e.g. {@code https://192.168.1.5}
      * @param token XO authentication token (a credential the plugin resolves at point of use, never
      *     stored here)
-     * @param certificateFingerprint SHA-256 fingerprint of the certificate the appliance is expected to
-     *     present. Null or blank means ordinary verification against the JVM trust store.
+     * @param trust how the appliance's certificate is verified: a pinned fingerprint, CA certificates (#172),
+     *     or {@link PoolTrust#JVM_DEFAULT} for the JVM trust store.
      * @param poolId uuid of the pool to resolve templates in, or null for any pool the token can see
+     * @throws HypervisorException when {@code trust} cannot be honoured, e.g. both modes set or a malformed
+     *     CA certificate.
      */
     public XoRestClient(
-            @NonNull String baseUrl,
-            @NonNull String token,
-            @CheckForNull String certificateFingerprint,
-            @CheckForNull String poolId) {
-        this(new HttpRestTransport(baseUrl, token, certificateFingerprint), d -> Thread.sleep(d.toMillis()), poolId);
+            @NonNull String baseUrl, @NonNull String token, @NonNull PoolTrust trust, @CheckForNull String poolId) {
+        this(new HttpRestTransport(baseUrl, token, trust), d -> Thread.sleep(d.toMillis()), poolId);
         // The form validator rejects http, but it is advisory: a JCasC document or a hand-edited
         // config.xml can still persist an http base URL. Warn here so the cleartext exposure is not
         // silent. It matters more than it did for XAPI: the token is sent on every single request as a
         // cookie, so one plaintext round trip hands it over, and it does not expire on its own.
         if (baseUrl.regionMatches(true, 0, "http://", 0, "http://".length())) {
             LOGGER.warning("Xen Orchestra URL " + baseUrl + " uses plain http; the authentication token is"
-                    + " sent in cleartext on every request, and the pinned certificate is not consulted."
+                    + " sent in cleartext on every request, and no certificate setting is consulted."
                     + " Use https://.");
         }
     }
