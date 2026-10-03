@@ -2638,6 +2638,130 @@ class XcpngProvisionTest {
                 "a pool that is still answering has answered about the name");
     }
 
+    private static final String ETH0 = "Pool-wide network associated with eth0";
+
+    private static FormValidation checkNetwork(XcpngTemplate.DescriptorImpl d, String network, String template) {
+        return d.doCheckNetworkName(network, template, "https://pool.example.test", "cred", null, null, null);
+    }
+
+    /**
+     * #285: a network the template's pool has passes, and one it does not is an ERROR carrying the client's
+     * message, asked about the template the form names rather than any template.
+     */
+    @Test
+    void aNetworkNameIsCheckedAgainstTheTemplatesPool(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).withNetworks(ETH0);
+        d.setPoolProbe((poolUrl, credentialsId, trust, poolId) -> fake);
+
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, ETH0, LINUX_TEMPLATE.getTemplateName()).kind);
+        assertTrue(
+                fake.calls().contains("checkNetwork:template/" + LINUX_TEMPLATE.getTemplateName() + "->" + ETH0),
+                "the network must be checked against the template the form names: " + fake.calls());
+
+        FormValidation missing = checkNetwork(d, "  Storage ", LINUX_TEMPLATE.getTemplateName());
+        assertEquals(FormValidation.Kind.ERROR, missing.kind, "a network the pool does not have must be named here");
+        // getMessage() is HTML-escaped, so the quotes in the client's message do not survive to here.
+        assertTrue(missing.getMessage().contains("Storage"), missing.getMessage());
+        assertTrue(
+                fake.calls().contains("checkNetwork:template/" + LINUX_TEMPLATE.getTemplateName() + "->Storage"),
+                "the network name must reach the pool trimmed: " + fake.calls());
+    }
+
+    /**
+     * Nothing to check is not a reason to log in: a blank network is the default, and without a template name
+     * there is no pool to look the network up in. Asserted on the call log, as for the template name, because
+     * an implementation that opened a session and swallowed the result would return the same OK.
+     */
+    @Test
+    void aBlankNetworkOrTemplateOpensNoSession(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName());
+        d.setPoolProbe((poolUrl, credentialsId, trust, poolId) -> fake);
+
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, null, LINUX_TEMPLATE.getTemplateName()).kind);
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, "   ", LINUX_TEMPLATE.getTemplateName()).kind);
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, ETH0, "  ").kind);
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, ETH0, null).kind);
+        assertEquals(
+                FormValidation.Kind.OK,
+                d.doCheckNetworkName(ETH0, LINUX_TEMPLATE.getTemplateName(), null, "cred", null, null, null).kind,
+                "no pool URL means nothing to check against");
+        assertEquals(List.of(), fake.calls(), "nothing to check must not open a session");
+    }
+
+    /**
+     * A template the pool cannot resolve leaves the network field OK, and the network is never asked about:
+     * the template name field is already reporting it, and an error here would blame the network for it.
+     */
+    @Test
+    void anUnresolvableTemplateIsNotBlamedOnTheNetwork(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient fake = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName());
+        d.setPoolProbe((poolUrl, credentialsId, trust, poolId) -> fake);
+
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, "Storage", "no-such-golden-image").kind);
+        assertFalse(
+                fake.calls().stream().anyMatch(c -> c.startsWith("checkNetwork")),
+                "the network must not be checked against a template that did not resolve: " + fake.calls());
+    }
+
+    /** The ping discipline is the template check's, shared: an unreachable pool, or one lost mid-check, is OK. */
+    @Test
+    void anUnreachablePoolDoesNotBlameTheNetwork(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        FakeHypervisorClient down = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failPing();
+        d.setPoolProbe((poolUrl, credentialsId, trust, poolId) -> down);
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, "Storage", LINUX_TEMPLATE.getTemplateName()).kind);
+        assertFalse(down.calls().stream().anyMatch(c -> c.startsWith("checkNetwork")), down.calls()::toString);
+
+        // Reachable for the first ping, gone by the time the refusal is confirmed.
+        FakeHypervisorClient dropping = new FakeHypervisorClient(LINUX_TEMPLATE.getTemplateName()).failPingAfter(1);
+        d.setPoolProbe((poolUrl, credentialsId, trust, poolId) -> dropping);
+        assertEquals(FormValidation.Kind.OK, checkNetwork(d, "Storage", LINUX_TEMPLATE.getTemplateName()).kind);
+        assertEquals(
+                2,
+                dropping.calls().stream().filter(c -> c.equals("ping")).count(),
+                "a refusal must be confirmed with a second ping before it is reported: " + dropping.calls());
+    }
+
+    /**
+     * The rendered form wires the sibling template name and the cloud's five connection fields into the
+     * network check, at the right depths. Same reasoning as the template name's own test: a wrong level
+     * fails as a silent OK, which nothing else here would notice.
+     */
+    @Test
+    void theNetworkCheckReachesTheTemplateNameAndTheCloudsConnectionFields(JenkinsRule r) throws Exception {
+        r.jenkins.clouds.add(
+                new XcpngCloud("xcpng", "https://pool.example.test", "cred", null, 2, List.of(LINUX_TEMPLATE)));
+
+        String form = r.createWebClient()
+                .goTo("manage/cloud/xcpng/configure")
+                .getFormByName("config")
+                .asXml();
+
+        int name = form.indexOf("name=\"_.networkName\"");
+        assertTrue(name >= 0, "the network field must be on the cloud's configuration page");
+        int start = form.lastIndexOf("<input", name);
+        int end = form.indexOf("/>", name);
+        assertTrue(start >= 0 && end > start, "could not isolate the network input from: " + form);
+        String field = form.substring(start, end + 2);
+
+        java.util.regex.Matcher declared =
+                java.util.regex.Pattern.compile("checkdependson=\"([^\"]*)\"").matcher(field);
+        assertTrue(declared.find(), "the network field must send its dependencies with the check: " + field);
+        assertEquals(
+                Set.of(
+                        "templateName",
+                        "../poolUrl",
+                        "../credentialsId",
+                        "../certificateFingerprint",
+                        "../caCertificates",
+                        "../poolId"),
+                Set.of(declared.group(1).trim().split("\\s+")),
+                "the check must depend on the sibling template name and the cloud's five connection fields");
+    }
+
     /**
      * A template the pool cannot resolve is not retried on every provisioning round for as long as a build
      * sits in the queue (#157).

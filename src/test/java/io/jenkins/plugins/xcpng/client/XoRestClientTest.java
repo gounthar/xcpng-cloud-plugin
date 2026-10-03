@@ -364,6 +364,53 @@ class XoRestClientTest {
         assertNoCloneAttempted(t);
     }
 
+    // -- checkNetwork: the same refusals, at form time (#285) ---------------
+
+    @Test
+    void checkNetworkAcceptsANetworkInTheTemplatesPoolAndWritesNothing() {
+        ScriptedRest t = new ScriptedRest();
+        XoRestClient c = new XoRestClient(t);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+        c.checkNetwork(template, AGENTS);
+        c.checkNetwork(template, ETH0);
+
+        // A form check runs on page load and on every edit of six fields. It must only ever read.
+        assertTrue(t.calls.stream().allMatch(call -> "GET".equals(call.method())), t.calls::toString);
+        assertTrue(t.destroyed.isEmpty(), t.destroyed::toString);
+    }
+
+    @Test
+    void checkNetworkRefusesWhatTheCloneRefuses() {
+        ScriptedRest unknown = new ScriptedRest();
+        unknown.networks.add(network("only-elsewhere", "Storage", OTHER_POOL));
+        XoRestClient c = new XoRestClient(unknown);
+        VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
+        HypervisorException absent = assertThrows(HypervisorException.class, () -> c.checkNetwork(template, "Storage"));
+        // The clone's own message, word for word: the form is where the operator reads the pool's network list.
+        assertTrue(absent.getMessage().contains("no network named 'Storage' in pool " + POOL), absent.getMessage());
+        assertTrue(absent.getMessage().contains("Pool " + OTHER_POOL), absent.getMessage());
+
+        ScriptedRest duplicated = new ScriptedRest();
+        duplicated.networks.add(network("dup", AGENTS, POOL));
+        XoRestClient d = new XoRestClient(duplicated);
+        VmRef dTemplate = d.resolveTemplate("jenkins-agent-debian13-v7");
+        assertTrue(assertThrows(HypervisorException.class, () -> d.checkNetwork(dTemplate, AGENTS))
+                .getMessage()
+                .contains("2 networks are named"));
+
+        ScriptedRest twoNics = new ScriptedRest();
+        twoNics.templateVifs.add("second-vif");
+        XoRestClient n = new XoRestClient(twoNics);
+        VmRef nTemplate = n.resolveTemplate("jenkins-agent-debian13-v7");
+        assertTrue(assertThrows(HypervisorException.class, () -> n.checkNetwork(nTemplate, AGENTS))
+                .getMessage()
+                .contains("2 network interfaces"));
+
+        for (ScriptedRest t : List.of(unknown, duplicated, twoNics)) {
+            assertTrue(t.calls.stream().allMatch(call -> "GET".equals(call.method())), t.calls::toString);
+        }
+    }
+
     @Test
     void aBlankNetworkNameIsNoNetworkName() {
         assertNull(new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), null, "  ").networkName());
