@@ -22,6 +22,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public final class FakeHypervisorClient implements HypervisorClient {
 
     private final Set<String> knownTemplates;
+    private final Set<String> knownNetworks = new LinkedHashSet<>();
     /**
      * The verb log, on a copy-on-write list rather than an {@code ArrayList}.
      *
@@ -89,6 +90,12 @@ public final class FakeHypervisorClient implements HypervisorClient {
      */
     public synchronized FakeHypervisorClient failResolveAtTransport() {
         this.resolveFailsAtTransport = true;
+        return this;
+    }
+
+    /** The networks {@link #checkNetwork} accepts, for any template. None until this is called. */
+    public synchronized FakeHypervisorClient withNetworks(String... networks) {
+        knownNetworks.addAll(List.of(networks));
         return this;
     }
 
@@ -173,6 +180,15 @@ public final class FakeHypervisorClient implements HypervisorClient {
             throw new HypervisorException("no template named '" + name + "'");
         }
         return new VmRef("template/" + name);
+    }
+
+    @Override
+    public synchronized void checkNetwork(VmRef template, String networkName) {
+        checkNotInterrupted("checkNetwork");
+        calls.add("checkNetwork:" + template.value() + "->" + networkName);
+        if (!knownNetworks.contains(networkName)) {
+            throw new HypervisorException("no network named '" + networkName + "' in the template's pool");
+        }
     }
 
     @Override

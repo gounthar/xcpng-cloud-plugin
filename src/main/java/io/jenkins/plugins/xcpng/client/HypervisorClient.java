@@ -21,7 +21,7 @@ import java.util.Optional;
  * </ul>
  *
  * <p>Do not over-abstract this: no capability negotiation, no factory-of-factories, no generic
- * {@code execute()}. Eight verbs, closed over {@link AutoCloseable} so a session is released.
+ * {@code execute()}. A handful of verbs, closed over {@link AutoCloseable} so a session is released.
  */
 public interface HypervisorClient extends AutoCloseable {
 
@@ -40,6 +40,16 @@ public interface HypervisorClient extends AutoCloseable {
      */
     @NonNull
     VmRef cloneFromTemplate(@NonNull VmRef template, @NonNull ProvisionSpec spec);
+
+    /**
+     * Check that a clone of {@code template} could be cabled to the network named {@code networkName}: make
+     * the refusals {@link #cloneFromTemplate} would make over {@link ProvisionSpec#networkName()}, and
+     * create nothing. A form-time check (#285), so a network the template's pool cannot honour is named on
+     * the configuration page rather than on every provisioning round for as long as a build waits.
+     *
+     * @throws HypervisorException if a clone of this template would be refused over this network name.
+     */
+    void checkNetwork(@NonNull VmRef template, @NonNull String networkName);
 
     /** Power on a halted VM. */
     void start(@NonNull VmRef vm);

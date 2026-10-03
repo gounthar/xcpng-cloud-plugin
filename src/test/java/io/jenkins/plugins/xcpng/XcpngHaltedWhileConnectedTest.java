@@ -212,6 +212,11 @@ class XcpngHaltedWhileConnectedTest {
         }
 
         @Override
+        public void checkNetwork(VmRef template, String networkName) {
+            delegate.checkNetwork(template, networkName);
+        }
+
+        @Override
         public void start(VmRef vm) {
             delegate.start(vm);
         }

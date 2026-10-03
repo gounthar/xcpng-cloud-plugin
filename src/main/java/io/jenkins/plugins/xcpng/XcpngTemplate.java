@@ -10,6 +10,8 @@ import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.CaCertificates;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.PoolTrust;
+import io.jenkins.plugins.xcpng.client.VmRef;
+import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -339,32 +341,105 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             if (value == null || value.isBlank()) {
                 return FormValidation.error(Messages.XcpngTemplate_templateName_required());
             }
-            return resolveAgainstPool(
-                    value.trim(),
+            String name = value.trim();
+            return askPool(
+                    "a template name",
                     poolUrl,
                     credentialsId,
                     new PoolTrust(certificateFingerprint, CaCertificates.normalize(caCertificates)),
-                    poolId);
+                    poolId,
+                    client -> client.resolveTemplate(name),
+                    detail -> detail == null || detail.isBlank()
+                            ? FormValidation.error(Messages.XcpngTemplate_templateName_unresolvedNoDetail(name))
+                            : FormValidation.error(Messages.XcpngTemplate_templateName_unresolved(detail)));
         }
 
         /**
-         * Ask the pool whether {@code name} resolves, and say so only when the pool actually answered.
+         * #285: the network name is optional, but when one is given and the form can reach the pool, it is
+         * checked the way a clone would check it, so a typo or a network from another pool is named here
+         * rather than on every provisioning round. The rules are the client's own
+         * ({@link HypervisorClient#checkNetwork}): no network by that name in the template's pool, two by that
+         * name, or a template with more than one network interface.
+         *
+         * <p>The network is looked up in the template's pool, so the template has to resolve first. When it
+         * does not, the field stays OK: the template name field is already saying so, and saying it twice,
+         * here under the wrong field, would blame the network for a problem it did not cause. The same goes
+         * for everything {@link #askPool} leaves to Test connection.
+         *
+         * <p>{@code templateName} is a sibling field, so it carries no {@link RelativePath}; the connection
+         * fields are the enclosing cloud's, as in {@link #doCheckTemplateName}. Both are inferred into
+         * {@code checkDependsOn}, so a change to the template name re-runs this check as well.
+         */
+        @POST
+        public FormValidation doCheckNetworkName(
+                @QueryParameter String value,
+                @QueryParameter String templateName,
+                @RelativePath("..") @QueryParameter String poolUrl,
+                @RelativePath("..") @QueryParameter String credentialsId,
+                @RelativePath("..") @QueryParameter String certificateFingerprint,
+                @RelativePath("..") @QueryParameter String caCertificates,
+                @RelativePath("..") @QueryParameter String poolId) {
+            Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+            String network = normalizeNetworkName(value);
+            if (network == null || templateName == null || templateName.isBlank()) {
+                return FormValidation.ok();
+            }
+            String template = templateName.trim();
+            return askPool(
+                    "a network name",
+                    poolUrl,
+                    credentialsId,
+                    new PoolTrust(certificateFingerprint, CaCertificates.normalize(caCertificates)),
+                    poolId,
+                    client -> {
+                        VmRef ref;
+                        try {
+                            ref = client.resolveTemplate(template);
+                        } catch (RuntimeException e) {
+                            LOGGER.log(
+                                    Level.FINE,
+                                    e,
+                                    () -> "Template '" + template + "' did not resolve, so network '" + network
+                                            + "' was not checked");
+                            return;
+                        }
+                        client.checkNetwork(ref, network);
+                    },
+                    detail -> detail == null || detail.isBlank()
+                            ? FormValidation.error(Messages.XcpngTemplate_networkName_unresolvedNoDetail(network))
+                            : FormValidation.error(Messages.XcpngTemplate_networkName_unresolved(detail)));
+        }
+
+        /**
+         * One question {@link #askPool} puts to the pool. Returning normally means the pool has no objection;
+         * throwing means it may have one, which {@code askPool} confirms with a second ping before it believes it.
+         */
+        @FunctionalInterface
+        private interface PoolQuestion {
+            void ask(@NonNull HypervisorClient client);
+        }
+
+        /**
+         * Put {@code question} to the pool, and report a refusal only when the pool actually answered.
          *
          * <p>Every way of failing to reach the pool returns {@code ok()}: an unreachable host, a wrong
          * password and a missing credential are all Test connection's story to tell, and reporting them
-         * under this field would blame the template name for a problem it did not cause — and would put a
+         * under a field would blame its value for a problem it did not cause — and would put a
          * red error on a half-filled form, which is the state every form starts in. The discriminator is
          * {@code ping()}, asked twice: once before the lookup, to establish that the pool is reachable and
          * the credential works, and again after a failed lookup, because a successful ping does not stay
          * true — the pool can drop between the two calls, and the exception cannot say which happened. The
-         * error stands only when the pool answered that second ping as well.
+         * error stands only when the pool answered that second ping as well. {@code what} names the value
+         * being checked in the log lines; {@code refused} turns the client's message into the field's error.
          */
-        private FormValidation resolveAgainstPool(
-                @NonNull String name,
+        private FormValidation askPool(
+                @NonNull String what,
                 @CheckForNull String poolUrl,
                 @CheckForNull String credentialsId,
                 @NonNull PoolTrust trust,
-                @CheckForNull String poolId) {
+                @CheckForNull String poolId,
+                @NonNull PoolQuestion question,
+                @NonNull Function<String, FormValidation> refused) {
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.ok();
             }
@@ -378,18 +453,18 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             try {
                 client = poolProbe.open(url, credentialsId, trust, poolId);
             } catch (RuntimeException e) {
-                LOGGER.log(Level.FINE, e, () -> "Could not open a session to " + url + " to check a template name");
+                LOGGER.log(Level.FINE, e, () -> "Could not open a session to " + url + " to check " + what);
                 return FormValidation.ok();
             }
             try {
                 try {
                     client.ping();
                 } catch (RuntimeException e) {
-                    LOGGER.log(Level.FINE, e, () -> "Could not reach " + url + " to check a template name");
+                    LOGGER.log(Level.FINE, e, () -> "Could not reach " + url + " to check " + what);
                     return FormValidation.ok();
                 }
                 try {
-                    client.resolveTemplate(name);
+                    question.ask(client);
                     return FormValidation.ok();
                 } catch (RuntimeException e) {
                     // A successful ping does not stay true. The pool can drop between the two calls, and the
@@ -399,15 +474,12 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                     try {
                         client.ping();
                     } catch (RuntimeException poolWentAway) {
-                        LOGGER.log(Level.FINE, e, () -> "Lost " + url + " while checking a template name");
+                        LOGGER.log(Level.FINE, e, () -> "Lost " + url + " while checking " + what);
                         return FormValidation.ok();
                     }
-                    // The client's own message names the case (absent, not a template, or ambiguous) and is
-                    // more specific than anything reconstructed here would be.
-                    String detail = e.getMessage();
-                    return detail == null || detail.isBlank()
-                            ? FormValidation.error(Messages.XcpngTemplate_templateName_unresolvedNoDetail(name))
-                            : FormValidation.error(Messages.XcpngTemplate_templateName_unresolved(detail));
+                    // The client's own message names the case (absent, ambiguous, and so on) and is more
+                    // specific than anything reconstructed here would be.
+                    return refused.apply(e.getMessage());
                 }
             } finally {
                 // Closed by hand rather than with try-with-resources: a close() that threw would replace
@@ -415,7 +487,7 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                 try {
                     client.close();
                 } catch (RuntimeException e) {
-                    LOGGER.log(Level.FINE, e, () -> "Releasing the session used to check a template name failed");
+                    LOGGER.log(Level.FINE, e, () -> "Releasing the session used to check " + what + " failed");
                 }
             }
         }

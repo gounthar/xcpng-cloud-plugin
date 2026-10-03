@@ -9,6 +9,11 @@
   The template must have at most one network interface.
   </p>
   <p>
+  When the cloud's connection fields are filled in and Xen Orchestra answers, the name is checked here, against
+  the template's pool, so a network the pool does not have is reported on this page rather than at the first
+  build. A pool that cannot be reached, or a template name that does not resolve, leaves this field unchecked.
+  </p>
+  <p>
   Warm-pool agents created on the previous network are replaced after this field changes.
   </p>
 </div>

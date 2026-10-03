@@ -669,6 +669,16 @@ public final class XoRestClient implements HypervisorClient {
     }
 
     /**
+     * Runs the same lookups {@link #cloneFromTemplate} runs before it creates anything, and discards the
+     * entry. Sharing {@link #recableEntry} is the point: a form check with its own copy of these rules would
+     * drift from the clone's, and then pass a name the clone refuses.
+     */
+    @Override
+    public void checkNetwork(@NonNull VmRef template, @NonNull String networkName) {
+        recableEntry(TemplateHandle.parse(template), networkName);
+    }
+
+    /**
      * The {@code vifs} entry that cables a clone of {@code handle} to the network named {@code networkName},
      * or null when the template's NIC is already on it and the clone needs nothing passed.
      *
