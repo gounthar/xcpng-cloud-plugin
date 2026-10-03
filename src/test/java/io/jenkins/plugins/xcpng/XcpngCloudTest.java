@@ -17,6 +17,7 @@ import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -265,7 +266,7 @@ class XcpngCloudTest {
     @Test
     void testConnectionRejectsMalformedUrlBeforeConnecting(JenkinsRule r) {
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
-        FormValidation v = d.doTestConnection("192.168.1.87", "", null, null);
+        FormValidation v = d.doTestConnection("192.168.1.87", "", null, null, null);
         assertEquals(FormValidation.Kind.ERROR, v.kind);
         assertTrue(v.getMessage().contains("http"), v.getMessage());
     }
@@ -278,10 +279,10 @@ class XcpngCloudTest {
      */
     @Test
     void testConnectionReportsWhichWayTheCertificateWasAccepted(JenkinsRule r) {
-        FormValidation caTrusted = XcpngCloud.DescriptorImpl.connectedResult(null);
+        FormValidation caTrusted = XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.JVM_DEFAULT);
         assertEquals(FormValidation.Kind.OK, caTrusted.kind);
 
-        FormValidation pinned = XcpngCloud.DescriptorImpl.connectedResult(PINNED_FINGERPRINT);
+        FormValidation pinned = XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.pinned(PINNED_FINGERPRINT));
         assertEquals(FormValidation.Kind.OK, pinned.kind);
         assertTrue(pinned.getMessage().contains("pinned"), pinned.getMessage());
         assertNotEquals(
@@ -671,5 +672,86 @@ class XcpngCloudTest {
         assertTrue(
                 saved.leakedVmRefs().contains("OpaqueRef:leaked-1"),
                 "a UI save must not forget a VM the plugin failed to destroy: " + saved.leakedVmRefs());
+    }
+
+    /** The CA certificates survive a save through the form, line breaks included (#172). */
+    @Test
+    void caCertificatesSurviveAConfigRoundTrip(JenkinsRule r) throws Exception {
+        String pem = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIU\nAAAA\n-----END CERTIFICATE-----";
+        XcpngCloud cloud = new XcpngCloud(
+                "xcpng",
+                "https://pool.example.test",
+                "xcpng-root",
+                null,
+                1,
+                List.of(new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048)));
+        cloud.setCaCertificates(pem.replace("\n", "\r\n") + "\r\n");
+        r.jenkins.clouds.add(cloud);
+        r.configRoundtrip();
+
+        XcpngCloud reloaded = (XcpngCloud) r.jenkins.clouds.getByName("xcpng");
+        assertEquals(pem, reloaded.getCaCertificates(), "stored with LF line endings and no trailing blank");
+        assertNull(reloaded.getCertificateFingerprint());
+    }
+
+    /**
+     * A CA value that does not parse is kept rather than dropped, so the cloud fails closed instead of falling
+     * back to the JVM trust store, which for a CA also imported into cacerts would be a silent widening.
+     */
+    @Test
+    void anUnparseableCaIsKeptSoTheCloudFailsClosed(JenkinsRule r) {
+        XcpngCloud cloud = new XcpngCloud("xcpng", "https://pool.example.test", "xcpng-root", null, 1, List.of());
+        cloud.setCaCertificates("  not a certificate  ");
+        assertEquals("not a certificate", cloud.getCaCertificates());
+        cloud.setCaCertificates("   ");
+        assertNull(cloud.getCaCertificates(), "blank means none");
+    }
+
+    /** Test connection refuses both trust modes at once before it opens anything, naming the conflict. */
+    @Test
+    void testConnectionRefusesAFingerprintAndACaTogether(JenkinsRule r) {
+        XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        FormValidation v = d.doTestConnection(
+                "https://pool.example.test", "", PINNED_FINGERPRINT, "-----BEGIN CERTIFICATE-----", null);
+        assertEquals(FormValidation.Kind.ERROR, v.kind);
+        assertTrue(v.getMessage().contains("not both"), v.getMessage());
+    }
+
+    /** And a CA value that does not parse, with the parser's own reason, before the credential check. */
+    @Test
+    void testConnectionRefusesAnUnparseableCa(JenkinsRule r) {
+        XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        FormValidation v = d.doTestConnection("https://pool.example.test", "", null, "garbage", null);
+        assertEquals(FormValidation.Kind.ERROR, v.kind);
+        assertTrue(v.getMessage().contains("No PEM certificate found"), v.getMessage());
+    }
+
+    /** The field validator says the same things on the form, and accepts empty. */
+    @Test
+    void theCaFieldValidatorRefusesWhatTheClientWould(JenkinsRule r) {
+        XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        assertEquals(FormValidation.Kind.OK, d.doCheckCaCertificates("", null).kind);
+        assertEquals(FormValidation.Kind.OK, d.doCheckCaCertificates(" ", PINNED_FINGERPRINT).kind);
+        assertEquals(
+                FormValidation.Kind.ERROR,
+                d.doCheckCaCertificates("-----BEGIN CERTIFICATE-----", PINNED_FINGERPRINT).kind);
+        FormValidation key =
+                d.doCheckCaCertificates("-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----", null);
+        assertEquals(FormValidation.Kind.ERROR, key.kind);
+        assertTrue(key.getMessage().contains("private key"), key.getMessage());
+    }
+
+    /** A CA-verified connection reports itself as such, distinct from the other two. */
+    @Test
+    void testConnectionSaysWhenTheCaVerifiedTheAppliance(JenkinsRule r) {
+        FormValidation anchored = XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.anchoredAt("pem"));
+        assertEquals(FormValidation.Kind.OK, anchored.kind);
+        assertTrue(anchored.getMessage().contains("CA certificate"), anchored.getMessage());
+        assertNotEquals(
+                XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.JVM_DEFAULT).getMessage(), anchored.getMessage());
+        assertNotEquals(
+                XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.pinned(PINNED_FINGERPRINT))
+                        .getMessage(),
+                anchored.getMessage());
     }
 }

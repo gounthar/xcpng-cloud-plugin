@@ -15,6 +15,7 @@ import hudson.util.FormValidation;
 import hudson.util.Secret;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.XoRestClient;
 import java.util.List;
 import java.util.concurrent.AbstractExecutorService;
@@ -151,8 +152,8 @@ class XcpngBackendSelectionTest {
     @Test
     void theXoBackendBuildsAnXoClient(JenkinsRule r) throws Exception {
         addTokenCredential(XO_CREDENTIAL_ID);
-        try (HypervisorClient client =
-                XcpngCloud.openClient(XO_URL, XO_CREDENTIAL_ID, PINNED_FINGERPRINT, XcpngBackend.XO, "a test")) {
+        try (HypervisorClient client = XcpngCloud.openClient(
+                XO_URL, XO_CREDENTIAL_ID, PoolTrust.pinned(PINNED_FINGERPRINT), XcpngBackend.XO, "a test")) {
             assertInstanceOf(XoRestClient.class, client);
         }
     }
@@ -168,7 +169,11 @@ class XcpngBackendSelectionTest {
         IllegalStateException e = assertThrows(
                 IllegalStateException.class,
                 () -> XcpngCloud.openClient(
-                        XO_URL, XO_CREDENTIAL_ID, PINNED_FINGERPRINT, XcpngBackend.XAPI, "cloud 'old-pool'"));
+                        XO_URL,
+                        XO_CREDENTIAL_ID,
+                        PoolTrust.pinned(PINNED_FINGERPRINT),
+                        XcpngBackend.XAPI,
+                        "cloud 'old-pool'"));
         assertTrue(e.getMessage().contains("cloud 'old-pool'"), e.getMessage());
         assertTrue(e.getMessage().contains("XAPI backend has been removed"), e.getMessage());
         assertTrue(e.getMessage().contains("Xen Orchestra"), "the message must say what to move to: " + e.getMessage());
@@ -185,7 +190,8 @@ class XcpngBackendSelectionTest {
         addTokenCredential(XO_CREDENTIAL_ID);
         IllegalStateException e = assertThrows(
                 IllegalStateException.class,
-                () -> XcpngCloud.openClient(XO_URL, XO_CREDENTIAL_ID, null, null, "agent 'old-agent'"));
+                () -> XcpngCloud.openClient(
+                        XO_URL, XO_CREDENTIAL_ID, PoolTrust.JVM_DEFAULT, null, "agent 'old-agent'"));
         assertTrue(e.getMessage().contains("XAPI backend has been removed"), e.getMessage());
     }
 
@@ -197,7 +203,8 @@ class XcpngBackendSelectionTest {
     void theRefusalComesBeforeTheUrlCheck(JenkinsRule r) {
         IllegalStateException e = assertThrows(
                 IllegalStateException.class,
-                () -> XcpngCloud.openClient(null, LEFTOVER_CREDENTIAL_ID, null, XcpngBackend.XAPI, "cloud 'lab'"));
+                () -> XcpngCloud.openClient(
+                        null, LEFTOVER_CREDENTIAL_ID, PoolTrust.JVM_DEFAULT, XcpngBackend.XAPI, "cloud 'lab'"));
         assertTrue(e.getMessage().contains("XAPI backend has been removed"), e.getMessage());
     }
 
@@ -211,7 +218,8 @@ class XcpngBackendSelectionTest {
         addPasswordCredential(LEFTOVER_CREDENTIAL_ID);
         IllegalStateException e = assertThrows(
                 IllegalStateException.class,
-                () -> XcpngCloud.openClient(XO_URL, LEFTOVER_CREDENTIAL_ID, null, XcpngBackend.XO, "cloud 'xo-lab'"));
+                () -> XcpngCloud.openClient(
+                        XO_URL, LEFTOVER_CREDENTIAL_ID, PoolTrust.JVM_DEFAULT, XcpngBackend.XO, "cloud 'xo-lab'"));
         assertTrue(e.getMessage().contains("cloud 'xo-lab'"), e.getMessage());
         assertTrue(e.getMessage().contains("secret-text"), "the message must name the kind needed: " + e.getMessage());
     }
@@ -227,7 +235,8 @@ class XcpngBackendSelectionTest {
         for (String missing : new String[] {null, "", "   "}) {
             IllegalStateException e = assertThrows(
                     IllegalStateException.class,
-                    () -> XcpngCloud.openClient(missing, XO_CREDENTIAL_ID, null, XcpngBackend.XO, "cloud 'xo-lab'"),
+                    () -> XcpngCloud.openClient(
+                            missing, XO_CREDENTIAL_ID, PoolTrust.JVM_DEFAULT, XcpngBackend.XO, "cloud 'xo-lab'"),
                     "a poolUrl of " + (missing == null ? "null" : "'" + missing + "'") + " must be refused here");
             assertTrue(e.getMessage().contains("cloud 'xo-lab'"), e.getMessage());
             assertTrue(e.getMessage().contains("Xen Orchestra URL"), e.getMessage());
@@ -242,7 +251,8 @@ class XcpngBackendSelectionTest {
     void aMissingCredentialIsReportedAsThatWhenTheUrlIsFine(JenkinsRule r) {
         IllegalStateException e = assertThrows(
                 IllegalStateException.class,
-                () -> XcpngCloud.openClient(XO_URL, "no-such-credential", null, XcpngBackend.XO, "cloud 'lab'"));
+                () -> XcpngCloud.openClient(
+                        XO_URL, "no-such-credential", PoolTrust.JVM_DEFAULT, XcpngBackend.XO, "cloud 'lab'"));
         assertTrue(e.getMessage().contains("token credential"), e.getMessage());
         assertFalse(e.getMessage().contains("Xen Orchestra URL"), e.getMessage());
     }
@@ -358,7 +368,7 @@ class XcpngBackendSelectionTest {
         addPasswordCredential(LEFTOVER_CREDENTIAL_ID);
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
 
-        FormValidation v = d.doTestConnection(XO_URL, LEFTOVER_CREDENTIAL_ID, null, null);
+        FormValidation v = d.doTestConnection(XO_URL, LEFTOVER_CREDENTIAL_ID, null, null, null);
 
         assertEquals(FormValidation.Kind.ERROR, v.kind);
         assertTrue(v.getMessage().contains("secret-text"), "the message must name the kind needed: " + v.getMessage());
@@ -444,7 +454,11 @@ class XcpngBackendSelectionTest {
         IllegalStateException e = assertThrows(
                 IllegalStateException.class,
                 () -> XcpngCloud.openClient(
-                        "https://192.168.1.87", LEFTOVER_CREDENTIAL_ID, null, XcpngBackend.XO, "cloud 'xcpng-lab'"));
+                        "https://192.168.1.87",
+                        LEFTOVER_CREDENTIAL_ID,
+                        PoolTrust.JVM_DEFAULT,
+                        XcpngBackend.XO,
+                        "cloud 'xcpng-lab'"));
         assertTrue(
                 e.getMessage().contains("XAPI backend has been removed"),
                 "the message must say why, not only that the kind is wrong: " + e.getMessage());

@@ -22,6 +22,7 @@ import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Base64;
 import java.util.Date;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.SSLContext;
@@ -100,7 +101,7 @@ class HttpRestTransportPinningTest {
      */
     @Test
     void aSelfSignedCertificateIsRejectedWithoutAPin() {
-        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", null);
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", PoolTrust.JVM_DEFAULT);
         IOException failure = assertThrows(IOException.class, () -> get(transport));
         assertTrue(
                 isTlsFailure(failure),
@@ -114,7 +115,7 @@ class HttpRestTransportPinningTest {
      */
     @Test
     void thePinnedCertificateIsAccepted() throws Exception {
-        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", servedFingerprint);
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", PoolTrust.pinned(servedFingerprint));
         assertEquals(BODY, get(transport), "a pinned certificate must complete the handshake");
     }
 
@@ -123,7 +124,7 @@ class HttpRestTransportPinningTest {
     void thePinIsAcceptedInTheFormOperatorsPasteIt() throws Exception {
         String asPasted = servedFingerprint.replace(":", "").toLowerCase(java.util.Locale.ROOT);
         assertNotEquals(servedFingerprint, asPasted, "the fixture must really differ, or it proves nothing");
-        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", asPasted);
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", PoolTrust.pinned(asPasted));
         assertEquals(BODY, get(transport));
     }
 
@@ -138,7 +139,7 @@ class HttpRestTransportPinningTest {
         String otherFingerprint = CertificateFingerprint.of(other);
         assertNotEquals(servedFingerprint, otherFingerprint, "two generated certificates must differ");
 
-        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", otherFingerprint);
+        HttpRestTransport transport = new HttpRestTransport(poolUrl, "a-token", PoolTrust.pinned(otherFingerprint));
         IOException failure = assertThrows(IOException.class, () -> get(transport));
         assertTrue(isTlsFailure(failure), "a mismatched pin must fail the handshake: " + failure);
     }
@@ -156,7 +157,8 @@ class HttpRestTransportPinningTest {
         X509Certificate xoDefault = selfSigned(keyPair, XO_DEFAULT_DN, null);
 
         withServer(keyPair, xoDefault, url -> {
-            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(xoDefault));
+            HttpRestTransport transport =
+                    new HttpRestTransport(url, "a-token", PoolTrust.pinned(CertificateFingerprint.of(xoDefault)));
             assertEquals(BODY, get(transport), "the pin alone must identify the server");
         });
     }
@@ -174,7 +176,8 @@ class HttpRestTransportPinningTest {
         assertNotEquals(CertificateFingerprint.of(served), CertificateFingerprint.of(pinned));
 
         withServer(keyPair, served, url -> {
-            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(pinned));
+            HttpRestTransport transport =
+                    new HttpRestTransport(url, "a-token", PoolTrust.pinned(CertificateFingerprint.of(pinned)));
             IOException failure = assertThrows(IOException.class, () -> get(transport));
             assertTrue(isTlsFailure(failure), "a mismatched pin must fail the handshake: " + failure);
         });
@@ -261,7 +264,8 @@ class HttpRestTransportPinningTest {
                 false);
 
         withServer(leafKeys.getPrivate(), new Certificate[] {leaf, ca}, url -> {
-            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(leaf));
+            HttpRestTransport transport =
+                    new HttpRestTransport(url, "a-token", PoolTrust.pinned(CertificateFingerprint.of(leaf)));
             assertEquals(BODY, get(transport), "a CA-issued pinned leaf served with its chain must connect");
         });
 
@@ -315,7 +319,8 @@ class HttpRestTransportPinningTest {
                 CertificateAuthority.root("CN=Unrelated", generateKeyPair(), "SHA256withRSA").certificate;
 
         withServer(keyPair.getPrivate(), new Certificate[] {leaf, unrelated}, url -> {
-            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(leaf));
+            HttpRestTransport transport =
+                    new HttpRestTransport(url, "a-token", PoolTrust.pinned(CertificateFingerprint.of(leaf)));
             assertEquals(BODY, get(transport), "an unrelated extra certificate must not refuse the pin");
         });
     }
@@ -329,9 +334,179 @@ class HttpRestTransportPinningTest {
         X509Certificate leaf = intermediate.issueLeaf(leafKeys.getPublic());
 
         withServer(leafKeys.getPrivate(), new Certificate[] {leaf, root.certificate, intermediate.certificate}, url -> {
-            HttpRestTransport transport = new HttpRestTransport(url, "a-token", CertificateFingerprint.of(leaf));
+            HttpRestTransport transport =
+                    new HttpRestTransport(url, "a-token", PoolTrust.pinned(CertificateFingerprint.of(leaf)));
             assertEquals(BODY, get(transport), "a chain served out of order must still be checked and accepted");
         });
+    }
+
+    // ---- CA certificates (#172) --------------------------------------------------------------------------
+    //
+    // The third mode: trust exactly the authorities configured, with the hostname check kept. The negative
+    // cases are built the same way as the pinning ones above, against a control that succeeds on the same
+    // server shape, and the wrong-CA test is the one to mutate before believing any of them.
+
+    /** The control for every CA refusal below: a leaf issued by the configured CA, naming the host, connects. */
+    @Test
+    void aLeafIssuedByTheConfiguredCaIsAccepted() throws Exception {
+        CertificateAuthority ca = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = ca.issueLeaf(leafKeys.getPublic());
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf}, url -> {
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", PoolTrust.anchoredAt(pem(ca)));
+            assertEquals(BODY, get(transport), "a leaf issued by the configured CA must connect");
+        });
+    }
+
+    /**
+     * The test the anchor comparison exists for. Same server shape as the control above; only the issuer
+     * differs, so a refusal here is the anchor check and nothing else.
+     */
+    @Test
+    void aLeafIssuedByAnotherCaIsRejected() throws Exception {
+        CertificateAuthority configured = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        CertificateAuthority other = CertificateAuthority.root("CN=Other CA", generateKeyPair(), "SHA256withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = other.issueLeaf(leafKeys.getPublic());
+
+        assertRefusedWithCa(leafKeys.getPrivate(), new Certificate[] {leaf}, pem(configured));
+    }
+
+    /** Served with its own issuer appended, a leaf from another CA is still refused: a served root is not an anchor. */
+    @Test
+    void aLeafIssuedByAnotherCaIsRejectedEvenServedWithThatCa() throws Exception {
+        CertificateAuthority configured = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        CertificateAuthority other = CertificateAuthority.root("CN=Other CA", generateKeyPair(), "SHA256withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = other.issueLeaf(leafKeys.getPublic());
+
+        assertRefusedWithCa(leafKeys.getPrivate(), new Certificate[] {leaf, other.certificate}, pem(configured));
+    }
+
+    /** A self-signed certificate naming the right host is not issued by the CA, and is refused. */
+    @Test
+    void aSelfSignedLeafNamingTheHostIsRejected() throws Exception {
+        CertificateAuthority configured = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        KeyPair keyPair = generateKeyPair();
+        X509Certificate leaf = selfSigned(keyPair, "CN=127.0.0.1", "127.0.0.1");
+
+        assertRefusedWithCa(keyPair.getPrivate(), new Certificate[] {leaf}, pem(configured));
+    }
+
+    /**
+     * The hostname check survived the new path. Issued by the configured CA, valid in every other respect,
+     * but naming 127.0.0.2 while the connection goes to 127.0.0.1: refused. Against a trust manager that
+     * skipped the hostname check, as {@code PinnedTrustManager} deliberately does, this would connect.
+     */
+    @Test
+    void aLeafIssuedByTheCaNamingAnotherHostIsRejected() throws Exception {
+        CertificateAuthority ca = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = ca.issueLeaf(leafKeys.getPublic(), "127.0.0.2");
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf}, url -> {
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", PoolTrust.anchoredAt(pem(ca)));
+            IOException failure = assertThrows(IOException.class, () -> get(transport));
+            assertTrue(isTlsFailure(failure), "the refusal must be a TLS failure: " + failure);
+            assertTrue(
+                    messages(failure).contains("127.0.0.1"),
+                    "the refusal must be the hostname check, naming the address connected to: " + messages(failure));
+        });
+    }
+
+    /**
+     * Rotation, the property this mode exists for. Two leaves from the same CA, with different fingerprints,
+     * are both accepted through one unchanged {@link PoolTrust}: nothing an operator configured has to move
+     * when the appliance's certificate is renewed.
+     */
+    @Test
+    void aRenewedLeafFromTheSameCaIsAcceptedWithNoChange() throws Exception {
+        CertificateAuthority ca = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        PoolTrust trust = PoolTrust.anchoredAt(pem(ca));
+        KeyPair firstKeys = generateKeyPair();
+        X509Certificate first = ca.issueLeaf(firstKeys.getPublic());
+        KeyPair renewedKeys = generateKeyPair();
+        X509Certificate renewed = ca.issueLeaf(renewedKeys.getPublic());
+        assertNotEquals(CertificateFingerprint.of(first), CertificateFingerprint.of(renewed));
+
+        withServer(firstKeys.getPrivate(), new Certificate[] {first}, url -> {
+            assertEquals(BODY, get(new HttpRestTransport(url, "a-token", trust)), "the first leaf must connect");
+        });
+        withServer(renewedKeys.getPrivate(), new Certificate[] {renewed}, url -> {
+            assertEquals(BODY, get(new HttpRestTransport(url, "a-token", trust)), "the renewed leaf must connect");
+        });
+    }
+
+    /** An appliance issued through an intermediate, served with it, verifies against the root alone. */
+    @Test
+    void aLeafIssuedThroughAnIntermediateIsAcceptedAgainstTheRoot() throws Exception {
+        CertificateAuthority root = CertificateAuthority.root("CN=Org Root", generateKeyPair(), "SHA256withRSA");
+        CertificateAuthority intermediate = root.intermediate("CN=Org Issuing", generateKeyPair());
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = intermediate.issueLeaf(leafKeys.getPublic());
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf, intermediate.certificate}, url -> {
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", PoolTrust.anchoredAt(pem(root)));
+            assertEquals(BODY, get(transport), "a leaf served with its intermediate must verify against the root");
+        });
+    }
+
+    /** Several authorities may be configured; a leaf from the second one connects. */
+    @Test
+    void anyOfSeveralConfiguredCasIsAccepted() throws Exception {
+        CertificateAuthority oldRoot = CertificateAuthority.root("CN=Old Root", generateKeyPair(), "SHA256withRSA");
+        CertificateAuthority newRoot = CertificateAuthority.root("CN=New Root", generateKeyPair(), "SHA256withRSA");
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = newRoot.issueLeaf(leafKeys.getPublic());
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf}, url -> {
+            HttpRestTransport transport =
+                    new HttpRestTransport(url, "a-token", PoolTrust.anchoredAt(pem(oldRoot) + "\n" + pem(newRoot)));
+            assertEquals(BODY, get(transport), "a leaf from either configured CA must connect");
+        });
+    }
+
+    /** Both modes at once is refused when the client is built, not resolved by picking one. */
+    @Test
+    void aFingerprintAndACaTogetherAreRefused() throws Exception {
+        CertificateAuthority ca = CertificateAuthority.root("CN=Org CA", generateKeyPair(), "SHA256withRSA");
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> new HttpRestTransport(poolUrl, "a-token", new PoolTrust(servedFingerprint, pem(ca))));
+        assertTrue(e.getMessage().contains("Clear one of them"), e.getMessage());
+    }
+
+    /** A CA value that does not parse fails closed rather than falling back to the JVM trust store. */
+    @Test
+    void anUnparseableCaIsRefusedRatherThanIgnored() {
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> new HttpRestTransport(poolUrl, "a-token", PoolTrust.anchoredAt("not a certificate")));
+        assertTrue(e.getMessage().contains("No PEM certificate found"), e.getMessage());
+    }
+
+    /**
+     * Refused by the CA mode, as a TLS failure, on a server whose only defect is its issuer or its key. The
+     * control is {@link #aLeafIssuedByTheConfiguredCaIsAccepted}.
+     */
+    private static void assertRefusedWithCa(PrivateKey key, Certificate[] chain, String caPem) throws Exception {
+        withServer(key, chain, url -> {
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", PoolTrust.anchoredAt(caPem));
+            IOException failure = assertThrows(IOException.class, () -> get(transport));
+            assertTrue(isTlsFailure(failure), "the refusal must be a TLS failure: " + failure);
+            assertTrue(
+                    messages(failure).contains("PKIX path building failed"),
+                    "the refusal must be the path to the configured CA: " + messages(failure));
+        });
+    }
+
+    /** A CA's certificate in PEM, as an operator would paste it. */
+    private static String pem(CertificateAuthority ca) throws Exception {
+        return "-----BEGIN CERTIFICATE-----\n"
+                + Base64.getMimeEncoder(64, "\n".getBytes(StandardCharsets.US_ASCII))
+                        .encodeToString(ca.certificate.getEncoded())
+                + "\n-----END CERTIFICATE-----\n";
     }
 
     /** A CA for one test: its own certificate and the key it signs with. */
@@ -375,6 +550,10 @@ class HttpRestTransportPinningTest {
         }
 
         X509Certificate issueLeaf(PublicKey subjectKey) throws Exception {
+            return issueLeaf(subjectKey, "127.0.0.1");
+        }
+
+        X509Certificate issueLeaf(PublicKey subjectKey, String ipSan) throws Exception {
             return issue(
                     subjectKey,
                     "CN=127.0.0.1",
@@ -383,7 +562,7 @@ class HttpRestTransportPinningTest {
                     "SHA256withRSA",
                     Instant.now().minus(Duration.ofDays(1)),
                     Instant.now().plus(Duration.ofDays(5)),
-                    "127.0.0.1",
+                    ipSan,
                     false);
         }
     }
@@ -395,7 +574,7 @@ class HttpRestTransportPinningTest {
     private static void assertRefusedByPolicy(PrivateKey key, Certificate[] chain, String expected) throws Exception {
         String pin = CertificateFingerprint.of((X509Certificate) chain[0]);
         withServer(key, chain, url -> {
-            HttpRestTransport transport = new HttpRestTransport(url, "a-token", pin);
+            HttpRestTransport transport = new HttpRestTransport(url, "a-token", PoolTrust.pinned(pin));
             IOException failure = assertThrows(IOException.class, () -> get(transport));
             assertTrue(isTlsFailure(failure), "the refusal must be a TLS failure: " + failure);
             String messages = messages(failure);

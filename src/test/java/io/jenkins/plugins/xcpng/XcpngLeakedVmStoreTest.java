@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -351,5 +352,20 @@ class XcpngLeakedVmStoreTest {
         assertFalse(
                 Jenkins.XSTREAM2.toXML(migrated).contains("leakedVmRefs"),
                 "a migrated cloud must stop carrying the set in its own configuration");
+    }
+
+    /** CA certificates are part of the connection too (#172), and come back off disk with it. */
+    @Test
+    void anEntryKeepsItsCaCertificatesAcrossARestart(JenkinsRule r) throws Exception {
+        String pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+        XcpngLeakedVm recorded = XcpngLeakedVm.of(
+                "11111111-2222-3333-4444-555555555555", XcpngBackend.XO, "https://xo.example.test", "tok", null, pem);
+        XcpngLeakedVmStore.get().record("xcpng-lab", recorded);
+
+        XcpngLeakedVm reloaded =
+                new XcpngLeakedVmStore().entries("xcpng-lab").iterator().next();
+        assertEquals(recorded, reloaded);
+        assertEquals(pem, reloaded.getCaCertificates());
+        assertEquals(PoolTrust.anchoredAt(pem), reloaded.connection().trust());
     }
 }

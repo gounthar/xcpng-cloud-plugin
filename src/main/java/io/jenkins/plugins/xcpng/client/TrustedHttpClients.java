@@ -1,9 +1,11 @@
 package io.jenkins.plugins.xcpng.client;
 
-import edu.umd.cs.findbugs.annotations.CheckForNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
+import java.io.IOException;
 import java.net.Socket;
 import java.net.http.HttpClient;
 import java.security.GeneralSecurityException;
+import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.cert.CertPathValidator;
 import java.security.cert.CertPathValidatorException;
@@ -15,6 +17,7 @@ import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -22,6 +25,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509ExtendedTrustManager;
 import javax.net.ssl.X509TrustManager;
 
@@ -29,12 +33,13 @@ import javax.net.ssl.X509TrustManager;
  * The shared {@link HttpClient} instances every transport in this package dials through, and the only
  * place TLS trust is decided.
  *
- * <p>There are exactly two modes and neither of them is "accept anything". With no pinned fingerprint the
- * JVM's own trust store and hostname check apply, which is what a pool or appliance holding a certificate
- * from a real CA wants. With a fingerprint, the connection succeeds only against that one certificate. The
- * trust-all context this package used to carry is gone: "trust this pool's self-signed certificate" and
- * "trust every certificate in the world" were the same switch, and only the second of those is what the
- * code did.
+ * <p>There are exactly three modes and none of them is "accept anything". With nothing configured the JVM's
+ * own trust store and hostname check apply, which is what an appliance holding a certificate from a public
+ * CA wants. With a fingerprint, the connection succeeds only against that one certificate. With CA
+ * certificates, it succeeds against a certificate that chains to one of them and names the host, and
+ * against nothing the JVM store alone would vouch for (#172). The trust-all context this package used to
+ * carry is gone: "trust this pool's self-signed certificate" and "trust every certificate in the world" were
+ * the same switch, and only the second of those is what the code did.
  *
  * <p>Extracted from the XAPI backend's JSON-RPC transport when {@link HttpRestTransport} needed the same
  * decision, and kept separate now that the REST transport is the only one: the trust decision is covered by
@@ -53,18 +58,96 @@ final class TrustedHttpClients {
 
     private static final Map<String, HttpClient> PINNED = new ConcurrentHashMap<>();
 
+    /**
+     * One CA-anchored client per distinct set of anchors, keyed by their fingerprints in sorted order. Not
+     * keyed by the PEM text, so the same authority pasted with different line wrapping, or the same two
+     * authorities in the other order, shares a client; and never keyed by a fingerprint alone, which is
+     * {@link #PINNED}'s key and means something else entirely.
+     */
+    private static final Map<String, HttpClient> ANCHORED = new ConcurrentHashMap<>();
+
     private TrustedHttpClients() {}
 
     /**
-     * @param certificateFingerprint SHA-256 fingerprint of the certificate the far end is expected to
-     *     present, in any form {@link CertificateFingerprint#normalize} accepts. Null or blank means
-     *     ordinary verification against the JVM trust store.
+     * The client for {@code trust}.
+     *
+     * @throws HypervisorException when the configuration cannot be honoured: both a fingerprint and CA
+     *     certificates set, a fingerprint that does not parse, or CA certificates that do not. Thrown rather
+     *     than falling back to the JVM trust store, which would widen trust past what the operator wrote.
      */
-    static HttpClient forFingerprint(@CheckForNull String certificateFingerprint) {
-        return certificateFingerprint == null || certificateFingerprint.isBlank()
-                ? SHARED
-                : PINNED.computeIfAbsent(
-                        CertificateFingerprint.normalize(certificateFingerprint), TrustedHttpClients::pinnedClient);
+    static HttpClient forTrust(@NonNull PoolTrust trust) {
+        if (trust.isPinned() && trust.isAnchored()) {
+            throw new HypervisorException("both a certificate fingerprint and a CA certificate are configured."
+                    + " They are alternatives: the fingerprint trusts one certificate exactly, the CA certificate"
+                    + " trusts what that authority issues. Clear one of them.");
+        }
+        if (trust.isPinned()) {
+            String fingerprint;
+            try {
+                fingerprint = CertificateFingerprint.normalize(trust.certificateFingerprint());
+            } catch (IllegalArgumentException e) {
+                throw new HypervisorException("the certificate fingerprint is malformed: " + e.getMessage(), e);
+            }
+            return PINNED.computeIfAbsent(fingerprint, TrustedHttpClients::pinnedClient);
+        }
+        if (trust.isAnchored()) {
+            List<X509Certificate> anchors;
+            try {
+                anchors = CaCertificates.parse(trust.caCertificates());
+            } catch (IllegalArgumentException e) {
+                throw new HypervisorException("the CA certificate cannot be used: " + e.getMessage(), e);
+            }
+            List<String> key = new ArrayList<>();
+            for (X509Certificate anchor : anchors) {
+                key.add(CertificateFingerprint.of(anchor));
+            }
+            Collections.sort(key);
+            return ANCHORED.computeIfAbsent(String.join(",", key), unused -> anchoredClient(anchors));
+        }
+        return SHARED;
+    }
+
+    /**
+     * A client that trusts exactly {@code anchors}: a certificate is accepted when it chains to one of them,
+     * passes the runtime's certificate policy, and names the host being connected to.
+     *
+     * <p>Unlike {@link #pinnedClient}, this one is built from the JDK's own PKIX trust manager over a key
+     * store holding only the anchors, and that is the point rather than a shortcut. The objection recorded on
+     * {@link #pinnedClient} to handing a certificate to a {@code TrustManagerFactory} is about a certificate
+     * that is itself an anchor, which the validator accepts unexamined; here the served leaf is never an
+     * anchor, because {@link CaCertificates#parse} admits only CA certificates, so the leaf is validated
+     * against them in full. That trust manager is an {@link X509ExtendedTrustManager}, and with the HTTPS
+     * endpoint-identification algorithm {@code java.net.http.HttpClient} always sets, it checks the host name
+     * itself; the policy, {@code jdk.certpath.disabledAlgorithms} and the validity dates come with it.
+     * Revocation is off, as it is by default for the JVM store.
+     *
+     * <p>Only the anchors given, not the anchors in addition to the JVM's. "This appliance is signed by our
+     * CA" is narrower than "trust our CA and every public one", and the narrower statement is what an
+     * operator who fills this field in means.
+     *
+     * <p>Suppressed for the same reason as {@link #pinnedClient}: the scan flags every {@code
+     * SSLContext#init}, and this one narrows trust to the configured authorities.
+     */
+    @SuppressWarnings("lgtm[jenkins/unsafe-calls]") // Trusts only the configured CAs; narrower than the JVM default.
+    private static HttpClient anchoredClient(List<X509Certificate> anchors) {
+        SSLContext ctx;
+        try {
+            KeyStore store = KeyStore.getInstance(KeyStore.getDefaultType());
+            store.load(null, null);
+            for (int i = 0; i < anchors.size(); i++) {
+                store.setCertificateEntry("ca-" + i, anchors.get(i));
+            }
+            TrustManagerFactory factory = TrustManagerFactory.getInstance("PKIX");
+            factory.init(store);
+            ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, factory.getTrustManagers(), new SecureRandom());
+        } catch (GeneralSecurityException | IOException e) {
+            throw new HypervisorException("cannot build an SSL context for the CA certificate: " + e.getMessage(), e);
+        }
+        return HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(30))
+                .sslContext(ctx)
+                .build();
     }
 
     /**
@@ -101,7 +184,7 @@ final class TrustedHttpClients {
      * certificate is already trusted without validating it.
      *
      * <p>Unpinned connections go through {@link #SHARED}, which keeps the JVM trust store and its hostname
-     * check. Nothing here changes those.
+     * check, or through {@link #anchoredClient}, which keeps the hostname check. Nothing here changes those.
      *
      * <p>The scan flags every {@code SSLContext#init}, because that call is how TLS verification is
      * normally switched off; it does not read the trust manager it is handed. This one narrows trust

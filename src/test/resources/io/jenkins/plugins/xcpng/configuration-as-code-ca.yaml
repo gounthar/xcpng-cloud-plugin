@@ -1,0 +1,16 @@
+jenkins:
+  clouds:
+    - xcpng:
+        name: "xcpng-ca"
+        poolUrl: "https://xo.example.test"
+        credentialsId: "xo-token"
+        caCertificates: |
+          -----BEGIN CERTIFICATE-----
+          MIIBszCCAVmgAwIBAgIUExampleOnlyNotARealCertificateBody
+          -----END CERTIFICATE-----
+        maxInstances: 2
+        templates:
+          - templateName: "jenkins-golden-debian"
+            labelString: "xcpng-linux"
+            numCpus: 2
+            memoryMb: 2048

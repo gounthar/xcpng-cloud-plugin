@@ -2,6 +2,7 @@ package io.jenkins.plugins.xcpng;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.VmRef;
 import java.util.Objects;
 
@@ -35,17 +36,25 @@ public final class XcpngLeakedVm {
     private final String credentialsId;
     private final String certificateFingerprint;
 
+    /**
+     * CA certificates the connection trusted (#172), or null. An entry written before this field existed loads
+     * with null, which is what every such entry's cloud had.
+     */
+    private final String caCertificates;
+
     private XcpngLeakedVm(
             @NonNull String vmRef,
             @NonNull XcpngBackend backend,
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
-            @CheckForNull String certificateFingerprint) {
+            @CheckForNull String certificateFingerprint,
+            @CheckForNull String caCertificates) {
         this.vmRef = Objects.requireNonNull(vmRef, "vmRef");
         this.backend = Objects.requireNonNull(backend, "backend");
         this.poolUrl = poolUrl;
         this.credentialsId = credentialsId;
         this.certificateFingerprint = certificateFingerprint;
+        this.caCertificates = caCertificates;
     }
 
     /**
@@ -60,10 +69,23 @@ public final class XcpngLeakedVm {
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
             @CheckForNull String certificateFingerprint) {
+        return of(vmRef, backend, poolUrl, credentialsId, certificateFingerprint, null);
+    }
+
+    /** As above, for a connection that may trust CA certificates rather than, or as well as, a fingerprint. */
+    @NonNull
+    static XcpngLeakedVm of(
+            @NonNull String vmRef,
+            @CheckForNull XcpngBackend backend,
+            @CheckForNull String poolUrl,
+            @CheckForNull String credentialsId,
+            @CheckForNull String certificateFingerprint,
+            @CheckForNull String caCertificates) {
         if (poolUrl == null) {
-            return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), null, null, null);
+            return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), null, null, null, null);
         }
-        return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), poolUrl, credentialsId, certificateFingerprint);
+        return new XcpngLeakedVm(
+                vmRef, XcpngBackend.resolve(backend), poolUrl, credentialsId, certificateFingerprint, caCertificates);
     }
 
     /** A leak recorded with the cloud's connection as it is now, for a VM provisioned under that connection. */
@@ -74,7 +96,8 @@ public final class XcpngLeakedVm {
                 cloud.getBackend(),
                 cloud.getPoolUrl(),
                 cloud.getCredentialsId(),
-                cloud.getCertificateFingerprint());
+                cloud.getCertificateFingerprint(),
+                cloud.getCaCertificates());
     }
 
     /**
@@ -84,7 +107,7 @@ public final class XcpngLeakedVm {
     @NonNull
     static XcpngLeakedVm legacy(@NonNull String vmRef) {
         XcpngBackend inferred = vmRef.startsWith(VmRef.XAPI_REF_PREFIX) ? XcpngBackend.XAPI : XcpngBackend.XO;
-        return new XcpngLeakedVm(vmRef, inferred, null, null, null);
+        return new XcpngLeakedVm(vmRef, inferred, null, null, null, null);
     }
 
     @NonNull
@@ -113,6 +136,11 @@ public final class XcpngLeakedVm {
         return certificateFingerprint;
     }
 
+    @CheckForNull
+    public String getCaCertificates() {
+        return caCertificates;
+    }
+
     /** Whether this entry carries its own connection, rather than depending on the cloud's current one. */
     boolean hasConnection() {
         return poolUrl != null;
@@ -124,13 +152,14 @@ public final class XcpngLeakedVm {
                 && backend == cloud.getBackend()
                 && poolUrl.equals(cloud.getPoolUrl())
                 && Objects.equals(credentialsId, cloud.getCredentialsId())
-                && Objects.equals(certificateFingerprint, cloud.getCertificateFingerprint());
+                && Objects.equals(certificateFingerprint, cloud.getCertificateFingerprint())
+                && Objects.equals(caCertificates, cloud.getCaCertificates());
     }
 
     /** The connection alone, for grouping entries so a sweep opens one client per connection. */
     @NonNull
     Connection connection() {
-        return new Connection(backend, poolUrl, credentialsId, certificateFingerprint);
+        return new Connection(backend, poolUrl, credentialsId, new PoolTrust(certificateFingerprint, caCertificates));
     }
 
     /** A connection as a map key. In memory only: never persisted, so a record is safe here. */
@@ -138,7 +167,7 @@ public final class XcpngLeakedVm {
             @NonNull XcpngBackend backend,
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
-            @CheckForNull String certificateFingerprint) {}
+            @NonNull PoolTrust trust) {}
 
     @Override
     public boolean equals(Object o) {
@@ -152,12 +181,13 @@ public final class XcpngLeakedVm {
                 && backend == other.backend
                 && Objects.equals(poolUrl, other.poolUrl)
                 && Objects.equals(credentialsId, other.credentialsId)
-                && Objects.equals(certificateFingerprint, other.certificateFingerprint);
+                && Objects.equals(certificateFingerprint, other.certificateFingerprint)
+                && Objects.equals(caCertificates, other.caCertificates);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(vmRef, backend, poolUrl, credentialsId, certificateFingerprint);
+        return Objects.hash(vmRef, backend, poolUrl, credentialsId, certificateFingerprint, caCertificates);
     }
 
     @Override

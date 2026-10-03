@@ -145,7 +145,9 @@ timeout, 10 min 45 s with `idleMinutes` 10.
    is signed by a CA the controller already trusts, it connects and there is nothing more to do. An
    appliance still on the certificate it generated for itself is not, so the usual answer is that the
    result shows you the SHA-256 fingerprint it presented. Check it against the appliance, then paste it
-   into the field. See [Security notes](#security-notes).
+   into the field. If your organisation's own CA issued the appliance's certificate, paste that CA's
+   certificate into **CA certificate** instead, and the appliance stays trusted when its certificate is
+   renewed. See [Security notes](#security-notes).
 4. Add one or more **Templates**. Each template names a golden image, the labels its agents serve, and
    the shape of the agents cloned from it. At least one label is required, and labels are how builds
    reach these agents: give the jobs you want on XCP-ng a matching label expression.
@@ -216,8 +218,11 @@ stick:
 
 Leave `certificateFingerprint` empty when the certificate chains to a CA the controller trusts.
 Otherwise set it to the SHA-256 fingerprint of the appliance's certificate; **Test connection**
-reports whatever the appliance actually presented. Colons are optional and case does not matter. See
-[Security notes](#security-notes).
+reports whatever the appliance actually presented. Colons are optional and case does not matter.
+
+For an appliance whose certificate comes from your own CA, set `caCertificates` to that CA's PEM
+certificate instead, as a block scalar (`caCertificates: |`). Set one of the two, never both: a cloud
+with both refuses to connect. See [Security notes](#security-notes).
 
 The `backend` key is optional and defaults to `XO`, the only value that works. It exists so a document
 exported from an older release still loads; see
@@ -236,6 +241,7 @@ Cloud fields:
 | Xen Orchestra URL | `poolUrl` | Base URL of the Xen Orchestra appliance, for example `https://xo.example.com`. The symbol keeps its old name so existing configurations bind. Do not embed credentials in the URL. |
 | Credentials | `credentialsId` | ID of a secret-text credential holding a Xen Orchestra authentication token. |
 | Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the appliance is expected to present, with or without colons. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; an appliance on its self-generated certificate needs its fingerprint here. Once set, only that exact certificate is accepted. |
+| CA certificate | `caCertificates` | Optional. PEM certificate of the CA that issued the appliance's certificate; several blocks trust several CAs. The appliance is accepted when its certificate chains to one of them and names the host in the URL, and only these CAs are trusted for this cloud, not the JVM's. Survives the appliance's certificate being renewed. Each block must be a CA certificate, and the form refuses a private key. An alternative to the fingerprint: set one or the other. |
 | Backend | `backend` | Optional, and `XO` is the only value that works; it defaults to that. `XAPI` still loads, so a document from an older release does not fail, but a cloud carrying it provisions nothing. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
 | Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
@@ -293,7 +299,8 @@ table, the Packer workflow and its honest status, and the produced template name
   it in that window lets an attacker impersonate that one agent, not the controller. The optional SSH
   key is seeded the same way and is not scrubbed; because it is a public key, its presence in the VM
   record is not a secret disclosure.
-- **The appliance's certificate is either trusted by the JVM or pinned by fingerprint.** There is no
+- **The appliance's certificate is trusted by the JVM, pinned by fingerprint, or issued by a CA you
+  configure on the cloud.** There is no
   setting that accepts an unrecognised certificate, because every request over that connection carries
   the token. A pinned connection succeeds only against the exact certificate whose fingerprint
   was confirmed, and it does not also require that certificate to name the host being dialled: the
@@ -301,7 +308,10 @@ table, the Packer workflow and its honest status, and the produced template name
   such a certificate is trusted. Without a pin, the JVM trust store and the ordinary hostname check
   both apply. If the appliance's certificate is later replaced, connections fail until an administrator
   confirms the new fingerprint — that failure is the feature, since a replaced certificate is either
-  routine maintenance or an interception and only a human can tell which.
+  routine maintenance or an interception and only a human can tell which. With **CA certificate** set,
+  the certificate must chain to one of those CAs and name the host, and the JVM's own CAs are not
+  consulted; a renewed certificate from the same CA is accepted without any change, which is the
+  reason to prefer it over a fingerprint when you run a CA.
 - **Reading a fingerprint does not trust it.** `Test connection` inspects the certificate an unknown
   appliance presents and then refuses the connection, so the token is never offered to a host nobody
   has confirmed. Check the fingerprint it reports against the appliance before pasting it in.

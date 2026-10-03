@@ -17,6 +17,9 @@
   <f:entry title="${%Certificate fingerprint}" field="certificateFingerprint">
     <f:textbox/>
   </f:entry>
+  <f:entry title="${%CA certificate}" field="caCertificates">
+    <f:textarea/>
+  </f:entry>
   <f:entry title="${%Pool}" field="poolId">
     <f:textbox/>
   </f:entry>
@@ -30,5 +33,5 @@
     <f:repeatableHeteroProperty field="templates" hasHeader="true" addCaption="${%Add template}"/>
   </f:entry>
   <f:validateButton title="${%Test connection}" progress="${%Testing...}"
-                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint,poolId"/>
+                    method="testConnection" with="poolUrl,credentialsId,certificateFingerprint,caCertificates,poolId"/>
 </j:jelly>

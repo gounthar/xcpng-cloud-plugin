@@ -14,6 +14,7 @@ import hudson.util.Secret;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -96,14 +97,14 @@ class XcpngPoolScopeTest {
     @Test
     void testConnectionNamesThePoolItResolvesIn(JenkinsRule r) {
         Map<String, String> pools = pools();
-        FormValidation v = XcpngCloud.DescriptorImpl.connectedResult(null, POOL_B, pools);
+        FormValidation v = XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.JVM_DEFAULT, POOL_B, pools);
         assertEquals(FormValidation.Kind.OK, v.kind);
         assertTrue(v.getMessage().contains("pool lab-98 (" + POOL_B + ")"), v.getMessage());
     }
 
     @Test
     void testConnectionListsThePoolsWhenNoneIsSetAndThereIsAChoice(JenkinsRule r) {
-        FormValidation v = XcpngCloud.DescriptorImpl.connectedResult(null, null, pools());
+        FormValidation v = XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.JVM_DEFAULT, null, pools());
         assertEquals(FormValidation.Kind.OK, v.kind);
         assertTrue(v.getMessage().contains("2 pools"), v.getMessage());
         assertTrue(v.getMessage().contains("lab-87 (" + POOL_A + ")"), v.getMessage());
@@ -112,8 +113,10 @@ class XcpngPoolScopeTest {
 
     @Test
     void testConnectionSaysNothingAboutPoolsWhenThereIsOnlyOne(JenkinsRule r) {
-        FormValidation v = XcpngCloud.DescriptorImpl.connectedResult(null, null, Map.of(POOL_A, "lab-87"));
-        assertEquals(XcpngCloud.DescriptorImpl.connectedResult(null).getMessage(), v.getMessage());
+        FormValidation v =
+                XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.JVM_DEFAULT, null, Map.of(POOL_A, "lab-87"));
+        assertEquals(
+                XcpngCloud.DescriptorImpl.connectedResult(PoolTrust.JVM_DEFAULT).getMessage(), v.getMessage());
     }
 
     // -- the template-name check -----------------------------------------
@@ -126,7 +129,7 @@ class XcpngPoolScopeTest {
             asked.add(poolId);
             return new FakeHypervisorClient("golden");
         });
-        d.doCheckTemplateName("golden", "https://xo.example.test", TOKEN_ID, null, POOL_B);
+        d.doCheckTemplateName("golden", "https://xo.example.test", TOKEN_ID, null, null, POOL_B);
         assertEquals(List.of(POOL_B), asked, "the check must resolve where provisioning will, not everywhere");
     }
 
@@ -261,5 +264,18 @@ class XcpngPoolScopeTest {
         try (OutputStream out = exchange.getResponseBody()) {
             out.write(bytes);
         }
+    }
+
+    /** The template-name check verifies the appliance the way the form says to, CA certificates included (#172). */
+    @Test
+    void theTemplateNameCheckCarriesTheCaCertificates(JenkinsRule r) {
+        XcpngTemplate.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngTemplate.DescriptorImpl.class);
+        List<PoolTrust> asked = new ArrayList<>();
+        d.setPoolProbe((poolUrl, credentialsId, trust, poolId) -> {
+            asked.add(trust);
+            return new FakeHypervisorClient("golden");
+        });
+        d.doCheckTemplateName("golden", "https://xo.example.test", TOKEN_ID, null, "PEM\r\nBODY\r\n", null);
+        assertEquals(List.of(PoolTrust.anchoredAt("PEM\nBODY")), asked);
     }
 }

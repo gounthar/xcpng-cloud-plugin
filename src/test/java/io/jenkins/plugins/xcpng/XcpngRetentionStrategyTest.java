@@ -11,6 +11,7 @@ import hudson.model.Executor;
 import hudson.slaves.AbstractCloudComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.VmState;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -111,6 +112,8 @@ class XcpngRetentionStrategyTest {
 
         private volatile String certificateFingerprint;
 
+        private volatile PoolTrust trust;
+
         private volatile XcpngBackend backend;
 
         private volatile int opens;
@@ -128,11 +131,11 @@ class XcpngRetentionStrategyTest {
 
         /** Record the snapshot, then answer with the fake or throw, whichever this factory was built for. */
         @Override
-        public HypervisorClient open(
-                String poolUrl, String credentialsId, String certificateFingerprint, XcpngBackend backend) {
+        public HypervisorClient open(String poolUrl, String credentialsId, PoolTrust trust, XcpngBackend backend) {
             this.poolUrl = poolUrl;
             this.credentialsId = credentialsId;
-            this.certificateFingerprint = certificateFingerprint;
+            this.certificateFingerprint = trust.certificateFingerprint();
+            this.trust = trust;
             this.backend = backend;
             opens++;
             if (failure != null) {
@@ -1045,5 +1048,34 @@ class XcpngRetentionStrategyTest {
     /** The captured messages alone, so a failing log assertion prints what was logged instead of object ids. */
     private static List<String> messages(List<LogRecord> records) {
         return records.stream().map(LogRecord::getMessage).toList();
+    }
+
+    /**
+     * The CA certificates reach the snapshot as well (#172), so a teardown after the cloud is deleted trusts
+     * the appliance the way provisioning did. A cloud with CA certificates and no fingerprint, so the
+     * assertion reads a value only the new field could have carried.
+     */
+    @Test
+    void terminateCarriesTheCaCertificatesInTheSnapshotWhenTheCloudIsGone(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        String pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+        XcpngCloud cloud = new XcpngCloud("xcpng-ca", POOL_URL, CREDENTIALS_ID, null, 3, List.of(LINUX_TEMPLATE));
+        cloud.setCaCertificates(pem);
+        cloud.setClientFactory(c -> fake);
+        cloud.setWaitForOnline(false);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-ca", false);
+        r.jenkins.addNode(agent);
+        RecordingConnectionFactory connections = new RecordingConnectionFactory(fake);
+        agent.setConnectionClientFactory(connections);
+
+        r.jenkins.clouds.remove(cloud);
+        agent.terminate();
+
+        assertEquals(1, connections.opens, "teardown must open exactly one client");
+        assertEquals(PoolTrust.anchoredAt(pem), connections.trust, "the snapshot must carry the CA certificates");
+        assertTrue(
+                fake.calls().contains("destroyWithDisks:" + agent.getVmRef()),
+                "the VM must still be destroyed: " + fake.calls());
     }
 }

@@ -2181,8 +2181,8 @@ class XcpngProvisionTest {
         XcpngCloud cloud = cloudBackedBy(current, 2);
         r.jenkins.clouds.add(cloud);
         List<String> openedWith = new ArrayList<>();
-        cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, certificateFingerprint, backend) -> {
-            openedWith.add(backend + " " + poolUrl + " " + credentialsId + " " + certificateFingerprint);
+        cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, trust, backend) -> {
+            openedWith.add(backend + " " + poolUrl + " " + credentialsId + " " + trust.certificateFingerprint());
             return recorded;
         });
         cloud.recordLeakedVm(XcpngLeakedVm.of(
@@ -2471,12 +2471,13 @@ class XcpngProvisionTest {
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null)
+                d.doCheckTemplateName(
+                                LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null, null)
                         .kind,
                 "a template the pool has must pass");
 
         FormValidation missing =
-                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null, null);
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null, null, null);
         assertEquals(FormValidation.Kind.ERROR, missing.kind, "a template the pool does not have must be named here");
         assertTrue(
                 missing.getMessage().contains("no-such-golden-image"),
@@ -2500,20 +2501,20 @@ class XcpngProvisionTest {
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("anything", null, null, null, null).kind,
+                d.doCheckTemplateName("anything", null, null, null, null, null).kind,
                 "no pool URL means nothing to check against");
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("anything", "   ", "cred", null, null).kind,
+                d.doCheckTemplateName("anything", "   ", "cred", null, null, null).kind,
                 "a blank pool URL means nothing to check against");
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("anything", "192.168.1.87", "cred", null, null).kind,
+                d.doCheckTemplateName("anything", "192.168.1.87", "cred", null, null, null).kind,
                 "a malformed pool URL is doCheckPoolUrl's to report, not this field's");
         assertEquals(List.of(), fake.calls(), "an unusable connection must not open a session at all");
 
         // And the name is still required, whatever the connection looks like.
-        assertEquals(FormValidation.Kind.ERROR, d.doCheckTemplateName("  ", null, null, null, null).kind);
+        assertEquals(FormValidation.Kind.ERROR, d.doCheckTemplateName("  ", null, null, null, null, null).kind);
     }
 
     /**
@@ -2530,7 +2531,8 @@ class XcpngProvisionTest {
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null, null).kind,
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "cred", null, null, null)
+                        .kind,
                 "a pool that never answered cannot condemn a template name");
         assertFalse(
                 fake.calls().stream().anyMatch(c -> c.startsWith("resolveTemplate")),
@@ -2543,7 +2545,7 @@ class XcpngProvisionTest {
         });
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "", null, null).kind,
+                d.doCheckTemplateName("no-such-golden-image", "https://pool.example.test", "", null, null, null).kind,
                 "a missing credential is Test connection's to report, not this field's");
     }
 
@@ -2588,9 +2590,9 @@ class XcpngProvisionTest {
         // substring assertion would pass at every depth and pin nothing. The level is the whole claim —
         // one ../ reaches the cloud, two overshoot it — so the tokens have to match exactly.
         assertEquals(
-                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint", "../poolId"),
+                Set.of("../poolUrl", "../credentialsId", "../certificateFingerprint", "../caCertificates", "../poolId"),
                 Set.of(declared.group(1).trim().split("\\s+")),
-                "the check must depend on exactly the cloud's four connection fields, one level up");
+                "the check must depend on exactly the cloud's five connection fields, one level up");
     }
 
     /**
@@ -2614,7 +2616,8 @@ class XcpngProvisionTest {
 
         assertEquals(
                 FormValidation.Kind.OK,
-                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null)
+                d.doCheckTemplateName(
+                                LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null, null)
                         .kind,
                 "a connection lost mid-check must not be reported as an unresolvable name");
         assertEquals(
@@ -2629,7 +2632,8 @@ class XcpngProvisionTest {
         d.setPoolProbe((poolUrl, credentialsId, certificateFingerprint, poolId) -> healthy);
         assertEquals(
                 FormValidation.Kind.ERROR,
-                d.doCheckTemplateName(LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null)
+                d.doCheckTemplateName(
+                                LINUX_TEMPLATE.getTemplateName(), "https://pool.example.test", "cred", null, null, null)
                         .kind,
                 "a pool that is still answering has answered about the name");
     }

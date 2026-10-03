@@ -19,8 +19,8 @@ import java.util.Objects;
  * not authenticated, and XO answers 401 with the same body it gives a wrong token, so the mistake reads
  * as a bad credential rather than as a wrong header.
  *
- * <p>TLS trust is {@link TrustedHttpClients}', which it used to share with the removed XAPI transport. There
- * is no third mode that accepts an unrecognised certificate.
+ * <p>TLS trust is {@link TrustedHttpClients}', which it used to share with the removed XAPI transport. None
+ * of its modes accepts an unrecognised certificate.
  */
 final class HttpRestTransport implements RestTransport {
 
@@ -32,13 +32,13 @@ final class HttpRestTransport implements RestTransport {
      * @param baseUrl base URL of the appliance, e.g. {@code https://192.168.1.5}. A trailing slash is
      *     trimmed so callers can pass either form.
      * @param token XO authentication token, resolved from the credential store at point of use.
-     * @param certificateFingerprint SHA-256 fingerprint of the certificate the appliance is expected to
-     *     present, or null for ordinary verification against the JVM trust store.
+     * @param trust how the appliance's certificate is verified: a pinned fingerprint, CA certificates, or
+     *     neither for the JVM trust store.
      */
-    HttpRestTransport(@NonNull String baseUrl, @NonNull String token, @CheckForNull String certificateFingerprint) {
+    HttpRestTransport(@NonNull String baseUrl, @NonNull String token, @NonNull PoolTrust trust) {
         this.base = Objects.requireNonNull(baseUrl, "baseUrl").replaceAll("/+$", "");
         this.token = Objects.requireNonNull(token, "token");
-        this.http = TrustedHttpClients.forFingerprint(certificateFingerprint);
+        this.http = TrustedHttpClients.forTrust(Objects.requireNonNull(trust, "trust"));
     }
 
     @Override

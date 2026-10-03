@@ -23,7 +23,7 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.springframework.security.access.AccessDeniedException;
 
 /**
- * Every {@code do*} method on a descriptor is a web endpoint, so each of the eight field validators
+ * Every {@code do*} method on a descriptor is a web endpoint, so each of the nine field validators
  * takes a permission check and a POST guard, matching {@code doTestConnection}. Read alone they are
  * harmless — each returns an ok or an error for the string it was handed — but the guard has to be on
  * the method before one of them grows a lookup that asks the pool something.
@@ -54,7 +54,7 @@ class XcpngFormValidationGuardTest {
     }
 
     /**
-     * The eight validators, each as a call that exercises the guard. The value passed is whatever that
+     * The nine validators, each as a call that exercises the guard. The value passed is whatever that
      * method would accept, so a failure here is the permission check and never the validation logic.
      */
     private static List<NamedCheck> validators(JenkinsRule r) {
@@ -63,9 +63,10 @@ class XcpngFormValidationGuardTest {
         return List.of(
                 new NamedCheck("doCheckPoolUrl", () -> cloud.doCheckPoolUrl("https://pool.example.test")),
                 new NamedCheck("doCheckPoolId", () -> cloud.doCheckPoolId("23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec")),
+                new NamedCheck("doCheckCaCertificates", () -> cloud.doCheckCaCertificates("", null)),
                 new NamedCheck(
                         "doCheckTemplateName",
-                        () -> tpl.doCheckTemplateName("jenkins-agent-debian13", null, null, null, null)),
+                        () -> tpl.doCheckTemplateName("jenkins-agent-debian13", null, null, null, null, null)),
                 new NamedCheck("doCheckLabelString", () -> tpl.doCheckLabelString("xcpng-linux")),
                 new NamedCheck("doCheckNumCpus", () -> tpl.doCheckNumCpus("2")),
                 new NamedCheck("doCheckMemoryMb", () -> tpl.doCheckMemoryMb("2048")),
@@ -82,13 +83,14 @@ class XcpngFormValidationGuardTest {
     private static final String TEMPLATE = "io.jenkins.plugins.xcpng.XcpngTemplate";
 
     /**
-     * All eight, so neither the GET nor the POST assertion can be satisfied by one representative method.
+     * All nine, so neither the GET nor the POST assertion can be satisfied by one representative method.
      * {@code checkMinInstances} is reached over HTTP with no cloud in the ancestor path, so it sees a null
      * cloud and falls back to the plain non-negative rule.
      */
     private static final List<Endpoint> ENDPOINTS = List.of(
             new Endpoint(CLOUD, "checkPoolUrl", "https://pool.example.test", "http://pool.example.test"),
             new Endpoint(CLOUD, "checkPoolId", "23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec", "xcp-ng-hhpfmhok"),
+            new Endpoint(CLOUD, "checkCaCertificates", "", "-----BEGIN PRIVATE KEY-----"),
             new Endpoint(TEMPLATE, "checkTemplateName", "jenkins-agent-debian13", ""),
             new Endpoint(TEMPLATE, "checkLabelString", "xcpng-linux", ""),
             new Endpoint(TEMPLATE, "checkNumCpus", "2", "0"),
@@ -96,7 +98,7 @@ class XcpngFormValidationGuardTest {
             new Endpoint(TEMPLATE, "checkMinInstances", "0", "-1"),
             new Endpoint(TEMPLATE, "checkSshAuthorizedKey", "", "-----BEGIN OPENSSH PRIVATE KEY-----"));
 
-    /** A user without ADMINISTER is refused by every one of the eight, not merely by the first. */
+    /** A user without ADMINISTER is refused by every one of the nine, not merely by the first. */
     @Test
     void aBystanderCannotReachAnyFieldValidator(JenkinsRule r) {
         lockDown(r);

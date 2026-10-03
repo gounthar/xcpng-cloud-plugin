@@ -7,7 +7,9 @@ import hudson.RelativePath;
 import hudson.model.AbstractDescribableImpl;
 import hudson.model.Descriptor;
 import hudson.util.FormValidation;
+import io.jenkins.plugins.xcpng.client.CaCertificates;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.PoolTrust;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -289,14 +291,14 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             HypervisorClient open(
                     @CheckForNull String poolUrl,
                     @CheckForNull String credentialsId,
-                    @CheckForNull String certificateFingerprint,
+                    @NonNull PoolTrust trust,
                     @CheckForNull String poolId);
         }
 
-        private PoolProbe poolProbe = (poolUrl, credentialsId, certificateFingerprint, poolId) -> XcpngCloud.openClient(
+        private PoolProbe poolProbe = (poolUrl, credentialsId, trust, poolId) -> XcpngCloud.openClient(
                 poolUrl,
                 credentialsId,
-                certificateFingerprint,
+                trust,
                 XcpngCloud.normalizePoolId(poolId),
                 XcpngBackend.XO,
                 "the template name check");
@@ -316,14 +318,14 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
          * <p>The connection fields come from the enclosing cloud through {@link RelativePath}, not from a
          * saved {@code XcpngCloud}, because the operator may be typing them right now and the value being
          * checked has to be the one they can see. Core infers {@code checkDependsOn} from this signature,
-         * so editing any of the four re-runs the check as well, which is what makes this validator ask
+         * so editing any of the five re-runs the check as well, which is what makes this validator ask
          * the appliance the operator is currently pointing at rather than the one they were pointing at
          * when the page loaded.
          *
          * <p>This does not remove the runtime case — a golden image can be deleted after the cloud is
          * saved, and #157's retry-forever half is still open — it moves the common case to where it is
          * cheap. The validator fires on page load, on this field's own change, and on a change to any of
-         * the four it depends on, so the cost is roughly a Test connection rather than one per keystroke.
+         * the five it depends on, so the cost is roughly a Test connection rather than one per keystroke.
          */
         @POST
         public FormValidation doCheckTemplateName(
@@ -331,12 +333,18 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                 @RelativePath("..") @QueryParameter String poolUrl,
                 @RelativePath("..") @QueryParameter String credentialsId,
                 @RelativePath("..") @QueryParameter String certificateFingerprint,
+                @RelativePath("..") @QueryParameter String caCertificates,
                 @RelativePath("..") @QueryParameter String poolId) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
                 return FormValidation.error(Messages.XcpngTemplate_templateName_required());
             }
-            return resolveAgainstPool(value.trim(), poolUrl, credentialsId, certificateFingerprint, poolId);
+            return resolveAgainstPool(
+                    value.trim(),
+                    poolUrl,
+                    credentialsId,
+                    new PoolTrust(certificateFingerprint, CaCertificates.normalize(caCertificates)),
+                    poolId);
         }
 
         /**
@@ -355,7 +363,7 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
                 @NonNull String name,
                 @CheckForNull String poolUrl,
                 @CheckForNull String credentialsId,
-                @CheckForNull String certificateFingerprint,
+                @NonNull PoolTrust trust,
                 @CheckForNull String poolId) {
             if (poolUrl == null || poolUrl.isBlank()) {
                 return FormValidation.ok();
@@ -368,7 +376,7 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
             }
             HypervisorClient client;
             try {
-                client = poolProbe.open(url, credentialsId, certificateFingerprint, poolId);
+                client = poolProbe.open(url, credentialsId, trust, poolId);
             } catch (RuntimeException e) {
                 LOGGER.log(Level.FINE, e, () -> "Could not open a session to " + url + " to check a template name");
                 return FormValidation.ok();
