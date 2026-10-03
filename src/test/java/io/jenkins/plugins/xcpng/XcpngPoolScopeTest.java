@@ -133,9 +133,9 @@ class XcpngPoolScopeTest {
     // -- the real client, through the cloud ------------------------------
 
     /**
-     * The cloud's own {@code openClient()}, the one provisioning uses, against a stub appliance with the
-     * same image in two pools. Every other test here goes through a seam; this is the one that shows the
-     * pool reaches the client that clones.
+     * The cloud's own {@code openClient()} against a stub appliance with the same image in two pools: Test
+     * connection and the template check open this one. Provisioning does not; it clones through the agent's
+     * connection snapshot, which is the next test.
      */
     @Test
     void theCloudsClientResolvesInItsPoolAndRefusesAPoolTheTokenCannotSee(JenkinsRule r) throws Exception {
@@ -162,6 +162,46 @@ class XcpngPoolScopeTest {
                 assertTrue(e.getMessage().contains("is not visible to this token"), e.getMessage());
                 assertTrue(e.getMessage().contains(POOL_A) && e.getMessage().contains(POOL_B), e.getMessage());
                 assertFalse(e.getMessage().contains("null"), e.getMessage());
+            }
+        } finally {
+            xo.stop(0);
+        }
+    }
+
+    /**
+     * The client provisioning actually clones through (#282): {@code provisionVm} opens it with {@code
+     * agent.openClientForVm}, from the connection the agent snapshotted when it was built. That snapshot used
+     * to carry no pool, so a cloud scoped to one pool resolved its template in every pool and was refused as
+     * ambiguous on the first launch, on the lab as here. The test above went through {@code
+     * cloud.openClient()} and passed throughout.
+     *
+     * <p>The cloud is repointed after the agent is built, as for the backend: the VM is cloned and destroyed
+     * against the pool the agent was created for, not wherever the cloud points by then.
+     */
+    @Test
+    void provisioningResolvesInThePoolTheAgentWasBuiltFor(JenkinsRule r) throws Exception {
+        HttpServer xo = stubAppliance();
+        try {
+            addToken();
+            String url = "http://127.0.0.1:" + xo.getAddress().getPort();
+            XcpngTemplate template = new XcpngTemplate("golden", "xcpng", 1, 1024);
+            XcpngCloud cloud = new XcpngCloud("xcpng", url, TOKEN_ID, null, 2, List.of(template));
+            cloud.setPoolId(POOL_B);
+            r.jenkins.clouds.add(cloud);
+            XcpngAgent agent = cloud.createAgent(
+                    template,
+                    "xcpng-golden-1",
+                    new org.jenkinsci.plugins.cloudstats.ProvisioningActivity.Id("xcpng", "golden", "xcpng-golden-1"),
+                    false);
+
+            cloud.setPoolId(POOL_A);
+
+            assertEquals(POOL_B, agent.getPoolId(), "the agent must snapshot the cloud's pool when it is built");
+            try (HypervisorClient client = agent.openClientForVm(cloud)) {
+                assertEquals(
+                        POOL_B + "/tpl-b",
+                        client.resolveTemplate("golden").value(),
+                        "the clone must resolve in the agent's pool, not in every pool and not in the cloud's new one");
             }
         } finally {
             xo.stop(0);

@@ -152,6 +152,16 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     private final XcpngBackend backend;
 
+    /**
+     * The pool the owning cloud resolves templates in (#247), snapshotted with the rest of the connection
+     * because provisioning opens its client from this snapshot, not from the cloud (#282). Before it was here
+     * the setting never reached the clone: a cloud scoped to one pool resolved its template in every pool
+     * the token can see. Null for a cloud that names no pool, and on an agent persisted before this field,
+     * both of which resolve everywhere as they always did.
+     */
+    @CheckForNull
+    private final String poolId;
+
     /** See {@link #getNetworkName()}. Persisted with the node; an agent saved before #243 reads null, i.e. inherit. */
     @CheckForNull
     private String networkName;
@@ -272,6 +282,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.credentialsId = cloud.getCredentialsId();
         this.certificateFingerprint = cloud.getCertificateFingerprint();
         this.backend = cloud.getBackend();
+        this.poolId = cloud.getPoolId();
         this.networkName = template.getNetworkName();
     }
 
@@ -344,6 +355,12 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     @CheckForNull
     public String getCertificateFingerprint() {
         return certificateFingerprint;
+    }
+
+    /** The pool snapshotted from the owning cloud, or null if that cloud resolved templates in every pool. */
+    @CheckForNull
+    public String getPoolId() {
+        return poolId;
     }
 
     /** The cloud that provisioned this agent, or null if it has since been removed from the config. */
@@ -635,10 +652,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         // to run only when the cloud had been deleted and said so unconditionally; it runs on every teardown
         // now, and a live cloud reported as removed sends whoever reads that log looking for a configuration
         // change that never happened.
+        // The pool too (#282): provisioning clones through this client, and without it the template resolves in
+        // every pool the token can see, so a cloud scoped to one pool is refused as ambiguous or, with the name
+        // on one other pool only, clones there. Teardown is unaffected either way: a VM handle carries its pool.
         return XcpngCloud.openClient(
                 poolUrl,
                 credentialsId,
                 certificateFingerprint,
+                poolId,
                 getBackend(),
                 (cloudIsGone ? "the removed cloud '" : "cloud '") + cloudName + "'");
     }
