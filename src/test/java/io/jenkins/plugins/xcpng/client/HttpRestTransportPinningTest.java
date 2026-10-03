@@ -467,6 +467,34 @@ class HttpRestTransportPinningTest {
         });
     }
 
+    /**
+     * A CA whose key usage forbids certificate signing does not get to vouch for a leaf, even though its
+     * basicConstraints say CA. Refused when the client is built, before any connection. Without that check the
+     * JDK still refuses it, at the handshake ("TrustAnchor ... does not have keyCertSign bit set"), which is
+     * what this test sees when the parser check is removed: an SSLHandshakeException, not a connection.
+     */
+    @Test
+    void aCaForbiddenToSignCertificatesCannotVouchForALeaf() throws Exception {
+        KeyPair caKeys = generateKeyPair();
+        X509Certificate noSign = CaCertificatesTest.certificate(
+                "CN=No Sign CA",
+                "CN=No Sign CA",
+                caKeys,
+                caKeys,
+                true,
+                org.bouncycastle.asn1.x509.KeyUsage.digitalSignature);
+        KeyPair leafKeys = generateKeyPair();
+        X509Certificate leaf = new CertificateAuthority(noSign, caKeys).issueLeaf(leafKeys.getPublic());
+
+        withServer(leafKeys.getPrivate(), new Certificate[] {leaf}, url -> {
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> get(new HttpRestTransport(
+                            url, "a-token", PoolTrust.anchoredAt(CaCertificatesTest.pem(noSign)))));
+            assertTrue(e.getMessage().contains("keyCertSign"), e.getMessage());
+        });
+    }
+
     /** Both modes at once is refused when the client is built, not resolved by picking one. */
     @Test
     void aFingerprintAndACaTogetherAreRefused() throws Exception {

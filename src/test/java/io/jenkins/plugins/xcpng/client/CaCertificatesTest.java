@@ -19,6 +19,7 @@ import java.util.List;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.KeyUsage;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
@@ -130,6 +131,22 @@ class CaCertificatesTest {
         assertTrue(e.getMessage().contains("not valid base64"), e.getMessage());
     }
 
+    /** basicConstraints CA:TRUE with a key usage that leaves out keyCertSign is refused, by name. */
+    @Test
+    void aCaWhoseKeyUsageForbidsCertificateSigningIsRefused() throws Exception {
+        KeyPair keys = keyPair();
+        X509Certificate noSign =
+                certificate("CN=No Sign CA", "CN=No Sign CA", keys, keys, true, KeyUsage.digitalSignature);
+        IllegalArgumentException e =
+                assertThrows(IllegalArgumentException.class, () -> CaCertificates.parse(pem(noSign)));
+        assertTrue(e.getMessage().contains("keyCertSign"), e.getMessage());
+
+        // The control: the same shape with keyCertSign set is accepted.
+        X509Certificate signs = certificate(
+                "CN=Signing CA", "CN=Signing CA", keys, keys, true, KeyUsage.keyCertSign | KeyUsage.cRLSign);
+        assertEquals(List.of(signs), CaCertificates.parse(pem(signs)));
+    }
+
     @Test
     void normalizeUnifiesLineEndingsAndDropsBlank() throws Exception {
         assertEquals("a\nb\nc", CaCertificates.normalize("  a\r\nb\rc\n\n"));
@@ -154,6 +171,13 @@ class CaCertificatesTest {
 
     private static X509Certificate certificate(
             String subject, String issuer, KeyPair subjectKeys, KeyPair issuerKeys, boolean ca) throws Exception {
+        return certificate(subject, issuer, subjectKeys, issuerKeys, ca, -1);
+    }
+
+    /** As above; {@code keyUsage} is a {@link KeyUsage} bit mask, or -1 for no key usage extension. */
+    static X509Certificate certificate(
+            String subject, String issuer, KeyPair subjectKeys, KeyPair issuerKeys, boolean ca, int keyUsage)
+            throws Exception {
         JcaX509v3CertificateBuilder builder = new JcaX509v3CertificateBuilder(
                 new X500Name(issuer),
                 new BigInteger(64, new SecureRandom()),
@@ -163,6 +187,9 @@ class CaCertificatesTest {
                 subjectKeys.getPublic());
         if (ca) {
             builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(true));
+        }
+        if (keyUsage >= 0) {
+            builder.addExtension(Extension.keyUsage, true, new KeyUsage(keyUsage));
         }
         return new JcaX509CertificateConverter()
                 .getCertificate(

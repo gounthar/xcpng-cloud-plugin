@@ -27,6 +27,9 @@ public final class CaCertificates {
     private static final Pattern BLOCK =
             Pattern.compile("-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", Pattern.DOTALL);
 
+    /** Index of {@code keyCertSign} in {@link X509Certificate#getKeyUsage()}, per RFC 5280 section 4.2.1.3. */
+    private static final int KEY_CERT_SIGN = 5;
+
     private CaCertificates() {}
 
     /**
@@ -85,6 +88,17 @@ public final class CaCertificates {
                         + certificate.getSubjectX500Principal().getName() + ") is not a CA certificate. Paste the"
                         + " certificate of the authority that issued the appliance's certificate; to trust one"
                         + " certificate exactly, use Certificate fingerprint instead.");
+            }
+            // basicConstraints says the certificate may be a CA; keyUsage, when present, can still forbid it to sign
+            // certificates. The JDK's validator refuses such an anchor at handshake time ("TrustAnchor ... does not
+            // have keyCertSign bit set"), so this is not the only line of defence. It is here so the operator meets
+            // the refusal on the form, naming the certificate, rather than as a TLS failure at first connection.
+            boolean[] keyUsage = certificate.getKeyUsage();
+            if (keyUsage != null && (keyUsage.length <= KEY_CERT_SIGN || !keyUsage[KEY_CERT_SIGN])) {
+                throw new IllegalArgumentException("Certificate " + index + " ("
+                        + certificate.getSubjectX500Principal().getName() + ") is marked as a CA but its key usage"
+                        + " does not allow it to sign certificates (keyCertSign), so it cannot vouch for the"
+                        + " appliance's certificate. Paste the certificate of the authority that actually issued it.");
             }
             certificates.add(certificate);
         }
