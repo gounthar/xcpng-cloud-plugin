@@ -290,9 +290,11 @@ table, the Packer workflow and its honest status, and the produced template name
 
 - **Credentials are never stored in the plugin configuration.** Only the credential ID is persisted;
   the token is resolved from the Jenkins credentials store when a connection is opened.
-- **The owner marker is a convention, not an authorisation boundary.** Each clone carries the
-  `xcpng-cloud` owner tag. The plugin destroys only the VMs it recorded creating, and
-  `tools/reaper.py` selects on the tag. Both decide what this project's own code chooses to touch,
+- **The owner marker is a convention, not an authorisation boundary.** The plugin tags each clone
+  it sets up with the `xcpng-cloud` owner tag. (A clone whose create call is refused while still in
+  flight can be left untagged; the error says so and names the VM, which then has to be removed by
+  hand.) The plugin destroys only the VMs it recorded creating, and `tools/reaper.py` selects on the
+  tag. Both decide what this project's own code chooses to touch,
   not what the token can reach: the token can do whatever the Xen Orchestra user it belongs to can do,
   and nothing in the plugin narrows that. An admin token, or a user granted VM privileges without a
   selector, reaches every VM the appliance manages. Keep that in mind before pointing the plugin at a
