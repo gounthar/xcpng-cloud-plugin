@@ -294,11 +294,11 @@ table, the Packer workflow and its honest status, and the produced template name
   `xcpng-cloud` owner tag. The plugin destroys only the VMs it recorded creating, and
   `tools/reaper.py` selects on the tag. Both decide what this project's own code chooses to touch,
   not what the token can reach: the token can do whatever the Xen Orchestra user it belongs to can do,
-  and nothing in the plugin narrows that. On a lab appliance, Xen Orchestra's REST privileges were
-  granted per resource type with no per-VM dimension, and a user with `read` on VMs saw every VM on the
-  pool. Destroy was not tested, but expect the same: a user that can destroy the plugin's agents can
-  likely destroy other VMs too. Keep that in mind before pointing the plugin at a pool that also runs
-  production VMs. The minimum permissions the token needs have not been established yet (#136).
+  and nothing in the plugin narrows that. An admin token, or a user granted VM privileges without a
+  selector, reaches every VM the appliance manages. Keep that in mind before pointing the plugin at a
+  pool that also runs production VMs. Xen Orchestra's ACL privileges can carry a selector that limits
+  them to matching objects, which may let a dedicated user be confined to the VMs it created; that has
+  not been tried with this plugin yet, and neither has the minimum set of permissions it needs (#136).
 - **The JNLP secret is delivered through the VM record's `xenstore-data`.** It is not hidden from the
   pool: until the agent connects, anyone with read access to the VM record (an XAPI read-only role, a
   Xen Orchestra user who can see the VM, a metadata export or a backup) can read it through `xe vm-param-get param-name=xenstore-data` or the
