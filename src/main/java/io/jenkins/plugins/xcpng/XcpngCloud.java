@@ -13,6 +13,7 @@ import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.TaskListener;
+import hudson.model.labels.LabelAtom;
 import hudson.security.ACL;
 import hudson.slaves.AbstractCloudComputer;
 import hudson.slaves.Cloud;
@@ -42,6 +43,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -777,7 +779,7 @@ public class XcpngCloud extends Cloud {
                         name,
                         displayName,
                         template.getTemplateName(),
-                        template.getNetworkName(),
+                        warmKey(template),
                         true,
                         System.currentTimeMillis() + RESERVATION_TTL_MILLIS);
         try {
@@ -844,15 +846,15 @@ public class XcpngCloud extends Cloud {
             return;
         }
         // Drain after the fill, in the same tick and still under this cloud's monitor, but outside the
-        // capacity lock. A template sitting at its target has no deficit and no surplus, so it is untouched
-        // by both halves.
-        for (XcpngTemplate template : templates) {
-            List<XcpngAgent> spares =
-                    warmByTemplate.get(warmKey(template.getTemplateName(), template.getNetworkName()));
+        // capacity lock. A pool sitting at its target has no deficit and no surplus, so it is untouched by
+        // both halves. Measured per pool, not per entry: an entry reading a sibling's spares as its own
+        // surplus would reap them, and the sibling's next fill would clone them again, every tick.
+        for (Map.Entry<String, Integer> pool : warmTargets().entrySet()) {
+            List<XcpngAgent> spares = warmByTemplate.get(pool.getKey());
             if (spares == null) {
                 continue;
             }
-            int surplus = spares.size() - warmTarget(template);
+            int surplus = spares.size() - pool.getValue();
             for (XcpngAgent spare : spares) {
                 if (surplus <= 0) {
                     break;
@@ -874,7 +876,7 @@ public class XcpngCloud extends Cloud {
      * <p>Runs under the capacity lock, called only from {@link #reconcileWarmPool}. Returns false when the
      * provisioning pool is shutting down, which is the one condition worth abandoning the whole tick for.
      *
-     * @param warmByTemplate filled with this cloud's unused spares, keyed by template name
+     * @param warmByTemplate filled with this cloud's unused spares, keyed by warm pool ({@link #warmKey})
      * @param orphanedSpares filled with spares whose template is no longer configured
      */
     private boolean fillWarmPool(
@@ -884,7 +886,7 @@ public class XcpngCloud extends Cloud {
         // themselves are collected, not just counted, because the drain needs the agents to reap.
         Set<String> configuredTemplates = new HashSet<>();
         for (XcpngTemplate template : templates) {
-            configuredTemplates.add(warmKey(template.getTemplateName(), template.getNetworkName()));
+            configuredTemplates.add(warmKey(template));
         }
         Set<String> registered = new HashSet<>();
         for (Node node : Jenkins.get().getNodes()) {
@@ -899,9 +901,14 @@ public class XcpngCloud extends Cloud {
                         // (#243), so a spare cabled to a network no entry for its image names any more is
                         // drained the same way rather than serving builds on the old network, and two entries
                         // for one image on two networks keep two pools instead of one draining the other's.
-                        // An activity naming no template matches no entry, and is drained as before.
+                        // Labels likewise: a spare serves only builds asking for a label it carries, so one
+                        // whose labels no entry names any more is stale, and two entries for one image under
+                        // two label sets are two pools. An activity naming no template matches no entry, and
+                        // is drained as before.
                         String templateName = id.getTemplateName();
-                        String key = templateName == null ? null : warmKey(templateName, agent.getNetworkName());
+                        String key = templateName == null
+                                ? null
+                                : warmKey(templateName, agent.getNetworkName(), agent.getLabelString());
                         if (key != null && configuredTemplates.contains(key)) {
                             warmByTemplate
                                     .computeIfAbsent(key, k -> new ArrayList<>())
@@ -922,11 +929,15 @@ public class XcpngCloud extends Cloud {
         int capacity = Math.max(
                 0,
                 maxInstances - registered.size() - XcpngReservationStore.get().count(name));
-        for (XcpngTemplate template : templates) {
-            int target = warmTarget(template);
+        for (Map.Entry<String, Integer> pool : warmTargets().entrySet()) {
+            String key = pool.getKey();
+            int target = pool.getValue();
             if (target <= 0) {
                 continue;
             }
+            // The spares of one pool are interchangeable, so they are cloned from the first entry that asked
+            // for any; entries sharing a key differ at most in sizing.
+            XcpngTemplate template = firstWarmEntry(key);
             // A warm pool refills on a timer with nothing queued, so a template that cannot resolve
             // produces the same endless stream of failures here as on the on-demand path, and with nobody
             // waiting on a build to notice it. Same backoff, read the same way (#157).
@@ -934,10 +945,8 @@ public class XcpngCloud extends Cloud {
                 continue;
             }
             // Deficit against both the spares already registered and those still booting, so repeated
-            // ticks do not stack duplicate provisions for the same template.
-            int deficit = target
-                    - warmCount(warmByTemplate, warmKey(template.getTemplateName(), template.getNetworkName()))
-                    - warmReserved(template);
+            // ticks do not stack duplicate provisions for the same pool.
+            int deficit = target - warmCount(warmByTemplate, key) - warmReserved(key);
             int toLaunch = Math.min(deficit, capacity);
             for (int i = 0; i < toLaunch; i++) {
                 final String displayName = "xcpng-" + template.getTemplateName() + "-"
@@ -955,13 +964,57 @@ public class XcpngCloud extends Cloud {
     }
 
     /**
-     * What a warm pool is keyed by: the golden image and the network its clones are cabled to. A NUL cannot
-     * occur in either half (a Jenkins form field or JCasC scalar would have to carry one), so two different
-     * pairs never collide; null, the template's own NIC, is spelled differently from every network name.
+     * What a warm pool is keyed by: the golden image, the network its clones are cabled to, and the labels
+     * they carry. Two spares with the same key serve exactly the same builds, so they are one pool; any of
+     * the three differing makes two. A NUL cannot occur in any part (a Jenkins form field or JCasC scalar
+     * would have to carry one), so two different triples never collide; null, the template's own NIC, is
+     * spelled differently from every network name. Labels are compared as a set, so {@code "a b"} and
+     * {@code "b  a"} name one pool.
      */
     @NonNull
-    static String warmKey(@NonNull String templateName, @CheckForNull String networkName) {
-        return templateName + (networkName == null ? "\u0000" : "\u0000=" + networkName);
+    static String warmKey(
+            @NonNull String templateName, @CheckForNull String networkName, @CheckForNull String labelString) {
+        Set<String> atoms = new TreeSet<>();
+        if (labelString != null && !labelString.isBlank()) {
+            for (LabelAtom atom : Label.parse(labelString)) {
+                atoms.add(atom.getName());
+            }
+        }
+        return templateName
+                + (networkName == null ? "\u0000" : "\u0000=" + networkName)
+                + "\u0000"
+                + String.join("\u0000", atoms);
+    }
+
+    /** The warm pool an entry's spares belong to. */
+    @NonNull
+    static String warmKey(@NonNull XcpngTemplate template) {
+        return warmKey(template.getTemplateName(), template.getNetworkName(), template.getLabelString());
+    }
+
+    /**
+     * Each warm pool's target: the sum of {@link #warmTarget} over the entries sharing its key, in the order
+     * the entries are configured. A pool whose entries all want none still appears, at zero, so the drain
+     * empties it.
+     */
+    @NonNull
+    private Map<String, Integer> warmTargets() {
+        Map<String, Integer> targets = new LinkedHashMap<>();
+        for (XcpngTemplate template : templates) {
+            targets.merge(warmKey(template), warmTarget(template), Integer::sum);
+        }
+        return targets;
+    }
+
+    /** The first entry with a warm target in the given pool; only called for a pool whose target is positive. */
+    @NonNull
+    private XcpngTemplate firstWarmEntry(@NonNull String key) {
+        for (XcpngTemplate template : templates) {
+            if (warmTarget(template) > 0 && warmKey(template).equals(key)) {
+                return template;
+            }
+        }
+        throw new IllegalStateException("no entry wants spares in warm pool " + key);
     }
 
     /**
@@ -1082,8 +1135,8 @@ public class XcpngCloud extends Cloud {
         return Math.max(0, template.getMinInstances());
     }
 
-    private static int warmCount(@NonNull Map<String, List<XcpngAgent>> warmByTemplate, @NonNull String templateName) {
-        List<XcpngAgent> spares = warmByTemplate.get(templateName);
+    private static int warmCount(@NonNull Map<String, List<XcpngAgent>> warmByTemplate, @NonNull String key) {
+        List<XcpngAgent> spares = warmByTemplate.get(key);
         return spares == null ? 0 : spares.size();
     }
 
@@ -1820,10 +1873,9 @@ public class XcpngCloud extends Cloud {
         }
     }
 
-    /** Reservations for a template's warm spares, so repeated ticks do not stack duplicate provisions. */
-    private int warmReserved(@NonNull XcpngTemplate template) {
-        return XcpngReservationStore.get()
-                .countWarmForTemplate(name, template.getTemplateName(), template.getNetworkName());
+    /** Reservations for a warm pool's spares, so repeated ticks do not stack duplicate provisions. */
+    private int warmReserved(@NonNull String warmPool) {
+        return XcpngReservationStore.get().countWarmForPool(name, warmPool);
     }
 
     /**

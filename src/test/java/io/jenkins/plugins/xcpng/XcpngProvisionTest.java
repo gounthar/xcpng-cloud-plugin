@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -1120,6 +1121,17 @@ class XcpngProvisionTest {
         return count;
     }
 
+    /** The label strings the warm spares on the node list carry, as a set. */
+    private static Set<String> warmLabels(JenkinsRule r) {
+        Set<String> labels = new HashSet<>();
+        for (Node node : r.jenkins.getNodes()) {
+            if (node instanceof XcpngAgent agent && agent.isWarm()) {
+                labels.add(agent.getLabelString());
+            }
+        }
+        return labels;
+    }
+
     @Test
     void warmPoolFillsToMinInstances(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
@@ -1841,6 +1853,101 @@ class XcpngProvisionTest {
         }
         assertEquals(Set.of("net-a", "net-b"), networks);
         assertEquals(0, destroyCount(fake), "neither pool may drain the other: " + fake.calls());
+    }
+
+    @Test
+    void oneImageOnOneNetworkUnderTwoLabelsKeepsTwoWarmPools(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate small = new XcpngTemplate("jenkins-golden-debian", "small", 2, 2048);
+        small.setMinInstances(1);
+        XcpngTemplate big = new XcpngTemplate("jenkins-golden-debian", "big", 8, 8192);
+        big.setMinInstances(1);
+        XcpngCloud cloud = warmCloudOver(fake, 4, small, big);
+        r.jenkins.clouds.add(cloud);
+
+        // A spare serves only builds asking for a label it carries. Counted by image and network alone, the
+        // "small" spare (or its reservation) satisfies the "big" target, and a build asking for "big" finds
+        // no spare however long it waits. Both launch in the first tick: within one, the "small" spare is
+        // still only a reservation, and that reservation must not count against "big".
+        reconcileAndSettle(cloud);
+        assertEquals(2, warmNodeCount(r), "both pools fill in a single tick");
+        reconcileAndSettle(cloud);
+
+        assertEquals(2, warmNodeCount(r), "each label keeps its own spare");
+        assertEquals(Set.of("small", "big"), warmLabels(r));
+        assertEquals(0, destroyCount(fake), "neither pool may drain the other: " + fake.calls());
+    }
+
+    @Test
+    void anEntryWithNoTargetDoesNotDrainASiblingsSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate warmed = new XcpngTemplate("jenkins-golden-debian", "small", 2, 2048);
+        warmed.setMinInstances(2);
+        XcpngTemplate onDemand = new XcpngTemplate("jenkins-golden-debian", "big", 8, 8192);
+        XcpngCloud cloud = warmCloudOver(fake, 4, warmed, onDemand);
+        r.jenkins.clouds.add(cloud);
+
+        // Sharing one bucket, the on-demand entry reads both spares as its own surplus against a target of
+        // zero and reaps them, and the next fill clones them again: a destroy and a clone every tick.
+        reconcileAndSettle(cloud);
+        reconcileAndSettle(cloud);
+        reconcileAndSettle(cloud);
+
+        assertEquals(2, warmNodeCount(r), "the warmed entry keeps its two spares");
+        assertEquals(Set.of("small"), warmLabels(r));
+        assertEquals(0, destroyCount(fake), "the on-demand entry must not drain them: " + fake.calls());
+    }
+
+    @Test
+    void changingATemplatesLabelsReplacesItsWarmSpares(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate before = new XcpngTemplate("jenkins-golden-debian", "old-label", 2, 2048);
+        before.setMinInstances(1);
+        XcpngCloud first = warmCloudOver(fake, 4, before);
+        r.jenkins.clouds.add(first);
+        reconcileAndSettle(first);
+        assertEquals(Set.of("old-label"), warmLabels(r));
+
+        // Kept, the old spare would serve no build at all: nothing asks for "old-label" any more, and a
+        // spare is exempt from the idle reap, so it would hold a slot until the cloud was reconfigured again.
+        XcpngTemplate after = new XcpngTemplate("jenkins-golden-debian", "new-label", 2, 2048);
+        after.setMinInstances(1);
+        XcpngCloud relabelled = warmCloudOver(fake, 4, after);
+        r.jenkins.clouds.remove(first);
+        r.jenkins.clouds.add(relabelled);
+        reconcileAndSettle(relabelled);
+        assertEquals(1, destroyCount(fake), "the spare under the old label must be drained: " + fake.calls());
+
+        reconcileAndSettle(relabelled);
+        assertEquals(Set.of("new-label"), warmLabels(r), "and replaced by one under the new label");
+    }
+
+    @Test
+    void theWarmPoolKeyReadsLabelsAsASet(JenkinsRule r) {
+        assertEquals(
+                XcpngCloud.warmKey("img", null, "linux  x86"),
+                XcpngCloud.warmKey("img", null, "x86 linux"),
+                "the order and spacing of labels must not split one pool in two");
+        assertNotEquals(XcpngCloud.warmKey("img", null, "linux"), XcpngCloud.warmKey("img", null, "linux x86"));
+        assertNotEquals(XcpngCloud.warmKey("img", null, "linux"), XcpngCloud.warmKey("img", "net", "linux"));
+        assertNotEquals(XcpngCloud.warmKey("img", null, "a"), XcpngCloud.warmKey("img", "=a", ""));
+    }
+
+    @Test
+    void twoIdenticalEntriesWarmTheSumOfTheirTargets(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngTemplate first = warmTemplate("jenkins-golden-debian", 1);
+        XcpngTemplate second = warmTemplate("jenkins-golden-debian", 2);
+        XcpngCloud cloud = warmCloudOver(fake, 4, first, second);
+        r.jenkins.clouds.add(cloud);
+
+        // Same image, network and labels: a spare from either entry serves exactly the same builds, so they
+        // are one pool, and its size is what the two entries asked for between them.
+        reconcileAndSettle(cloud);
+        reconcileAndSettle(cloud);
+
+        assertEquals(3, warmNodeCount(r), "one pool holding both entries' spares");
+        assertEquals(0, destroyCount(fake), "and nothing drained: " + fake.calls());
     }
 
     @Test
