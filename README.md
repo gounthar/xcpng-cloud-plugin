@@ -132,7 +132,9 @@ timeout, 10 min 45 s with `idleMinutes` 10.
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
   the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
   unreachable, a clone never connects and is destroyed after the connect timeout.
-- A Xen Orchestra authentication token stored in Jenkins as a **secret-text** credential.
+- A Xen Orchestra authentication token stored in Jenkins as a **secret-text** credential. An admin
+  user's token works; a dedicated user with only the permissions the plugin needs is better, see
+  [A least-privilege Xen Orchestra user](#a-least-privilege-xen-orchestra-user).
 
 ## Configuration
 
@@ -152,6 +154,65 @@ timeout, 10 min 45 s with `idleMinutes` 10.
    the shape of the agents cloned from it. At least one label is required, and labels are how builds
    reach these agents: give the jobs you want on XCP-ng a matching label expression.
 5. Use **Test connection** to confirm the controller can authenticate against the appliance.
+
+### A least-privilege Xen Orchestra user
+
+The token can do whatever the user it belongs to can do, so an admin token lets the plugin reach every
+VM the appliance manages. Xen Orchestra's ACL roles can do better: a user with `permission: none` and
+a role holding the privileges below can run the plugin's provisioning cycle, and the VM privileges
+can be limited to the VMs that user created.
+
+| Resource | Actions | Scope |
+|---|---|---|
+| `pool` | `read`, `create:vm` | all |
+| `vm-template` | `read`, `instantiate` | all |
+| `network` | `read` | all |
+| `vif` | `read` | all |
+| `vm` | `read`, `update:tags`, `update:cpus`, `update:memory`, `update:xenStoreData`, `update:memoryMin`, `start`, `shutdown:clean`, `delete` | selector `creation:user:<user id>` |
+
+Each row is one privilege per action, created with `POST /rest/v0/acl-privileges` and a body such as:
+
+```json
+{ "action": "delete", "resource": "vm", "roleId": "<role id>", "effect": "allow",
+  "selector": "creation:user:<user id>" }
+```
+
+Create the user with `POST /rest/v0/users` (`"permission": "none"`), the role with
+`POST /rest/v0/acl-roles`, attach one to the other with `PUT /rest/v0/acl-roles/<role id>/users/<user id>`,
+and add the privileges as that admin. The token has to be minted by the user itself, logged in with its
+own password: `POST /rest/v0/users/<user id>/authentication_tokens`.
+
+What this does and does not cover:
+
+- **Measured** on the lab appliance (Xen Orchestra REST API 0.40.2, 2026-10-04), once: such a user
+  cloned the golden image, seeded, started, shut down and destroyed the clone. With the selector in
+  place it listed none of the other VMs, and tagging a VM it had not created was refused with
+  `403 not enough privileges`.
+- **The three `read` privileges never show up as a refusal.** Listing pools, templates or networks
+  without them answers with an empty list, so the plugin reports the template or network as not found
+  rather than as a permission problem. Check them first when a dedicated user cannot find a template
+  that an admin can.
+- **Not measured:** a template with **Network** set, where the clone's network card is passed to the
+  create call; the appliance's source asks for `vif:create` there, so add it if you use that field.
+  Also not measured: **Test connection**, the warm pool (it uses the same calls), and whether ACL roles
+  require a particular Xen Orchestra edition.
+- The selector matches the user recorded in the VM's `creation` field, which Xen Orchestra set to the
+  creating user on every clone in that run. Going by the appliance's source, a VM created by any other
+  user carries that user instead, and falls outside the selector.
+
+**Switching an existing cloud to such a user can strand its running agents.** Their VMs were created
+by the previous user, so the selector puts them outside the new one's reach. Each agent keeps the
+credential ID it was provisioned with and looks the token up at teardown, which gives two outcomes:
+
+- Store the new user's token as a **new** credential and point the cloud at it, keeping the old
+  credential until the old agents are gone. They tear down with the token that created them.
+- Replace the token **inside** the existing credential, or delete the old credential early, and every
+  running agent, warm spares included, is refused at teardown; its VM and disks stay behind.
+  `tools/reaper.py` works on the pool directly over XAPI rather than through Xen Orchestra, so it can
+  still remove them.
+
+This follows from the snapshot and the selector; neither path has been tried. The same applies when
+one scoped user is later replaced by another.
 
 ### Upgrading from a release that spoke XAPI
 
