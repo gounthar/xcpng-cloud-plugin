@@ -193,6 +193,16 @@ Create the user with `POST /rest/v0/users` (`"permission": "none"`), the role wi
 and add the privileges as that admin. The token has to be minted by the user itself, logged in with its
 own password: `POST /rest/v0/users/<user id>/authentication_tokens`.
 
+**Tokens expire, and nothing warns you.** Read in Xen Orchestra's source, not measured: a token minted
+without `expiresIn` lasts the appliance's `defaultTokenValidity` (30 days in the shipped configuration),
+`expiresIn` may ask for up to `maxTokenValidity` (half a year), both are appliance settings, and using
+a token does not extend it. So mint the plugin's token on purpose, for example with
+`{"client": {"id": "jenkins-xcpng-cloud"}, "expiresIn": "0.5 year"}`, and note when it runs out.
+Posting the same body again while the token is still valid extends that same token, so the Jenkins
+credential does not have to change. An expired token stops provisioning, and also teardown: a VM the
+plugin cannot delete goes on the cloud's leaked-VM list, which is retried every minute, so it is
+reclaimed once a valid token is back, but it holds memory and storage until then.
+
 What this does and does not cover:
 
 - **Measured** on the lab appliance (Xen Orchestra REST API 0.40.2, 2026-10-04). A replay of the
