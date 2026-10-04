@@ -200,6 +200,20 @@ What this does and does not cover:
   creating user on every clone in that run. Going by the appliance's source, a VM created by any other
   user carries that user instead, and falls outside the selector.
 
+**Switching an existing cloud to such a user can strand its running agents.** Their VMs were created
+by the previous user, so the selector puts them outside the new one's reach. Each agent keeps the
+credential ID it was provisioned with and looks the token up at teardown, which gives two outcomes:
+
+- Store the new user's token as a **new** credential and point the cloud at it, keeping the old
+  credential until the old agents are gone. They tear down with the token that created them.
+- Replace the token **inside** the existing credential, or delete the old credential early, and every
+  running agent, warm spares included, is refused at teardown; its VM and disks stay behind.
+  `tools/reaper.py` works on the pool directly over XAPI rather than through Xen Orchestra, so it can
+  still remove them.
+
+This follows from the snapshot and the selector; neither path has been tried. The same applies when
+one scoped user is later replaced by another.
+
 ### Upgrading from a release that spoke XAPI
 
 Earlier releases could talk to a pool master directly over XAPI, and that was the default. **This
