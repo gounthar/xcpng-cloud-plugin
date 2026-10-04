@@ -159,13 +159,16 @@ timeout, 10 min 45 s with `idleMinutes` 10.
 
 The token can do whatever the user it belongs to can do, so an admin token lets the plugin reach every
 VM the appliance manages. Xen Orchestra's ACL roles can do better: a user with `permission: none` and
-a role holding the privileges below can run the plugin's provisioning cycle, and the VM privileges
-can be limited to the VMs that user created.
+a role holding the privileges below can run the plugin's provisioning cycle. The VM privileges can be
+limited to the VMs that user created, and the right to create VMs to the pool and golden image the
+plugin uses.
 
 | Resource | Actions | Scope |
 |---|---|---|
-| `pool` | `read`, `create:vm` | all |
-| `vm-template` | `read`, `instantiate` | all |
+| `pool` | `read` | all |
+| `pool` | `create:vm` | selector `id:<pool id>` |
+| `vm-template` | `read` | all |
+| `vm-template` | `instantiate` | selector `id:<template id>`, one privilege per golden image |
 | `network` | `read` | all |
 | `vif` | `read` | all |
 | `vm` | `read`, `update:tags`, `update:cpus`, `update:memory`, `update:xenStoreData`, `update:memoryMin`, `start`, `shutdown:clean`, `delete` | selector `creation:user:<user id>` |
@@ -177,6 +180,13 @@ Each row is one privilege per action, created with `POST /rest/v0/acl-privileges
   "selector": "creation:user:<user id>" }
 ```
 
+Take the pool and template ids from the `id` field of `GET /rest/v0/pools` and
+`GET /rest/v0/vm-templates`. A template's `id` is not always its UUID: on the lab appliance, a golden
+image's `id` was its UUID, but a built-in template's was `<pool id>-<uuid>`.
+
+Without those two selectors, a leaked token could still clone any template onto any pool the appliance
+manages, which is enough to fill a pool's memory and storage even though it cannot touch existing VMs.
+
 Create the user with `POST /rest/v0/users` (`"permission": "none"`), the role with
 `POST /rest/v0/acl-roles`, attach one to the other with `PUT /rest/v0/acl-roles/<role id>/users/<user id>`,
 and add the privileges as that admin. The token has to be minted by the user itself, logged in with its
@@ -187,7 +197,9 @@ What this does and does not cover:
 - **Measured** on the lab appliance (Xen Orchestra REST API 0.40.2, 2026-10-04), once: such a user
   cloned the golden image, seeded, started, shut down and destroyed the clone. With the selector in
   place it listed none of the other VMs, and tagging a VM it had not created was refused with
-  `403 not enough privileges`.
+  `403 not enough privileges`. In a separate run the same day, with `create:vm` and `instantiate`
+  scoped as above, the cycle still passed, while creating a VM from another template on the same pool
+  was refused on `instantiate`, and from a template on the other pool on both.
 - **The three `read` privileges never show up as a refusal.** Listing pools, templates or networks
   without them answers with an empty list, so the plugin reports the template or network as not found
   rather than as a permission problem. Check them first when a dedicated user cannot find a template
