@@ -290,6 +290,15 @@ table, the Packer workflow and its honest status, and the produced template name
 
 - **Credentials are never stored in the plugin configuration.** Only the credential ID is persisted;
   the token is resolved from the Jenkins credentials store when a connection is opened.
+- **The owner marker is a convention, not an authorisation boundary.** Each clone carries the
+  `xcpng-cloud` owner tag. The plugin destroys only the VMs it recorded creating, and
+  `tools/reaper.py` selects on the tag. Both decide what this project's own code chooses to touch,
+  not what the token can reach: the token can do whatever the Xen Orchestra user it belongs to can do,
+  and nothing in the plugin narrows that. On a lab appliance, Xen Orchestra's REST privileges were
+  granted per resource type with no per-VM dimension, and a user with `read` on VMs saw every VM on the
+  pool. Destroy was not tested, but expect the same: a user that can destroy the plugin's agents can
+  likely destroy other VMs too. Keep that in mind before pointing the plugin at a pool that also runs
+  production VMs. The minimum permissions the token needs have not been established yet (#136).
 - **The JNLP secret is delivered through the VM record's `xenstore-data`.** It is not hidden from the
   pool: until the agent connects, anyone with read access to the VM record (an XAPI read-only role, a
   Xen Orchestra user who can see the VM, a metadata export or a backup) can read it through `xe vm-param-get param-name=xenstore-data` or the
