@@ -296,9 +296,9 @@ table, the Packer workflow and its honest status, and the produced template name
   not what the token can reach: the token can do whatever the Xen Orchestra user it belongs to can do,
   and nothing in the plugin narrows that. An admin token, or a user granted VM privileges without a
   selector, reaches every VM the appliance manages. Keep that in mind before pointing the plugin at a
-  pool that also runs production VMs. Xen Orchestra's ACL privileges can carry a selector that limits
-  them to matching objects, which may let a dedicated user be confined to the VMs it created; that has
-  not been tried with this plugin yet, and neither has the minimum set of permissions it needs (#136).
+  pool that also runs production VMs. Xen Orchestra itself can enforce the boundary the marker cannot:
+  an ACL privilege selector can confine a dedicated user to the VMs it created. The permissions the
+  plugin needs, and how to scope them, are tracked in #136.
 - **The JNLP secret is delivered through the VM record's `xenstore-data`.** It is not hidden from the
   pool: until the agent connects, anyone with read access to the VM record (an XAPI read-only role, a
   Xen Orchestra user who can see the VM, a metadata export or a backup) can read it through `xe vm-param-get param-name=xenstore-data` or the
