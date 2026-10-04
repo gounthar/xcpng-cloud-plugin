@@ -171,6 +171,7 @@ plugin uses.
 | `vm-template` | `instantiate` | selector `id:<template id>`, one privilege per golden image |
 | `network` | `read` | all |
 | `vif` | `read` | all |
+| `vif` | `create` | all; only needed when a template has **Network** set |
 | `vm` | `read`, `update:tags`, `update:cpus`, `update:memory`, `update:xenStoreData`, `update:memoryMin`, `start`, `shutdown:clean`, `delete` | selector `creation:user:<user id>` |
 
 Each row is one privilege per action, created with `POST /rest/v0/acl-privileges` and a body such as:
@@ -192,22 +193,37 @@ Create the user with `POST /rest/v0/users` (`"permission": "none"`), the role wi
 and add the privileges as that admin. The token has to be minted by the user itself, logged in with its
 own password: `POST /rest/v0/users/<user id>/authentication_tokens`.
 
+**Tokens expire, and nothing warns you.** Read in Xen Orchestra's source, not measured: a token minted
+without `expiresIn` lasts the appliance's `defaultTokenValidity` (30 days in the shipped configuration),
+`expiresIn` may ask for up to `maxTokenValidity` (half a year), both are appliance settings, and using
+a token does not extend it. So mint the plugin's token on purpose, for example with
+`{"client": {"id": "jenkins-xcpng-cloud"}, "expiresIn": "0.5 year"}`, and note when it runs out.
+Posting the same body again while the token is still valid extends that same token, so the Jenkins
+credential does not have to change. An expired token stops provisioning, and also teardown: a VM the
+plugin cannot delete goes on the cloud's leaked-VM list, which is retried every minute, so it is
+reclaimed once a valid token is back, but it holds memory and storage until then.
+
 What this does and does not cover:
 
-- **Measured** on the lab appliance (Xen Orchestra REST API 0.40.2, 2026-10-04), once: such a user
-  cloned the golden image, seeded, started, shut down and destroyed the clone. With the selector in
-  place it listed none of the other VMs, and tagging a VM it had not created was refused with
-  `403 not enough privileges`. In a separate run the same day, with `create:vm` and `instantiate`
-  scoped as above, the cycle still passed, while creating a VM from another template on the same pool
-  was refused on `instantiate`, and from a template on the other pool on both.
+- **Measured** on the lab appliance (Xen Orchestra REST API 0.40.2, 2026-10-04). A replay of the
+  plugin's calls as such a user, run twice: it cloned the golden image, seeded, started, shut down and
+  destroyed the clone. With the selectors in place it listed none of the other VMs; tagging a VM it had
+  not created was refused with `403 not enough privileges`, and so was creating a VM from another
+  template on the same pool, or from a template on the other pool.
+- **Measured with the plugin itself**, once, with the lab controller's cloud pointed at such a user's
+  token: **Test connection** passed, a build ran on an agent cloned for it and the VM was destroyed
+  afterwards, and a warm spare was cloned, came online and was destroyed when the pool was set back to
+  zero. Nothing was left in the leaked-VM list.
+- **The Network field** needs `vif:create` on top. Measured in the replay: the create call is refused
+  without it, and with it the clone came up with a single network card, on the chosen network. The
+  plugin itself was not run with **Network** set.
 - **The three `read` privileges never show up as a refusal.** Listing pools, templates or networks
   without them answers with an empty list, so the plugin reports the template or network as not found
   rather than as a permission problem. Check them first when a dedicated user cannot find a template
   that an admin can.
-- **Not measured:** a template with **Network** set, where the clone's network card is passed to the
-  create call; the appliance's source asks for `vif:create` there, so add it if you use that field.
-  Also not measured: **Test connection**, the warm pool (it uses the same calls), and whether ACL roles
-  require a particular Xen Orchestra edition.
+- **Xen Orchestra edition**, read in the appliance's source rather than measured: an XOA appliance
+  needs the Essential+, Pro or Enterprise bundle to create ACL roles (Essential and X1 are refused), and
+  Xen Orchestra built from sources has no such check. Creating roles worked on the lab appliance.
 - The selector matches the user recorded in the VM's `creation` field, which Xen Orchestra set to the
   creating user on every clone in that run. Going by the appliance's source, a VM created by any other
   user carries that user instead, and falls outside the selector.
