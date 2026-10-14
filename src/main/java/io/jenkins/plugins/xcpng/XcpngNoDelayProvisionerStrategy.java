@@ -204,7 +204,13 @@ public class XcpngNoDelayProvisionerStrategy extends NodeProvisioner.Strategy {
             // A null label never matches an XCP-ng template (the agents are EXCLUSIVE), so there is no
             // unlabeled provisioner to wake here.
             if (label != null && anyCloudServes(label)) {
-                label.nodeProvisioner.suggestReviewNow();
+                // Not straight away (#273). This runs inside Queue.maintain, before the queue publishes the
+                // snapshot a provisioning round reads its queue length from, and the round runs on another
+                // thread without the queue lock. Started now, it can count no waiting build, plan nothing,
+                // and leave this one to the provisioner's next periodic round: up to 10 seconds later, or
+                // up to 100 seconds in the first minutes after startup. Waiting for the queue lock first
+                // means maintain has finished, and maintain publishes the snapshot before it lets go of it.
+                Timer.get().submit(() -> Queue.withLock(label.nodeProvisioner::suggestReviewNow));
             }
         }
     }

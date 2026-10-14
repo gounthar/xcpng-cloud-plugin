@@ -12,7 +12,9 @@ import hudson.model.Executor;
 import hudson.model.FreeStyleProject;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Queue;
 import hudson.model.queue.QueueListener;
+import hudson.model.queue.QueueSorter;
 import hudson.slaves.Cloud;
 import hudson.slaves.CloudProvisioningListener;
 import hudson.slaves.DumbSlave;
@@ -276,6 +278,46 @@ class XcpngNoDelayProvisionerStrategyTest {
                     "one build, one agent booting elsewhere, no second clone: " + second.calls());
         } finally {
             cleanUp(r);
+        }
+    }
+
+    @Test
+    void aBuildIsSeenByTheRoundItsArrivalAsksFor(JenkinsRule r) throws Exception {
+        // #273. onEnterBuildable fires inside Queue.maintain, before the queue publishes the snapshot the
+        // provisioning round reads its queue length from. A round started straight from the listener can
+        // therefore count no waiting build, plan nothing, and leave the build to the provisioner's first periodic
+        // round,
+        // 100 s after startup. The sorter below holds maintain open between the two, after every listener has
+        // fired and before the snapshot is published, so such a round always reads the stale snapshot.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        r.jenkins.clouds.add(bootingCloudBackedBy(fake, 2));
+        Queue queue = r.jenkins.getQueue();
+        QueueSorter original = queue.getSorter();
+        queue.setSorter(new SlowSorter());
+        try {
+            labelled(r, "arrives").scheduleBuild2(0);
+            awaitWithin(
+                    () -> cloneCount(fake) == 1 && isAnAgentConnecting(r),
+                    WINDOW_MILLIS,
+                    () -> "the round the build's arrival asked for should have seen it: " + fake.calls());
+        } finally {
+            queue.setSorter(original);
+            cleanUp(r);
+        }
+    }
+
+    /** Keeps the queue lock for half a second whenever a build has just become buildable. */
+    private static class SlowSorter extends QueueSorter {
+        @Override
+        public void sortBuildableItems(List<Queue.BuildableItem> buildables) {
+            if (buildables.isEmpty()) {
+                return;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
