@@ -20,20 +20,32 @@ permissions:
 
 jobs:
   build:
-    name: JDK 21
+    name: JDK ${{ matrix.java }}
     runs-on: ubuntu-latest
+    # One JDK failing must not cancel the other: a red 25 next to a green 21 is the
+    # signal this matrix exists to give (#296).
+    strategy:
+      fail-fast: false
+      matrix:
+        # No 17: maven-hpi-plugin refuses to build at all on it ("Java 21 or later is
+        # necessary to build this plugin"). 25 is here because Jenkins core starts
+        # recommending a move off 21 a year before its end of life (2027-09-30).
+        #
+        # Both legs compile the same bytecode. maven.compiler.release is not set here:
+        # maven-hpi-plugin's validate goal writes target/java-level/21 from the core's
+        # minimum Java, and the parent POM's java-level-21 profile sets release from that
+        # marker. So the 25 leg checks that the plugin builds and its tests pass on a
+        # Java 25 JVM, not that it targets 25. The 2.555.3 LTS baseline governs what
+        # Jenkins runs on, not what compiles the plugin.
+        java: [21, 25]
     steps:
       - uses: actions/checkout@v7
 
-      # 21 only, and not by preference: maven-hpi-plugin refuses to build at all on 17
-      # ("Java 21 or later is necessary to build this plugin"), and the parent POM pins
-      # maven.compiler.release to 21. The 2.555.3 LTS baseline governs what Jenkins runs
-      # on, not what compiles the plugin. proxmox-cloud-plugin builds on 21 alone too.
-      - name: Set up JDK 21
+      - name: Set up JDK ${{ matrix.java }}
         uses: actions/setup-java@v6.0.1
         with:
           distribution: temurin
-          java-version: 21
+          java-version: ${{ matrix.java }}
           cache: maven
 
       # verify, not test: it also runs the static analysis the parent POM binds and

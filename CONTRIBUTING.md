@@ -24,9 +24,10 @@ mvn -B -ntp verify
 
 Three things about that command:
 
-- **JDK 21, and only 21.** `maven-hpi-plugin` refuses to build on 17 outright, and the plugin
-  parent POM pins `maven.compiler.release` to 21. The 2.555.3 LTS baseline governs what Jenkins
-  *runs* on, not what compiles the plugin.
+- **JDK 21 or 25.** `maven-hpi-plugin` refuses to build on 17 outright. CI builds on both 21 and
+  25, and both produce Java 21 bytecode: `maven-hpi-plugin` writes `target/java-level/21` from the
+  core's minimum Java, and the parent POM sets `maven.compiler.release` from that marker. The
+  2.555.3 LTS baseline governs what Jenkins *runs* on, not what compiles the plugin.
 - **`verify`, not `test`.** It also runs SpotBugs and packages the `.hpi`, which is where errors in
   `index.jelly` and `config.jelly` paths surface. A green `mvn test` proves less than it looks like.
 - **Spotless is enforced.** This repository sets `spotless.check.skip=false`, so any formatting
