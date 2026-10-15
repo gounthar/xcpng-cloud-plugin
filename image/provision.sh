@@ -11,14 +11,18 @@
 #   SKIP_CLEANUP=1       do not run cloud-init clean or reset machine identity
 #
 # Why Temurin and not the distro JDK: Jenkins core is compiled at class-file major 65, so an agent
-# needs a Java 21 JVM. Bookworm ships no openjdk-21 at all, not even in bookworm-backports; trixie
-# does, but Temurin pins the vendor and version to match the controller on either base. An agent on
-# Java 17 opens its WebSocket, logs "Connected", then dies in a silent reconnect loop with
-# UnsupportedClassVersionError. The controller and agents must run the same Java major.
+# needs Java 21 or later. Bookworm ships neither openjdk-21 nor openjdk-25, not even in
+# bookworm-backports; Temurin publishes both for bookworm and trixie, and pins the vendor on either
+# base. An agent on Java 17 opens its WebSocket, logs "Connected", then dies in a silent reconnect
+# loop with UnsupportedClassVersionError.
+#
+# Why 25: Jenkins ends Java 21 support in September 2027 and supports 25 until September 2029
+# (issue #296). Set JAVA_MAJOR=21 to build an image for a controller kept on 21. A Java 25 agent
+# against a Java 21 controller has not been tested here yet.
 
 set -euo pipefail
 
-JAVA_MAJOR=21
+JAVA_MAJOR="${JAVA_MAJOR:-25}"
 ADOPTIUM_KEYRING=/etc/apt/keyrings/adoptium.asc
 ADOPTIUM_LIST=/etc/apt/sources.list.d/adoptium.list
 # Fallback source of xenstore-read, the client the agent service uses to read its per-clone seed. On

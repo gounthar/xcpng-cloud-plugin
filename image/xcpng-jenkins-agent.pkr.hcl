@@ -92,7 +92,7 @@ variable "template_name" {
 // image that is arguably what you want, since it picks up security updates with no bump here. If a
 // reproducible base system is ever wanted, snapshot.debian.org pinned to a timestamp is the
 // mechanism for the Debian half and only that half: provision.sh installs an unversioned
-// temurin-21-jre from packages.adoptium.net, whose metadata moves too. See issue #201 and
+// temurin-25-jre from packages.adoptium.net, whose metadata moves too. See issue #201 and
 // docs/golden-image.md.
 variable "debian_version" {
   type    = string

@@ -127,8 +127,10 @@ timeout, 10 min 45 s with `idleMinutes` 10.
   it, and when it is missing says which REST API version the appliance reports and whether the appliance
   itself lacks the route or something in front of it is not forwarding it.
 - A golden-image VM on that pool, prepared as described below.
-- A Jenkins controller on the 2.555.x line or newer. The controller and the agent must run the same
-  Java major version; the baseline here is Java 21 (Temurin on the agent side).
+- A Jenkins controller on the 2.555.x line or newer. The agent needs Java 21 or later to load core's
+  class files. The golden image ships Temurin 25; a Java 25 agent against a Java 21 controller has not
+  been tested here, so keep them on the same major until it has (`JAVA_MAJOR=21 image/provision.sh`
+  builds a 21 image).
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
   the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
   unreachable, a clone never connects and is destroyed after the connect timeout.
@@ -434,9 +436,9 @@ is up.
 - On the clone, check the launcher: `journalctl -u jenkins-agent`. The unit reads the agent name and
   secret from xenstore and starts the agent; its log shows whether it got them and what the connection
   attempt did.
-- If the agent logs `Connected` and then drops into a silent reconnect loop, suspect a Java major
-  mismatch: the agent JRE must match the controller's Java major version (Java 21 here). A mismatch
-  throws `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
+- If the agent logs `Connected` and then drops into a silent reconnect loop, suspect the agent's Java:
+  an agent JRE older than 21 cannot load core's class files. It throws
+  `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
   offline cause in the UI.
 - **If the clone has no address at all, none of the above is reachable** and there is nothing to read
   with `journalctl`, because you cannot log in. Check `networks` on the VM record

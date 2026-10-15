@@ -158,12 +158,23 @@ jobs:
           SKIP_CLEANUP: '1'
         run: bash image/provision.sh
 
+      # Two checks, read independently of provision.sh's own: the floor core needs, and the major the
+      # recipe asks for, so an image that quietly lands on 21 instead of 25 goes red here too.
       - name: The JVM must be able to load Jenkins core (class-file major 65)
         run: |
           major="$(java -version 2>&1 | head -1 | sed -E 's/.*version "([0-9]+).*/\1/')"
-          echo "java major: $major"
+          want="$(sed -n -E 's/^JAVA_MAJOR="\$\{JAVA_MAJOR:-([0-9]+)\}"$/\1/p' image/provision.sh)"
+          echo "java major: $major, recipe default: ${want:-<not found>}"
+          test -n "$want" || {
+            echo "::error::could not read the JAVA_MAJOR default from image/provision.sh"
+            exit 1
+          }
           test "$major" -ge 21 || {
             echo "::error::agent JVM is Java $major; Jenkins core is class-file 65 and needs 21+"
+            exit 1
+          }
+          test "$major" = "$want" || {
+            echo "::error::agent JVM is Java $major; image/provision.sh asks for Java $want"
             exit 1
           }
 

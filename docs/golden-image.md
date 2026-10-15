@@ -20,7 +20,7 @@ preparation, as this does.
 
 | requirement | why |
 |---|---|
-| **Java 21** | Jenkins core is compiled at class-file **major 65**. An agent on Java 17 opens its WebSocket, logs `Connected`, then dies in a silent reconnect loop with `UnsupportedClassVersionError`. It never reports a useful reason; you have to read `agent.log` inside the VM. The controller and its agents must run the same Java major. |
+| **Java 21 or later** (the image ships 25) | Jenkins core is compiled at class-file **major 65**. An agent on Java 17 opens its WebSocket, logs `Connected`, then dies in a silent reconnect loop with `UnsupportedClassVersionError`. It never reports a useful reason; you have to read `agent.log` inside the VM. `provision.sh` installs Temurin 25 by default; run it with `JAVA_MAJOR=21` for a 21 image. A Java 25 agent against a Java 21 controller has not been tested here yet, so match the controller's major until it has. |
 | **`xenstore-read`** | The baked agent service reads its per-clone data (controller URL, agent name, JNLP secret) from xenstore, so the guest needs a `xenstore-read` binary. On Debian 13 `xe-guest-utilities` 7.30 already ships one; `provision.sh` installs `xenstore-utils` only as a fallback when it is missing. |
 | **`xe-guest-utilities`** | Without the guest agent the VM never writes its address to xenstore, and XAPI reports `networks={}` for its whole life. The inbound launcher does not need an address, but `tools/measure_clone.py` and any future SSH launcher do. |
 | **cloud-init** | Needed for the from-scratch `import_raw_vdi` bootstrap, which relies on a seed `network-config` to bring the network up (see below). The clone path no longer consumes it: per-clone data arrives over xenstore, not a NoCloud seed. |
@@ -515,7 +515,7 @@ says so. For an agent image that is arguably what you want, since it picks up se
 nobody bumping a variable. It stops being fine the moment anyone quotes reproducibility. If that is
 ever wanted, `snapshot.debian.org` pinned to a timestamp is the mechanism for the *Debian* half of
 the image, and only that half: `provision.sh` adds `packages.adoptium.net` and installs an
-unversioned `temurin-21-jre` from it, so a Debian snapshot alone still leaves the JRE floating.
+unversioned `temurin-25-jre` from it, so a Debian snapshot alone still leaves the JRE floating.
 Pinning both costs those security updates until someone moves the timestamps, which is not a trade
 worth making for an ephemeral agent image without a reason to.
 [#201](https://github.com/gounthar/xcpng-cloud-plugin/issues/201)
