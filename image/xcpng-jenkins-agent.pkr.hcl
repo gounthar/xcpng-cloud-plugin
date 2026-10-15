@@ -62,6 +62,14 @@ variable "sr_iso_name" {
   default = "local-iso"
 }
 
+// The Temurin major provision.sh installs. Empty keeps the script's own default (25), so the version
+// lives in one place, and that place is what CI checks. Set "21" for a controller still on Java 21.
+variable "java_major" {
+  type        = string
+  description = "Temurin major to install (for example 21). Empty means provision.sh's default."
+  default     = ""
+}
+
 variable "template_name" {
   type        = string
   description = "The template this build produces. XcpngCloud's template field points at this name."
@@ -291,6 +299,9 @@ build {
     script = "image/provision.sh"
     # The preseed grants debian passwordless sudo, so no password needs piping in. provision.sh
     # then locks that sudo grant during template cleanup, so it does not survive into clones.
-    execute_command = "sudo bash '{{ .Path }}'"
+    # {{ .Vars }} goes after `env`, which runs as root, so the variable reaches the script without
+    # depending on sudo's env_reset or SETENV policy.
+    environment_vars = ["JAVA_MAJOR=${var.java_major}"]
+    execute_command  = "sudo env {{ .Vars }} bash '{{ .Path }}'"
   }
 }

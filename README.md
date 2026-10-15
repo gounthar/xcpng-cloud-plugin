@@ -129,8 +129,8 @@ timeout, 10 min 45 s with `idleMinutes` 10.
 - A golden-image VM on that pool, prepared as described below.
 - A Jenkins controller on the 2.555.x line or newer. The agent needs Java 21 or later to load core's
   class files. The golden image ships Temurin 25; a Java 25 agent against a Java 21 controller has not
-  been tested here, so keep them on the same major until it has (`JAVA_MAJOR=21 image/provision.sh`
-  builds a 21 image).
+  been tested here, so keep them on the same major until it has (`PKR_VAR_java_major=21` builds a 21
+  image).
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
   the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
   unreachable, a clone never connects and is destroyed after the connect timeout.
@@ -362,7 +362,8 @@ The plugin clones an existing VM or template on the pool. That image must be abl
 agent on first boot with no manual steps. It needs, at minimum:
 
 - The XCP-ng guest tools, so the guest can read xenstore.
-- A JRE matching the controller's Java major version (Temurin 21 here).
+- Java 21 or later. The recipe installs Temurin 25; `JAVA_MAJOR=21` (or `PKR_VAR_java_major=21` for
+  a Packer build) installs 21 for a controller that stays on 21.
 - A systemd unit that reads the agent name and secret from xenstore and launches the agent over an
   inbound WebSocket.
 
