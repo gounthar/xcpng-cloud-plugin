@@ -411,6 +411,29 @@ class XcpngCloudTest {
     }
 
     /**
+     * The template name is matched exactly against the pool, so a space pasted with it would pass the form
+     * check and then fail every provision with "no template named". Trimmed on the way in, like poolUrl (#75).
+     */
+    @Test
+    void templateNameAndLabelsAreTrimmedOnConstruction(JenkinsRule r) {
+        XcpngTemplate t = new XcpngTemplate(" jenkins-agent-debian13 \t", "  xcpng-linux ", 2, 2048);
+        assertEquals("jenkins-agent-debian13", t.getTemplateName());
+        assertEquals("xcpng-linux", t.getLabelString());
+    }
+
+    /** XStream skips the constructor, so a hand-edited config.xml with a padded name must be trimmed on reload. */
+    @Test
+    void aPaddedTemplateNameIsTrimmedOnReload(JenkinsRule r) {
+        String xml = "<io.jenkins.plugins.xcpng.XcpngTemplate>\n"
+                + "  <templateName>jenkins-agent-debian13 </templateName>\n"
+                + "  <labelString> xcpng-linux</labelString>\n"
+                + "</io.jenkins.plugins.xcpng.XcpngTemplate>\n";
+        XcpngTemplate t = (XcpngTemplate) jenkins.model.Jenkins.XSTREAM2.fromXML(xml);
+        assertEquals("jenkins-agent-debian13", t.getTemplateName());
+        assertEquals("xcpng-linux", t.getLabelString());
+    }
+
+    /**
      * A template persisted before the sizing fields existed reloads with {@code numCpus}/{@code
      * memoryMb} at 0. {@code readResolve} must clamp them to the defaults so provisioning never builds
      * an invalid {@link io.jenkins.plugins.xcpng.client.ProvisionSpec}.

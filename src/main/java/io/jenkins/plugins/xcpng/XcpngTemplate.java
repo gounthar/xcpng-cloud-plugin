@@ -84,8 +84,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         return "Enter a single OpenSSH public key, starting with a type such as ssh-ed25519 or ssh-rsa.";
     }
 
-    private final String templateName;
-    private final String labelString;
+    // Not final: readResolve re-trims both, since XStream bypasses the constructor.
+    private String templateName;
+    private String labelString;
     private int numCpus;
     private int memoryMb;
     // Optional: an OpenSSH *public* key. When set, each clone trusts it for the debian user (delivered
@@ -113,8 +114,10 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
 
     @DataBoundConstructor
     public XcpngTemplate(String templateName, String labelString, int numCpus, int memoryMb) {
-        this.templateName = templateName;
-        this.labelString = labelString;
+        // Trimmed like the cloud's poolUrl: the name is matched exactly against the pool, so a space pasted
+        // from a terminal or a wiki table would pass the form check yet fail every provision (#75).
+        this.templateName = trimmed(templateName);
+        this.labelString = trimmed(labelString);
         this.numCpus = numCpus <= 0 ? DEFAULT_NUM_CPUS : numCpus;
         this.memoryMb = memoryMb <= 0 ? DEFAULT_MEMORY_MB : memoryMb;
     }
@@ -130,6 +133,9 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
      * meaning "two builds share this VM" on reload, which is the point of the change, not a casualty of it.
      */
     protected Object readResolve() {
+        // A hand-edited or JCasC-era config.xml reaches here without the constructor's trim.
+        templateName = trimmed(templateName);
+        labelString = trimmed(labelString);
         if (numCpus <= 0) {
             numCpus = DEFAULT_NUM_CPUS;
         }
@@ -170,8 +176,8 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
         // Agents are EXCLUSIVE now and the cloud declines a null label, so such a template provisions
         // nothing at all. An upgraded controller would simply stop cloning, with nothing to read anywhere,
         // so say it at load. Warn rather than reject, for the same reason the SSH key above is dropped
-        // rather than thrown on: one template must not stop the controller loading. The field is final,
-        // so there is nothing to normalise here — doCheckLabelString is where it gets fixed.
+        // rather than thrown on: one template must not stop the controller loading. Nothing to normalise
+        // here beyond the trim above — doCheckLabelString is where it gets fixed.
         if (labelString == null || labelString.isBlank()) {
             LOGGER.log(
                     Level.WARNING,
@@ -262,6 +268,12 @@ public class XcpngTemplate extends AbstractDescribableImpl<XcpngTemplate> {
     @DataBoundSetter
     public void setNetworkName(@CheckForNull String networkName) {
         this.networkName = normalizeNetworkName(networkName);
+    }
+
+    /** Surrounding whitespace off, nothing else: a blank stays blank so the form check still names it. */
+    @CheckForNull
+    private static String trimmed(@CheckForNull String value) {
+        return value == null ? null : value.trim();
     }
 
     /** Trimmed, with blank collapsed to null: an untouched form field means "inherit", not a network named "". */
