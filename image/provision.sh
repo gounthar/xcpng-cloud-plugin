@@ -18,7 +18,7 @@
 #
 # Why 25: Jenkins ends Java 21 support in September 2027 and supports 25 until September 2029
 # (issue #296). Set JAVA_MAJOR=21 to build an image for a controller kept on 21. A Java 25 agent
-# against a Java 21 controller has not been tested here yet.
+# has run a build against a Java 21 controller once on the lab (issue #296, PR #298).
 
 set -euo pipefail
 

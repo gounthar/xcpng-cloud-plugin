@@ -128,9 +128,9 @@ timeout, 10 min 45 s with `idleMinutes` 10.
   itself lacks the route or something in front of it is not forwarding it.
 - A golden-image VM on that pool, prepared as described below.
 - A Jenkins controller on the 2.555.x line or newer. The agent needs Java 21 or later to load core's
-  class files. The golden image ships Temurin 25; a Java 25 agent against a Java 21 controller has not
-  been tested here, so keep them on the same major until it has (`PKR_VAR_java_major=21` builds a 21
-  image).
+  class files. The golden image ships Temurin 25. A Java 25 agent has run a build against a Java 21
+  controller once on the lab (2.580.1, a freestyle job); a controller on 21 that you would rather
+  not mix with can use a 21 image (`PKR_VAR_java_major=21`).
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
   the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
   unreachable, a clone never connects and is destroyed after the connect timeout.
