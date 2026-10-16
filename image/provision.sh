@@ -10,8 +10,10 @@
 #   SKIP_GUEST_TOOLS=1   do not install xe-guest-utilities from the tools ISO
 #   SKIP_CLEANUP=1       do not run cloud-init clean or reset machine identity
 #
-# Why Temurin and not the distro JDK: Jenkins core is compiled at class-file major 65, so an agent
-# needs Java 21 or later. Bookworm ships neither openjdk-21 nor openjdk-25, not even in
+# Why Temurin and not the distro JDK: Jenkins core is compiled at class-file major 65, so 21 is
+# the floor; above it the agent must run a Java version the target Jenkins release supports
+# (21 or 25 today, https://www.jenkins.io/doc/book/platform-information/support-policy-java/).
+# Bookworm ships neither openjdk-21 nor openjdk-25, not even in
 # bookworm-backports; Temurin publishes both for bookworm and trixie, and pins the vendor on either
 # base. An agent on Java 17 opens its WebSocket, logs "Connected", then dies in a silent reconnect
 # loop with UnsupportedClassVersionError.

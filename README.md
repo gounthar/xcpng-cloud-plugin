@@ -127,8 +127,10 @@ timeout, 10 min 45 s with `idleMinutes` 10.
   it, and when it is missing says which REST API version the appliance reports and whether the appliance
   itself lacks the route or something in front of it is not forwarding it.
 - A golden-image VM on that pool, prepared as described below.
-- A Jenkins controller on the 2.555.x line or newer. The agent needs Java 21 or later to load core's
-  class files. The golden image ships Temurin 25. A Java 25 agent has run a build against a Java 21
+- A Jenkins controller on the 2.555.x line or newer. The agent needs at least Java 21 to load
+  core's class files, and must run a Java version Jenkins supports for agents: 21 or 25 today (see
+  the [Java support policy](https://www.jenkins.io/doc/book/platform-information/support-policy-java/)).
+  The golden image ships Temurin 25. A Java 25 agent has run a build against a Java 21
   controller once on the lab (2.580.1, a freestyle job); a controller on 21 that you would rather
   not mix with can use a 21 image (`PKR_VAR_java_major=21`).
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
@@ -362,8 +364,8 @@ The plugin clones an existing VM or template on the pool. That image must be abl
 agent on first boot with no manual steps. It needs, at minimum:
 
 - The XCP-ng guest tools, so the guest can read xenstore.
-- Java 21 or later. The recipe installs Temurin 25; `JAVA_MAJOR=21` (or `PKR_VAR_java_major=21` for
-  a Packer build) installs 21 for a controller that stays on 21.
+- Java 21 or 25, the versions Jenkins supports. The recipe installs Temurin 25; `JAVA_MAJOR=21`
+  (or `PKR_VAR_java_major=21` for a Packer build) installs 21 for a controller that stays on 21.
 - A systemd unit that reads the agent name and secret from xenstore and launches the agent over an
   inbound WebSocket.
 
