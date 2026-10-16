@@ -1,0 +1,46 @@
+---
+jenkins:
+  clouds:
+    - xcpng:
+        name: "xcpng-lab"
+        poolUrl: "${XO_URL}"
+        credentialsId: "xo-token"
+        # Xen Orchestra appliances ship a self-signed certificate; pin it by SHA-256 fingerprint.
+        certificateFingerprint: "${XO_FINGERPRINT}"
+        maxInstances: 2
+        # Must exceed boot-to-connect, or the retention strategy reclaims an agent that is still
+        # booting and has never come online.
+        idleMinutes: 10
+        templates:
+          - templateName: "${TEMPLATE_NAME}"
+            labelString: "xcpng-linux xcpng-xo"
+            numCpus: 2
+            memoryMb: 2048
+            minInstances: 0
+  systemMessage: "XCP-ng cloud plugin lab controller"
+  numExecutors: 0
+  securityRealm:
+    local:
+      allowsSignup: false
+      users:
+        - id: admin
+          password: "${JENKINS_ADMIN_PASSWORD}"
+  authorizationStrategy:
+    loggedInUsersCanDoAnything:
+      allowAnonymousRead: false
+
+unclassified:
+  location:
+    # Agents fetch agent.jar from this URL and dial back to it, so it must be an address the
+    # pool's guests can reach, never localhost.
+    url: "${CONTROLLER_URL}"
+
+credentials:
+  system:
+    domainCredentials:
+      - credentials:
+          - string:
+              scope: GLOBAL
+              id: "xo-token"
+              secret: "${XO_TOKEN}"
+              description: "Xen Orchestra REST API token"
