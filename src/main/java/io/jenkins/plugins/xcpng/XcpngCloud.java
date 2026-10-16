@@ -2014,20 +2014,19 @@ public class XcpngCloud extends Cloud {
         }
 
         /**
-         * Warn when the selected credential is not a secret-text token. The case this exists for is a cloud
-         * carried over from the XAPI backend, whose username/password credential is still selected.
+         * Flag a cloud with no credential selected, or with one that is not a secret-text token.
          *
-         * <p>A warning rather than an error: the kind is enforced where it is used -- Test connection, and
-         * {@code openClient} at provision time -- and an error here would block a save the operator may be
-         * making in several steps.
+         * <p>Blank is an error, the same message Test connection gives: a cloud with no credential cannot
+         * authenticate, so every provision against it would fail at runtime. The wrong-kind case stays a warning;
+         * it exists for a cloud carried over from the XAPI backend, whose username/password credential is still
+         * selected, and the kind is enforced where it is used -- Test connection, and {@code openClient} at
+         * provision time.
          */
         @POST
         public FormValidation doCheckCredentialsId(@QueryParameter String value, @QueryParameter String poolUrl) {
             Jenkins.get().checkPermission(Jenkins.ADMINISTER);
             if (value == null || value.isBlank()) {
-                // A fresh form should not nag; the missing credential is reported by Test connection and
-                // by the provisioning path, both of which name the cloud.
-                return FormValidation.ok();
+                return FormValidation.error(Messages.XcpngCloud_credentials_required());
             }
             return lookupTokenCredentials(poolUrl, value) != null
                     ? FormValidation.ok()

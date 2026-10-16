@@ -5,10 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.cloudbees.plugins.credentials.CredentialsScope;
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.FormValidation;
+import hudson.util.Secret;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
@@ -16,6 +19,7 @@ import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.htmlunit.util.NameValuePair;
+import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
@@ -34,6 +38,20 @@ import org.springframework.security.access.AccessDeniedException;
  */
 @WithJenkins
 class XcpngFormValidationGuardTest {
+
+    /** A secret-text credential, the one value {@code doCheckCredentialsId} answers with a plain ok. */
+    private static final String TOKEN_ID = "xo-token";
+
+    private static void addToken() throws Exception {
+        SystemCredentialsProvider.getInstance()
+                .getCredentials()
+                .add(new StringCredentialsImpl(
+                        CredentialsScope.GLOBAL,
+                        TOKEN_ID,
+                        "XO token",
+                        Secret.fromString("an-xo-authentication-token")));
+        SystemCredentialsProvider.getInstance().save();
+    }
 
     /** A realm with an administrator and a bystander who can see Jenkins and nothing else. */
     private static void lockDown(JenkinsRule r) {
@@ -63,7 +81,7 @@ class XcpngFormValidationGuardTest {
         return List.of(
                 new NamedCheck("doCheckPoolUrl", () -> cloud.doCheckPoolUrl("https://pool.example.test")),
                 new NamedCheck("doCheckPoolId", () -> cloud.doCheckPoolId("23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec")),
-                new NamedCheck("doCheckCredentialsId", () -> cloud.doCheckCredentialsId("", null)),
+                new NamedCheck("doCheckCredentialsId", () -> cloud.doCheckCredentialsId(TOKEN_ID, null)),
                 new NamedCheck("doCheckCertificateFingerprint", () -> cloud.doCheckCertificateFingerprint("")),
                 new NamedCheck("doCheckCaCertificates", () -> cloud.doCheckCaCertificates("", null)),
                 new NamedCheck(
@@ -89,10 +107,9 @@ class XcpngFormValidationGuardTest {
     private record NamedCheck(String name, java.util.function.Supplier<FormValidation> call) {}
 
     /**
-     * One validator, with a value it must accept and a value it must reject. {@code rejected} is null for a
-     * validator that never returns an error, only a warning: {@code doCheckCredentialsId}, which leaves the
-     * refusal to Test connection and provisioning. And for {@code doCheckNetworkName}, which can only refuse
-     * once the pool answers, and is reached here with no pool.
+     * One validator, with a value it must accept and a value it must reject. {@code rejected} is null for
+     * {@code doCheckNetworkName}, which can only refuse once the pool answers, and is reached here with no
+     * pool.
      */
     private record Endpoint(String descriptor, String method, String accepted, String rejected) {}
 
@@ -107,7 +124,7 @@ class XcpngFormValidationGuardTest {
     private static final List<Endpoint> ENDPOINTS = List.of(
             new Endpoint(CLOUD, "checkPoolUrl", "https://pool.example.test", "http://pool.example.test"),
             new Endpoint(CLOUD, "checkPoolId", "23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec", "xcp-ng-hhpfmhok"),
-            new Endpoint(CLOUD, "checkCredentialsId", "", null),
+            new Endpoint(CLOUD, "checkCredentialsId", TOKEN_ID, ""),
             new Endpoint(
                     CLOUD,
                     "checkCertificateFingerprint",
@@ -138,7 +155,8 @@ class XcpngFormValidationGuardTest {
 
     /** And the guard does not break the form for the administrator it was added to protect. */
     @Test
-    void anAdministratorStillGetsAnAnswerFromEveryValidator(JenkinsRule r) {
+    void anAdministratorStillGetsAnAnswerFromEveryValidator(JenkinsRule r) throws Exception {
+        addToken();
         lockDown(r);
         for (NamedCheck check : validators(r)) {
             asUser(
@@ -187,6 +205,7 @@ class XcpngFormValidationGuardTest {
      */
     @Test
     void aPostReachesEveryValidatorAndItAnswers(JenkinsRule r) throws Exception {
+        addToken();
         lockDown(r);
         JenkinsRule.WebClient wc = r.createWebClient().login("alice");
         for (Endpoint e : ENDPOINTS) {
