@@ -352,10 +352,16 @@ class XcpngBackendSelectionTest {
                 FormValidation.Kind.WARNING,
                 d.doCheckCredentialsId(LEFTOVER_CREDENTIAL_ID, XO_URL).kind,
                 "a username/password credential left over from XAPI must be flagged");
-        assertEquals(
-                FormValidation.Kind.OK,
-                d.doCheckCredentialsId("", XO_URL).kind,
-                "an empty field is a fresh form, not a mistake to nag about");
+        // The message, not only the kind: a blank ID that fell through to the lookup would warn too, but
+        // as the wrong kind of credential rather than none.
+        for (String blank : new String[] {"", "   "}) {
+            FormValidation empty = d.doCheckCredentialsId(blank, XO_URL);
+            assertEquals(
+                    FormValidation.Kind.WARNING,
+                    empty.kind,
+                    "a cloud saved with no credential must be flagged on the form, not first at provision time");
+            assertEquals(Messages.XcpngCloud_credentials_required(), empty.getMessage());
+        }
     }
 
     /**

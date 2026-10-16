@@ -5,10 +5,13 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.cloudbees.plugins.credentials.CredentialsScope;
+import com.cloudbees.plugins.credentials.SystemCredentialsProvider;
 import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.FormValidation;
+import hudson.util.Secret;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Consumer;
@@ -16,6 +19,7 @@ import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.htmlunit.util.NameValuePair;
+import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
@@ -63,7 +67,7 @@ class XcpngFormValidationGuardTest {
         return List.of(
                 new NamedCheck("doCheckPoolUrl", () -> cloud.doCheckPoolUrl("https://pool.example.test")),
                 new NamedCheck("doCheckPoolId", () -> cloud.doCheckPoolId("23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec")),
-                new NamedCheck("doCheckCredentialsId", () -> cloud.doCheckCredentialsId("", null)),
+                new NamedCheck("doCheckCredentialsId", () -> cloud.doCheckCredentialsId(TOKEN_ID, null)),
                 new NamedCheck("doCheckCertificateFingerprint", () -> cloud.doCheckCertificateFingerprint("")),
                 new NamedCheck("doCheckCaCertificates", () -> cloud.doCheckCaCertificates("", null)),
                 new NamedCheck(
@@ -136,9 +140,20 @@ class XcpngFormValidationGuardTest {
         }
     }
 
+    /** A secret-text credential, the one value {@code doCheckCredentialsId} answers with a plain ok. */
+    private static final String TOKEN_ID = "xo-token";
+
     /** And the guard does not break the form for the administrator it was added to protect. */
     @Test
-    void anAdministratorStillGetsAnAnswerFromEveryValidator(JenkinsRule r) {
+    void anAdministratorStillGetsAnAnswerFromEveryValidator(JenkinsRule r) throws Exception {
+        SystemCredentialsProvider.getInstance()
+                .getCredentials()
+                .add(new StringCredentialsImpl(
+                        CredentialsScope.GLOBAL,
+                        TOKEN_ID,
+                        "XO token",
+                        Secret.fromString("an-xo-authentication-token")));
+        SystemCredentialsProvider.getInstance().save();
         lockDown(r);
         for (NamedCheck check : validators(r)) {
             asUser(
