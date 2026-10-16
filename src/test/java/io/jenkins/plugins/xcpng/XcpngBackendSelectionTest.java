@@ -342,7 +342,7 @@ class XcpngBackendSelectionTest {
     // ---- What the form says ----
 
     @Test
-    void theCredentialCheckWarnsOnAnythingButAToken(JenkinsRule r) throws Exception {
+    void theCredentialCheckFlagsAnythingButAToken(JenkinsRule r) throws Exception {
         addPasswordCredential(LEFTOVER_CREDENTIAL_ID);
         addTokenCredential(XO_CREDENTIAL_ID);
         XcpngCloud.DescriptorImpl d = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
@@ -352,14 +352,13 @@ class XcpngBackendSelectionTest {
                 FormValidation.Kind.WARNING,
                 d.doCheckCredentialsId(LEFTOVER_CREDENTIAL_ID, XO_URL).kind,
                 "a username/password credential left over from XAPI must be flagged");
-        // The message, not only the kind: a blank ID that fell through to the lookup would warn too, but
-        // as the wrong kind of credential rather than none.
-        for (String blank : new String[] {"", "   "}) {
+        // The message as well as the kind: it names the missing credential, not a wrong kind of one.
+        for (String blank : new String[] {null, "", "   "}) {
             FormValidation empty = d.doCheckCredentialsId(blank, XO_URL);
             assertEquals(
-                    FormValidation.Kind.WARNING,
+                    FormValidation.Kind.ERROR,
                     empty.kind,
-                    "a cloud saved with no credential must be flagged on the form, not first at provision time");
+                    "a cloud with no credential must be flagged on the form, not first at provision time");
             assertEquals(Messages.XcpngCloud_credentials_required(), empty.getMessage());
         }
     }
