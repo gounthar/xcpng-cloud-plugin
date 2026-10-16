@@ -127,8 +127,12 @@ timeout, 10 min 45 s with `idleMinutes` 10.
   it, and when it is missing says which REST API version the appliance reports and whether the appliance
   itself lacks the route or something in front of it is not forwarding it.
 - A golden-image VM on that pool, prepared as described below.
-- A Jenkins controller on the 2.555.x line or newer. The controller and the agent must run the same
-  Java major version; the baseline here is Java 21 (Temurin on the agent side).
+- A Jenkins controller on the 2.555.x line or newer. The agent needs at least Java 21 to load
+  core's class files, and must run a Java version Jenkins supports for agents: 21 or 25 today (see
+  the [Java support policy](https://www.jenkins.io/doc/book/platform-information/support-policy-java/)).
+  The golden image ships Temurin 25. A Java 25 agent has run a build against a Java 21
+  controller once on the lab (2.580.1, a freestyle job); a controller on 21 that you would rather
+  not mix with can use a 21 image (`PKR_VAR_java_major=21`).
 - The Jenkins root URL (**Manage Jenkins** then **System**) must be set and reachable over HTTP(S) from
   the network the clones boot on. Agents dial out to it over an inbound WebSocket; if it is unset or
   unreachable, a clone never connects and is destroyed after the connect timeout.
@@ -360,7 +364,8 @@ The plugin clones an existing VM or template on the pool. That image must be abl
 agent on first boot with no manual steps. It needs, at minimum:
 
 - The XCP-ng guest tools, so the guest can read xenstore.
-- A JRE matching the controller's Java major version (Temurin 21 here).
+- Java 21 or 25, the versions Jenkins supports. The recipe installs Temurin 25; `JAVA_MAJOR=21`
+  (or `PKR_VAR_java_major=21` for a Packer build) installs 21 for a controller that stays on 21.
 - A systemd unit that reads the agent name and secret from xenstore and launches the agent over an
   inbound WebSocket.
 
@@ -434,9 +439,9 @@ is up.
 - On the clone, check the launcher: `journalctl -u jenkins-agent`. The unit reads the agent name and
   secret from xenstore and starts the agent; its log shows whether it got them and what the connection
   attempt did.
-- If the agent logs `Connected` and then drops into a silent reconnect loop, suspect a Java major
-  mismatch: the agent JRE must match the controller's Java major version (Java 21 here). A mismatch
-  throws `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
+- If the agent logs `Connected` and then drops into a silent reconnect loop, suspect the agent's Java:
+  an agent JRE older than 21 cannot load core's class files. It throws
+  `UnsupportedClassVersionError` and the agent never stays up, without ever reporting a useful
   offline cause in the UI.
 - **If the clone has no address at all, none of the above is reachable** and there is nothing to read
   with `journalctl`, because you cannot log in. Check `networks` on the VM record
