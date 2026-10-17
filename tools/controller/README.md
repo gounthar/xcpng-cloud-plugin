@@ -48,6 +48,17 @@ Do not use `copy_reference_file.log` for this. With a reference-copy override it
 `SKIPPED ... Image version (1.5.2) is older than installed version (1.5.2-273)` while copying the
 file anyway.
 
+## Plugin versions change only here
+
+Every plugin in `plugins.txt` is pinned, dependencies included, and `casc.yaml` sets no update
+sites. The plugin manager therefore has nothing to install or upgrade from while Jenkins runs, and
+rebuilding the image does not pull newer releases. In #206 an upgrade from the plugin manager
+scheduled a restart in the middle of a lab run and took the queued build and its agent with it.
+
+To upgrade a plugin, change its version in `plugins.txt` and run `docker compose up -d --build`
+between runs. A new dependency the new version needs has to be pinned too, or the build fetches
+its latest release.
+
 ## Why the plugin is not baked into the image
 
 An image that copies the plugin into `/usr/share/jenkins/ref/plugins` hands the decision to the
@@ -77,6 +88,17 @@ fresh volume and two builds whose jars differ (`819d72f1` and `85d2ebbc`):
 4. `sed -i` on `casc/casc.yaml`: the container sees the change at once.
 5. No `plugin/xcpng-cloud.hpi`: `start.sh` exits with an error naming the missing path, and the
    container restarts in a loop on that error rather than bringing up a controller with no cloud.
+
+The update guard, locally on 2026-10-17 with the same image tag, by asking the plugin manager to
+install a plugin from the script console as `admin`:
+
+1. Without `updateCenter` in `casc.yaml` (the control): the install completes and the `.jpi`
+   lands in `JENKINS_HOME/plugins`.
+2. With `sites: []` on a fresh volume: `No such update center: default`, nothing written. Same
+   after a container restart.
+3. With `sites: []` on the control's volume, which had the default site saved: the site list is
+   empty after start, and the install is refused the same way.
+4. The image built from the pinned `plugins.txt` holds exactly the 30 pinned versions.
 
 On the lab controller on 2026-10-17, migrating its existing `JENKINS_HOME` volume in place: the
 running jar matched the deployed 1.5.2 build (`85d2ebbc`), JCasC recreated the cloud from `.env`,
