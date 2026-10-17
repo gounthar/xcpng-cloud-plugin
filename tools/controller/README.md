@@ -78,4 +78,6 @@ fresh volume and two builds whose jars differ (`819d72f1` and `85d2ebbc`):
 5. No `plugin/xcpng-cloud.hpi`: `start.sh` exits with an error naming the missing path, and the
    container restarts in a loop on that error rather than bringing up a controller with no cloud.
 
-Not yet run on the lab controller itself.
+On the lab controller on 2026-10-17, migrating its existing `JENKINS_HOME` volume in place: the
+running jar matched the deployed 1.5.2 build (`85d2ebbc`), JCasC recreated the cloud from `.env`,
+and one live-test build passed on a fresh clone, which was destroyed after the build.
