@@ -59,6 +59,12 @@ To upgrade a plugin, change its version in `plugins.txt` and run `docker compose
 between runs. A new dependency the new version needs has to be pinned too, or the build fetches
 its latest release.
 
+The cost: Jenkins takes its security warnings, the banner naming an installed plugin with a known
+vulnerability, from the same update site data. With no site, the controller shows none, and
+nothing prompts a bump of `plugins.txt`. Check the pinned versions against the
+[Jenkins security advisories](https://www.jenkins.io/security/advisories/) when you upgrade the
+core image, and at the latest when one names a plugin listed here.
+
 ## Why the plugin is not baked into the image
 
 An image that copies the plugin into `/usr/share/jenkins/ref/plugins` hands the decision to the
