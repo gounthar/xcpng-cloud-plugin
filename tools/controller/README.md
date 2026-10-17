@@ -38,9 +38,11 @@ The version string is what the archive claims about itself. To know which build 
 running, compare the jar Jenkins exploded with the jar inside the file you deployed:
 
 ```bash
-unzip -p plugin/xcpng-cloud.hpi WEB-INF/lib/xcpng-cloud.jar | md5sum
+python3 -c 'import zipfile, hashlib; print(hashlib.md5(zipfile.ZipFile("plugin/xcpng-cloud.hpi").read("WEB-INF/lib/xcpng-cloud.jar")).hexdigest())'
 docker exec jenkins md5sum /var/jenkins_home/plugins/xcpng-cloud/WEB-INF/lib/xcpng-cloud.jar
 ```
+
+The first line uses Python rather than `unzip`, which a Debian cloud image does not install.
 
 Do not use `copy_reference_file.log` for this. With a reference-copy override it can print
 `SKIPPED ... Image version (1.5.2) is older than installed version (1.5.2-273)` while copying the
