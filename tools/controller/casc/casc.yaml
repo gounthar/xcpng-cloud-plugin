@@ -19,6 +19,11 @@ jenkins:
             minInstances: 0
   systemMessage: "XCP-ng cloud plugin lab controller"
   numExecutors: 0
+  # No update sites, so nothing can be installed or upgraded from the plugin manager while a lab run
+  # is in flight (#206). plugins.txt is then the only way a plugin version changes. JCasC applies
+  # this on every start, so it also empties the default site an existing JENKINS_HOME remembers.
+  updateCenter:
+    sites: []
   securityRealm:
     local:
       allowsSignup: false
