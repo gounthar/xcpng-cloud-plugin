@@ -1,0 +1,34 @@
+---
+services:
+  jenkins:
+    build: .
+    container_name: jenkins
+    restart: unless-stopped
+    ports:
+      # Only the HTTP port. The agents connect with -webSocket, which tunnels over it, so no
+      # separate inbound TCP agent port is needed.
+      - "8080:8080"
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+      CASC_JENKINS_CONFIG: /var/jenkins_conf/casc.yaml
+      # Secrets come from .env and are resolved by JCasC; none is written into casc.yaml.
+      JENKINS_ADMIN_PASSWORD: "${JENKINS_ADMIN_PASSWORD:?}"
+      XO_TOKEN: "${XO_TOKEN:?}"
+      # Non-secret lab values, also from .env, so casc.yaml carries no site details.
+      CONTROLLER_URL: "${CONTROLLER_URL:?}"
+      XO_URL: "${XO_URL:?}"
+      XO_FINGERPRINT: "${XO_FINGERPRINT:-}"
+      TEMPLATE_NAME: "${TEMPLATE_NAME:?}"
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      # A directory, not the file: Docker binds a single file by inode, and an editor or sed -i
+      # that writes a new file leaves the container reading the old one. A directory bind sees
+      # every replacement.
+      - ./casc:/var/jenkins_conf:ro
+      # The plugin under test, as plugin/xcpng-cloud.hpi. A directory rather than the file, for the
+      # same inode reason as casc/. start.sh copies it into JENKINS_HOME on every start, so to deploy
+      # a build: replace the file, then restart the container.
+      - "${XCPNG_CLOUD_PLUGIN_DIR:-./plugin}:/opt/xcpng-cloud:ro"
+
+volumes:
+  jenkins_home:

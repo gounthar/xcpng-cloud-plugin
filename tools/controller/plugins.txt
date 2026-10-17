@@ -1,0 +1,5 @@
+cloud-stats
+credentials
+jackson2-api
+configuration-as-code
+plain-credentials:199.v9f8e1f741799
