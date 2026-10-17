@@ -38,9 +38,11 @@ The version string is what the archive claims about itself. To know which build 
 running, compare the jar Jenkins exploded with the jar inside the file you deployed:
 
 ```bash
-unzip -p plugin/xcpng-cloud.hpi WEB-INF/lib/xcpng-cloud.jar | md5sum
+python3 -c 'import zipfile, hashlib; print(hashlib.md5(zipfile.ZipFile("plugin/xcpng-cloud.hpi").read("WEB-INF/lib/xcpng-cloud.jar")).hexdigest())'
 docker exec jenkins md5sum /var/jenkins_home/plugins/xcpng-cloud/WEB-INF/lib/xcpng-cloud.jar
 ```
+
+The first line uses Python rather than `unzip`, which a Debian cloud image does not install.
 
 Do not use `copy_reference_file.log` for this. With a reference-copy override it can print
 `SKIPPED ... Image version (1.5.2) is older than installed version (1.5.2-273)` while copying the
@@ -76,4 +78,6 @@ fresh volume and two builds whose jars differ (`819d72f1` and `85d2ebbc`):
 5. No `plugin/xcpng-cloud.hpi`: `start.sh` exits with an error naming the missing path, and the
    container restarts in a loop on that error rather than bringing up a controller with no cloud.
 
-Not yet run on the lab controller itself.
+On the lab controller on 2026-10-17, migrating its existing `JENKINS_HOME` volume in place: the
+running jar matched the deployed 1.5.2 build (`85d2ebbc`), JCasC recreated the cloud from `.env`,
+and one live-test build passed on a fresh clone, which was destroyed after the build.
