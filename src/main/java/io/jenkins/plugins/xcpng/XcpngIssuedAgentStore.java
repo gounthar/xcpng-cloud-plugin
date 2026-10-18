@@ -177,10 +177,16 @@ public class XcpngIssuedAgentStore implements Saveable {
             try {
                 file.unmarshal(this);
             } catch (IOException e) {
-                // Starting empty and unseeded falls back to trusting the node files until the next startup seed,
-                // which is the behaviour before this store existed. Failing extension load would cost the plugin.
-                LOGGER.log(Level.WARNING, e, () -> "Could not read the XCP-ng issued-agent store; starting empty");
-                seeded = false;
+                // An unreadable store is not a first start: the agents on disk were issued against a record that
+                // can no longer be checked, so none of them is trusted. Their teardown is refused and their VMs
+                // are left for tools/reaper.py, which is the loud failure; re-seeding here would be the silent one.
+                LOGGER.log(
+                        Level.SEVERE,
+                        e,
+                        () -> "Could not read the XCP-ng issued-agent store; no existing XCP-ng agent is trusted, and"
+                                + " their VMs must be reclaimed with tools/reaper.py");
+                issuedByNode = new ConcurrentHashMap<>();
+                seeded = true;
             }
         }
         Map<String, Issued> concurrent = new ConcurrentHashMap<>();

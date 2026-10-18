@@ -60,6 +60,22 @@ class XcpngIssuedAgentRestartTest {
         sessions.then(r -> assertEquals(Set.of(vmRef[0], FOREIGN_VM), leaksOnceReclaimed(r)));
     }
 
+    @Test
+    void anUnreadableStoreTrustsNothing() throws Throwable {
+        sessions.then(r -> {
+            provisionAndWriteForeign(r);
+            File store = new File(r.jenkins.getRootDir(), XcpngIssuedAgentStore.class.getName() + ".xml");
+            assertTrue(store.isFile(), "the store file exists before it is damaged");
+            Files.writeString(
+                    store.toPath(),
+                    "<io.jenkins.plugins.xcpng.XcpngIssuedAgentStore><issuedByNode",
+                    StandardCharsets.UTF_8);
+        });
+        // Unlike a missing store, a damaged one is not a first start: neither teardown may reach the pool.
+        // anUnissuedNodeStaysRefusedAcrossARestart is the control, where the provisioned agent's does.
+        sessions.then(r -> assertEquals(Set.of(), leaksOnceReclaimed(r)));
+    }
+
     /** Provision one agent, then write a second, unissued node next to it on disk. Returns the agent's VM handle. */
     private static String provisionAndWriteForeign(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
