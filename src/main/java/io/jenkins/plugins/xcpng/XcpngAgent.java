@@ -544,7 +544,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         try {
             terminateVm(listener);
         } finally {
-            XcpngIssuedAgentStore.get().forget(getNodeName());
+            XcpngIssuedAgentStore.get().forget(this);
         }
     }
 

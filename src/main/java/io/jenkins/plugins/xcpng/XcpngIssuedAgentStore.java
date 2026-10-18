@@ -101,16 +101,34 @@ public class XcpngIssuedAgentStore implements Saveable {
     }
 
     /** Record the snapshot an agent was built with. Called from its constructor and nowhere else. */
-    void issue(@NonNull XcpngAgent agent) {
-        issuedByNode.put(agent.getNodeName(), Issued.of(agent));
-        saveQuietly();
+    void issue(@NonNull XcpngAgent agent) throws IOException {
+        Issued issued = Issued.of(agent);
+        issuedByNode.put(agent.getNodeName(), issued);
+        try {
+            save();
+        } catch (IOException e) {
+            // Fail the agent build while no VM exists yet. Kept only in memory, the record would be gone after a
+            // restart, and the agent's teardown would then be refused with its VM left on the pool.
+            issuedByNode.remove(agent.getNodeName(), issued);
+            throw e;
+        }
     }
 
     /** Record the VM handle the plugin stamped onto an agent it issued. A name it never issued is ignored. */
     void issueVmRef(@NonNull String nodeName, @CheckForNull String vmRef) {
         Issued updated = issuedByNode.computeIfPresent(nodeName, (k, issued) -> issued.withVmRef(vmRef));
         if (updated != null) {
-            saveQuietly();
+            try {
+                save();
+            } catch (IOException e) {
+                // The clone already exists, so this cannot fail the launch. Until the next successful write the
+                // handle is trusted in memory only: a restart before then refuses this agent's teardown.
+                LOGGER.log(
+                        Level.SEVERE,
+                        e,
+                        () -> "Could not record VM " + vmRef + " for XCP-ng agent " + nodeName + "; if the controller"
+                                + " restarts before its teardown, reclaim the VM with tools/reaper.py");
+            }
         }
     }
 
@@ -126,9 +144,12 @@ public class XcpngIssuedAgentStore implements Saveable {
         return issued != null && issued.equals(Issued.of(agent));
     }
 
-    /** Forget a node once its teardown is over. */
-    void forget(@NonNull String nodeName) {
-        if (issuedByNode.remove(nodeName) != null) {
+    /**
+     * Forget an agent once its teardown is over, but only if the record under its name is this agent's: tearing
+     * down a node the plugin did not issue must not drop the record of the one it did.
+     */
+    void forget(@NonNull XcpngAgent agent) {
+        if (issuedByNode.remove(agent.getNodeName(), Issued.of(agent))) {
             saveQuietly();
         }
     }

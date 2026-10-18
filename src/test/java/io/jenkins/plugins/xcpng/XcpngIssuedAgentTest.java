@@ -15,7 +15,10 @@ import hudson.slaves.DumbSlave;
 import hudson.slaves.SlaveComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.io.ByteArrayInputStream;
+import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -119,6 +122,7 @@ class XcpngIssuedAgentTest {
         assertTrue(
                 XcpngLeakedVmStore.get().entries("xcpng").isEmpty(),
                 "a refused teardown must not hand the rewritten connection to the leaked-VM sweep");
+        assertTrue(original.isIssued(), "tearing down an unissued node must not drop the issued agent's record");
 
         // Control, on a node the guard has not seen: the plugin's own agent is still issued and opens.
         XcpngAgent other = provisioned(r, cloud, "xcpng-agent-2");
@@ -240,6 +244,36 @@ class XcpngIssuedAgentTest {
         // Control: the agent the plugin issued is scrubbed through the same listener and fake.
         scrubOnOnline(original.toComputer());
         assertEquals(1, scrubs(fake, original.getVmRef()), "calls were " + fake.calls());
+    }
+
+    @Test
+    void anAgentWhoseRecordCannotBeWrittenIsNotBuilt(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake);
+        r.jenkins.clouds.add(cloud);
+        // Control: with a writable store the same call builds an issued agent.
+        XcpngAgent writable = cloud.createAgent(
+                TEMPLATE, "xcpng-writable", new ProvisioningActivity.Id("xcpng", "t", "xcpng-writable"), false);
+        assertTrue(writable.isIssued());
+
+        // A non-empty directory where the store file goes: the atomic replace cannot land.
+        File store = new File(r.jenkins.getRootDir(), XcpngIssuedAgentStore.class.getName() + ".xml");
+        Files.deleteIfExists(store.toPath());
+        assertTrue(store.mkdir());
+        Files.writeString(new File(store, "occupied").toPath(), "x");
+
+        assertThrows(
+                IOException.class,
+                () -> cloud.createAgent(
+                        TEMPLATE,
+                        "xcpng-unwritable",
+                        new ProvisioningActivity.Id("xcpng", "t", "xcpng-unwritable"),
+                        false));
+        XcpngAgent same = fromDefinition(Jenkins.XSTREAM2
+                .toXML(writable)
+                .replace("<name>xcpng-writable</name>", "<name>xcpng-unwritable</name>"));
+        assertFalse(same.isIssued(), "a record that was never written must not stay trusted in memory");
+        assertEquals(0, clones(fake), "nothing is cloned for an agent that was never built");
     }
 
     private static void scrubOnOnline(Computer computer) throws InterruptedException {
