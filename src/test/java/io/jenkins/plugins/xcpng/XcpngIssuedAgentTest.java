@@ -7,6 +7,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.model.Computer;
+import hudson.model.TaskListener;
 import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
@@ -16,6 +17,9 @@ import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import jenkins.model.Jenkins;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
@@ -197,6 +201,64 @@ class XcpngIssuedAgentTest {
         XcpngIssuedAgentStore.get().seedAndPrune(List.of());
 
         assertFalse(agent.isIssued(), "a pruned name must not stay trusted for a node created under it later");
+    }
+
+    @Test
+    void aNameIsNoLongerTrustedOnceItsTeardownIsOver(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = provisioned(r, cloud, "xcpng-agent-1");
+        String xml = Jenkins.XSTREAM2.toXML(agent);
+
+        // Control: the same definition, read back while the agent is alive, is still the issued one.
+        assertTrue(fromDefinition(xml).isIssued());
+
+        agent.terminate();
+
+        assertFalse(
+                fromDefinition(xml).isIssued(),
+                "a node created later from the torn-down agent's definition must not inherit its trust");
+    }
+
+    @Test
+    void anUnissuedNodeComingOnlineIsNotScrubbed(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent original = provisioned(r, cloud, "xcpng-agent-1");
+
+        XcpngAgent second = fromDefinition(Jenkins.XSTREAM2
+                .toXML(original)
+                .replace("<name>xcpng-agent-1</name>", "<name>xcpng-agent-second</name>"));
+        r.jenkins.addNode(second);
+        assertFalse(second.isIssued());
+
+        scrubOnOnline(second.toComputer());
+        assertEquals(0, scrubs(fake, original.getVmRef()), "an unissued node must not reach the pool: " + fake.calls());
+
+        // Control: the agent the plugin issued is scrubbed through the same listener and fake.
+        scrubOnOnline(original.toComputer());
+        assertEquals(1, scrubs(fake, original.getVmRef()), "calls were " + fake.calls());
+    }
+
+    private static void scrubOnOnline(Computer computer) throws InterruptedException {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        XcpngComputerListener listener = new XcpngComputerListener();
+        listener.setScrubExecutor(executor);
+        try {
+            listener.onOnline(computer, TaskListener.NULL);
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(30, TimeUnit.SECONDS), "the scrub should finish");
+        } finally {
+            executor.shutdownNow();
+        }
+    }
+
+    private static long scrubs(FakeHypervisorClient fake, String vmRef) {
+        return fake.calls().stream()
+                .filter(c -> c.equals("clearGuestSecret:" + vmRef))
+                .count();
     }
 
     private static void awaitTrue(BooleanSupplier condition, String message) throws InterruptedException {

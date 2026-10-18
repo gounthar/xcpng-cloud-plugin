@@ -54,8 +54,12 @@ public class XcpngIssuedAgentStore implements Saveable {
      */
     private Map<String, Issued> issuedByNode = new ConcurrentHashMap<>();
 
-    /** Whether the agents on disk at the first start with this store have been seeded into it. */
-    private boolean seeded;
+    /**
+     * Whether the agents on disk at the first start with this store have been seeded into it. Volatile because
+     * {@link #matches} reads it from request threads without the lock the seed holds, and a stale {@code false}
+     * there would answer true for every agent.
+     */
+    private volatile boolean seeded;
 
     public XcpngIssuedAgentStore() {
         load();
