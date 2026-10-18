@@ -94,6 +94,12 @@ public class XcpngLauncher extends JNLPLauncher {
             throw new IllegalStateException("XCP-ng cloud '" + agent.getCloudName()
                     + "' is gone; cannot provision a VM for " + agent.getNodeName() + ".");
         }
+        if (!agent.isIssued()) {
+            // Before any bookkeeping: a node the plugin did not issue is not this cloud's to count, and a failure
+            // here must not hold the template back the way a failed clone does.
+            throw new IllegalStateException("Agent " + agent.getNodeName() + " was not provisioned by XCP-ng cloud '"
+                    + agent.getCloudName() + "'; not launching it.");
+        }
         String displayName = agent.getNodeName();
         // This node is registered -- a computer exists for it -- so the slot the cloud reserved for it while
         // it was only planned is now held by the node itself.

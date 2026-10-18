@@ -34,6 +34,8 @@ public final class FakeHypervisorClient implements HypervisorClient {
      */
     private final List<String> calls = new CopyOnWriteArrayList<>();
 
+    private final List<String> destroyOwners = new CopyOnWriteArrayList<>();
+
     /**
      * The rest of the mutable state, guarded by this object's monitor.
      *
@@ -109,6 +111,11 @@ public final class FakeHypervisorClient implements HypervisorClient {
     public synchronized FakeHypervisorClient failStart() {
         this.startFails = true;
         return this;
+    }
+
+    /** The owner each {@link #destroyWithDisks} call named, in call order. */
+    public synchronized List<String> destroyOwners() {
+        return List.copyOf(destroyOwners);
     }
 
     /**
@@ -245,9 +252,10 @@ public final class FakeHypervisorClient implements HypervisorClient {
     }
 
     @Override
-    public synchronized void destroyWithDisks(VmRef vm) {
+    public synchronized void destroyWithDisks(VmRef vm, String owner) {
         checkNotInterrupted("destroyWithDisks");
         calls.add("destroyWithDisks:" + vm.value());
+        destroyOwners.add(owner);
         if (destroyFails) {
             throw new HypervisorException("destroy failed");
         }

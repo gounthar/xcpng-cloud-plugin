@@ -654,7 +654,10 @@ public final class XoRestClient implements HypervisorClient {
             // interrupt mid-configure would otherwise leak the very clone this cleanup exists to reclaim.
             boolean interrupted = Thread.interrupted();
             try {
-                destroyWithDisks(new VmRef(vm));
+                // Not the public verb: its ownership check would refuse this clone, whose tags configure may
+                // never have reached. The VM was created a moment ago by this very call, which is the proof
+                // of ownership the tags stand in for everywhere else.
+                deleteVm(new VmRef(vm));
             } catch (RuntimeException cleanup) {
                 // Best effort. The original failure is what the caller needs.
                 LOGGER.warning("could not clean up partly configured clone " + vm + ": " + cleanup.getMessage());
@@ -1126,8 +1129,65 @@ public final class XoRestClient implements HypervisorClient {
      * cannot swallow a real one.
      */
     @Override
-    public void destroyWithDisks(@NonNull VmRef vm) {
+    public void destroyWithDisks(@NonNull VmRef vm, @NonNull String owner) {
         refuseForeignHandle(vm);
+        if (!refuseUnlessOwned(vm, owner)) {
+            return;
+        }
+        deleteVm(vm);
+    }
+
+    /**
+     * Refuse to destroy a VM that does not carry both of this plugin's markers for {@code owner}: the owner
+     * tag naming that cloud, and the uuid stamp naming the VM's own uuid. Answers false when XO says the VM
+     * is already gone, which is the destroy's goal state.
+     *
+     * <p>The handle alone is not proof of ownership. It is persisted with the node and read back on every
+     * teardown, so whatever produced the wrong handle -- a misrouted ref, a node file restored from the wrong
+     * backup -- would otherwise reach a DELETE that, on this backend, also takes every disk. The two markers
+     * are what {@code markOwner} stamps on every clone since 1.0.0, the first release with this backend.
+     *
+     * <p>Both tags, matched exactly. The owner tag alone is inherited by a hand-made copy of an agent (#249),
+     * and a prefix match would let cloud {@code lab} claim a VM of cloud {@code lab-2}. The uuid stamp is
+     * compared against the record's own uuid, not the XO id, for the reason {@code markOwner} gives.
+     */
+    private boolean refuseUnlessOwned(@NonNull VmRef vm, @NonNull String owner) {
+        if (owner.isBlank()) {
+            throw new HypervisorException("refusing to destroy " + vm.value() + ": no owning cloud was named");
+        }
+        String path = API + "/vms/" + vm.value() + "?fields=uuid,tags";
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("GET", path, null, READ_TIMEOUT);
+        } catch (IOException e) {
+            throw new HypervisorException("GET " + path + ": transport error: " + e.getMessage(), e);
+        }
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), vm.value())) {
+            LOGGER.info(() ->
+                    "VM " + vm.value() + " was already gone when teardown reached it;" + " treating that as destroyed");
+            return false;
+        }
+        if (!resp.isSuccess()) {
+            throw failure("GET", path, resp.status(), resp.body());
+        }
+        JsonNode record = parse("GET " + path, resp.body());
+        String uuid = record.path("uuid").asText("");
+        Set<String> tags = new HashSet<>();
+        for (JsonNode tag : record.path("tags")) {
+            tags.add(tag.asText(""));
+        }
+        String ownerTag = OWNER_TAG_PREFIX + owner;
+        String selfTag = SELF_TAG_PREFIX + uuid;
+        if (uuid.isBlank() || !tags.contains(ownerTag) || !tags.contains(selfTag)) {
+            throw new HypervisorException("refusing to destroy VM " + vm.value() + ": it does not carry both '"
+                    + ownerTag + "' and '" + SELF_TAG_PREFIX + "<its own uuid>', so it is not a VM cloud '" + owner
+                    + "' provisioned. Its tags are " + tags + ".");
+        }
+        return true;
+    }
+
+    /** {@code DELETE /vms/{id}}, which on this backend takes the disks too. No ownership check: see the callers. */
+    private void deleteVm(@NonNull VmRef vm) {
         String path = API + "/vms/" + vm.value();
         RestTransport.RestResponse resp;
         try {

@@ -237,8 +237,8 @@ class XcpngHaltedWhileConnectedTest {
         }
 
         @Override
-        public void destroyWithDisks(VmRef vm) {
-            delegate.destroyWithDisks(vm);
+        public void destroyWithDisks(VmRef vm, String owner) {
+            delegate.destroyWithDisks(vm, owner);
         }
 
         @Override

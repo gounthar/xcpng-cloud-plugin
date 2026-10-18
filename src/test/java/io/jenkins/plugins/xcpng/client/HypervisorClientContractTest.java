@@ -39,7 +39,7 @@ class HypervisorClientContractTest {
         VmRef vm = client.cloneFromTemplate(template, spec);
         client.start(vm);
         assertEquals(VmState.RUNNING, client.state(vm));
-        client.destroyWithDisks(vm);
+        client.destroyWithDisks(vm, "lab");
         assertEquals(VmState.UNKNOWN, client.state(vm), "destroyed VM has no state");
 
         List<String> calls = client.calls();
@@ -62,8 +62,8 @@ class HypervisorClientContractTest {
         VmRef vm = client.cloneFromTemplate(client.resolveTemplate("t"), spec());
         client.start(vm);
 
-        client.destroyWithDisks(vm);
-        client.destroyWithDisks(vm); // must not throw
+        client.destroyWithDisks(vm, "lab");
+        client.destroyWithDisks(vm, "lab"); // must not throw
 
         assertEquals(VmState.UNKNOWN, client.state(vm));
     }

@@ -1033,6 +1033,9 @@ class XcpngRetentionStrategyTest {
         assertNull(legacy.getPoolUrl(), "the fixture must really predate the snapshot, or it proves nothing");
 
         r.jenkins.addNode(legacy);
+        // An agent this old is on disk at the first start with the issued-agent store, which records it as it
+        // stands. Without this the fixture is a node the plugin never issued, which is refused for that reason.
+        XcpngIssuedAgentStore.get().issue(legacy);
         r.jenkins.clouds.remove(cloud);
 
         List<LogRecord> log = whileCapturingAgentLog(

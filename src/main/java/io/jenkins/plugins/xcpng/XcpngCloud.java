@@ -1301,7 +1301,7 @@ public class XcpngCloud extends Cloud {
         try (HypervisorClient client = opened) {
             for (XcpngLeakedVm vm : vms) {
                 try {
-                    client.destroyWithDisks(new VmRef(vm.getVmRef()));
+                    client.destroyWithDisks(new VmRef(vm.getVmRef()), name);
                     done.add(vm);
                     LOGGER.log(Level.INFO, () -> "Reclaimed leaked XCP-ng VM " + vm + " for cloud " + name);
                 } catch (RuntimeException e) {
