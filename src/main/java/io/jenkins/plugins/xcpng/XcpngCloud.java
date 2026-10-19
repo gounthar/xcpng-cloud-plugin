@@ -26,7 +26,9 @@ import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
+import io.jenkins.plugins.xcpng.client.VmGoneException;
 import io.jenkins.plugins.xcpng.client.VmRef;
+import io.jenkins.plugins.xcpng.client.VmState;
 import io.jenkins.plugins.xcpng.client.XoRestClient;
 import java.io.IOException;
 import java.net.URI;
@@ -1217,6 +1219,12 @@ public class XcpngCloud extends Cloud {
      * fails, and the cloud's own connection failing to open, which is live configuration an operator can
      * repair. The first failure of each entry is logged at WARNING so a stuck entry is visible at the
      * default level, and the repeats at FINE.
+     *
+     * <p>A held entry (#306), one the #48 guard refused to destroy, has its state read first on every sweep.
+     * Running, Paused and Suspended release the destroy, because on those Xen Orchestra shuts the VM down
+     * before removing its disks. XO saying the VM no longer exists drops the entry, since that is the destroy's
+     * goal state. Anything else -- Halted, a state that does not map, a read that fails -- keeps it, and the
+     * {@value #HELD_SWEEPS_BEFORE_SEVERE}th sweep in a row to keep it says so once at SEVERE.
      */
     void sweepLeakedVms() {
         // A snapshot off the store: iterating it cannot throw even if a record lands mid-sweep.
@@ -1288,6 +1296,12 @@ public class XcpngCloud extends Cloud {
                 return;
             }
             for (XcpngLeakedVm vm : vms) {
+                // Not a held entry (#306): giving up drops it from the store and so from the held-VM banner,
+                // and the banner is the only thing still saying the refused VM may be running.
+                if (vm.isHeld()) {
+                    stillLeaked(vm, e, "could not open the connection it was recorded with");
+                    continue;
+                }
                 giveUp(vm, "its connection can no longer be opened: " + e.getMessage());
                 done.add(vm);
             }
@@ -1300,6 +1314,9 @@ public class XcpngCloud extends Cloud {
         }
         try (HypervisorClient client = opened) {
             for (XcpngLeakedVm vm : vms) {
+                if (vm.isHeld() && !heldEntryMayBeDestroyed(client, vm, done)) {
+                    continue;
+                }
                 try {
                     client.destroyWithDisks(new VmRef(vm.getVmRef()), name);
                     done.add(vm);
@@ -1311,6 +1328,61 @@ public class XcpngCloud extends Cloud {
         } catch (RuntimeException e) {
             // close() threw. Whatever was reclaimed is already in done and is dropped by the caller's finally.
             LOGGER.log(Level.FINE, e, () -> "Could not close the client used to sweep leaked VMs for cloud " + name);
+        }
+    }
+
+    /**
+     * Whether a held entry may be destroyed on this sweep, adding it to {@code done} if its VM is gone.
+     *
+     * <p>The hazard is one-directional. The delete skips the shutdown only on a {@code Halted} reading, and that
+     * is the reading #48 recorded for a running domain, so a VM reading anything Xen Orchestra shuts down first
+     * is safe to delete whether or not the reading is true. Only those release it.
+     */
+    private boolean heldEntryMayBeDestroyed(
+            @NonNull HypervisorClient client, @NonNull XcpngLeakedVm vm, @NonNull List<XcpngLeakedVm> done) {
+        VmState state;
+        try {
+            state = client.state(new VmRef(vm.getVmRef()));
+        } catch (VmGoneException e) {
+            done.add(vm);
+            LOGGER.log(
+                    Level.INFO, () -> "Held leaked XCP-ng VM " + vm + " for cloud " + name + " is gone; dropping it");
+            return false;
+        } catch (RuntimeException e) {
+            keptHeld(vm, "its power state could not be read (" + e.getMessage() + ")");
+            return false;
+        }
+        return switch (state) {
+            case RUNNING, PAUSED, SUSPENDED -> true;
+            default -> {
+                keptHeld(vm, "the pool still reads it " + state);
+                yield false;
+            }
+        };
+    }
+
+    /**
+     * How many sweeps in a row may keep one held entry before it is reported at SEVERE. Ten minutes at the
+     * maintainer's one-minute tick. The second #48 observation (after a host reboot) had already cleared when
+     * rechecked about 30 s later, inside the guard's own wait; one recheck, so an upper bound on that window and
+     * not a measurement. A VM still held after ten sweeps is either really halted or worth a look from dom0.
+     */
+    static final int HELD_SWEEPS_BEFORE_SEVERE = 10;
+
+    private void keptHeld(@NonNull XcpngLeakedVm vm, @NonNull String why) {
+        int sweeps = XcpngLeakedVmStore.get().keptHeld(name, vm);
+        if (sweeps == HELD_SWEEPS_BEFORE_SEVERE) {
+            LOGGER.log(
+                    Level.SEVERE,
+                    () -> "Leaked XCP-ng VM " + vm + " for cloud " + name + " has been held for " + sweeps
+                            + " sweeps: " + why + ". Its teardown was refused because the pool read it Halted while"
+                            + " its agent was connected (#48), and it is not deleted on that reading. A dry run of"
+                            + " tools/reaper.py --cloud " + name + " --dom0-check reports whether dom0 still runs"
+                            + " it. This entry clears once the VM is gone or the pool reads it running");
+        } else {
+            LOGGER.log(
+                    Level.FINE,
+                    () -> "Held leaked XCP-ng VM " + vm + " for cloud " + name + " kept for the next sweep: " + why);
         }
     }
 

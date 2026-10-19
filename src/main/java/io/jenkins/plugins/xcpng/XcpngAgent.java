@@ -660,8 +660,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     .println("Failed to destroy VM " + vmRef + "; recorded for later cleanup: " + e.getMessage());
             // With this agent's connection, not the cloud's: the sweep must reach the VM the way it was made,
             // even after the cloud is edited (#223). An agent predating the snapshot records none.
-            cloud.recordLeakedVm(XcpngLeakedVm.of(
-                    vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates));
+            XcpngLeakedVm leaked = XcpngLeakedVm.of(
+                    vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates);
+            // Held when the #48 guard is what refused (#306): the sweep would otherwise send the very delete
+            // the guard just refused, on the same Halted reading, a minute later at most.
+            cloud.recordLeakedVm(e instanceof HaltedWhileConnectedException ? leaked.asHeld() : leaked);
         }
     }
 
@@ -748,10 +751,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * <p>What the plugin has that the pool cannot give it is a second opinion. An open channel means the
      * agent JVM inside the VM is talking to the controller, so the VM is running whatever the record says.
      * When the two disagree this re-reads for up to {@code wait}. If the disagreement outlasts that, it
-     * throws, the caller records the VM as leaked, and the maintainer reissues the destroy on its next tick.
-     * That tick runs about once a minute at any phase and the sweep has no minimum age, so the retry can come
-     * anywhere from at once to a minute later, without this check. The hold this guarantees is {@code wait}
-     * itself, not the retry's delay.
+     * throws {@link HaltedWhileConnectedException}, and the caller records the VM as leaked and held. The
+     * maintainer's sweep then reads the state again on every tick, about once a minute, and reissues the
+     * destroy only once the pool reads the VM in a state Xen Orchestra shuts down before deleting (#306).
+     * There is no age-out: a VM the pool reads {@code Halted} for good stays recorded, and is reported once at
+     * SEVERE with the tool that can check it from dom0.
      *
      * <p>No channel means no second opinion, and neither does a first read that fails, so both fall through
      * to the destroy exactly as before: this must never make an ordinary teardown fail. Once a contradiction
@@ -759,7 +763,12 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * that fails keeps waiting rather than letting the delete through.
      *
      * <p>A channel that is open on the controller's side but whose VM really did stop (a guest crash the
-     * pinger has not noticed yet) costs one delayed teardown and a leaked-VM entry that the next sweep clears.
+     * pinger has not noticed yet) costs one delayed teardown and a held entry that stays until the VM is
+     * gone, since a VM that is really halted keeps reading {@code Halted}. The sweep's SEVERE names
+     * {@code tools/reaper.py}, whose dom0 check tells the two cases apart.
+     *
+     * @throws HaltedWhileConnectedException when the contradiction outlasts {@code wait}, or the wait is
+     *     interrupted after it has been seen
      */
     static void refuseIfHaltedWhileConnected(
             @NonNull HypervisorClient client,
@@ -797,7 +806,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 sleeper.sleep(poll);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw new HypervisorException(
+                throw new HaltedWhileConnectedException(
                         "Interrupted while VM " + vm.value()
                                 + " read Halted under a connected agent; not destroying it now (#48)",
                         e);
@@ -817,9 +826,26 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                 return;
             }
         }
-        throw new HypervisorException("VM " + vm.value() + " still reads Halted after " + wait.toSeconds()
+        throw new HaltedWhileConnectedException("VM " + vm.value() + " still reads Halted after " + wait.toSeconds()
                 + " s while its agent is connected. Destroying it now would skip the shutdown and remove a"
                 + " running domain's disks (#48), so the destroy is left for a later retry.");
+    }
+
+    /**
+     * The #48 guard refusing a destroy, as distinct from a destroy that failed. The teardown records a VM
+     * refused this way as held, so the sweep does not send the same delete on the same reading (#306).
+     */
+    static final class HaltedWhileConnectedException extends HypervisorException {
+
+        private static final long serialVersionUID = 1L;
+
+        HaltedWhileConnectedException(String message) {
+            super(message);
+        }
+
+        HaltedWhileConnectedException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     /** Whether this agent's channel to the controller is open right now. */

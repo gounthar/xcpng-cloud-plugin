@@ -1103,9 +1103,23 @@ public final class XoRestClient implements HypervisorClient {
     @Override
     @NonNull
     public VmState state(@NonNull VmRef vm) {
-        return switch (get(API + "/vms/" + vm.value() + "?fields=power_state")
-                .path("power_state")
-                .asText("")) {
+        // Not through get(): a 404 here has to stay distinguishable. XO's own "no such VM" about this id is
+        // the VM being gone, which the leaked-VM sweep treats as done, and any other 404 is a read that failed.
+        String path = API + "/vms/" + vm.value() + "?fields=power_state";
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("GET", path, null, READ_TIMEOUT);
+        } catch (IOException e) {
+            throw new HypervisorException("GET " + path + ": transport error: " + e.getMessage(), e);
+        }
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), vm.value())) {
+            throw new VmGoneException("Xen Orchestra has no VM " + vm.value());
+        }
+        if (!resp.isSuccess()) {
+            throw failure("GET", path, resp.status(), resp.body());
+        }
+        refuseAsyncAccepted("GET", path, resp, null);
+        return switch (parse("GET " + path, resp.body()).path("power_state").asText("")) {
             case "Halted" -> VmState.HALTED;
             case "Running" -> VmState.RUNNING;
             case "Paused" -> VmState.PAUSED;

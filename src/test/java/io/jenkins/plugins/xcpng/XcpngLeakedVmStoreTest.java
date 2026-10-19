@@ -368,4 +368,79 @@ class XcpngLeakedVmStoreTest {
         assertEquals(pem, reloaded.getCaCertificates());
         assertEquals(PoolTrust.anchoredAt(pem), reloaded.connection().trust());
     }
+
+    /**
+     * Held is what makes the sweep read the state before deleting (#306), and the VM can outlive a restart in
+     * exactly the state that made the teardown refuse. Losing it on the way through the file would hand the next
+     * sweep a plain delete on the reading the guard refused.
+     */
+    @Test
+    void aHeldEntryStaysHeldAcrossARestart(JenkinsRule r) {
+        XcpngLeakedVmStore.get().record("xcpng-lab", leak("vm-held").asHeld());
+
+        XcpngLeakedVm reloaded =
+                new XcpngLeakedVmStore().entries("xcpng-lab").iterator().next();
+
+        assertTrue(reloaded.isHeld(), "held must come back off disk");
+    }
+
+    /**
+     * A file written before held existed has no element for it, and every entry in it was recorded by a
+     * teardown that did not know to hold. It loads unheld, the way {@code caCertificates} loads null.
+     */
+    @Test
+    void anEntryWrittenBeforeHeldExistedLoadsUnheld(JenkinsRule r) throws Exception {
+        XcpngLeakedVmStore.get().record("xcpng-lab", leak("vm-old").asHeld());
+        File file = new File(Jenkins.get().getRootDir(), STORE_FILE);
+        String written = Files.readString(file.toPath(), StandardCharsets.UTF_8);
+        assertTrue(
+                written.contains("<held>true</held>"), "the control: held must be in the file to remove: " + written);
+        Files.writeString(file.toPath(), written.replaceAll("\\s*<held>true</held>", ""), StandardCharsets.UTF_8);
+
+        XcpngLeakedVm reloaded =
+                new XcpngLeakedVmStore().entries("xcpng-lab").iterator().next();
+
+        assertEquals("vm-old", reloaded.getVmRef());
+        assertFalse(reloaded.isHeld(), "an entry with no held element is not held");
+    }
+
+    /**
+     * Held is not part of an entry's identity, so the same VM recorded twice is still one entry, and the second
+     * record is still silent.
+     */
+    @Test
+    void theSameVmRecordedTwiceIsOneEntry(JenkinsRule r) {
+        XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
+
+        assertTrue(store.record("xcpng-lab", leak("vm-1")));
+        assertFalse(store.record("xcpng-lab", leak("vm-1")), "a duplicate is not new");
+        assertFalse(store.record("xcpng-lab", leak("vm-1").asHeld()), "nor is the same VM held");
+
+        assertEquals(
+                1, store.entries("xcpng-lab").size(), store.entries("xcpng-lab").toString());
+    }
+
+    /**
+     * Held wins and is never taken back. A later unheld record of the same VM -- a second teardown that failed
+     * for some ordinary reason -- says nothing about whether the pool still reads it Halted.
+     */
+    @Test
+    void heldWinsWhicheverOrderTheRecordsArriveIn(JenkinsRule r) {
+        XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
+
+        store.record("first-unheld", leak("vm-1"));
+        store.record("first-unheld", leak("vm-1").asHeld());
+        store.record("first-held", leak("vm-1").asHeld());
+        store.record("first-held", leak("vm-1"));
+
+        assertTrue(store.entries("first-unheld").iterator().next().isHeld(), "an unheld entry is upgraded");
+        assertTrue(store.entries("first-held").iterator().next().isHeld(), "a held entry is never downgraded");
+        assertTrue(
+                new XcpngLeakedVmStore()
+                        .entries("first-unheld")
+                        .iterator()
+                        .next()
+                        .isHeld(),
+                "the upgrade is saved");
+    }
 }

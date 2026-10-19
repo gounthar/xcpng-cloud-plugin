@@ -810,6 +810,59 @@ class XcpngRetentionStrategyTest {
     }
 
     /**
+     * #306 end to end: the refused VM is recorded held, so the sweep that follows does not send the delete the
+     * guard has just refused while the pool still reads {@code Halted}, and sends it once the pool reads
+     * {@code Running}. Before #306 the first sweep deleted it, on the very reading that made the guard refuse.
+     */
+    @Test
+    void aRefusedTeardownIsHeldUntilThePoolStopsReadingHalted(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        // Thirteen reads for the guard's whole window, one Halted for the first sweep, then Running.
+        VmState[] answers = new VmState[15];
+        Arrays.fill(answers, VmState.HALTED);
+        answers[14] = VmState.RUNNING;
+        fake.scriptStates(agent.getVmRef(), answers);
+        agent.setChannelProbe(() -> true);
+        agent.setSleeper(new FakeSleeper());
+        r.jenkins.addNode(agent);
+
+        agent.terminate();
+
+        assertEquals(13, fake.stateReads(), "the guard must have spent its whole window");
+        List<XcpngLeakedVm> recorded = List.copyOf(XcpngLeakedVmStore.get().entries("xcpng"));
+        assertEquals(1, recorded.size(), recorded.toString());
+        assertTrue(recorded.get(0).isHeld(), "a refusal by the #48 guard must be recorded held: " + recorded);
+
+        cloud.sweepLeakedVms();
+        assertEquals(0, destroyCount(fake), "the first sweep still reads Halted and must not delete: " + fake.calls());
+        assertTrue(cloud.leakedVmRefs().contains(agent.getVmRef()));
+
+        cloud.sweepLeakedVms();
+        assertEquals(1, destroyCount(fake), "Running releases the delete: " + fake.calls());
+        assertTrue(cloud.leakedVmRefs().isEmpty(), cloud.leakedVmRefs().toString());
+    }
+
+    /**
+     * A teardown that fails for an ordinary reason is not held: the guard never refused it, and holding it
+     * would make the sweep wait on a state read it has no reason to need.
+     */
+    @Test
+    void anOrdinaryFailedTeardownIsNotHeld(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+
+        agent.terminate();
+
+        List<XcpngLeakedVm> recorded = List.copyOf(XcpngLeakedVmStore.get().entries("xcpng"));
+        assertEquals(1, recorded.size(), recorded.toString());
+        assertFalse(recorded.get(0).isHeld(), "only the #48 refusal holds an entry: " + recorded);
+    }
+
+    /**
      * The same connected agent, but the pool agrees the VM is running: the destroy goes ahead at once and
      * nothing is recorded as leaked. The control for the test above, so a guard that refused everything
      * under a connected agent would show here.

@@ -72,7 +72,11 @@ public interface HypervisorClient extends AutoCloseable {
     @NonNull
     Optional<String> primaryIpAddress(@NonNull VmRef vm);
 
-    /** Current power state, or {@link VmState#UNKNOWN} for a value the backend does not map. */
+    /**
+     * Current power state, or {@link VmState#UNKNOWN} for a value the backend does not map.
+     *
+     * @throws VmGoneException when the backend says it has no such VM
+     */
     @NonNull
     VmState state(@NonNull VmRef vm);
 
