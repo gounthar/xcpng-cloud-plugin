@@ -3,7 +3,7 @@
 Runs dry by default. Nothing is destroyed without --apply.
 
     XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py
-    curl -su USER:TOKEN "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
+    curl -fsu USER:TOKEN "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
       | XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --keep-nodes -
     XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --include-live
 
@@ -182,6 +182,12 @@ def read_node_names(path):
     for line in text.splitlines():
         line = line.strip()
         if line and not line.startswith("#"):
+            # Jenkins refuses '<' and '>' in a node name, so a line carrying one is not a name. It is
+            # what a failed login looks like: `curl -s` without -f passes the HTML error page through,
+            # and read as names it keeps nothing while looking like a non-empty answer.
+            if "<" in line or ">" in line:
+                raise ValueError(f"{path}: {line[:60]!r} is not a node name; this looks like an HTML "
+                                 "page, e.g. a failed login. Fetch the list with curl -f.")
             names.add(line)
     return names
 

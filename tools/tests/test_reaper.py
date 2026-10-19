@@ -675,3 +675,20 @@ def test_a_kept_node_is_reported_in_a_dry_run_too(pool, tmp_path, capsys):
     assert f"KEEPING {LIVE!r}" in out
     assert "matching VMs carrying the 'xcpng-cloud' marker: 1 VM(s)" in out
     assert fake.destroyed == []
+
+
+@pytest.mark.parametrize("page", [
+    "<!DOCTYPE html>\n<html><head><title>Authentication required</title></head>\n"
+    "<body>\nYou are authenticated as: anonymous\n</body></html>\n",
+    "  <html>\n<body>Error 403 No valid crumb</body></html>",
+])
+def test_an_html_error_page_is_refused_not_read_as_node_names(pool, tmp_path, page):
+    """curl -s without -f passes a failed login's error page through. Read as names, it is a non-empty
+    list that matches no VM, so every live agent would be reaped while the empty-list guard stays quiet."""
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(page)
+    fake = pool(_two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", str(nodes)))
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+    assert fake.destroyed == []
