@@ -929,6 +929,35 @@ class XoRestClientTest {
         assertEquals(VmState.UNKNOWN, stateOf("Migrating"));
     }
 
+    /**
+     * XO saying it has no such VM is an answer about the VM, not a failed read, and the leaked-VM sweep has to
+     * tell the two apart: a held entry whose VM is gone is done, and one whose state could not be read is not.
+     */
+    @Test
+    void stateOfAVmXoHasNoRecordOfSaysTheVmIsGone() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/vms/" + CLONE + "?fields=power_state", 404, noSuchVm(CLONE));
+
+        assertThrows(VmGoneException.class, () -> new XoRestClient(t).state(new VmRef(CLONE)));
+    }
+
+    /**
+     * Only XO's own 404 about this VM means it is gone. A route the appliance does not serve, or XO's envelope
+     * about some other object, is a read that failed, and reporting that as gone would drop a held entry for a
+     * VM that may still be running.
+     */
+    @Test
+    void aStateFourOhFourThatIsNotXosOwnIsAFailedReadNotAGoneVm() {
+        for (String body : new String[] {"<html><body>404 Not Found</body></html>", "", noSuchVm("some-other-vm")}) {
+            ScriptedRest t = new ScriptedRest();
+            t.fail("GET", "/rest/v0/vms/" + CLONE + "?fields=power_state", 404, body);
+
+            HypervisorException e =
+                    assertThrows(HypervisorException.class, () -> new XoRestClient(t).state(new VmRef(CLONE)));
+            assertFalse(e instanceof VmGoneException, "a 404 without XO's envelope for this VM: " + body);
+        }
+    }
+
     @Test
     void startAndStopUseTheSynchronousFormSoTheyReturnOnlyWhenDone() {
         ScriptedRest t = new ScriptedRest();
