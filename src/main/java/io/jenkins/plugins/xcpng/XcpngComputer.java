@@ -2,6 +2,10 @@ package io.jenkins.plugins.xcpng;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import hudson.slaves.AbstractCloudComputer;
+import jakarta.servlet.ServletException;
+import java.io.IOException;
+import java.io.InputStream;
+import jenkins.model.Jenkins;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.jenkinsci.plugins.cloudstats.TrackedItem;
 
@@ -26,5 +30,19 @@ public class XcpngComputer extends AbstractCloudComputer<XcpngAgent> implements 
     public ProvisioningActivity.Id getId() {
         XcpngAgent node = getNode();
         return node == null ? null : node.getId();
+    }
+
+    /**
+     * Replacing an XCP-ng agent's whole definition is reserved to administrators.
+     *
+     * <p>Its fields are not an operator's to set: the pool URL, credential ID, TLS trust, VM handle and owning
+     * cloud are written by the plugin when it provisions, from a cloud only an administrator configures, and
+     * {@link XcpngAgent#reconfigure} already keeps them off the HTML form. Reading the definition stays at
+     * {@code EXTENDED_READ}, as core has it: none of those fields is a secret.
+     */
+    @Override
+    public void updateByXml(InputStream source) throws IOException, ServletException {
+        Jenkins.get().checkPermission(Jenkins.ADMINISTER);
+        super.updateByXml(source);
     }
 }

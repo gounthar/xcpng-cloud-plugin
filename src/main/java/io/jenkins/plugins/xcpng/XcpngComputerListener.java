@@ -82,6 +82,13 @@ public class XcpngComputerListener extends ComputerListener {
                             + agent.getNodeName());
             return;
         }
+        if (!agent.isIssued()) {
+            LOGGER.log(
+                    Level.WARNING,
+                    () -> "Agent " + agent.getNodeName() + " carries connection details this plugin did not issue"
+                            + " it; not scrubbing its seed secret");
+            return;
+        }
         String vmRef = agent.getVmRef();
         if (vmRef == null) {
             // An agent cannot be online without a VM to be online on, so this is unreachable in practice; it

@@ -83,8 +83,13 @@ public interface HypervisorClient extends AutoCloseable {
      * Destroy the VM and every disk that was attached to it. Implementations must capture the
      * VBD-to-VDI references <em>before</em> destroying the VM, because destroying it removes the VBDs
      * and orphans the VDIs otherwise.
+     *
+     * <p>Refuses, by throwing, a VM that does not carry this plugin's ownership markers for {@code owner}.
+     * A VM that is already gone is not a failure.
+     *
+     * @param owner the name of the cloud the VM was provisioned for, as stamped on it at clone time.
      */
-    void destroyWithDisks(@NonNull VmRef vm);
+    void destroyWithDisks(@NonNull VmRef vm, @NonNull String owner);
 
     /**
      * Verify connectivity and authentication against the pool. Throws on failure so a UI

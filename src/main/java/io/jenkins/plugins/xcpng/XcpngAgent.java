@@ -295,6 +295,9 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         this.backend = cloud.getBackend();
         this.poolId = cloud.getPoolId();
         this.networkName = template.getNetworkName();
+        // Last, once every field the record copies is set. See XcpngIssuedAgentStore for why the node's own
+        // file is not trusted on its own.
+        XcpngIssuedAgentStore.get().issue(this);
     }
 
     /**
@@ -327,6 +330,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     void setVmRef(@CheckForNull String vmRef) {
         this.vmRef = vmRef;
+        XcpngIssuedAgentStore.get().issueVmRef(getNodeName(), vmRef);
         try {
             save();
         } catch (IOException e) {
@@ -537,6 +541,23 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     @Override
     protected void _terminate(TaskListener listener) {
+        try {
+            terminateVm(listener);
+        } finally {
+            XcpngIssuedAgentStore.get().forget(this);
+        }
+    }
+
+    /**
+     * Whether this node's connection details and VM handle are still exactly what the plugin issued it.
+     * False for a node the plugin did not build and for one whose definition has changed since; such a node
+     * is never given a session to the pool. See {@link XcpngIssuedAgentStore}.
+     */
+    boolean isIssued() {
+        return XcpngIssuedAgentStore.get().matches(this);
+    }
+
+    private void terminateVm(TaskListener listener) {
         // Read the field once. Everything below branches on it, and the launcher writes it from another
         // thread, so re-reading could take the destroy branch on a reference that has since gone.
         final String vmRef = this.vmRef;
@@ -549,6 +570,20 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     Level.FINE,
                     () -> "Agent " + getNodeName() + " never had a VM behind it; nothing to destroy on teardown");
             listener.getLogger().println("No XCP-ng VM was ever created for this agent; nothing to destroy.");
+            return;
+        }
+        if (!isIssued()) {
+            // Nothing is contacted and nothing is recorded as leaked: the connection and the handle are exactly
+            // the fields that cannot be trusted. A VM the plugin really did make still carries its owner marker,
+            // which is what tools/reaper.py selects on.
+            LOGGER.log(
+                    Level.WARNING,
+                    () -> "Agent " + getNodeName() + " names VM " + vmRef + ", but its connection details or VM"
+                            + " are not what this plugin issued it, or its teardown already ran; not contacting"
+                            + " the pool. If the VM is this plugin's, reclaim it with tools/reaper.py");
+            listener.getLogger()
+                    .println("This agent's connection details are not the ones the XCP-ng plugin issued it;"
+                            + " not destroying VM " + vmRef + ". Reclaim it with tools/reaper.py if it is ours.");
             return;
         }
         XcpngCloud cloud = getCloud();
@@ -594,7 +629,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     sleeper != null ? sleeper : Sleeper.REAL,
                     HALTED_WHILE_CONNECTED_WAIT,
                     HALTED_WHILE_CONNECTED_POLL);
-            client.destroyWithDisks(new VmRef(vmRef));
+            client.destroyWithDisks(new VmRef(vmRef), cloudName);
         } catch (RuntimeException e) {
             if (cloud == null) {
                 // Nothing downstream can recover this one: the durable leaked-VM set lives on the cloud that
@@ -657,6 +692,10 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      */
     @NonNull
     HypervisorClient openClientForVm(@CheckForNull XcpngCloud fallback) {
+        if (!isIssued()) {
+            throw new IllegalStateException("Agent " + getNodeName() + " carries connection details this plugin did"
+                    + " not issue it; refusing to open a session with them.");
+        }
         if (poolUrl != null) {
             return openClientFromSnapshot(fallback == null);
         }

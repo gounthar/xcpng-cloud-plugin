@@ -950,7 +950,7 @@ class XoRestClientTest {
     void destroyTreatsAnAlreadyGoneVmAsDone() {
         ScriptedRest t = new ScriptedRest();
         t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, noSuchVm(CLONE));
-        new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)); // must not throw
+        destroyOwned(t); // must not throw
     }
 
     /**
@@ -968,7 +968,7 @@ class XoRestClientTest {
         ScriptedRest t = new ScriptedRest();
         HypervisorException e = assertThrows(
                 HypervisorException.class,
-                () -> new XoRestClient(t).destroyWithDisks(new VmRef("OpaqueRef:9b1f-dead-beef")));
+                () -> new XoRestClient(t).destroyWithDisks(new VmRef("OpaqueRef:9b1f-dead-beef"), OWNER));
 
         assertTrue(e.getMessage().contains("XAPI handle"), e.getMessage());
         assertTrue(t.destroyed.isEmpty(), "nothing may reach the appliance: " + t.destroyed);
@@ -986,11 +986,59 @@ class XoRestClientTest {
             ScriptedRest t = new ScriptedRest();
             HypervisorException e = assertThrows(
                     HypervisorException.class,
-                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(mangled)),
+                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(mangled), OWNER),
                     "'" + mangled + "' must be refused");
             assertTrue(e.getMessage().contains("not a VM id from this backend"), e.getMessage());
             assertTrue(t.calls.isEmpty(), "nothing may be sent for '" + mangled + "': " + t.calls);
         }
+    }
+
+    /**
+     * The handle a destroy is given is read back from a node's own file, so it is not proof the VM is this
+     * plugin's. Only the two markers {@code markOwner} stamps are, and both must be there, exactly. Each case
+     * asserts nothing was deleted, not only that it threw: a client that issued the DELETE and then complained
+     * would pass an exception-only check.
+     */
+    @Test
+    void destroyRefusesAVmThatIsNotThisCloudsOwn() {
+        String owner = XoRestClient.OWNER_TAG_PREFIX + OWNER;
+        String self = XoRestClient.SELF_TAG_PREFIX + CLONE_UUID;
+        Map<String, List<String>> cases = new LinkedHashMap<>();
+        cases.put("an untagged VM, which is anything not provisioned here", List.of());
+        cases.put("the uuid stamp alone", List.of(self));
+        cases.put("the owner tag alone, which a hand-made copy inherits", List.of(owner));
+        cases.put("another cloud whose name starts with this one's", List.of(owner + "-2", self));
+        cases.put("a copy carrying its source's stamp", List.of(owner, XoRestClient.SELF_TAG_PREFIX + "other-uuid"));
+        cases.forEach((what, tags) -> {
+            ScriptedRest t = new ScriptedRest();
+            t.vmTags.addAll(tags);
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE), OWNER),
+                    what + " must be refused");
+            assertTrue(e.getMessage().contains("not a VM cloud 'lab' provisioned"), e.getMessage());
+            assertTrue(t.destroyed.isEmpty(), what + ": nothing may be deleted: " + t.destroyed);
+        });
+    }
+
+    @Test
+    void destroyDeletesAVmCarryingBothOfThisCloudsMarkers() {
+        // Control for the refusals above: the same fixture, owned, really is deleted.
+        ScriptedRest t = new ScriptedRest();
+        destroyOwned(t);
+        assertEquals(List.of(CLONE), t.destroyed);
+        assertTrue(
+                t.indexOf("GET", "/rest/v0/vms/" + CLONE + "?fields=uuid,tags")
+                        < t.indexOf("DELETE", "/rest/v0/vms/" + CLONE),
+                "the markers are read before the delete: " + t.paths());
+    }
+
+    @Test
+    void destroyTreatsAVmGoneBeforeItsMarkersWereReadAsDone() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/vms/" + CLONE + "?fields=uuid,tags", 404, noSuchVm(CLONE));
+        new XoRestClient(t).destroyWithDisks(new VmRef(CLONE), OWNER); // must not throw
+        assertTrue(t.all("DELETE", "/rest/v0/vms/" + CLONE).isEmpty(), "nothing left to delete: " + t.paths());
     }
 
     /**
@@ -1020,9 +1068,24 @@ class XoRestClientTest {
             t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, body);
             assertThrows(
                     HypervisorException.class,
-                    () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)),
+                    () -> destroyOwned(t),
                     "a 404 without XO's envelope must not be swallowed: " + body);
         }
+    }
+
+    /** The cloud name the destroy tests pass, and the one {@link #owned} stamps. */
+    private static final String OWNER = "lab";
+
+    /** Give the fixture clone both markers {@code markOwner} stamps for {@link #OWNER}. */
+    private static ScriptedRest owned(ScriptedRest t) {
+        t.vmTags.add(XoRestClient.OWNER_TAG_PREFIX + OWNER);
+        t.vmTags.add(XoRestClient.SELF_TAG_PREFIX + CLONE_UUID);
+        return t;
+    }
+
+    /** Destroy the fixture clone as its owner, so a test reaches the DELETE it is about. */
+    private static void destroyOwned(ScriptedRest t) {
+        new XoRestClient(owned(t)).destroyWithDisks(new VmRef(CLONE), OWNER);
     }
 
     /** XO's 404 for a VM it does not have, as the lab appliance (xo-server 5.208.3) answers it. */
@@ -1042,8 +1105,7 @@ class XoRestClientTest {
     void anAcceptedTaskIsRefusedRatherThanReadAsDone() {
         ScriptedRest started = new ScriptedRest();
         started.fail("DELETE", "/rest/v0/vms/" + CLONE, 202, "{\"id\":\"task-7\"}");
-        HypervisorException e = assertThrows(
-                HypervisorException.class, () -> new XoRestClient(started).destroyWithDisks(new VmRef(CLONE)));
+        HypervisorException e = assertThrows(HypervisorException.class, () -> destroyOwned(started));
         assertTrue(e.getMessage().contains("202"), e.getMessage());
         assertTrue(e.getMessage().contains("6.5.0"), "the operator needs the version: " + e.getMessage());
 
@@ -1087,8 +1149,7 @@ class XoRestClientTest {
     void destroyPropagatesAnythingThatIsNotAMissingObject() {
         ScriptedRest t = new ScriptedRest();
         t.fail("DELETE", "/rest/v0/vms/" + CLONE, 409, "{\"error\":\"incorrect state\"}");
-        HypervisorException e =
-                assertThrows(HypervisorException.class, () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)));
+        HypervisorException e = assertThrows(HypervisorException.class, () -> destroyOwned(t));
         assertEquals("incorrect state", e.getErrorCode());
     }
 
@@ -1236,8 +1297,7 @@ class XoRestClientTest {
     void anUnroutedCallElsewhereGetsNoVersionClaim() {
         ScriptedRest t = new ScriptedRest();
         t.fail("DELETE", "/rest/v0/vms/" + CLONE, 404, cannot("DELETE", "/rest/v0/vms/" + CLONE));
-        HypervisorException e =
-                assertThrows(HypervisorException.class, () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)));
+        HypervisorException e = assertThrows(HypervisorException.class, () -> destroyOwned(t));
 
         assertTrue(e.getMessage().contains("does not serve DELETE"), e.getMessage());
         assertFalse(e.getMessage().contains("5.202.1"), e.getMessage());
@@ -1453,7 +1513,7 @@ class XoRestClientTest {
                 "/rest/v0/vms/" + CLONE,
                 404,
                 "{\"error\":\"not found\",\"data\":{\"id\":\"" + CLONE + "\",\"type\":\"VM\"}}");
-        assertThrows(HypervisorException.class, () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE)));
+        assertThrows(HypervisorException.class, () -> destroyOwned(t));
     }
 
     /**
@@ -1529,8 +1589,7 @@ class XoRestClientTest {
         // Teardown reaches failure() by its own path, and had the same gap.
         ScriptedRest gateway = new ScriptedRest();
         gateway.fail("DELETE", "/rest/v0/vms/" + CLONE, 502, "<html><body>Bad Gateway</body></html>");
-        HypervisorException down = assertThrows(
-                HypervisorException.class, () -> new XoRestClient(gateway).destroyWithDisks(new VmRef(CLONE)));
+        HypervisorException down = assertThrows(HypervisorException.class, () -> destroyOwned(gateway));
         assertTrue(down.getMessage().contains("502"), down.getMessage());
     }
 
