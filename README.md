@@ -497,7 +497,9 @@ number of waiting builds and what was planned for them.
   `xcpng-cloud` owner marker stamped into each clone, so it finds these VMs without needing Jenkins to
   still know about them. The marker is on every live agent and warm spare too, so `--apply` refuses to
   run until it is given the controller's node list with `--keep-nodes`, whose VMs it keeps, or told
-  with `--include-live` that none is to be kept.
+  with `--include-live` that none is to be kept. The list is a snapshot: an agent the controller
+  adds after it was taken can be reaped, so pipe it straight in and run while the cloud is not
+  provisioning.
 
 ## Not in this version
 

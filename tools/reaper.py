@@ -3,7 +3,7 @@
 Runs dry by default. Nothing is destroyed without --apply.
 
     XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py
-    curl -fsu USER:TOKEN "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
+    curl -gfsu USER:TOKEN "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
       | XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --keep-nodes -
     XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --include-live
 
@@ -14,7 +14,13 @@ controller's node list (plain names one per line, or the JSON above) and keeps e
 after a node in it, the node name being the VM's name_label; --include-live says there is no
 node to keep, because the controller is gone or every agent is meant to go, and reaps
 everything the marker selects. An empty --keep-nodes list is refused, since a failed curl
-produces exactly that. A dry run needs neither.
+produces exactly that. A dry run needs neither. (curl needs -g: without it the brackets in
+the query are read as a URL range and the fetch fails.)
+
+The list is a snapshot. A node the controller adds after it was taken is not in it, and its
+VM, cloned once the node exists, is reaped if it is already in the pool when this lists VMs.
+Pipe the list straight in as above, so the gap is seconds, and run --apply while the cloud is
+not provisioning: no build waiting for its labels and no warm pool refilling.
 
 Keep using this until destroy_with_disks has survived enough provision/destroy
 cycles to be trusted: a half-working teardown leaks VDIs onto a shared pool.
@@ -87,23 +93,41 @@ def live_domains_on_dom0(host, password):
     does. Nothing is written to disk.
     """
     if shutil.which("sshpass") is None:
-        raise XapiError("DOM0_CHECK_UNAVAILABLE",
-                        "sshpass is required for --dom0-check (e.g. apt-get install sshpass)")
+        raise XapiError(
+            "DOM0_CHECK_UNAVAILABLE",
+            "sshpass is required for --dom0-check (e.g. apt-get install sshpass)",
+        )
     try:
         completed = subprocess.run(
-            ["sshpass", "-e", "ssh",
-             "-o", "PubkeyAuthentication=no",
-             "-o", "PreferredAuthentications=password",
-             "-o", "StrictHostKeyChecking=no",
-             "-o", "UserKnownHostsFile=/dev/null",
-             "-o", "ConnectTimeout=10",
-             f"root@{host}", "xl list"],
+            [
+                "sshpass",
+                "-e",
+                "ssh",
+                "-o",
+                "PubkeyAuthentication=no",
+                "-o",
+                "PreferredAuthentications=password",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                f"root@{host}",
+                "xl list",
+            ],
             env={**os.environ, "SSHPASS": password},
-            capture_output=True, text=True, timeout=30, check=True)
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
     except (subprocess.SubprocessError, OSError) as e:
         # A failed check must not read as "dom0 is clean". Raise so --apply fails closed.
         detail = getattr(e, "stderr", "") or str(e) or e.__class__.__name__
-        raise XapiError("DOM0_UNREACHABLE", f"xl list on {host}: {detail}".strip()) from e
+        raise XapiError(
+            "DOM0_UNREACHABLE", f"xl list on {host}: {detail}".strip()
+        ) from e
 
     # `xl list` prints a header row, then one row per running domain; Domain-0 is dom0 itself.
     # A genuinely halted guest is absent entirely, so anything here is a domain Xen is running.
@@ -175,9 +199,18 @@ def read_node_names(path):
             raise ValueError(f"{path}: looks like JSON but does not parse: {e}") from e
         computers = data.get("computer") if isinstance(data, dict) else None
         if not isinstance(computers, list):
-            raise ValueError(f"{path}: JSON without a 'computer' list; expected /computer/api/json")
-        return {c["displayName"] for c in computers
-                if isinstance(c, dict) and isinstance(c.get("displayName"), str)}
+            raise ValueError(
+                f"{path}: JSON without a 'computer' list; expected /computer/api/json"
+            )
+        # Every entry or nothing: dropping one that carries no name would leave a shorter list
+        # that still passes the empty check, and the agent it stood for would be reaped.
+        for c in computers:
+            if not (isinstance(c, dict) and isinstance(c.get("displayName"), str)):
+                raise ValueError(
+                    f"{path}: computer entry {str(c)[:60]!r} has no displayName; "
+                    "fetch with ?tree=computer[displayName]"
+                )
+        return {c["displayName"] for c in computers}
     names = set()
     for line in text.splitlines():
         line = line.strip()
@@ -186,8 +219,10 @@ def read_node_names(path):
             # what a failed login looks like: `curl -s` without -f passes the HTML error page through,
             # and read as names it keeps nothing while looking like a non-empty answer.
             if "<" in line or ">" in line:
-                raise ValueError(f"{path}: {line[:60]!r} is not a node name; this looks like an HTML "
-                                 "page, e.g. a failed login. Fetch the list with curl -f.")
+                raise ValueError(
+                    f"{path}: {line[:60]!r} is not a node name; this looks like an HTML "
+                    "page, e.g. a failed login. Fetch the list with curl -f."
+                )
             names.add(line)
     return names
 
@@ -202,9 +237,14 @@ def _confirm(doomed, what):
     # sys.stdin is None when the interpreter runs with stdin detached, not merely closed. Both mean
     # the same thing here: nobody to confirm to, so fail closed rather than sweep by name unattended.
     if sys.stdin is None or not sys.stdin.isatty():
-        print("refusing a non-interactive prefix --apply without --force.", file=sys.stderr)
+        print(
+            "refusing a non-interactive prefix --apply without --force.",
+            file=sys.stderr,
+        )
         return False
-    print(f"\nAbout to permanently destroy {len(doomed)} VM(s) {what}, with their disks.")
+    print(
+        f"\nAbout to permanently destroy {len(doomed)} VM(s) {what}, with their disks."
+    )
     answer = input(f"Type the number {len(doomed)} to confirm: ").strip()
     if answer != str(len(doomed)):
         print("not confirmed; nothing destroyed.", file=sys.stderr)
@@ -214,27 +254,49 @@ def _confirm(doomed, what):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Destroy VMs this plugin provisioned and lost track of, with their disks.")
-    parser.add_argument("--apply", action="store_true", help="actually destroy (default: dry run)")
-    parser.add_argument("--cloud", default=None,
-                        help="only VMs marked as owned by this cloud name (default: any marked VM)")
-    parser.add_argument("--prefix", default=None,
-                        help="legacy: select by name prefix instead of the marker, for pre-plugin probe "
-                             f"VMs (e.g. {LEGACY_PREFIX!r}). Guarded; prefer the default marker mode.")
-    parser.add_argument("--keep-nodes", metavar="FILE", default=None,
-                        help="the controller's node list, one name per line or the JSON from "
-                             "/computer/api/json ('-' reads stdin). A VM named after a node in it is "
-                             "kept: it is a live agent or a warm spare, not a leak.")
-    parser.add_argument("--include-live", action="store_true",
-                        help="state that no VM is to be kept (the controller is gone, or every agent "
-                             "is meant to go). A marker-mode --apply needs this or --keep-nodes.")
-    parser.add_argument("--force", action="store_true",
-                        help="skip the confirmation prompt for a prefix-mode --apply")
-    parser.add_argument("--dom0-check", action="store_true",
-                        help="before destroying, read `xl list` from dom0 and refuse any VM XAPI "
-                             "reports Halted that Xen still runs (power_state can lie; the reap "
-                             "would then take a live domain's disk). Needs sshpass and dom0 root "
-                             "sharing XCPNG_PASS; fails closed if dom0 is unreachable.")
+        description="Destroy VMs this plugin provisioned and lost track of, with their disks."
+    )
+    parser.add_argument(
+        "--apply", action="store_true", help="actually destroy (default: dry run)"
+    )
+    parser.add_argument(
+        "--cloud",
+        default=None,
+        help="only VMs marked as owned by this cloud name (default: any marked VM)",
+    )
+    parser.add_argument(
+        "--prefix",
+        default=None,
+        help="legacy: select by name prefix instead of the marker, for pre-plugin probe "
+        f"VMs (e.g. {LEGACY_PREFIX!r}). Guarded; prefer the default marker mode.",
+    )
+    parser.add_argument(
+        "--keep-nodes",
+        metavar="FILE",
+        default=None,
+        help="the controller's node list, one name per line or the JSON from "
+        "/computer/api/json ('-' reads stdin). A VM named after a node in it is "
+        "kept: it is a live agent or a warm spare, not a leak.",
+    )
+    parser.add_argument(
+        "--include-live",
+        action="store_true",
+        help="state that no VM is to be kept (the controller is gone, or every agent "
+        "is meant to go). A marker-mode --apply needs this or --keep-nodes.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="skip the confirmation prompt for a prefix-mode --apply",
+    )
+    parser.add_argument(
+        "--dom0-check",
+        action="store_true",
+        help="before destroying, read `xl list` from dom0 and refuse any VM XAPI "
+        "reports Halted that Xen still runs (power_state can lie; the reap "
+        "would then take a live domain's disk). Needs sshpass and dom0 root "
+        "sharing XCPNG_PASS; fails closed if dom0 is unreachable.",
+    )
     args = parser.parse_args()
 
     if args.prefix is not None and args.cloud:
@@ -242,16 +304,23 @@ def main():
 
     # Every name starts with "", so an empty prefix matches the entire pool.
     if args.apply and args.prefix is not None and not args.prefix:
-        parser.error("refusing --apply with an empty --prefix: it matches every VM on the pool")
+        parser.error(
+            "refusing --apply with an empty --prefix: it matches every VM on the pool"
+        )
 
     # A prefix shorter than the legacy default is too blunt to distinguish an agent from the
     # golden image: "jenkins-" already takes jenkins-golden-debian and its disk, unrecoverable
     # without a rebuild. Demand --force so it cannot happen through a typo.
-    if (args.apply and args.prefix and len(args.prefix) < len(LEGACY_PREFIX)
-            and not args.force):
+    if (
+        args.apply
+        and args.prefix
+        and len(args.prefix) < len(LEGACY_PREFIX)
+        and not args.force
+    ):
         parser.error(
             f"refusing --apply with a prefix shorter than {LEGACY_PREFIX!r} ({args.prefix!r}): it can match "
-            "the golden image. Re-run with --force if you are certain.")
+            "the golden image. Re-run with --force if you are certain."
+        )
 
     if args.keep_nodes is not None and args.include_live:
         parser.error("--keep-nodes and --include-live contradict each other; pass one")
@@ -259,12 +328,17 @@ def main():
     # The marker cannot tell a leak from an agent the controller is using, so a marker-mode sweep
     # that destroys must be told which is which before it touches the pool (#316). Prefix mode has
     # its own retype-the-count confirmation.
-    if (args.apply and args.prefix is None and args.keep_nodes is None
-            and not args.include_live):
+    if (
+        args.apply
+        and args.prefix is None
+        and args.keep_nodes is None
+        and not args.include_live
+    ):
         parser.error(
             "refusing a marker-mode --apply that does not know which agents are live: every agent "
             "and warm spare carries the marker too. Pass --keep-nodes with the controller's node "
-            "list, or --include-live if nothing is to be kept.")
+            "list, or --include-live if nothing is to be kept."
+        )
 
     keep = set()
     if args.keep_nodes is not None:
@@ -276,8 +350,10 @@ def main():
         # this option exists to prevent. The built-in node alone also says nothing about agents,
         # but it is a real answer from a real controller, so it is accepted.
         if not keep:
-            parser.error(f"--keep-nodes {args.keep_nodes}: no node names in it. If no node is "
-                         "live, say so with --include-live instead.")
+            parser.error(
+                f"--keep-nodes {args.keep_nodes}: no node names in it. If no node is "
+                "live, say so with --include-live instead."
+            )
 
     match, what = _selector(args)
 
@@ -312,7 +388,11 @@ def main():
                 # a notice they have no use for is how a useful one stops being read.
                 if args.cloud is None or args.cloud in marker_values(rec):
                     inherited.append(rec)
-            elif args.cloud is not None and ambiguous_owner(rec) and args.cloud in owners(rec):
+            elif (
+                args.cloud is not None
+                and ambiguous_owner(rec)
+                and args.cloud in owners(rec)
+            ):
                 # Ours, but carrying a second cloud's marker as well, so nothing in the record
                 # says which one stamped it (#250). A narrowed sweep refuses to attribute it
                 # rather than risk destroying the other cloud's VM. Report it, because a VM
@@ -328,14 +408,21 @@ def main():
         print(f"matching VMs {what}: {len(doomed)} VM(s)")
 
         for rec in kept:
-            print(f"  KEEPING {rec['name_label']!r} uuid={rec['uuid']}: a node on the controller, "
-                  f"so a live agent or a warm spare rather than a leak.")
+            print(
+                f"  KEEPING {rec['name_label']!r} uuid={rec['uuid']}: a node on the controller, "
+                f"so a live agent or a warm spare rather than a leak."
+            )
 
         for rec in inherited:
-            names = ", ".join(sorted(repr(n) for n in marker_values(rec))) or "no cloud name"
-            print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries the "
-                  f"{OWNER_KEY!r} marker ({names}) inherited from the VM it was cloned from, "
-                  f"not stamped by this plugin. Destroy it by hand if it is yours.")
+            names = (
+                ", ".join(sorted(repr(n) for n in marker_values(rec)))
+                or "no cloud name"
+            )
+            print(
+                f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries the "
+                f"{OWNER_KEY!r} marker ({names}) inherited from the VM it was cloned from, "
+                f"not stamped by this plugin. Destroy it by hand if it is yours."
+            )
 
         for rec in ambiguous:
             names = ", ".join(sorted(repr(n) for n in owners(rec)))
@@ -343,14 +430,18 @@ def main():
             # stamps its ancestry left on it, not one, and only the count that MATCHES is one;
             # and "just run it without --cloud" is dangerous advice, because marker mode selects
             # every marked VM on the pool and, unlike prefix mode, never asks for confirmation.
-            print(f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries markers for "
-                  f"more than one cloud ({names}), and the uuid stamp matching this record does "
-                  f"not say which of them provisioned it. Destroy it by hand if it is yours. A "
-                  f"run without --cloud does reap it, but it selects every marked VM on the "
-                  f"pool and marker mode does not confirm, so read its dry run first.")
+            print(
+                f"  SKIPPING {rec['name_label']!r} uuid={rec['uuid']}: carries markers for "
+                f"more than one cloud ({names}), and the uuid stamp matching this record does "
+                f"not say which of them provisioned it. Destroy it by hand if it is yours. A "
+                f"run without --cloud does reap it, but it selects every marked VM on the "
+                f"pool and marker mode does not confirm, so read its dry run first."
+            )
 
         if not doomed:
-            print("\nnothing to reap." if args.apply else "\nnothing to reap (dry run).")
+            print(
+                "\nnothing to reap." if args.apply else "\nnothing to reap (dry run)."
+            )
             return 0
 
         # Second opinion from dom0 before anything is destroyed. XAPI's power_state can read
@@ -365,9 +456,12 @@ def main():
             for vm, rec in doomed:
                 if _live_but_halted(rec, live):
                     refused.append(rec["name_label"])
-                    print(f"  REFUSING {rec['name_label']!r} uuid={rec['uuid']}: XAPI says "
-                          f"{rec['power_state']} but dom0 has a live domain for it. Investigate "
-                          f"with `xl list` / `xl destroy` before reaping it.", file=sys.stderr)
+                    print(
+                        f"  REFUSING {rec['name_label']!r} uuid={rec['uuid']}: XAPI says "
+                        f"{rec['power_state']} but dom0 has a live domain for it. Investigate "
+                        f"with `xl list` / `xl destroy` before reaping it.",
+                        file=sys.stderr,
+                    )
                 else:
                     allowed.append((vm, rec))
             doomed = allowed
@@ -377,7 +471,9 @@ def main():
         # making it prompt too would train the operator to type through it.
         if args.apply and args.prefix is not None and not args.force:
             for _, rec in doomed:
-                print(f"  {rec['power_state']:8} {rec['name_label']!r} uuid={rec['uuid']}")
+                print(
+                    f"  {rec['power_state']:8} {rec['name_label']!r} uuid={rec['uuid']}"
+                )
             if not _confirm(doomed, what):
                 return 2
 
@@ -388,7 +484,9 @@ def main():
             name = rec["name_label"]
             try:
                 vdis = x.disk_vdis(vm)
-                print(f"  {rec['power_state']:8} {name!r} uuid={rec['uuid']} disks={len(vdis)}")
+                print(
+                    f"  {rec['power_state']:8} {name!r} uuid={rec['uuid']} disks={len(vdis)}"
+                )
                 if args.apply:
                     destroyed = x.destroy_with_disks(vm)
                     print(f"     destroyed VM + {len(destroyed)} VDI(s)")
@@ -403,17 +501,24 @@ def main():
         free_after = x.sr_free_bytes(sr)
         vdis_after = x.vdi_count(sr)
         print(f"\nSR free after  : {free_after / 2**30:.2f} GiB   VDIs: {vdis_after}")
-        print(f"reclaimed      : {(free_after - free_before) / 2**30:+.2f} GiB   "
-              f"VDI delta: {vdis_after - vdis_before:+d}")
+        print(
+            f"reclaimed      : {(free_after - free_before) / 2**30:+.2f} GiB   "
+            f"VDI delta: {vdis_after - vdis_before:+d}"
+        )
 
         rc = 0
         if failed:
-            print(f"WARNING: {len(failed)} VM(s) not reaped: {', '.join(failed)}", file=sys.stderr)
+            print(
+                f"WARNING: {len(failed)} VM(s) not reaped: {', '.join(failed)}",
+                file=sys.stderr,
+            )
             rc = 1
         if refused:
-            print(f"WARNING: {len(refused)} VM(s) refused by the dom0 check (live on dom0 while "
-                  f"XAPI read Halted): {', '.join(refused)}. Resolve on dom0 before re-running.",
-                  file=sys.stderr)
+            print(
+                f"WARNING: {len(refused)} VM(s) refused by the dom0 check (live on dom0 while "
+                f"XAPI read Halted): {', '.join(refused)}. Resolve on dom0 before re-running.",
+                file=sys.stderr,
+            )
             rc = 1
         if vdis_after > vdis_before:
             print("WARNING: VDI count rose. Disks were orphaned.", file=sys.stderr)
