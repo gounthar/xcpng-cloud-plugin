@@ -74,7 +74,7 @@ public final class XoRestClient implements HypervisorClient {
      * System property that lets a plain {@code http://} base URL through (#309), for a lab appliance with no
      * certificate. Without it such a URL is refused when the client is built, before any request carries the
      * token. Read with {@link Boolean#getBoolean} on every construction, so it can be set from the script
-     * console; this package does not depend on Jenkins, so not through {@code jenkins.util.SystemProperties}.
+     * console; this package does not depend on Jenkins, so not through the core {@code SystemProperties} helper.
      */
     public static final String ALLOW_HTTP_PROPERTY = XoRestClient.class.getName() + ".allowHttp";
 
