@@ -3,8 +3,18 @@
 Runs dry by default. Nothing is destroyed without --apply.
 
     XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py
-    XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply
-    XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --dom0-check
+    curl -su USER:TOKEN "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
+      | XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --keep-nodes -
+    XCPNG_HOST=... XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py --apply --include-live
+
+The marker says the plugin made a VM, not that the plugin lost it. An agent mid-build and a
+warm spare carry the same marker as a leak, and only the controller knows which ones it still
+uses (#316). So a marker-mode --apply refuses to run until it is told: --keep-nodes takes the
+controller's node list (plain names one per line, or the JSON above) and keeps every VM named
+after a node in it, the node name being the VM's name_label; --include-live says there is no
+node to keep, because the controller is gone or every agent is meant to go, and reaps
+everything the marker selects. An empty --keep-nodes list is refused, since a failed curl
+produces exactly that. A dry run needs neither.
 
 Keep using this until destroy_with_disks has survived enough provision/destroy
 cycles to be trusted: a half-working teardown leaks VDIs onto a shared pool.
@@ -37,6 +47,7 @@ prefix cannot tell an agent from the golden image every future provision needs.
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -143,6 +154,38 @@ def _selector(args):
     )
 
 
+def read_node_names(path):
+    """The node names in a --keep-nodes file, or stdin for "-".
+
+    Accepts either plain names, one per line (blank lines and `#` comments ignored), or the JSON
+    the controller returns from /computer/api/json, so its output can be piped in unedited.
+    Names that are not this plugin's (the built-in node, other clouds' agents) are harmless:
+    they match no marked VM.
+    """
+    if path == "-":
+        text = sys.stdin.read()
+    else:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            data = json.loads(stripped)
+        except ValueError as e:
+            raise ValueError(f"{path}: looks like JSON but does not parse: {e}") from e
+        computers = data.get("computer") if isinstance(data, dict) else None
+        if not isinstance(computers, list):
+            raise ValueError(f"{path}: JSON without a 'computer' list; expected /computer/api/json")
+        return {c["displayName"] for c in computers
+                if isinstance(c, dict) and isinstance(c.get("displayName"), str)}
+    names = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            names.add(line)
+    return names
+
+
 def _confirm(doomed, what):
     """Make the operator retype the count before a prefix-mode --apply destroys anything.
 
@@ -172,6 +215,13 @@ def main():
     parser.add_argument("--prefix", default=None,
                         help="legacy: select by name prefix instead of the marker, for pre-plugin probe "
                              f"VMs (e.g. {LEGACY_PREFIX!r}). Guarded; prefer the default marker mode.")
+    parser.add_argument("--keep-nodes", metavar="FILE", default=None,
+                        help="the controller's node list, one name per line or the JSON from "
+                             "/computer/api/json ('-' reads stdin). A VM named after a node in it is "
+                             "kept: it is a live agent or a warm spare, not a leak.")
+    parser.add_argument("--include-live", action="store_true",
+                        help="state that no VM is to be kept (the controller is gone, or every agent "
+                             "is meant to go). A marker-mode --apply needs this or --keep-nodes.")
     parser.add_argument("--force", action="store_true",
                         help="skip the confirmation prompt for a prefix-mode --apply")
     parser.add_argument("--dom0-check", action="store_true",
@@ -197,6 +247,32 @@ def main():
             f"refusing --apply with a prefix shorter than {LEGACY_PREFIX!r} ({args.prefix!r}): it can match "
             "the golden image. Re-run with --force if you are certain.")
 
+    if args.keep_nodes is not None and args.include_live:
+        parser.error("--keep-nodes and --include-live contradict each other; pass one")
+
+    # The marker cannot tell a leak from an agent the controller is using, so a marker-mode sweep
+    # that destroys must be told which is which before it touches the pool (#316). Prefix mode has
+    # its own retype-the-count confirmation.
+    if (args.apply and args.prefix is None and args.keep_nodes is None
+            and not args.include_live):
+        parser.error(
+            "refusing a marker-mode --apply that does not know which agents are live: every agent "
+            "and warm spare carries the marker too. Pass --keep-nodes with the controller's node "
+            "list, or --include-live if nothing is to be kept.")
+
+    keep = set()
+    if args.keep_nodes is not None:
+        try:
+            keep = read_node_names(args.keep_nodes)
+        except (OSError, ValueError) as e:
+            parser.error(f"--keep-nodes: {e}")
+        # A failed curl writes nothing, and "nothing is live" would reap every agent: the bug
+        # this option exists to prevent. The built-in node alone also says nothing about agents,
+        # but it is a real answer from a real controller, so it is accepted.
+        if not keep:
+            parser.error(f"--keep-nodes {args.keep_nodes}: no node names in it. If no node is "
+                         "live, say so with --include-live instead.")
+
     match, what = _selector(args)
 
     with Xapi() as x:
@@ -207,6 +283,7 @@ def main():
         doomed = []
         inherited = []
         ambiguous = []
+        kept = []
         for vm, rec in x.call("VM.get_all_records").items():
             # Snapshots are VM objects too, and a snapshot of jenkins-ci-agent-3 inherits a
             # matching name. It also reports power_state=Halted, so it is indistinguishable
@@ -214,7 +291,9 @@ def main():
             # restore point with it.
             if rec["is_a_template"] or rec["is_control_domain"] or rec["is_a_snapshot"]:
                 continue
-            if match(rec):
+            if match(rec) and rec["name_label"] in keep:
+                kept.append(rec)
+            elif match(rec):
                 doomed.append((vm, rec))
             elif args.prefix is None and inherited_marker(rec):
                 # Marked, and not ours: the marker came from whatever this was cloned from.
@@ -237,9 +316,14 @@ def main():
         doomed.sort(key=lambda pair: pair[1]["name_label"])
         inherited.sort(key=lambda rec: rec["name_label"])
         ambiguous.sort(key=lambda rec: rec["name_label"])
+        kept.sort(key=lambda rec: rec["name_label"])
 
         print(f"SR free before : {free_before / 2**30:.2f} GiB   VDIs: {vdis_before}")
         print(f"matching VMs {what}: {len(doomed)} VM(s)")
+
+        for rec in kept:
+            print(f"  KEEPING {rec['name_label']!r} uuid={rec['uuid']}: a node on the controller, "
+                  f"so a live agent or a warm spare rather than a leak.")
 
         for rec in inherited:
             names = ", ".join(sorted(repr(n) for n in marker_values(rec))) or "no cloud name"
@@ -271,7 +355,7 @@ def main():
         refused = []
         if args.dom0_check:
             live = live_domains_on_dom0(x.host, os.environ.get("XCPNG_PASS", ""))
-            kept = []
+            allowed = []
             for vm, rec in doomed:
                 if _live_but_halted(rec, live):
                     refused.append(rec["name_label"])
@@ -279,8 +363,8 @@ def main():
                           f"{rec['power_state']} but dom0 has a live domain for it. Investigate "
                           f"with `xl list` / `xl destroy` before reaping it.", file=sys.stderr)
                 else:
-                    kept.append((vm, rec))
-            doomed = kept
+                    allowed.append((vm, rec))
+            doomed = allowed
 
         # Prefix mode only. Marker mode selects on a marker plus a matching uuid stamp, so the VMs
         # it can reach are the plugin's own clones and clones stamped before that check existed;

@@ -495,7 +495,9 @@ number of waiting builds and what was planned for them.
   an agent provisioned by a version of the plugin older than the snapshot, which reloads with no
   connection details at all. In both cases `tools/reaper.py` is the recovery path: it selects on the
   `xcpng-cloud` owner marker stamped into each clone, so it finds these VMs without needing Jenkins to
-  still know about them.
+  still know about them. The marker is on every live agent and warm spare too, so `--apply` refuses to
+  run until it is given the controller's node list with `--keep-nodes`, whose VMs it keeps, or told
+  with `--include-live` that none is to be kept.
 
 ## Not in this version
 
