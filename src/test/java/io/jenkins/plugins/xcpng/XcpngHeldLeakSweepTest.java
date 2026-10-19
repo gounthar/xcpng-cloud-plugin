@@ -234,4 +234,36 @@ class XcpngHeldLeakSweepTest {
         assertEquals(1, destroyCount(fake), fake.calls().toString());
         assertFalse(cloud.leakedVmRefs().contains(VM));
     }
+
+    /**
+     * A held entry whose recorded connection can no longer be opened stays. The sweep gives up on an ordinary
+     * entry there, since nothing will bring that connection back, but giving up on a held one drops it from the
+     * store and so from the banner, the last thing saying the refused VM may still run. The unheld entry on the
+     * same dead connection is the control: without it, a sweep that kept everything would pass.
+     */
+    @Test
+    void aHeldEntryOnAConnectionThatCannotOpenIsKept(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        List<String> opened = new ArrayList<>();
+        cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, trust, backend) -> {
+            opened.add(poolUrl);
+            throw new IllegalStateException("credential old-cred no longer exists");
+        });
+        String unheld = "vm/old-connection/unheld";
+        cloud.recordLeakedVm(XcpngLeakedVm.of(VM, XcpngBackend.XO, "https://old-pool.example.test", "old-cred", null)
+                .asHeld());
+        cloud.recordLeakedVm(
+                XcpngLeakedVm.of(unheld, XcpngBackend.XO, "https://old-pool.example.test", "old-cred", null));
+
+        cloud.sweepLeakedVms();
+
+        assertEquals(
+                List.of("https://old-pool.example.test"),
+                opened,
+                "the sweep must have tried the recorded connection, or this proves nothing");
+        assertFalse(cloud.leakedVmRefs().contains(unheld), "control: an unheld entry there is given up as before");
+        assertTrue(cloud.leakedVmRefs().contains(VM), "the held entry must stay for the next sweep");
+        assertEquals(0, destroyCount(fake), "nothing reaches the cloud's own client: " + fake.calls());
+    }
 }

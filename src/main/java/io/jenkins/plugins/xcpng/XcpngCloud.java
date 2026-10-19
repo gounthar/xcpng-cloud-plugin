@@ -1296,6 +1296,12 @@ public class XcpngCloud extends Cloud {
                 return;
             }
             for (XcpngLeakedVm vm : vms) {
+                // Not a held entry (#306): giving up drops it from the store and so from the held-VM banner,
+                // and the banner is the only thing still saying the refused VM may be running.
+                if (vm.isHeld()) {
+                    stillLeaked(vm, e, "could not open the connection it was recorded with");
+                    continue;
+                }
                 giveUp(vm, "its connection can no longer be opened: " + e.getMessage());
                 done.add(vm);
             }
