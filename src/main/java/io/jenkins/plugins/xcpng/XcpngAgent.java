@@ -110,6 +110,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private volatile String vmRef;
 
     /**
+     * Raised by the teardown in the same step as it reads {@link #vmRef}, so a clone that comes back after the
+     * teardown has run is refused by {@link #adoptVmRef} rather than stamped onto a node that is gone (#305).
+     * Both are read and written under this agent's monitor; that is the whole handoff. Transient because a
+     * torn-down node is never saved again.
+     */
+    private transient boolean tornDown;
+
+    /**
      * Connection parameters copied off the owning cloud at provision time, so this agent can still reach the
      * pool to destroy its VM when {@link #getCloud()} no longer resolves — the cloud deleted from the
      * configuration, or renamed, which is the same thing to an agent holding a name.
@@ -328,6 +336,25 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * to the VM that build is on. {@link Node#save()} writes this node's own {@code config.xml} and nothing
      * else; it is a no-op before the node is registered, which is why the launcher is the only caller.
      */
+    /**
+     * Record a freshly cloned VM as this agent's, unless the teardown has already run.
+     *
+     * <p>The teardown reads {@link #vmRef} once and never again, so a clone stamped after that read would be
+     * started on a node nothing tracks: not the node, which is gone, not the leaked-VM set, and not
+     * {@code maxInstances}. Returns false in that case, and the caller destroys the clone itself.
+     */
+    boolean adoptVmRef(@NonNull String vmRef) {
+        synchronized (this) {
+            if (tornDown) {
+                return false;
+            }
+            this.vmRef = vmRef;
+        }
+        // Outside the monitor: save() takes core's locks, and the teardown only needs the field.
+        setVmRef(vmRef);
+        return true;
+    }
+
     void setVmRef(@CheckForNull String vmRef) {
         this.vmRef = vmRef;
         XcpngIssuedAgentStore.get().issueVmRef(getNodeName(), vmRef);
@@ -559,8 +586,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
 
     private void terminateVm(TaskListener listener) {
         // Read the field once. Everything below branches on it, and the launcher writes it from another
-        // thread, so re-reading could take the destroy branch on a reference that has since gone.
-        final String vmRef = this.vmRef;
+        // thread, so re-reading could take the destroy branch on a reference that has since gone. Read under
+        // the monitor together with raising tornDown, so a clone still in flight is refused by adoptVmRef
+        // rather than adopted after this read has missed it (#305).
+        final String vmRef;
+        synchronized (this) {
+            tornDown = true;
+            vmRef = this.vmRef;
+        }
         if (vmRef == null) {
             // No VM was ever built for this node: the launch failed before the clone, or the node was removed
             // before its computer was ever connected. Distinct from a lost handle, and deliberately said out

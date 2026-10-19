@@ -241,6 +241,64 @@ class XcpngLauncherTest {
         }
     }
 
+    /**
+     * A node torn down while its clone is still in flight must not leave the clone behind (#305).
+     *
+     * <p>The teardown runs first and finds no VM, because the launcher has not stamped one yet; the clone then
+     * comes back. Before the fix the launcher stamped it onto a node that no longer existed and started it, and
+     * nothing in Jenkins knew about the running VM: not the node, not the leaked-VM store, not the instance cap.
+     * The warm-pool drain gets here whenever it retires a spare that is still connecting.
+     */
+    @Test
+    void aCloneThatReturnsAfterItsNodeWasTornDownIsDestroyedNotStarted(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch held = fake.holdClonesUntil(release);
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+        assertTrue(held.await(30, TimeUnit.SECONDS), "the launcher should have reached the clone");
+
+        // What drainSpare does to an idle spare, and an idle spare includes one still connecting.
+        agent.terminate();
+        assertNull(r.jenkins.getNode("xcpng-agent-1"), "the teardown removes the node");
+        release.countDown();
+
+        String clone = "vm/xcpng-agent-1/1";
+        awaitTrue(
+                () -> fake.calls().contains("destroyWithDisks:" + clone),
+                () -> "the clone that came back to a torn-down node must be destroyed: " + fake.calls());
+        assertFalse(
+                fake.calls().contains("start:" + clone),
+                "and never started, since no node is left to connect it: " + fake.calls());
+        assertEquals(List.of("xcpng"), fake.destroyOwners(), "destroyed as this cloud's VM");
+    }
+
+    /**
+     * If destroying that unadopted clone fails, it goes to the leaked-VM set: no node holds it, so the
+     * warm-pool maintainer's sweep is the only thing left that will retry the destroy.
+     */
+    @Test
+    void anUnadoptedCloneWhoseDestroyFailsIsRecordedAsLeaked(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch held = fake.holdClonesUntil(release);
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+        assertTrue(held.await(30, TimeUnit.SECONDS), "the launcher should have reached the clone");
+
+        agent.terminate();
+        release.countDown();
+
+        String clone = "vm/xcpng-agent-1/1";
+        awaitTrue(
+                () -> cloud.leakedVmRefs().contains(clone),
+                () -> "a clone that could not be destroyed must be recorded as leaked: " + cloud.leakedVmRefs());
+        assertTrue(fake.calls().contains("destroyWithDisks:" + clone), "the destroy was attempted first");
+        assertFalse(fake.calls().contains("start:" + clone), "and the clone was never started: " + fake.calls());
+    }
+
     /** A launcher is only ever attached to an {@link XcpngAgent}; anything else is a configuration error. */
     @Test
     void aLauncherOnSomethingOtherThanAnXcpngAgentRefusesToRun(JenkinsRule r) throws Exception {
