@@ -499,7 +499,7 @@ number of waiting builds and what was planned for them.
   run until it is given the controller's node list with `--keep-nodes`, whose VMs it keeps, or told
   with `--include-live` that none is to be kept. The list is a snapshot: an agent the controller
   adds after it was taken can be reaped, so pipe it straight in and run while the cloud is not
-  provisioning.
+  provisioning. A saved list file older than 5 minutes is refused (`--keep-nodes-max-age`).
 
 ## Not in this version
 

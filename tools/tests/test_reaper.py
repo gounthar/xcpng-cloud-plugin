@@ -730,6 +730,66 @@ def test_a_computer_json_entry_without_a_name_refuses_the_whole_list(
     assert fake.destroyed == []
 
 
+def _aged(path, minutes):
+    """Backdate a file's modification time, as a list saved earlier and reused would be."""
+    import os
+    import time
+
+    then = time.time() - minutes * 60
+    os.utime(path, (then, then))
+    return path
+
+
+def test_a_stale_node_list_file_is_refused_before_the_pool_is_contacted(
+    monkeypatch, tmp_path
+):
+    """A saved list does not know about agents provisioned since. Reused an hour later, every one of
+    them reads as a leak."""
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    _aged(nodes, 6)
+    monkeypatch.setattr(
+        reaper, "Xapi", lambda *a, **k: pytest.fail("the pool was contacted")
+    )
+    monkeypatch.setattr(
+        reaper.sys, "argv", ["reaper.py", "--apply", "--keep-nodes", str(nodes)]
+    )
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+
+
+def test_an_older_node_list_is_accepted_when_the_operator_raises_the_limit(
+    pool, tmp_path
+):
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    _aged(nodes, 6)
+    fake = pool(
+        _two_agents(),
+        argv=(
+            "reaper.py",
+            "--apply",
+            "--keep-nodes",
+            str(nodes),
+            "--keep-nodes-max-age",
+            "10",
+        ),
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-lost"]
+
+
+def test_a_stale_node_list_does_not_stop_a_dry_run(pool, tmp_path):
+    """A dry run destroys nothing, so an old list costs nothing there."""
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    _aged(nodes, 60)
+    fake = pool(_two_agents(), argv=("reaper.py", "--keep-nodes", str(nodes)))
+    assert reaper.main() == 0
+    assert fake.destroyed == []
+
+
 def test_the_node_list_can_come_from_stdin(pool, monkeypatch):
     import io
 

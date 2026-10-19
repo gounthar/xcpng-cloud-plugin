@@ -20,7 +20,9 @@ the query are read as a URL range and the fetch fails.)
 The list is a snapshot. A node the controller adds after it was taken is not in it, and its
 VM, cloned once the node exists, is reaped if it is already in the pool when this lists VMs.
 Pipe the list straight in as above, so the gap is seconds, and run --apply while the cloud is
-not provisioning: no build waiting for its labels and no warm pool refilling.
+not provisioning: no build waiting for its labels and no warm pool refilling. A --keep-nodes
+file written more than 5 minutes before an --apply is refused (--keep-nodes-max-age changes
+the limit), so a saved list cannot be reused long after the fact; stdin is not checked.
 
 Keep using this until destroy_with_disks has survived enough provision/destroy
 cycles to be trusted: a half-working teardown leaks VDIs onto a shared pool.
@@ -58,6 +60,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 from owner import (
     OWNER_KEY,
@@ -68,6 +71,10 @@ from owner import (
     owners,
 )
 from xapi import Xapi, XapiError
+
+# How old a --keep-nodes file may be before an --apply refuses it. Long enough to fetch the list
+# and type the command, short enough that a list saved yesterday is not reused.
+KEEP_NODES_MAX_AGE_MINUTES = 5
 
 # The legacy tools-era prefix, kept only as the suggested value for --prefix.
 LEGACY_PREFIX = "jenkins-ci-"
@@ -279,6 +286,15 @@ def main():
         "kept: it is a live agent or a warm spare, not a leak.",
     )
     parser.add_argument(
+        "--keep-nodes-max-age",
+        metavar="MINUTES",
+        type=float,
+        default=KEEP_NODES_MAX_AGE_MINUTES,
+        help="refuse an --apply whose --keep-nodes file was last written longer ago than "
+        f"this (default {KEEP_NODES_MAX_AGE_MINUTES:g}): agents provisioned since are not in "
+        "it and would be reaped. stdin is always fresh.",
+    )
+    parser.add_argument(
         "--include-live",
         action="store_true",
         help="state that no VM is to be kept (the controller is gone, or every agent "
@@ -339,6 +355,21 @@ def main():
             "and warm spare carries the marker too. Pass --keep-nodes with the controller's node "
             "list, or --include-live if nothing is to be kept."
         )
+
+    # A saved list knows nothing of agents provisioned since it was written, and each of them
+    # reads as a leak. Piping it in keeps that gap to seconds; reusing a file stretches it to
+    # however long ago the file was made. A dry run destroys nothing, so it is not held to this.
+    if args.apply and args.keep_nodes not in (None, "-"):
+        try:
+            age = (time.time() - os.path.getmtime(args.keep_nodes)) / 60
+        except OSError as e:
+            parser.error(f"--keep-nodes: {e}")
+        if age > args.keep_nodes_max_age:
+            parser.error(
+                f"--keep-nodes {args.keep_nodes} was written {age:.0f} minutes ago; agents "
+                "provisioned since are not in it and would be reaped. Fetch the list again, or "
+                "pipe it in with '-'. --keep-nodes-max-age raises the limit."
+            )
 
     keep = set()
     if args.keep_nodes is not None:
