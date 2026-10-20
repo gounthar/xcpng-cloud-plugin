@@ -27,12 +27,15 @@ the limit), so a saved list cannot be reused long after the fact; stdin is not c
 Keep using this until destroy_with_disks has survived enough provision/destroy
 cycles to be trusted: a half-working teardown leaks VDIs onto a shared pool.
 
---dom0-check reads `xl list` straight from dom0 and refuses to reap any VM XAPI
-reports Halted while Xen still has a live domain for it. XAPI's power_state has
-been seen to lie (Halted with domid -1 for a domain still running), and the reap
-skips the shutdown on Halted, so without this check it can take a live domain's
-disk. Recommended before any --apply on a shared pool; needs sshpass and dom0
-root sharing XCPNG_PASS, and fails closed if dom0 cannot be reached.
+--dom0-check reads `xl list` straight from the dom0 of every host in the pool and
+refuses to reap any VM XAPI reports Halted while Xen still has a live domain for
+it. XAPI's power_state has been seen to lie (Halted with domid -1 for a domain
+still running), and the reap skips the shutdown on Halted, so without this check
+it can take a live domain's disk. Recommended before any --apply on a shared pool.
+It connects as root over ssh, checks each host key against your known_hosts and
+refuses a host it does not know, tries your ssh key first (--dom0-identity picks
+one), and falls back to XCPNG_PASS through sshpass only when a host whose key
+matched refuses the key. It fails closed if any host cannot be read.
 
 Selection is by the owner marker the plugin stamps on each clone, not by name: the
 `xcpng-cloud` key in other_config on a clone made over XAPI, or the `xcpng-cloud:<cloud>` tag
@@ -80,8 +83,21 @@ KEEP_NODES_MAX_AGE_MINUTES = 5
 LEGACY_PREFIX = "jenkins-ci-"
 
 
-def live_domains_on_dom0(host, password):
-    """The names Xen actually has a live domain for, read straight from dom0.
+def pool_host_addresses(x):
+    """The address of every host in the pool, which is where `xl list` has to be read.
+
+    A VM's domain runs on whichever host it is resident on, so the master's dom0 alone misses
+    every VM on the others. Raises rather than returning an empty list: no hosts would read as a
+    check that ran and found nothing live.
+    """
+    addresses = sorted(rec["address"] for rec in x.call("host.get_all_records").values())
+    if not addresses:
+        raise XapiError("DOM0_UNREACHABLE", "the pool lists no hosts to read xl list from")
+    return addresses
+
+
+def live_domains_on_dom0(hosts, password, identity=None):
+    """The names Xen actually has a live domain for, read from the dom0 of every host in `hosts`.
 
     The safety net's second opinion. XAPI's power_state can read Halted for a domain Xen still
     has running: on the lab pool a VM read power_state=Halted with domid -1 from XAPI while
@@ -92,49 +108,79 @@ def live_domains_on_dom0(host, password):
     Returns the set of Xen domain names (the first column of `xl list`). On XCP-ng 8.3 that name
     is the VM name_label (measured 2026-07-18: every live guest matched by name_label, none by
     uuid); callers still match on both uuid and name_label so the check does not depend on it.
-    Raises XapiError if dom0 cannot be reached, so an --apply that asked for the check fails
-    closed rather than sweeping blind. Reads `xl list` on the connected host only, which is the
-    whole pool on a single-host lab; on a multi-host pool x.host is just the master, so a domain
-    resident on another host would not be seen (out of scope here). Assumes dom0 root shares
-    XCPNG_PASS (true on a single-host lab); uses sshpass with password auth as tools/lab-cookbook.md
-    does. Nothing is written to disk.
+    Raises XapiError if any host cannot be read, so an --apply that asked for the check fails
+    closed rather than sweeping blind: one host unread is every VM resident on it unchecked.
+    Nothing is written to disk.
     """
-    if shutil.which("sshpass") is None:
-        raise XapiError(
-            "DOM0_CHECK_UNAVAILABLE",
-            "sshpass is required for --dom0-check (e.g. apt-get install sshpass)",
+    names = set()
+    for host in hosts:
+        names |= _xl_list(host, password, identity)
+    return names
+
+
+def _ssh_failed(host, e):
+    """The XapiError for an ssh that did not produce `xl list`, with what ssh said."""
+    detail = getattr(e, "stderr", "") or str(e) or e.__class__.__name__
+    hint = ""
+    if "Host key verification failed" in detail:
+        hint = (
+            f". The host key of {host} is not in your known_hosts: ssh root@{host} once and check "
+            "the fingerprint it shows against the host console before accepting it"
         )
+    return XapiError("DOM0_UNREACHABLE", f"xl list on {host}: {detail.strip()}{hint}")
+
+
+# What ssh prints when the server, past the host key check, refused every key offered. The second
+# is how the server answers an agent holding more keys than its MaxAuthTries, which the lab pool
+# did when no --dom0-identity was given (2026-10-20).
+AUTH_REFUSED = ("Permission denied", "Too many authentication failures")
+
+
+def _xl_list(host, password, identity):
+    """`xl list` from one host's dom0, as the set of domain names.
+
+    The host key is always checked against known_hosts: the password goes to root on dom0, and
+    with checking off whatever answered on port 22 received it. Key auth is tried first, in batch
+    mode so nothing prompts. The password is sent only when that host, whose key has just
+    matched, refused the keys (see AUTH_REFUSED); a host key failure never falls back.
+    """
+    base = ["ssh", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=10"]
+    if identity:
+        base += ["-i", identity, "-o", "IdentitiesOnly=yes"]
+    target = [f"root@{host}", "xl list"]
+    run = dict(capture_output=True, text=True, timeout=30, check=True)
     try:
-        completed = subprocess.run(
-            [
-                "sshpass",
-                "-e",
-                "ssh",
-                "-o",
-                "PubkeyAuthentication=no",
-                "-o",
-                "PreferredAuthentications=password",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "ConnectTimeout=10",
-                f"root@{host}",
-                "xl list",
-            ],
-            env={**os.environ, "SSHPASS": password},
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=True,
-        )
+        completed = subprocess.run(base + ["-o", "BatchMode=yes"] + target, **run)
+    except subprocess.CalledProcessError as e:
+        if not any(refusal in (e.stderr or "") for refusal in AUTH_REFUSED) or not password:
+            raise _ssh_failed(host, e) from e
+        if shutil.which("sshpass") is None:
+            raise XapiError(
+                "DOM0_CHECK_UNAVAILABLE",
+                f"{host} refused the ssh key, and the password fallback needs sshpass "
+                "(e.g. apt-get install sshpass)",
+            ) from e
+        try:
+            completed = subprocess.run(
+                ["sshpass", "-e"]
+                + base
+                + [
+                    "-o",
+                    "PubkeyAuthentication=no",
+                    "-o",
+                    "PreferredAuthentications=password,keyboard-interactive",
+                    "-o",
+                    "NumberOfPasswordPrompts=1",
+                ]
+                + target,
+                env={**os.environ, "SSHPASS": password},
+                **run,
+            )
+        except (subprocess.SubprocessError, OSError) as e2:
+            raise _ssh_failed(host, e2) from e2
     except (subprocess.SubprocessError, OSError) as e:
         # A failed check must not read as "dom0 is clean". Raise so --apply fails closed.
-        detail = getattr(e, "stderr", "") or str(e) or e.__class__.__name__
-        raise XapiError(
-            "DOM0_UNREACHABLE", f"xl list on {host}: {detail}".strip()
-        ) from e
+        raise _ssh_failed(host, e) from e
 
     # `xl list` prints a header row, then one row per running domain; Domain-0 is dom0 itself.
     # A genuinely halted guest is absent entirely, so anything here is a domain Xen is running.
@@ -308,10 +354,16 @@ def main():
     parser.add_argument(
         "--dom0-check",
         action="store_true",
-        help="before destroying, read `xl list` from dom0 and refuse any VM XAPI "
-        "reports Halted that Xen still runs (power_state can lie; the reap "
-        "would then take a live domain's disk). Needs sshpass and dom0 root "
-        "sharing XCPNG_PASS; fails closed if dom0 is unreachable.",
+        help="before destroying, read `xl list` from the dom0 of every pool host and refuse "
+        "any VM XAPI reports Halted that Xen still runs (power_state can lie; the reap "
+        "would then take a live domain's disk). Each host key must be in your known_hosts. "
+        "Uses your ssh key, or XCPNG_PASS through sshpass if a host refuses the key; fails "
+        "closed if any host cannot be read.",
+    )
+    parser.add_argument(
+        "--dom0-identity",
+        metavar="KEY",
+        help="ssh private key for --dom0-check, used alone (IdentitiesOnly)",
     )
     args = parser.parse_args()
 
@@ -482,7 +534,11 @@ def main():
         # dom0 is unreachable this raises and the sweep fails closed, destroying nothing.
         refused = []
         if args.dom0_check:
-            live = live_domains_on_dom0(x.host, os.environ.get("XCPNG_PASS", ""))
+            live = live_domains_on_dom0(
+                pool_host_addresses(x),
+                os.environ.get("XCPNG_PASS", ""),
+                args.dom0_identity,
+            )
             allowed = []
             for vm, rec in doomed:
                 if _live_but_halted(rec, live):
