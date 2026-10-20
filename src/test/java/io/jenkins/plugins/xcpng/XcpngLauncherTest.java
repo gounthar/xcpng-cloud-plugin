@@ -11,10 +11,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import hudson.ExtensionList;
+import hudson.XmlFile;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Saveable;
 import hudson.model.TaskListener;
+import hudson.model.listeners.SaveableListener;
 import hudson.slaves.Cloud;
 import hudson.slaves.ComputerLauncher;
 import hudson.slaves.DumbSlave;
@@ -23,6 +26,7 @@ import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -30,6 +34,7 @@ import java.util.function.Supplier;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /**
@@ -297,6 +302,49 @@ class XcpngLauncherTest {
                 () -> "a clone that could not be destroyed must be recorded as leaked: " + cloud.leakedVmRefs());
         assertTrue(fake.calls().contains("destroyWithDisks:" + clone), "the destroy was attempted first");
         assertFalse(fake.calls().contains("start:" + clone), "and the clone was never started: " + fake.calls());
+    }
+
+    /**
+     * Adopting a clone saves the issued-agent store and the node, and neither save may run under the agent's
+     * monitor: a save writes a file and fires save listeners, which may take core's locks, while the teardown
+     * takes that monitor too. Updating the record in memory under the monitor is what keeps the two in step.
+     */
+    @Test
+    void adoptingACloneSavesNothingUnderTheAgentsMonitor(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        SavesUnderAgentMonitor.watched = agent;
+        r.jenkins.addNode(agent);
+
+        awaitTrue(() -> agent.getVmRef() != null, () -> "the launcher should have adopted a clone: " + fake.calls());
+        awaitTrue(() -> !isConnecting(agent), () -> "the launcher should have returned");
+        assertTrue(
+                SavesUnderAgentMonitor.saves.stream().anyMatch(s -> s instanceof XcpngIssuedAgentStore),
+                "the control: the store save was seen at all, so an empty list below means something");
+        assertEquals(
+                List.of(),
+                SavesUnderAgentMonitor.underMonitor,
+                "saved while holding the agent's monitor: " + SavesUnderAgentMonitor.underMonitor);
+    }
+
+    @TestExtension("adoptingACloneSavesNothingUnderTheAgentsMonitor")
+    public static class SavesUnderAgentMonitor extends SaveableListener {
+        static volatile XcpngAgent watched;
+        static final List<Saveable> saves = new CopyOnWriteArrayList<>();
+        static final List<String> underMonitor = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            XcpngAgent agent = watched;
+            if (agent == null || !(o instanceof XcpngIssuedAgentStore || o == agent)) {
+                return;
+            }
+            saves.add(o);
+            if (Thread.holdsLock(agent)) {
+                underMonitor.add(o.getClass().getSimpleName());
+            }
+        }
     }
 
     /** A launcher is only ever attached to an {@link XcpngAgent}; anything else is a configuration error. */

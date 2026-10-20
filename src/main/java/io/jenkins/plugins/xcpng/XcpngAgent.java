@@ -344,6 +344,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * {@code maxInstances}. Returns false in that case, and the caller destroys the clone itself.
      */
     boolean adoptVmRef(@NonNull String vmRef) {
+        XcpngIssuedAgentStore store = XcpngIssuedAgentStore.get();
+        boolean recorded;
         synchronized (this) {
             if (tornDown) {
                 return false;
@@ -351,9 +353,13 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
             // The field and the issued record move together. A teardown that saw the new field against the old
             // record would read this agent as not issued and skip the destroy, leaking the clone.
             this.vmRef = vmRef;
-            XcpngIssuedAgentStore.get().issueVmRef(getNodeName(), vmRef);
+            recorded = store.recordVmRef(getNodeName(), vmRef);
         }
-        // Outside the monitor: save() takes core's locks, and the teardown only needs the field and the record.
+        // Both saves outside the monitor: each writes a file and fires save listeners, which may take core's
+        // locks, and the teardown only needs the field and the in-memory record.
+        if (recorded) {
+            store.saveVmRef(getNodeName(), vmRef);
+        }
         saveVmRef();
         return true;
     }
