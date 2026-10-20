@@ -1765,6 +1765,37 @@ class XoRestClientTest {
         assertTrue(e.getMessage().contains("Sign in"), e.getMessage());
     }
 
+    // -- the base URL's scheme (#309) ------------------------------------
+
+    @Test
+    void anHttpUrlIsRefusedBeforeAnyRequestCarriesTheToken() {
+        // The form refuses http, but a JCasC document or a hand-edited config.xml writes the field directly.
+        // Port 1 has nothing listening: if the refusal moved to the first request, this would fail on the
+        // connection instead, with a message that names neither https nor the property.
+        for (String url : List.of("http://127.0.0.1:1", "HTTP://127.0.0.1:1/")) {
+            HypervisorException e = assertThrows(
+                    HypervisorException.class, () -> new XoRestClient(url, "a-token", PoolTrust.JVM_DEFAULT, null));
+            assertTrue(e.getMessage().contains("https://"), e.getMessage());
+            assertTrue(e.getMessage().contains(XoRestClient.ALLOW_HTTP_PROPERTY), e.getMessage());
+            assertFalse(e.getMessage().contains("a-token"), e.getMessage());
+        }
+    }
+
+    @Test
+    void theLabPropertyLetsAnHttpUrlThrough() {
+        System.setProperty(XoRestClient.ALLOW_HTTP_PROPERTY, "true");
+        try {
+            new XoRestClient("http://127.0.0.1:1", "a-token", PoolTrust.JVM_DEFAULT, null).close();
+        } finally {
+            System.clearProperty(XoRestClient.ALLOW_HTTP_PROPERTY);
+        }
+    }
+
+    @Test
+    void anHttpsUrlNeedsNoProperty() {
+        new XoRestClient("https://127.0.0.1:1", "a-token", PoolTrust.JVM_DEFAULT, null).close();
+    }
+
     @Test
     void closeReleasesNothingBecauseTheTokenIsNotOurs() {
         ScriptedRest t = new ScriptedRest();

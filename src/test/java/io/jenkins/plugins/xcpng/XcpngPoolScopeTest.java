@@ -15,6 +15,7 @@ import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.HypervisorException;
 import io.jenkins.plugins.xcpng.client.PoolTrust;
+import io.jenkins.plugins.xcpng.client.XoRestClient;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
@@ -145,6 +146,8 @@ class XcpngPoolScopeTest {
         HttpServer xo = stubAppliance();
         try {
             addToken();
+            // The stub serves plain http, which the client refuses without the lab property (#309).
+            System.setProperty(XoRestClient.ALLOW_HTTP_PROPERTY, "true");
             String url = "http://127.0.0.1:" + xo.getAddress().getPort();
             XcpngCloud cloud = new XcpngCloud("xcpng", url, TOKEN_ID, null, 2, List.of());
 
@@ -167,6 +170,7 @@ class XcpngPoolScopeTest {
                 assertFalse(e.getMessage().contains("null"), e.getMessage());
             }
         } finally {
+            System.clearProperty(XoRestClient.ALLOW_HTTP_PROPERTY);
             xo.stop(0);
         }
     }
@@ -186,6 +190,8 @@ class XcpngPoolScopeTest {
         HttpServer xo = stubAppliance();
         try {
             addToken();
+            // The stub serves plain http, which the client refuses without the lab property (#309).
+            System.setProperty(XoRestClient.ALLOW_HTTP_PROPERTY, "true");
             String url = "http://127.0.0.1:" + xo.getAddress().getPort();
             XcpngTemplate template = new XcpngTemplate("golden", "xcpng", 1, 1024);
             XcpngCloud cloud = new XcpngCloud("xcpng", url, TOKEN_ID, null, 2, List.of(template));
@@ -207,6 +213,7 @@ class XcpngPoolScopeTest {
                         "the clone must resolve in the agent's pool, not in every pool and not in the cloud's new one");
             }
         } finally {
+            System.clearProperty(XoRestClient.ALLOW_HTTP_PROPERTY);
             xo.stop(0);
         }
     }
