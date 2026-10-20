@@ -499,8 +499,11 @@ number of waiting builds and what was planned for them.
   unreachable for instance, is kept on the leaked-VM list under the removed cloud's name and retried
   every minute over the agent's own connection details. Two cases still cannot be recovered
   automatically, and both are logged at SEVERE with the VM reference. If the referenced credential has
-  itself been deleted, the retry cannot connect and gives up. And an agent provisioned by a version of
-  the plugin older than the snapshot reloads with no connection details at all. In both cases
+  itself been deleted, the retry cannot connect and gives up, except on a VM listed as held (one the
+  plugin refused to destroy because it may still be running): that entry stays listed, and it stays even
+  after the VM is removed by hand, since nothing can reach the pool to see that it is gone. And an agent
+  provisioned by a version of the plugin older than the snapshot reloads with no connection details at
+  all. In both cases
   `tools/reaper.py` is the recovery path: it selects on the
   `xcpng-cloud` owner marker stamped into each clone, so it finds these VMs without needing Jenkins to
   still know about them. The marker is on every live agent and warm spare too, so `--apply` refuses to

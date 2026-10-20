@@ -697,8 +697,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                         Level.SEVERE,
                         e,
                         () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName() + " after cloud '"
-                                + cloudName + "' was removed; recorded it as a leaked VM, retried over this"
-                                + " agent's connection details");
+                                + cloudName + "' was removed; recorded it as a leaked VM, to be retried over"
+                                + " this agent's connection details");
                 listener.getLogger()
                         .println("Failed to destroy VM " + vmRef + " and cloud '" + cloudName
                                 + "' is gone; recorded for later cleanup: " + e.getMessage());
