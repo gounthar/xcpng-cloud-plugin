@@ -14,15 +14,16 @@ import java.util.Map;
  * the disk is larger).
  *
  * <p>{@code placementHint} is an opaque string; null means "let the pool schedule". {@code userData}
- * (a cloud-init NoCloud payload) is optional and no backend reads it in v0 (the seed is
- * attached as a separate concern, not through this field).
+ * (a cloud-init NoCloud payload) is optional and no backend reads it, so the Xen Orchestra backend
+ * refuses a non-null one rather than drop it (the seed is attached as a separate concern, not through this
+ * field).
  *
  * <p>{@code guestData} carries per-clone key/value pairs the guest reads on first boot to launch its
  * inbound agent (the controller URL, the node name, and the JNLP secret). It is backend-neutral: the
  * keys are plain logical names ({@code url}, {@code name}, {@code secret}) and each backend chooses how
  * to deliver them. The Xen Orchestra backend writes them into the clone's xenstore data (under
  * {@code vm-data/jenkins/}) in the same call that sizes the clone, before the VM starts. Empty
- * when no seed is needed. Distinct from {@code userData}, which is an opaque cloud-init blob v0 ignores.
+ * when no seed is needed. Distinct from {@code userData}, which is an opaque cloud-init blob no backend accepts yet.
  *
  * <p>{@code owner} names the cloud this clone belongs to, and asks the backend to record it <em>on the VM
  * itself</em> so the VM can be identified later without the plugin. Null means "do not mark", which is what

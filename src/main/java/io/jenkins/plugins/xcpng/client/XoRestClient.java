@@ -636,6 +636,12 @@ public final class XoRestClient implements HypervisorClient {
             throw new HypervisorException("diskBytes is not honoured by the Xen Orchestra backend yet;"
                     + " size the golden image's disk instead");
         }
+        if (spec.userData() != null) {
+            // The agent's seed travels in guestData, as xenstore data; nothing here would deliver a
+            // cloud-init payload, and every caller passes null today (#321).
+            throw new HypervisorException(
+                    "userData is not honoured by the Xen Orchestra backend;" + " pass the guest seed as guestData");
+        }
         TemplateHandle handle = TemplateHandle.parse(template);
         // Resolved before anything is created, so a network the pool lacks fails with no VM behind it.
         String networkName = spec.networkName();
