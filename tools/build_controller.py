@@ -25,8 +25,10 @@ one failure this script cannot detect for you. Sites that want a reservation can
 --reservation-hook; DHCP servers have nothing in common at the API level, so vendor code
 lives in the hook rather than here.
 
-Re-running destroys and rebuilds the VM of the same name, and sweeps VDIs a previous failed
-run left behind, so it is safe to iterate on.
+Re-running with --replace destroys and rebuilds the VM of the same name, and sweeps VDIs a
+previous failed run left behind, so it is safe to iterate on. Only a VM this script built is
+replaced: one that merely shares the name is refused, and so is a copy of ours (see
+VM_SELF_KEY).
 
     XCPNG_HOST=192.168.1.98 XCPNG_USER=root XCPNG_PASS=... XCPNG_TRUST_SELF_SIGNED=1 \
         python3 tools/build_controller.py --pubkey ~/.ssh/id_ed25519.pub
@@ -52,6 +54,14 @@ DOCKER_KEY_URL = "https://download.docker.com/linux/debian/gpg"
 # anything. It lives here rather than inline at the two call sites on purpose: the sweep
 # matches what the create writes, and a literal in each place lets them drift apart silently.
 VDI_MARKER = "built by tools/build_controller.py"
+
+# Stamped into the VM's other_config at creation and required before a re-run destroys it. The
+# purpose tag alone says what the VM is for, and a copy of the VM inherits it; the second key
+# holds the VM's own uuid, which a copy does not share, so together they say this VM is the
+# one this script built. Same reasoning as the plugin's self marker on clones (#25, #283).
+VM_MARKER_KEY = "lab-purpose"
+VM_MARKER = "jenkins-controller-docker-host"
+VM_SELF_KEY = "built-by-build-controller-uuid"
 
 # External binaries the build shells out to. Checked before the image download rather than
 # after it, so a missing package costs a second instead of a few hundred MiB.
@@ -317,8 +327,93 @@ def run_reservation_hook(hook, mac, name):
     return reserved or None
 
 
-def destroy_existing(x, name, sr):
+def is_own_controller(rec):
+    """Whether a VM record carries both markers build() stamps, the second naming this VM."""
+    other = rec.get("other_config", {})
+    return other.get(VM_MARKER_KEY) == VM_MARKER and other.get(VM_SELF_KEY) == rec["uuid"]
+
+
+def stamp_owner(x, vm):
+    """Mark a freshly cloned VM as built here, so a later --replace may destroy it."""
+    x.call("VM.add_to_other_config", vm, VM_MARKER_KEY, VM_MARKER)
+    x.call("VM.add_to_other_config", vm, VM_SELF_KEY, x.call("VM.get_uuid", vm))
+
+
+def same_name_vms(x, name):
+    """Every ordinary VM labelled `name`: templates, snapshots and dom0 are never candidates."""
+    return [
+        (ref, rec)
+        for ref, rec in x.call("VM.get_all_records").items()
+        if rec["name_label"] == name
+        and not (rec["is_a_template"] or rec["is_a_snapshot"] or rec["is_control_domain"])
+    ]
+
+
+def refuse_unless_replaceable(vms, name, replace):
+    """Exit before anything is destroyed unless every VM named `name` is ours and --replace was given.
+
+    Checked for all of them first, so a pool holding our VM and someone else's of the same name
+    loses neither.
+    """
+    for _ref, rec in vms:
+        if not is_own_controller(rec):
+            raise SystemExit(
+                f"refusing to touch {name} ({rec['uuid']}): it does not carry the markers this script "
+                f"stamps ({VM_MARKER_KEY}={VM_MARKER} and {VM_SELF_KEY}=<its own uuid>), so it is not a "
+                "VM this script built, or it is a copy of one. Pick another --name, or remove it by hand."
+            )
+    if vms and not replace:
+        uuids = ", ".join(rec["uuid"] for _ref, rec in vms)
+        raise SystemExit(f"{name} already exists ({uuids}); pass --replace to destroy and rebuild it")
+
+
+def hard_shutdown(x, vm):
+    """Stop the VM whatever its power_state reads.
+
+    Not gated on power_state == Halted: that field has read Halted for a domain dom0 was still
+    running (#48), and a destroy on that reading takes the disks of a live VM. XAPI answers
+    VM_BAD_POWER_STATE when it believes the VM is already down, which is the one refusal that is
+    safe to step over. This does not detect #48 when XAPI itself holds the wrong state; it only
+    stops this script trusting the field on its own.
+    """
+    try:
+        x.call("VM.hard_shutdown", vm)
+    except XapiError as exc:
+        if exc.message != "VM_BAD_POWER_STATE":
+            raise
+
+
+def destroy_own_disks(x, vbd_records):
+    """Destroy the disks behind a destroyed VM's VBDs that this script created and no other VM uses.
+
+    The VBD records are read before VM.destroy, which removes those VBDs, so any VBD a disk still
+    has afterwards is another VM's. A CD is never ours, a disk without the VDI marker was attached
+    by hand, and a disk another VM has attached would leave that VM without it.
+    """
+    for record in vbd_records:
+        vdi = record["VDI"]
+        if record["type"] == "CD" or vdi == "OpaqueRef:NULL":
+            continue
+        disk = x.call("VDI.get_record", vdi)
+        label = disk["name_label"]
+        if disk["name_description"] != VDI_MARKER:
+            print(f"  kept VDI {label}: not created by this script")
+            continue
+        if disk["VBDs"]:
+            print(f"  kept VDI {label}: another VM has it attached")
+            continue
+        try:
+            x.call("VDI.destroy", vdi)
+            print(f"  destroyed VDI {label}")
+        except XapiError as exc:
+            print(f"  could not destroy VDI {label}: {exc}", file=sys.stderr)
+
+
+def destroy_existing(x, name, sr, replace=False):
     """Remove a previous build of this VM, and sweep VDIs an earlier failure stranded.
+
+    The VM is matched on name, then required to carry this script's markers, and destroyed only
+    with --replace (see refuse_unless_replaceable).
 
     The sweep is deliberately narrow. ``debian-13-genericcloud`` is the name anyone importing
     a stock Debian cloud image lands on, and this pool is shared, so matching a label alone
@@ -327,29 +422,16 @@ def destroy_existing(x, name, sr):
     to disks we made. Same lesson as the reaper's owner marker (#25): a name prefix is a
     guess about ownership, a stamp is a record of it.
     """
-    for ref, rec in x.call("VM.get_all_records").items():
-        if rec["name_label"] != name:
-            continue
-        if rec["is_a_template"] or rec["is_a_snapshot"] or rec["is_control_domain"]:
-            continue
+    vms = same_name_vms(x, name)
+    refuse_unless_replaceable(vms, name, replace)
+    for ref, rec in vms:
         print(f"destroying existing {name} ({rec['uuid']}) ...")
-        if rec["power_state"] != "Halted":
-            await_void_task(x, x.call("Async.VM.hard_shutdown", ref))
-        # Capture the VDIs before VM.destroy: it removes the VBDs on the way out, and the
-        # VDIs behind them become unreachable orphans.
-        vdis = [x.call("VBD.get_VDI", b) for b in x.call("VM.get_VBDs", ref)]
+        hard_shutdown(x, ref)
+        # Capture the VBDs before VM.destroy: it removes them on the way out, and the VDIs
+        # behind them become unreachable orphans.
+        vbd_records = [x.call("VBD.get_record", b) for b in x.call("VM.get_VBDs", ref)]
         x.call("VM.destroy", ref)
-        for vdi in vdis:
-            if vdi == "OpaqueRef:NULL":
-                continue
-            label = x.call("VDI.get_name_label", vdi)
-            if label.endswith(".iso"):
-                continue  # shared ISO SR content, not ours to destroy
-            try:
-                x.call("VDI.destroy", vdi)
-                print(f"  destroyed VDI {label}")
-            except XapiError as exc:
-                print(f"  could not destroy VDI {label}: {exc}", file=sys.stderr)
+        destroy_own_disks(x, vbd_records)
 
     for ref, rec in x.call("VDI.get_all_records").items():
         if (
@@ -373,6 +455,11 @@ def find_ext_sr(x):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--name", default="jenkins-controller")
+    p.add_argument(
+        "--replace",
+        action="store_true",
+        help="destroy and rebuild an existing VM of this name; only one this script built",
+    )
     p.add_argument(
         "--pubkey",
         required=True,
@@ -420,7 +507,7 @@ def parse_args(argv=None):
 def build(x, args, pubkey, docker_key):
     """Create the VM and start it. Returns its VM ref."""
     sr = find_ext_sr(x)
-    destroy_existing(x, args.name, sr)
+    destroy_existing(x, args.name, sr, args.replace)
 
     tools_iso = None
     for ref, rec in x.call("VDI.get_all_records").items():
@@ -465,10 +552,9 @@ def build(x, args, pubkey, docker_key):
     # after. Building the VM from scratch with VM.create is the case that needs a seeded
     # varstore.
     vm = x.call("VM.clone", template, args.name)
+    # First, so a run that fails anywhere after the clone leaves a VM the next --replace can take.
+    stamp_owner(x, vm)
     x.call("VM.set_is_a_template", vm, False)
-    x.call(
-        "VM.add_to_other_config", vm, "lab-purpose", "jenkins-controller-docker-host"
-    )
     memory = str(args.memory_gib * 1024**3)
     x.call("VM.set_memory_limits", vm, memory, memory, memory, memory)
     x.call("VM.set_VCPUs_max", vm, str(args.vcpus))
