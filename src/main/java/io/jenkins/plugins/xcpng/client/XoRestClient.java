@@ -11,6 +11,8 @@ import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -155,6 +157,12 @@ public final class XoRestClient implements HypervisorClient {
      * look for: bad parameters, and no or not enough authority.
      */
     private static final Set<Integer> REFUSED_BEFORE_WORK = Set.of(400, 401, 403, 422);
+
+    /**
+     * How far before the request a found VM's XO creation date may fall: the controller's clock and the
+     * appliance's are not the same clock. Generous, since the other checks carry the weight.
+     */
+    static final Duration CREATION_SKEW = Duration.ofMinutes(5);
 
     /** A wait between two reads. A seam so tests do not sleep; production is {@link Thread#sleep}. */
     @FunctionalInterface
@@ -700,9 +708,10 @@ public final class XoRestClient implements HypervisorClient {
      * which no sweep selects. Only the statuses in {@link #REFUSED_BEFORE_WORK} are taken to mean nothing
      * was made; any other status, a 404 or 409 included, may come from a step after the clone.
      *
-     * <p>The clone is found by its exact name. The caller names every clone {@code xcpng-<template>-} plus
-     * eight random hex characters, so the name is this agent's, though not necessarily this attempt's: a node
-     * reloaded with no VM recorded clones again under the same name, and two matches are then left alone.
+     * <p>The clone is found by its exact name, and then only taken if XO's own record of it says this create
+     * could have made it ({@link #findLeftBehind}). The caller names every clone {@code xcpng-<template>-}
+     * plus eight random hex characters, so the name is this agent's, though not necessarily this attempt's:
+     * a node reloaded with no VM recorded clones again under the same name, and two matches are left alone.
      * The search gives up after {@link #LEFT_BEHIND_READS} reads, about a minute: a create that has not
      * finished by then is still running on an appliance slow enough to have timed us out, and nothing short
      * of waiting for it would find it. The destroy that follows does not wait for XO's create to settle; what
@@ -712,6 +721,7 @@ public final class XoRestClient implements HypervisorClient {
     private JsonNode createVm(TemplateHandle handle, ObjectNode create, ProvisionSpec spec) {
         String path = API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true";
         HypervisorException failure;
+        Instant sent = Instant.now();
         try {
             RestTransport.RestResponse resp = transport.send("POST", path, create.toString(), ACTION_TIMEOUT);
             if (resp.isSuccess() && resp.status() != 202) {
@@ -735,7 +745,7 @@ public final class XoRestClient implements HypervisorClient {
         // on an interrupted thread, and an interrupt is one of the ways the answer gets lost.
         boolean interrupted = Thread.interrupted();
         try {
-            LeftBehind search = findLeftBehind(spec.name());
+            LeftBehind search = findLeftBehind(spec.name(), handle, sent.minus(CREATION_SKEW));
             if (search.vm() == null) {
                 throw new HypervisorException(
                         failure.getMessage() + " " + search.outcome() + "; if a VM named '" + spec.name()
@@ -755,14 +765,33 @@ public final class XoRestClient implements HypervisorClient {
     private record LeftBehind(
             @CheckForNull VmRef vm, @NonNull String outcome) {}
 
-    /** The one VM named {@code name}, polling until it appears. */
-    private LeftBehind findLeftBehind(String name) {
+    /**
+     * The one VM named {@code name} that this create could have made, polling until it appears.
+     *
+     * <p>A name alone does not license a DELETE that takes the disks, nor a stamp that makes the VM ours for
+     * good: anyone who can see the VM list can read the name while the create runs and rename another VM to
+     * it. So a match must also be what XO records for a VM its create route made from this template, now:
+     * on the template's pool, {@code creation.template} the template this call cloned, {@code creation.date}
+     * no earlier than {@code notBefore}, and no owner marker of any cloud. Read on the lab appliance
+     * 2026-10-20, a fresh clone carries {@code creation} with the template's bare id and the date; a VM not
+     * made by that route (10 of the pool's 14) carries no {@code creation} and is never taken. A match that
+     * fails these is reported and left alone, and the search goes on, since the real clone may still come.
+     */
+    private LeftBehind findLeftBehind(String name, TemplateHandle handle, Instant notBefore) {
+        Set<String> refusedMatches = new LinkedHashSet<>();
         for (int read = 1; read <= LEFT_BEHIND_READS; read++) {
             List<String> ids = new ArrayList<>();
             try {
-                for (JsonNode vm : get(API + "/vms?fields=id,name_label")) {
-                    if (name.equals(vm.path("name_label").asText(null))) {
-                        ids.add(vm.path("id").asText(""));
+                for (JsonNode vm : get(API + "/vms?fields=id,name_label,$pool,creation,tags")) {
+                    if (!name.equals(vm.path("name_label").asText(null))) {
+                        continue;
+                    }
+                    String id = vm.path("id").asText("");
+                    String why = notThisCreate(vm, handle, notBefore);
+                    if (why == null) {
+                        ids.add(id);
+                    } else if (refusedMatches.add(id + " (" + why + ")")) {
+                        LOGGER.warning("VM " + id + " is named '" + name + "' but " + why + "; leaving it alone");
                     }
                 }
             } catch (RuntimeException e) {
@@ -790,7 +819,39 @@ public final class XoRestClient implements HypervisorClient {
                 }
             }
         }
-        return new LeftBehind(null, "No VM named '" + name + "' appeared within " + LEFT_BEHIND_READS + " reads");
+        String refused = refusedMatches.isEmpty()
+                ? ""
+                : " (left alone as not made by this create: " + String.join(", ", refusedMatches) + ")";
+        return new LeftBehind(
+                null,
+                "No VM named '" + name + "' that this create made appeared within " + LEFT_BEHIND_READS + " reads"
+                        + refused);
+    }
+
+    /** Why {@code vm} cannot be the clone this create made, or null if it can be. */
+    @CheckForNull
+    private static String notThisCreate(JsonNode vm, TemplateHandle handle, Instant notBefore) {
+        if (!handle.poolId().equals(vm.path("$pool").asText(null))) {
+            return "it is on another pool";
+        }
+        JsonNode creation = vm.path("creation");
+        if (!handle.templateUuid().equals(creation.path("template").asText(null))) {
+            return "XO does not record it as created from template " + handle.templateUuid();
+        }
+        try {
+            if (Instant.parse(creation.path("date").asText("")).isBefore(notBefore)) {
+                return "it was created before this request";
+            }
+        } catch (DateTimeParseException e) {
+            return "its creation date cannot be read";
+        }
+        for (JsonNode tag : vm.path("tags")) {
+            String t = tag.asText("");
+            if (t.startsWith(OWNER_TAG_PREFIX) || t.startsWith(SELF_TAG_PREFIX)) {
+                return "it already carries owner marker '" + t + "'";
+            }
+        }
+        return null;
     }
 
     /**

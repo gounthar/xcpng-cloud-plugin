@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -1344,10 +1345,27 @@ class XoRestClientTest {
     private static final ProvisionSpec OWNED =
             new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab");
 
+    /**
+     * A VM as {@code GET /vms?fields=id,name_label,$pool,creation,tags} lists it: the shape read on the lab
+     * appliance 2026-10-20 for a clone XO's create route had just made from this template.
+     */
     private static Map<String, Object> listed(String id, String name) {
+        return listed(id, name, TEMPLATE_UUID, Instant.now().toString(), List.of());
+    }
+
+    private static Map<String, Object> listed(String id, String name, String template, String date, List<String> tags) {
         Map<String, Object> vm = new LinkedHashMap<>();
         vm.put("id", id);
         vm.put("name_label", name);
+        vm.put("$pool", POOL);
+        if (template != null) {
+            Map<String, Object> creation = new LinkedHashMap<>();
+            creation.put("date", date);
+            creation.put("template", template);
+            creation.put("user", "6a07c94f-76e9-4ab8-9aa1-d893d15cfa02");
+            vm.put("creation", creation);
+        }
+        vm.put("tags", tags);
         return vm;
     }
 
@@ -1454,6 +1472,61 @@ class XoRestClientTest {
         assertTrue(e.getMessage().contains("'a/b'"), "the operator needs the id: " + e.getMessage());
     }
 
+    /**
+     * The name is readable by anyone who can list VMs while the create runs, so a VM renamed to it must not
+     * be destroyed nor stamped as ours. Each case is one VM with the right name that this create cannot have
+     * made, and the search must leave it alone.
+     */
+    @Test
+    void aVmWithTheCloneNameThatThisCreateDidNotMakeIsLeftAlone() {
+        String recent = Instant.now().toString();
+        List<Map<String, Object>> impostors = List.of(
+                listed(CLONE, "agent-1", "0e5e4c35-1bd8-4f1a-9a39-5c0bd2fd2d1a", recent, List.of()),
+                listed(CLONE, "agent-1", TEMPLATE_UUID, "2026-01-01T00:00:00Z", List.of()),
+                listed(CLONE, "agent-1", TEMPLATE_UUID, recent, List.of(XoRestClient.OWNER_TAG_PREFIX + "other")),
+                listed(CLONE, "agent-1", null, null, List.of()));
+        Map<String, Object> otherPool = listed(CLONE, "agent-1");
+        otherPool.put("$pool", OTHER_POOL);
+        impostors = new ArrayList<>(impostors);
+        impostors.add(otherPool);
+        for (Map<String, Object> impostor : impostors) {
+            ScriptedRest t = new ScriptedRest();
+            t.loseAnswerTo("POST", CREATE);
+            t.vmList.add(impostor);
+            XoRestClient c = new XoRestClient(t, d -> {});
+
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
+
+            assertTrue(t.destroyed.isEmpty(), "must not be destroyed: " + impostor + " " + t.destroyed);
+            assertTrue(t.vmTags.isEmpty(), "must not be stamped as ours: " + impostor + " " + t.vmTags);
+            assertTrue(e.getMessage().contains("left alone"), "and the operator is told: " + e.getMessage());
+        }
+    }
+
+    @Test
+    void aRenamedVmDoesNotHideTheRealCloneThatComesLater() {
+        ScriptedRest t = new ScriptedRest();
+        t.loseAnswerTo("POST", CREATE);
+        Map<String, Object> decoy = listed(
+                "decoy",
+                "agent-1",
+                "0e5e4c35-1bd8-4f1a-9a39-5c0bd2fd2d1a",
+                Instant.now().toString(),
+                List.of());
+        t.vmListViews.add(List.of(decoy));
+        t.vmList.add(decoy);
+        t.vmList.add(listed(CLONE, "agent-1"));
+        XoRestClient c = new XoRestClient(t, d -> {});
+
+        assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
+
+        assertEquals(List.of(CLONE), t.destroyed, "the real clone, and not the decoy");
+    }
+
     @Test
     void aCreateXoRefusedIsNotSearchedFor() {
         // A 4xx is XO refusing the request, so no VM was made and a minute of listing would be wasted.
@@ -1535,7 +1608,8 @@ class XoRestClientTest {
 
         assertEquals(
                 XoRestClient.LEFT_BEHIND_READS,
-                t.all("GET", "/rest/v0/vms?fields=id,name_label").size());
+                t.all("GET", "/rest/v0/vms?fields=id,name_label,$pool,creation,tags")
+                        .size());
         assertEquals(XoRestClient.LEFT_BEHIND_READS - 1, pauses.size(), "no pause after the last read");
         assertTrue(e.getMessage().contains("agent-1"), "the name, for an operator: " + e.getMessage());
         assertTrue(e.getMessage().contains("no owner tag"), e.getMessage());
