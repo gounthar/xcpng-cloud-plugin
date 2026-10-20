@@ -256,6 +256,14 @@ public final class FakeHypervisorClient implements HypervisorClient {
                 throw new HypervisorException("cloneFromTemplate interrupted while held");
             }
         }
+        // After the hold, as a backend's configure step fails once the clone exists, so a test can tear the
+        // node down while the clone is in flight and still have it come back left behind.
+        if (leavesCloneBehind()) {
+            throw new CloneLeftBehindException(
+                    "configure failed; clone " + clone.value() + " was left behind",
+                    clone,
+                    new HypervisorException("configure failed"));
+        }
         return clone;
     }
 
@@ -265,13 +273,11 @@ public final class FakeHypervisorClient implements HypervisorClient {
         VmRef clone = new VmRef("vm/" + spec.name() + "/" + (++cloneCounter));
         calls.add("cloneFromTemplate:" + template.value() + "->" + clone.value());
         states.put(clone.value(), VmState.HALTED);
-        if (cloneLeftBehind) {
-            throw new CloneLeftBehindException(
-                    "configure failed; clone " + clone.value() + " was left behind",
-                    clone,
-                    new HypervisorException("configure failed"));
-        }
         return clone;
+    }
+
+    private synchronized boolean leavesCloneBehind() {
+        return cloneLeftBehind;
     }
 
     @Override
