@@ -803,6 +803,25 @@ class XoRestClientTest {
         // The clone already existed when the sizing was rejected. Leaving it is the leak this catch exists
         // to prevent, and an XO-made clone carries no other_config marker for tools/reaper.py to find.
         assertEquals(List.of(CLONE), t.destroyed, "the partly configured clone must be reclaimed");
+        assertFalse(e instanceof CloneLeftBehindException, "a clone that was reclaimed was not left behind");
+    }
+
+    @Test
+    void cloneNamesThePartialCloneWhenItsOwnCleanupFailsToo() {
+        // #310. Both the configure and the cleanup DELETE fail: the clone is still on the pool, and the
+        // exception is the only thing left that names it, so it must carry the id to the caller.
+        ScriptedRest t = new ScriptedRest();
+        t.fail("PATCH", "/rest/v0/vms/" + CLONE, 422, "{\"error\":\"invalid parameters\"}");
+        t.fail("DELETE", "/rest/v0/vms/" + CLONE, 500, "{\"error\":\"unknown error from the peer\"}");
+        XoRestClient c = new XoRestClient(t);
+        CloneLeftBehindException e = assertThrows(
+                CloneLeftBehindException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), spec()));
+
+        assertEquals(new VmRef(CLONE), e.getVmRef());
+        assertTrue(e.getCause().getMessage().contains("invalid parameters"), "the configure failure stays the cause");
+        assertEquals(1, e.getSuppressed().length, "the cleanup failure travels with it");
+        assertTrue(e.getMessage().contains(CLONE), e.getMessage());
     }
 
     @Test

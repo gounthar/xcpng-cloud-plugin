@@ -64,6 +64,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private int pingSuccessesBeforeFailing = -1;
     private boolean resolveFailsAtTransport = false;
     private boolean startFails = false;
+    private boolean cloneLeftBehind = false;
     private boolean destroyFails = false;
     private String assignIpOnStart = null;
     private ProvisionSpec lastSpec = null;
@@ -113,6 +114,15 @@ public final class FakeHypervisorClient implements HypervisorClient {
     /** Make {@link #start} throw after the clone exists, to test failed-provision cleanup. */
     public synchronized FakeHypervisorClient failStart() {
         this.startFails = true;
+        return this;
+    }
+
+    /**
+     * Make {@link #cloneFromTemplate} create the clone and then throw {@link CloneLeftBehindException} naming
+     * it, the way a backend does when configuring the clone fails and so does its own cleanup (#310).
+     */
+    public synchronized FakeHypervisorClient leaveCloneBehind() {
+        this.cloneLeftBehind = true;
         return this;
     }
 
@@ -218,6 +228,12 @@ public final class FakeHypervisorClient implements HypervisorClient {
         VmRef clone = new VmRef("vm/" + spec.name() + "/" + (++cloneCounter));
         calls.add("cloneFromTemplate:" + template.value() + "->" + clone.value());
         states.put(clone.value(), VmState.HALTED);
+        if (cloneLeftBehind) {
+            throw new CloneLeftBehindException(
+                    "configure failed; clone " + clone.value() + " was left behind",
+                    clone,
+                    new HypervisorException("configure failed"));
+        }
         return clone;
     }
 

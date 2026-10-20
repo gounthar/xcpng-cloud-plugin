@@ -23,6 +23,7 @@ import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 import io.jenkins.plugins.xcpng.client.CaCertificates;
 import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
+import io.jenkins.plugins.xcpng.client.CloneLeftBehindException;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
 import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
@@ -749,7 +750,16 @@ public class XcpngCloud extends Cloud {
                     // two disagree about where this VM is.
                     agent.getNetworkName());
             listener.getLogger().println("Cloning XCP-ng template " + template.getTemplateName() + " for this agent.");
-            VmRef clone = client.cloneFromTemplate(templateRef, spec);
+            VmRef clone;
+            try {
+                clone = client.cloneFromTemplate(templateRef, spec);
+            } catch (CloneLeftBehindException e) {
+                // The clone exists and its own cleanup failed (#310). Stamp it onto the agent before the
+                // launcher's teardown runs, so that teardown retries the destroy and, if that fails too,
+                // records the VM as leaked over this agent's connection, as for any other failed destroy.
+                agent.setVmRef(e.getVmRef().value());
+                throw e;
+            }
             agent.setVmRef(clone.value());
             client.start(clone);
             listener.getLogger().println("Started XCP-ng VM " + clone.value() + "; waiting for the agent to connect.");

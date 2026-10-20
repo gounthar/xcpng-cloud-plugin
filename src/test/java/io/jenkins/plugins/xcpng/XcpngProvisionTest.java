@@ -2257,6 +2257,45 @@ class XcpngProvisionTest {
     }
 
     @Test
+    void aCloneItsOwnCleanupLeftBehindIsDestroyedByTheLaunchTeardown(JenkinsRule r) throws Exception {
+        // #310. The backend created the clone, failed to configure it, and failed to destroy it. Before, it
+        // logged the id and threw an exception that did not carry it, so the agent never learned the VM existed.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").leaveCloneBehind();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+
+        awaitTrue(
+                () -> fake.calls().contains("destroyWithDisks:vm/xcpng-agent-1/1"),
+                () -> "the launch teardown must reach the clone the backend left behind: " + fake.calls());
+        assertFalse(
+                fake.calls().contains("start:vm/xcpng-agent-1/1"),
+                "a clone that failed to configure must not be started: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(),
+                "a destroy that worked leaves nothing recorded: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void aCloneLeftBehindThatStillCannotBeDestroyedIsRecordedAsLeaked(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian")
+                .leaveCloneBehind()
+                .failDestroy();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+
+        awaitTrue(
+                () -> cloud.leakedVmRefs().contains("vm/xcpng-agent-1/1"),
+                () -> "a clone left behind whose teardown also failed must be recorded as leaked: "
+                        + cloud.leakedVmRefs());
+    }
+
+    @Test
     void theMaintainerSweepsLeakedVms(JenkinsRule r) {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
