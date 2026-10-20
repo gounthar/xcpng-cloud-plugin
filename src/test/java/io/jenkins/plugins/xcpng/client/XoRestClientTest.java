@@ -765,7 +765,7 @@ class XoRestClientTest {
     }
 
     @Test
-    void cloneRejectsPlacementHintAndDiskBytesBeforeCreatingAnything() {
+    void cloneRejectsWhatItDoesNotHonourBeforeCreatingAnything() {
         ScriptedRest t = new ScriptedRest();
         XoRestClient c = new XoRestClient(t);
         VmRef template = c.resolveTemplate("jenkins-agent-debian13-v7");
@@ -777,6 +777,11 @@ class XoRestClientTest {
         assertThrows(
                 HypervisorException.class,
                 () -> c.cloneFromTemplate(template, new ProvisionSpec("a", 2, 2048L, 8_000_000_000L, null, null)));
+        // Nothing here delivers a cloud-init payload, so dropping one would only hide that from the caller (#321).
+        HypervisorException userData = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(template, new ProvisionSpec("a", 2, 2048L, null, null, "#cloud-config\n")));
+        assertTrue(userData.getMessage().contains("userData"), userData.getMessage());
         assertEquals(reads, t.calls.size(), "a rejected spec must not reach the appliance at all");
     }
 
