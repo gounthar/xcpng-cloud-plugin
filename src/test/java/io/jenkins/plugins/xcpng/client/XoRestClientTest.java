@@ -1392,6 +1392,69 @@ class XoRestClientTest {
     }
 
     @Test
+    void anAcceptedCreateIsSearchedFor() {
+        // A 202 is XO saying it started the work, so the clone may well exist; the old message only named it.
+        ScriptedRest t = new ScriptedRest();
+        t.fail("POST", CREATE, 202, "{\"id\":\"task-9\"}");
+        t.vmList.add(listed(CLONE, "agent-1"));
+        XoRestClient c = new XoRestClient(t, d -> {});
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
+
+        assertEquals(List.of(CLONE), t.destroyed);
+        assertTrue(e.getMessage().contains("202"), e.getMessage());
+    }
+
+    @Test
+    void aConflictOnCreateIsSearchedFor() {
+        // A 409 or a 404 can come from a step XO runs after VM.clone, so only an up-front refusal is skipped.
+        ScriptedRest t = new ScriptedRest();
+        t.fail("POST", CREATE, 409, "{\"error\":\"incorrect state\"}");
+        t.vmList.add(listed(CLONE, "agent-1"));
+        XoRestClient c = new XoRestClient(t, d -> {});
+
+        assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
+
+        assertEquals(List.of(CLONE), t.destroyed);
+    }
+
+    @Test
+    void aCreateAnsweredWithAPageInsteadOfJsonIsSearchedFor() {
+        // A proxy's 200 page is not XO's answer: the create behind it may have run.
+        ScriptedRest t = new ScriptedRest();
+        t.fail("POST", CREATE, 200, "<html>Welcome</html>");
+        t.vmList.add(listed(CLONE, "agent-1"));
+        XoRestClient c = new XoRestClient(t, d -> {});
+
+        assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
+
+        assertEquals(List.of(CLONE), t.destroyed);
+    }
+
+    @Test
+    void aMatchWithAnUnusableIdIsNamedRatherThanWaitedOn() {
+        ScriptedRest t = new ScriptedRest();
+        t.loseAnswerTo("POST", CREATE);
+        t.vmList.add(listed("a/b", "agent-1"));
+        List<Duration> pauses = new ArrayList<>();
+        XoRestClient c = new XoRestClient(t, pauses::add);
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
+
+        assertTrue(t.destroyed.isEmpty(), "nothing addresses it: " + t.destroyed);
+        assertTrue(pauses.isEmpty(), "found on the first read, so no point polling: " + pauses);
+        assertTrue(e.getMessage().contains("'a/b'"), "the operator needs the id: " + e.getMessage());
+    }
+
+    @Test
     void aCreateXoRefusedIsNotSearchedFor() {
         // A 4xx is XO refusing the request, so no VM was made and a minute of listing would be wasted.
         ScriptedRest t = new ScriptedRest();
@@ -1433,6 +1496,12 @@ class XoRestClientTest {
                         < t.indexOf("PUT", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Alab"),
                 "the stamp is only spent once the destroy has failed: " + t.paths());
         assertTrue(e.getMessage().contains("now carries"), e.getMessage());
+
+        // The point of the stamp: the public destroy, whose ownership check refuses an unmarked VM, now takes
+        // it once the pool recovers. CLONE and CLONE_UUID differ, so a stamp of the id would be refused here.
+        t.recover("DELETE", "/rest/v0/vms/" + CLONE);
+        c.destroyWithDisks(e.getVmRef(), "lab");
+        assertEquals(List.of(CLONE), t.destroyed, "the stamped clone must pass the ownership check");
     }
 
     @Test
@@ -1475,18 +1544,20 @@ class XoRestClientTest {
 
     @Test
     void twoVmsWithTheCloneNameAreBothLeftAlone() {
-        // The random suffix makes this impossible in practice; if it happens, either could be someone else's.
+        // A node reloaded with no VM recorded clones again under its own name, so two can match. Both are
+        // then this agent's, but which one this attempt made cannot be told, so neither is touched.
         ScriptedRest t = new ScriptedRest();
         t.loseAnswerTo("POST", CREATE);
         t.vmList.add(listed(CLONE, "agent-1"));
         t.vmList.add(listed("e3b0c442-98fc-1c14-9afb-f4c8996fb924", "agent-1"));
         XoRestClient c = new XoRestClient(t, d -> {});
 
-        assertThrows(
+        HypervisorException e = assertThrows(
                 HypervisorException.class,
                 () -> c.cloneFromTemplate(c.resolveTemplate("jenkins-agent-debian13-v7"), OWNED));
 
         assertTrue(t.destroyed.isEmpty(), "neither may be destroyed: " + t.destroyed);
+        assertTrue(e.getMessage().contains("2 VMs are named"), "and the operator is told why: " + e.getMessage());
     }
 
     @Test
@@ -2185,6 +2256,11 @@ class XoRestClientTest {
 
         void interruptOn(String method, String path) {
             interrupts.add(method + " " + path);
+        }
+
+        /** Undo {@link #fail}: the appliance answers that route normally again. */
+        void recover(String method, String path) {
+            failures.remove(method + " " + path);
         }
 
         /** The request reaches the appliance and the answer never comes back: a timeout or a reset. */

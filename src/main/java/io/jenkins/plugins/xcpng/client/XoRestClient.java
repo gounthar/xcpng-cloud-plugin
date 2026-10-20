@@ -150,6 +150,12 @@ public final class XoRestClient implements HypervisorClient {
 
     static final Duration LEFT_BEHIND_POLL = Duration.ofSeconds(5);
 
+    /**
+     * The create statuses that mean XO refused the request before doing any work, so there is no clone to
+     * look for: bad parameters, and no or not enough authority.
+     */
+    private static final Set<Integer> REFUSED_BEFORE_WORK = Set.of(400, 401, 403, 422);
+
     /** A wait between two reads. A seam so tests do not sleep; production is {@link Thread#sleep}. */
     @FunctionalInterface
     interface Pause {
@@ -691,12 +697,16 @@ public final class XoRestClient implements HypervisorClient {
      * by name about 5 s later, 3 runs of 3. A timeout, a reset connection, a proxy's 504 or an interrupt
      * all reach that state, and so does a refused 202, which is XO saying it started the work. Jenkins
      * retries provisioning, so without this each such failure left one more VM carrying no owner tag,
-     * which no sweep selects. A 4xx is XO refusing the request, so there is nothing to look for.
+     * which no sweep selects. Only the statuses in {@link #REFUSED_BEFORE_WORK} are taken to mean nothing
+     * was made; any other status, a 404 or 409 included, may come from a step after the clone.
      *
-     * <p>The clone is found by its exact name, which ends in eight random hex characters and was chosen by
-     * this very call; that, and not a tag, is the proof that it is ours. The search gives up after {@link
-     * #LEFT_BEHIND_READS} reads: a create that has not finished by then is still running on an appliance
-     * slow enough to have timed us out, and nothing short of waiting for it would find it.
+     * <p>The clone is found by its exact name. The caller names every clone {@code xcpng-<template>-} plus
+     * eight random hex characters, so the name is this agent's, though not necessarily this attempt's: a node
+     * reloaded with no VM recorded clones again under the same name, and two matches are then left alone.
+     * The search gives up after {@link #LEFT_BEHIND_READS} reads, about a minute: a create that has not
+     * finished by then is still running on an appliance slow enough to have timed us out, and nothing short
+     * of waiting for it would find it. The destroy that follows does not wait for XO's create to settle; what
+     * a DELETE does to a create still running is not measured.
      */
     @NonNull
     private JsonNode createVm(TemplateHandle handle, ObjectNode create, ProvisionSpec spec) {
@@ -705,13 +715,19 @@ public final class XoRestClient implements HypervisorClient {
         try {
             RestTransport.RestResponse resp = transport.send("POST", path, create.toString(), ACTION_TIMEOUT);
             if (resp.isSuccess() && resp.status() != 202) {
-                return parse("POST " + path, resp.body());
-            }
-            if (resp.status() / 100 == 4) {
+                try {
+                    return parse("POST " + path, resp.body());
+                } catch (HypervisorException e) {
+                    // A 2xx that is not JSON is a proxy's page, not XO's answer; the create may have run.
+                    failure = e;
+                }
+            } else if (REFUSED_BEFORE_WORK.contains(resp.status())) {
                 throw failure("POST", path, resp.status(), resp.body());
+            } else {
+                failure = resp.isSuccess()
+                        ? asyncAccepted("POST", path)
+                        : failure("POST", path, resp.status(), resp.body());
             }
-            failure =
-                    resp.isSuccess() ? asyncAccepted("POST", path) : failure("POST", path, resp.status(), resp.body());
         } catch (IOException e) {
             failure = new HypervisorException("POST " + path + ": transport error: " + e.getMessage(), e);
         }
@@ -719,15 +735,15 @@ public final class XoRestClient implements HypervisorClient {
         // on an interrupted thread, and an interrupt is one of the ways the answer gets lost.
         boolean interrupted = Thread.interrupted();
         try {
-            VmRef clone = findLeftBehind(spec.name());
-            if (clone == null) {
+            LeftBehind search = findLeftBehind(spec.name());
+            if (search.vm() == null) {
                 throw new HypervisorException(
-                        failure.getMessage() + " No VM named '" + spec.name() + "' appeared"
-                                + " after it; if one appears later it carries no owner tag, which no sweep will find,"
-                                + " so remove it by hand.",
+                        failure.getMessage() + " " + search.outcome() + "; if a VM named '" + spec.name()
+                                + "' appears later it carries no owner tag, which no sweep will find, so remove it"
+                                + " by hand.",
                         failure);
             }
-            throw reclaim(clone, spec, failure);
+            throw reclaim(search.vm(), spec, failure);
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
@@ -735,9 +751,12 @@ public final class XoRestClient implements HypervisorClient {
         }
     }
 
-    /** The one VM named {@code name}, polling until it appears, or null if none does or more than one does. */
-    @CheckForNull
-    private VmRef findLeftBehind(String name) {
+    /** The clone a search found, or null with what the search saw instead, for the operator's message. */
+    private record LeftBehind(
+            @CheckForNull VmRef vm, @NonNull String outcome) {}
+
+    /** The one VM named {@code name}, polling until it appears. */
+    private LeftBehind findLeftBehind(String name) {
         for (int read = 1; read <= LEFT_BEHIND_READS; read++) {
             List<String> ids = new ArrayList<>();
             try {
@@ -749,25 +768,29 @@ public final class XoRestClient implements HypervisorClient {
             } catch (RuntimeException e) {
                 LOGGER.warning("could not list VMs while looking for clone '" + name + "': " + e.getMessage());
             }
-            if (ids.size() == 1 && unaddressable(ids.get(0)) == null) {
-                return new VmRef(ids.get(0));
+            if (ids.size() == 1) {
+                String refused = unaddressable(ids.get(0));
+                if (refused == null) {
+                    return new LeftBehind(new VmRef(ids.get(0)), "found");
+                }
+                return new LeftBehind(null, "A VM named '" + name + "' exists as '" + ids.get(0) + "', " + refused);
             }
             if (ids.size() > 1) {
-                // A random suffix should make this impossible; touching either would be guessing.
-                LOGGER.severe("found " + ids.size() + " VMs named '" + name + "' (" + ids + "); destroying"
-                        + " none of them, remove the extra ones by hand");
-                return null;
+                // Possible when a node reloaded with no VM recorded clones again under its own name: both are
+                // then ours, but which one this call made cannot be told apart, so neither is touched.
+                return new LeftBehind(
+                        null, ids.size() + " VMs are named '" + name + "' " + ids + ", so none was" + " destroyed");
             }
             if (read < LEFT_BEHIND_READS) {
                 try {
                     pause.pause(LEFT_BEHIND_POLL);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
-                    return null;
+                    return new LeftBehind(null, "The search for a VM named '" + name + "' was interrupted");
                 }
             }
         }
-        return null;
+        return new LeftBehind(null, "No VM named '" + name + "' appeared within " + LEFT_BEHIND_READS + " reads");
     }
 
     /**
@@ -778,8 +801,10 @@ public final class XoRestClient implements HypervisorClient {
      * clone left behind untagged used to need an operator. Stamped, the teardown the caller runs next, or the
      * sweep after it, can reclaim it. The stamp comes only after a failed destroy because a destroy that
      * works makes it pointless, and a stamp before it would repeat whatever {@link #configure} already spent
-     * on the same tags. It skips the inherited-marker strip: the ownership check needs both markers present,
-     * not the foreign ones gone. Only both failing leaves a VM for an operator.
+     * on the same tags. It skips the inherited-marker strip: the plugin's ownership check needs both markers
+     * present, not the foreign ones gone. {@code tools/reaper.py --cloud} is stricter and refuses a VM with two
+     * owner markers, so a clone of a marked golden image stays the plugin's to reclaim. Only both failing
+     * leaves a VM for an operator.
      *
      * @return the exception to throw: {@code cause} once the clone is gone, else a {@link
      *     CloneLeftBehindException} naming it
