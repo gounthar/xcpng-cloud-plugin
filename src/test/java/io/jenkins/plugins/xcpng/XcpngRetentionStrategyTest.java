@@ -1075,6 +1075,44 @@ class XcpngRetentionStrategyTest {
                 "giving up must name the VM and the reaper at SEVERE: " + messages(sweep));
     }
 
+    /**
+     * The held half of the residual above. A VM the #48 guard refused to destroy after its cloud was removed is
+     * recorded held, and when the sweep then cannot open its connection it keeps the entry rather than giving up:
+     * the held banner is the only thing still saying that VM may be running. The test above cannot tell this apart,
+     * because its teardown fails opening the client, before the guard runs, so its entry is never held.
+     */
+    @Test
+    void aHeldLeakOfAGoneCloudSurvivesItsCredentialGoingToo(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        agent.setConnectionClientFactory(new RecordingConnectionFactory(fake));
+        VmState[] alwaysHalted = new VmState[20];
+        Arrays.fill(alwaysHalted, VmState.HALTED);
+        fake.scriptStates(agent.getVmRef(), alwaysHalted);
+        agent.setChannelProbe(() -> true);
+        agent.setSleeper(new FakeSleeper());
+        r.jenkins.clouds.remove(cloud);
+
+        agent.terminate();
+        assertEquals(0, destroyCount(fake), "the guard must have refused the delete: " + fake.calls());
+        assertEquals(
+                List.of(agent.getVmRef()),
+                XcpngLeakedVmStore.get().held().getOrDefault("xcpng", List.of()).stream()
+                        .map(XcpngLeakedVm::getVmRef)
+                        .toList(),
+                "control: the refused VM must be recorded held under the gone cloud's name");
+
+        // The sweep opens the recorded connection the production way, and the test store holds no credential.
+        XcpngCloud.sweepOrphanedLeaks();
+
+        assertTrue(
+                XcpngLeakedVmStore.get().held().getOrDefault("xcpng", List.of()).stream()
+                        .anyMatch(vm -> vm.getVmRef().equals(agent.getVmRef())),
+                "a held entry is kept, not given up on, when its connection cannot be opened");
+    }
+
     /** The case #314 is about: a failed destroy after the cloud is gone is retried, under the name it was tagged with. */
     @Test
     void aFailedDestroyAfterTheCloudIsGoneIsRetriedByTheOrphanSweep(JenkinsRule r) throws Exception {
