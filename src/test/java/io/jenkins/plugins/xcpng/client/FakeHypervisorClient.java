@@ -10,6 +10,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * In-memory {@link HypervisorClient} for testing the Jenkins half without a pool.
@@ -68,6 +70,11 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private boolean destroyFails = false;
     private String assignIpOnStart = null;
     private ProvisionSpec lastSpec = null;
+
+    /** Set by {@link #holdClonesUntil}; read outside the monitor, so volatile. */
+    private volatile CountDownLatch cloneEntered = null;
+
+    private volatile CountDownLatch cloneRelease = null;
 
     public FakeHypervisorClient(String... templates) {
         this.knownTemplates = new LinkedHashSet<>(List.of(templates));
@@ -221,8 +228,38 @@ public final class FakeHypervisorClient implements HypervisorClient {
         }
     }
 
+    /**
+     * Make each {@link #cloneFromTemplate} hold its answer until {@code release} opens, after the clone exists
+     * on the pool. Models a clone that has finished pool-side while the call is still on its way back, which is
+     * the window a node can be removed in (#305). The returned latch opens once a clone is being held.
+     */
+    public CountDownLatch holdClonesUntil(CountDownLatch release) {
+        CountDownLatch entered = new CountDownLatch(1);
+        this.cloneEntered = entered;
+        this.cloneRelease = release;
+        return entered;
+    }
+
     @Override
-    public synchronized VmRef cloneFromTemplate(VmRef template, ProvisionSpec spec) {
+    public VmRef cloneFromTemplate(VmRef template, ProvisionSpec spec) {
+        VmRef clone = recordClone(template, spec);
+        CountDownLatch release = cloneRelease;
+        if (release != null) {
+            // Outside the monitor, so the teardown the test runs meanwhile can reach the other verbs.
+            cloneEntered.countDown();
+            try {
+                if (!release.await(30, TimeUnit.SECONDS)) {
+                    throw new IllegalStateException("cloneFromTemplate was held and never released");
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new HypervisorException("cloneFromTemplate interrupted while held");
+            }
+        }
+        return clone;
+    }
+
+    private synchronized VmRef recordClone(VmRef template, ProvisionSpec spec) {
         checkNotInterrupted("cloneFromTemplate");
         this.lastSpec = spec;
         VmRef clone = new VmRef("vm/" + spec.name() + "/" + (++cloneCounter));

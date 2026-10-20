@@ -331,7 +331,7 @@ Cloud fields:
 | Field | Symbol | Description |
 | --- | --- | --- |
 | Name | `name` | Display name for this cloud. |
-| Xen Orchestra URL | `poolUrl` | Base URL of the Xen Orchestra appliance, for example `https://xo.example.com`. The symbol keeps its old name so existing configurations bind. Do not embed credentials in the URL. |
+| Xen Orchestra URL | `poolUrl` | Base URL of the Xen Orchestra appliance, for example `https://xo.example.com`. Must be https; see [Security notes](#security-notes) for the lab exception. The symbol keeps its old name so existing configurations bind. Do not embed credentials in the URL. |
 | Credentials | `credentialsId` | ID of a secret-text credential holding a Xen Orchestra authentication token. |
 | Certificate fingerprint | `certificateFingerprint` | SHA-256 fingerprint of the certificate the appliance is expected to present, with or without colons. Empty means ordinary verification against the controller's JVM trust store, which is right for a CA-signed certificate; an appliance on its self-generated certificate needs its fingerprint here. Once set, only that exact certificate is accepted. |
 | CA certificate | `caCertificates` | Optional. PEM certificate of the CA that issued the appliance's certificate; several blocks trust several CAs. The appliance is accepted when its certificate chains to one of them and names the host in the URL, and only these CAs are trusted for this cloud, not the JVM's. Survives the appliance's certificate being renewed. Each block must be a CA certificate, and the form refuses a private key. An alternative to the fingerprint: set one or the other. |
@@ -417,6 +417,13 @@ table, the Packer workflow and its honest status, and the produced template name
   the certificate must chain to one of those CAs and name the host, and the JVM's own CAs are not
   consulted; a renewed certificate from the same CA is accepted without any change, which is the
   reason to prefer it over a fingerprint when you run a CA.
+- **A plain `http://` Xen Orchestra URL is refused.** The form rejects one, and since #309 so does the
+  plugin when it opens a connection, so a URL written by Configuration as Code or into `config.xml`
+  by hand provisions nothing and names the URL in the error. Over http the token travels in cleartext
+  on every request. For a lab appliance with no certificate, start the controller with
+  `-Dio.jenkins.plugins.xcpng.client.XoRestClient.allowHttp=true`; the plugin then connects and logs a
+  warning each time. Before #309 such a URL only produced the warning, so check `poolUrl` before
+  upgrading a controller configured outside the form.
 - **Reading a fingerprint does not trust it.** `Test connection` inspects the certificate an unknown
   appliance presents and then refuses the connection, so the token is never offered to a host nobody
   has confirmed. Check the fingerprint it reports against the appliance before pasting it in.
@@ -495,7 +502,11 @@ number of waiting builds and what was planned for them.
   an agent provisioned by a version of the plugin older than the snapshot, which reloads with no
   connection details at all. In both cases `tools/reaper.py` is the recovery path: it selects on the
   `xcpng-cloud` owner marker stamped into each clone, so it finds these VMs without needing Jenkins to
-  still know about them.
+  still know about them. The marker is on every live agent and warm spare too, so `--apply` refuses to
+  run until it is given the controller's node list with `--keep-nodes`, whose VMs it keeps, or told
+  with `--include-live` that none is to be kept. The list is a snapshot: an agent the controller
+  adds after it was taken can be reaped, so pipe it straight in and run while the cloud is not
+  provisioning. A saved list file older than 5 minutes is refused (`--keep-nodes-max-age`).
 
 ## Not in this version
 

@@ -27,7 +27,12 @@ CLOUD = "xcpng-lab"
 def pool(monkeypatch):
     """Install a fake pool and return it. Nothing here can reach a hypervisor."""
 
-    def _pool(records, stuck=(), vdis_after=None, argv=("reaper.py", "--apply")):
+    def _pool(
+        records,
+        stuck=(),
+        vdis_after=None,
+        argv=("reaper.py", "--apply", "--include-live"),
+    ):
         fake = FakeXapi(records=records, stuck=stuck, vdis_after=vdis_after)
         monkeypatch.setattr(reaper, "Xapi", lambda *a, **k: fake)
         monkeypatch.setattr(reaper.sys, "argv", list(argv))
@@ -45,7 +50,9 @@ def test_a_vm_the_plugin_provisioned_is_found_by_default(pool):
     """
     fake = pool({"vm-leaked": vm_record(PLUGIN_VM, owner=CLOUD)})
     assert reaper.main() == 0
-    assert fake.destroyed == ["vm-leaked"], "the reaper cannot see the VMs it exists to catch"
+    assert fake.destroyed == [
+        "vm-leaked"
+    ], "the reaper cannot see the VMs it exists to catch"
 
 
 def test_an_unmarked_vm_is_never_touched_however_it_is_named(pool):
@@ -75,7 +82,7 @@ def test_cloud_filter_selects_only_that_clouds_vms(pool):
             "vm-ours": vm_record("xcpng-a-1111", owner=CLOUD),
             "vm-theirs": vm_record("xcpng-b-2222", owner="some-other-cloud"),
         },
-        argv=("reaper.py", "--apply", "--cloud", CLOUD),
+        argv=("reaper.py", "--apply", "--include-live", "--cloud", CLOUD),
     )
     assert reaper.main() == 0
     assert fake.destroyed == ["vm-ours"]
@@ -83,7 +90,8 @@ def test_cloud_filter_selects_only_that_clouds_vms(pool):
 
 def test_a_vm_leaked_by_an_xo_cloud_is_found_by_default(pool):
     """#231. The XO backend cannot write other_config, so it tags the clone instead. Before
-    the reaper read tags it listed this VM as "nothing to reap" and left it holding its disk."""
+    the reaper read tags it listed this VM as "nothing to reap" and left it holding its disk.
+    """
     fake = pool(
         {
             "vm-xo-leaked": vm_record(PLUGIN_VM, owner_tag="xcpng-xo"),
@@ -91,7 +99,9 @@ def test_a_vm_leaked_by_an_xo_cloud_is_found_by_default(pool):
         }
     )
     assert reaper.main() == 0
-    assert fake.destroyed == ["vm-xo-leaked"], "the reaper cannot see a VM an XO cloud leaked"
+    assert fake.destroyed == [
+        "vm-xo-leaked"
+    ], "the reaper cannot see a VM an XO cloud leaked"
 
 
 def test_cloud_filter_matches_the_xo_tag_and_spares_other_clouds(pool):
@@ -102,7 +112,7 @@ def test_cloud_filter_matches_the_xo_tag_and_spares_other_clouds(pool):
             "vm-xapi": vm_record("xcpng-b-2222", owner="xcpng-xo"),
             "vm-other": vm_record("xcpng-c-3333", owner_tag="xcpng-lab"),
         },
-        argv=("reaper.py", "--apply", "--cloud", "xcpng-xo"),
+        argv=("reaper.py", "--apply", "--include-live", "--cloud", "xcpng-xo"),
     )
     assert reaper.main() == 0
     assert sorted(fake.destroyed) == ["vm-xapi", "vm-xo"]
@@ -129,8 +139,12 @@ def test_snapshots_templates_and_the_control_domain_are_spared(pool):
         {
             "vm-agent": vm_record(PLUGIN_VM, owner=CLOUD),
             "vm-snap": vm_record(f"{PLUGIN_VM}-preupgrade", owner=CLOUD, snapshot=True),
-            "vm-template": vm_record("xcpng-golden-template", owner=CLOUD, template=True),
-            "vm-dom0": vm_record("xcpng-control-domain", owner=CLOUD, control_domain=True),
+            "vm-template": vm_record(
+                "xcpng-golden-template", owner=CLOUD, template=True
+            ),
+            "vm-dom0": vm_record(
+                "xcpng-control-domain", owner=CLOUD, control_domain=True
+            ),
             "vm-prod": vm_record("production-db"),
         }
     )
@@ -207,7 +221,9 @@ def test_apply_with_empty_prefix_is_refused_before_the_pool_is_contacted(monkeyp
 
 def test_empty_prefix_without_apply_is_allowed(pool):
     """A dry run destroys nothing, so an empty prefix is harmless and useful for listing."""
-    fake = pool({"vm-1": vm_record("production-db")}, argv=("reaper.py", "--prefix", ""))
+    fake = pool(
+        {"vm-1": vm_record("production-db")}, argv=("reaper.py", "--prefix", "")
+    )
     assert reaper.main() == 0
     assert fake.destroyed == []
 
@@ -218,10 +234,14 @@ def test_a_short_prefix_apply_is_refused_without_force(monkeypatch):
     docs/golden-image.md already documents that exact footgun, and the image is not
     recoverable without a rebuild. Refuse before the pool is contacted.
     """
-    monkeypatch.setattr(reaper.sys, "argv", ["reaper.py", "--apply", "--prefix", "jenkins-"])
+    monkeypatch.setattr(
+        reaper.sys, "argv", ["reaper.py", "--apply", "--prefix", "jenkins-"]
+    )
 
     def explode(*args, **kwargs):
-        raise AssertionError("connected to the pool despite a golden-image-matching prefix")
+        raise AssertionError(
+            "connected to the pool despite a golden-image-matching prefix"
+        )
 
     monkeypatch.setattr(reaper, "Xapi", explode)
 
@@ -265,18 +285,24 @@ def test_a_record_with_a_null_other_config_is_not_a_crash(pool):
     I could not get real XAPI to emit this (it types other_config as a map and returns {} when
     empty), so this pins the guard rather than a reproduced failure.
     """
-    records = {"vm-odd": vm_record("xcpng-weird-1"), "vm-ok": vm_record(PLUGIN_VM, owner=CLOUD)}
+    records = {
+        "vm-odd": vm_record("xcpng-weird-1"),
+        "vm-ok": vm_record(PLUGIN_VM, owner=CLOUD),
+    }
     records["vm-odd"]["other_config"] = None
     fake = pool(records)
 
     assert reaper.main() == 0
-    assert fake.destroyed == ["vm-ok"], "a null other_config must read as unmarked, not match or explode"
+    assert fake.destroyed == [
+        "vm-ok"
+    ], "a null other_config must read as unmarked, not match or explode"
 
 
 def test_prefix_and_cloud_together_are_refused(monkeypatch):
     """--cloud filters the marker, so combining it with a name prefix asks for two things at once."""
     monkeypatch.setattr(
-        reaper.sys, "argv", ["reaper.py", "--prefix", "jenkins-ci-", "--cloud", CLOUD])
+        reaper.sys, "argv", ["reaper.py", "--prefix", "jenkins-ci-", "--cloud", CLOUD]
+    )
     with pytest.raises(SystemExit) as caught:
         reaper.main()
     assert caught.value.code == 2
@@ -302,14 +328,18 @@ def _stub_dom0(monkeypatch, live=(), raises=None):
 
 
 @pytest.mark.parametrize("identifier", ["uuid", "name_label"])
-def test_dom0_check_refuses_a_halted_vm_live_on_dom0(pool, monkeypatch, capsys, identifier):
+def test_dom0_check_refuses_a_halted_vm_live_on_dom0(
+    pool, monkeypatch, capsys, identifier
+):
     """The lie: XAPI reads Halted, dom0 has a live domain. Refuse it, do not destroy its disk.
 
     dom0 names its domains by uuid on XCP-ng, but the match falls back to name_label so the check
     does not depend on that; both identifiers must condemn the VM.
     """
     rec = vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")
-    fake = pool({"vm-lie": rec}, argv=("reaper.py", "--apply", "--dom0-check"))
+    fake = pool(
+        {"vm-lie": rec}, argv=("reaper.py", "--apply", "--include-live", "--dom0-check")
+    )
     _stub_dom0(monkeypatch, live=[rec[identifier]])
 
     assert reaper.main() == 1, "a refused VM must be a non-zero exit"
@@ -320,8 +350,10 @@ def test_dom0_check_refuses_a_halted_vm_live_on_dom0(pool, monkeypatch, capsys, 
 
 def test_dom0_check_allows_a_halted_vm_absent_from_dom0(pool, monkeypatch):
     """A genuinely halted VM is absent from `xl list`, so the check clears it and it reaps."""
-    fake = pool({"vm-dead": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
-                argv=("reaper.py", "--apply", "--dom0-check"))
+    fake = pool(
+        {"vm-dead": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
+        argv=("reaper.py", "--apply", "--include-live", "--dom0-check"),
+    )
     _stub_dom0(monkeypatch, live=["Domain-0"])  # dom0 has no domain for this VM
 
     assert reaper.main() == 0
@@ -335,7 +367,9 @@ def test_dom0_check_still_reaps_a_running_leaked_agent(pool, monkeypatch):
     record it acts on is true. Refusing here would break the tool's own job.
     """
     rec = vm_record(PLUGIN_VM, owner=CLOUD, power="Running")
-    fake = pool({"vm-run": rec}, argv=("reaper.py", "--apply", "--dom0-check"))
+    fake = pool(
+        {"vm-run": rec}, argv=("reaper.py", "--apply", "--include-live", "--dom0-check")
+    )
     _stub_dom0(monkeypatch, live=[rec["uuid"]])
 
     assert reaper.main() == 0
@@ -348,8 +382,10 @@ def test_dom0_check_fails_closed_when_dom0_is_unreachable(pool, monkeypatch):
     The CLI wrapper turns this XapiError into exit 2; here it propagates, and crucially the raise
     happens before the destroy loop, so nothing is torn down.
     """
-    fake = pool({"vm-x": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
-                argv=("reaper.py", "--apply", "--dom0-check"))
+    fake = pool(
+        {"vm-x": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
+        argv=("reaper.py", "--apply", "--include-live", "--dom0-check"),
+    )
     _stub_dom0(monkeypatch, raises=XapiError("DOM0_UNREACHABLE", "no route"))
 
     with pytest.raises(XapiError):
@@ -392,7 +428,9 @@ def test_live_domains_parses_xl_list(monkeypatch):
         "Domain-0                                 0  2048     6     r-----   1234.5\n"
         "244561b4-1fdf-6739-6fec-006defa76152    18  2048     2     -b----     12.3\n"
     )
-    monkeypatch.setattr(reaper.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout=xl))
+    monkeypatch.setattr(
+        reaper.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout=xl)
+    )
 
     assert reaper.live_domains_on_dom0("dom0.invalid", "pw") == {
         "Domain-0",
@@ -413,7 +451,9 @@ def test_live_domains_raises_when_ssh_fails(monkeypatch):
     monkeypatch.setattr(reaper.shutil, "which", lambda _: "/usr/bin/sshpass")
 
     def boom(*args, **kwargs):
-        raise reaper.subprocess.CalledProcessError(255, "ssh", stderr="Permission denied")
+        raise reaper.subprocess.CalledProcessError(
+            255, "ssh", stderr="Permission denied"
+        )
 
     monkeypatch.setattr(reaper.subprocess, "run", boom)
     with pytest.raises(XapiError) as caught:
@@ -425,7 +465,9 @@ def test_live_domains_raises_when_ssh_fails(monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ["owner", "owner_tag"])
-def test_a_hand_made_clone_of_an_agent_survives_while_the_agent_is_reaped(pool, backend):
+def test_a_hand_made_clone_of_an_agent_survives_while_the_agent_is_reaped(
+    pool, backend
+):
     """The sweep end to end, both backends, both outcomes in one run.
 
     `vm-agent` is a clone the plugin made and lost. `vm-copy` is what an operator gets by
@@ -440,19 +482,22 @@ def test_a_hand_made_clone_of_an_agent_survives_while_the_agent_is_reaped(pool, 
     fake = pool(
         {
             "vm-agent": vm_record(PLUGIN_VM, **{backend: CLOUD}),
-            "vm-copy": vm_record("investigating-a-failure", inherited_from=PLUGIN_VM,
-                                 **{backend: CLOUD}),
+            "vm-copy": vm_record(
+                "investigating-a-failure", inherited_from=PLUGIN_VM, **{backend: CLOUD}
+            ),
         }
     )
     assert reaper.main() == 0
-    assert fake.destroyed == ["vm-agent"], "an operator's clone was destroyed with its disks"
+    assert fake.destroyed == [
+        "vm-agent"
+    ], "an operator's clone was destroyed with its disks"
 
 
 def test_the_cloud_filter_does_not_reach_an_inherited_marker_either(pool):
     """--cloud narrows the sweep; it must not widen what counts as ownership."""
     fake = pool(
         {"vm-copy": vm_record("copy", owner=CLOUD, inherited_from=PLUGIN_VM)},
-        argv=("reaper.py", "--apply", "--cloud", CLOUD),
+        argv=("reaper.py", "--apply", "--include-live", "--cloud", CLOUD),
     )
     assert reaper.main() == 0
     assert fake.destroyed == []
@@ -462,14 +507,20 @@ def test_a_skipped_clone_is_reported_rather_than_passed_over(pool, capsys):
     """A marked VM absent from the list, with no word about why, reads as the sweep missing
     it -- and the next thing reached for is --prefix, which has none of these guards."""
     pool(
-        {"vm-copy": vm_record("investigating-a-failure", owner=CLOUD, inherited_from=PLUGIN_VM)},
+        {
+            "vm-copy": vm_record(
+                "investigating-a-failure", owner=CLOUD, inherited_from=PLUGIN_VM
+            )
+        },
         argv=("reaper.py",),
     )
     reaper.main()
     out = capsys.readouterr().out
     assert "SKIPPING 'investigating-a-failure'" in out
     assert "inherited" in out
-    assert CLOUD in out, "the operator needs the cloud name to know whose marker it carries"
+    assert (
+        CLOUD in out
+    ), "the operator needs the cloud name to know whose marker it carries"
 
 
 def test_a_clone_stamped_before_the_uuid_check_is_still_reaped(pool):
@@ -489,7 +540,11 @@ def test_prefix_mode_reports_no_skips_because_it_reads_no_marker(pool, capsys):
     reports skips in every mode -- which is what the first version of it did.
     """
     pool(
-        {"vm-copy": vm_record("investigating-a-failure", owner=CLOUD, inherited_from=PLUGIN_VM)},
+        {
+            "vm-copy": vm_record(
+                "investigating-a-failure", owner=CLOUD, inherited_from=PLUGIN_VM
+            )
+        },
         argv=("reaper.py", "--prefix", "jenkins-ci-"),
     )
     reaper.main()
@@ -504,7 +559,11 @@ def test_the_skip_notice_is_narrowed_by_cloud_like_the_sweep_itself(pool, capsys
     reported every inherited marker regardless would still print a SKIPPING line for it.
     """
     pool(
-        {"vm-copy": vm_record("someone-elses", owner="xcpng-other", inherited_from=PLUGIN_VM)},
+        {
+            "vm-copy": vm_record(
+                "someone-elses", owner="xcpng-other", inherited_from=PLUGIN_VM
+            )
+        },
         argv=("reaper.py", "--cloud", CLOUD),
     )
     reaper.main()
@@ -523,8 +582,10 @@ def _two_cloud_record(name, mine, theirs):
     """
     rec = vm_record(name)
     rec["tags"] = [
-        f"xcpng-cloud:{theirs}", "xcpng-cloud-uuid:uuid-their-agent",
-        f"xcpng-cloud:{mine}", f"xcpng-cloud-uuid:uuid-{name}",
+        f"xcpng-cloud:{theirs}",
+        "xcpng-cloud-uuid:uuid-their-agent",
+        f"xcpng-cloud:{mine}",
+        f"xcpng-cloud-uuid:uuid-{name}",
     ]
     return rec
 
@@ -533,7 +594,7 @@ def test_cloud_filter_does_not_reap_a_vm_carrying_another_clouds_marker(pool):
     """The #250 defect end to end. Before the fix this run destroyed the VM with its disks."""
     fake = pool(
         {"vm-b": _two_cloud_record("b-agent", mine=CLOUD, theirs="xcpng-other")},
-        argv=("reaper.py", "--apply", "--cloud", "xcpng-other"),
+        argv=("reaper.py", "--apply", "--include-live", "--cloud", "xcpng-other"),
     )
     assert reaper.main() == 0
     assert fake.destroyed == [], "a VM another cloud provisioned was destroyed"
@@ -542,7 +603,9 @@ def test_cloud_filter_does_not_reap_a_vm_carrying_another_clouds_marker(pool):
 def test_an_unnarrowed_sweep_still_reaps_it(pool):
     """The other half, and the one that stops this being a blanket refusal: the VM is still
     the plugin's, so a sweep that names no cloud must still reclaim its disks."""
-    fake = pool({"vm-b": _two_cloud_record("b-agent", mine=CLOUD, theirs="xcpng-other")})
+    fake = pool(
+        {"vm-b": _two_cloud_record("b-agent", mine=CLOUD, theirs="xcpng-other")}
+    )
     assert reaper.main() == 0
     assert fake.destroyed == ["vm-b"]
 
@@ -570,7 +633,236 @@ def test_the_ambiguous_skip_is_reported_with_both_cloud_names(pool, capsys):
 def test_a_single_marker_vm_is_still_reaped_by_its_cloud(pool):
     """Control. A guard that fired on every record would pass the tests above and break the
     tool, which is exactly the failure mode the #246 mutations were written against."""
-    fake = pool({"vm-a": vm_record(PLUGIN_VM, owner_tag=CLOUD)},
-                argv=("reaper.py", "--apply", "--cloud", CLOUD))
+    fake = pool(
+        {"vm-a": vm_record(PLUGIN_VM, owner_tag=CLOUD)},
+        argv=("reaper.py", "--apply", "--include-live", "--cloud", CLOUD),
+    )
     assert reaper.main() == 0
     assert fake.destroyed == ["vm-a"]
+
+
+# --- #316: a live agent is not a leak ---------------------------------------------------------
+#
+# The marker says the plugin made a VM. It does not say the plugin has lost it: every agent mid-build
+# and every warm spare carries the same marker. Only the controller knows which ones it still uses, so
+# a marker-mode --apply has to be told, either with the controller's node list or by the operator
+# stating there is nothing live to keep.
+
+LIVE = "xcpng-jenkins-golden-debian-1111aaaa"
+LOST = "xcpng-jenkins-golden-debian-2222bbbb"
+
+
+def _two_agents():
+    return {
+        "vm-live": vm_record(LIVE, owner=CLOUD, power="Running"),
+        "vm-lost": vm_record(LOST, owner=CLOUD, power="Running"),
+    }
+
+
+def test_a_marker_apply_without_a_node_list_is_refused_before_the_pool_is_contacted(
+    monkeypatch,
+):
+    """The issue itself: plain --apply would destroy the live agent along with the lost one."""
+    monkeypatch.setattr(
+        reaper, "Xapi", lambda *a, **k: pytest.fail("the pool was contacted")
+    )
+    monkeypatch.setattr(reaper.sys, "argv", ["reaper.py", "--apply"])
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+
+
+def test_a_dry_run_needs_no_node_list(pool):
+    """Looking is always allowed; the banners in the plugin print a dry-run command."""
+    fake = pool(_two_agents(), argv=("reaper.py",))
+    assert reaper.main() == 0
+    assert fake.destroyed == []
+
+
+def test_a_node_the_controller_still_has_is_kept(pool, tmp_path, capsys):
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"# from the controller\n{LIVE}\n\n")
+    fake = pool(
+        _two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", str(nodes))
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-lost"], "a live agent was destroyed"
+    assert f"KEEPING {LIVE!r}" in capsys.readouterr().out
+
+
+def test_the_node_list_can_be_the_controllers_computer_json(pool, tmp_path):
+    """What `curl .../computer/api/json?tree=computer[displayName]` returns, piped in unedited."""
+    nodes = tmp_path / "computer.json"
+    nodes.write_text(
+        '{"_class":"hudson.model.ComputerSet","computer":['
+        '{"_class":"hudson.model.Hudson$MasterComputer","displayName":"Built-In Node"},'
+        f'{{"_class":"io.jenkins.plugins.xcpng.XcpngComputer","displayName":"{LIVE}"}}]}}'
+    )
+    fake = pool(
+        _two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", str(nodes))
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-lost"]
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        '{"_class":"io.jenkins.plugins.xcpng.XcpngComputer"}',
+        '{"_class":"io.jenkins.plugins.xcpng.XcpngComputer","displayName":null}',
+        '"not-a-computer"',
+    ],
+)
+def test_a_computer_json_entry_without_a_name_refuses_the_whole_list(
+    pool, tmp_path, entry
+):
+    """Dropping the entry would leave a shorter list that still passes the empty check, and the agent it
+    stood for would be reaped. A list that cannot be read in full is not a list of what is live.
+    """
+    nodes = tmp_path / "computer.json"
+    nodes.write_text('{"computer":[{"displayName":"Built-In Node"},' + entry + "]}")
+    fake = pool(
+        _two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", str(nodes))
+    )
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+    assert fake.destroyed == []
+
+
+def _aged(path, minutes):
+    """Backdate a file's modification time, as a list saved earlier and reused would be."""
+    import os
+    import time
+
+    then = time.time() - minutes * 60
+    os.utime(path, (then, then))
+    return path
+
+
+def test_a_stale_node_list_file_is_refused_before_the_pool_is_contacted(
+    monkeypatch, tmp_path
+):
+    """A saved list does not know about agents provisioned since. Reused an hour later, every one of
+    them reads as a leak."""
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    _aged(nodes, 6)
+    monkeypatch.setattr(
+        reaper, "Xapi", lambda *a, **k: pytest.fail("the pool was contacted")
+    )
+    monkeypatch.setattr(
+        reaper.sys, "argv", ["reaper.py", "--apply", "--keep-nodes", str(nodes)]
+    )
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+
+
+def test_an_older_node_list_is_accepted_when_the_operator_raises_the_limit(
+    pool, tmp_path
+):
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    _aged(nodes, 6)
+    fake = pool(
+        _two_agents(),
+        argv=(
+            "reaper.py",
+            "--apply",
+            "--keep-nodes",
+            str(nodes),
+            "--keep-nodes-max-age",
+            "10",
+        ),
+    )
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-lost"]
+
+
+def test_a_stale_node_list_does_not_stop_a_dry_run(pool, tmp_path):
+    """A dry run destroys nothing, so an old list costs nothing there."""
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    _aged(nodes, 60)
+    fake = pool(_two_agents(), argv=("reaper.py", "--keep-nodes", str(nodes)))
+    assert reaper.main() == 0
+    assert fake.destroyed == []
+
+
+def test_the_node_list_can_come_from_stdin(pool, monkeypatch):
+    import io
+
+    monkeypatch.setattr(reaper.sys, "stdin", io.StringIO(f"{LIVE}\n"))
+    fake = pool(_two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", "-"))
+    assert reaper.main() == 0
+    assert fake.destroyed == ["vm-lost"]
+
+
+def test_an_empty_node_list_is_refused(pool, tmp_path):
+    """An empty file is what a failed curl leaves behind. Reading it as "nothing is live" is the bug again."""
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text("\n# nothing\n")
+    fake = pool(
+        _two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", str(nodes))
+    )
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+    assert fake.destroyed == []
+
+
+def test_include_live_reaps_everything_the_marker_selects(pool):
+    """The controller is gone, or every agent is meant to go: the operator says so explicitly."""
+    fake = pool(_two_agents(), argv=("reaper.py", "--apply", "--include-live"))
+    assert reaper.main() == 0
+    assert sorted(fake.destroyed) == ["vm-live", "vm-lost"]
+
+
+def test_keep_nodes_and_include_live_together_are_refused(monkeypatch, tmp_path):
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    monkeypatch.setattr(
+        reaper, "Xapi", lambda *a, **k: pytest.fail("the pool was contacted")
+    )
+    monkeypatch.setattr(
+        reaper.sys,
+        "argv",
+        ["reaper.py", "--apply", "--include-live", "--keep-nodes", str(nodes)],
+    )
+    with pytest.raises(SystemExit):
+        reaper.main()
+
+
+def test_a_kept_node_is_reported_in_a_dry_run_too(pool, tmp_path, capsys):
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(f"{LIVE}\n")
+    fake = pool(_two_agents(), argv=("reaper.py", "--keep-nodes", str(nodes)))
+    assert reaper.main() == 0
+    out = capsys.readouterr().out
+    assert f"KEEPING {LIVE!r}" in out
+    assert "matching VMs carrying the 'xcpng-cloud' marker: 1 VM(s)" in out
+    assert fake.destroyed == []
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        "<!DOCTYPE html>\n<html><head><title>Authentication required</title></head>\n"
+        "<body>\nYou are authenticated as: anonymous\n</body></html>\n",
+        "  <html>\n<body>Error 403 No valid crumb</body></html>",
+    ],
+)
+def test_an_html_error_page_is_refused_not_read_as_node_names(pool, tmp_path, page):
+    """curl -s without -f passes a failed login's error page through. Read as names, it is a non-empty
+    list that matches no VM, so every live agent would be reaped while the empty-list guard stays quiet.
+    """
+    nodes = tmp_path / "nodes.txt"
+    nodes.write_text(page)
+    fake = pool(
+        _two_agents(), argv=("reaper.py", "--apply", "--keep-nodes", str(nodes))
+    )
+    with pytest.raises(SystemExit) as exc:
+        reaper.main()
+    assert exc.value.code == 2
+    assert fake.destroyed == []

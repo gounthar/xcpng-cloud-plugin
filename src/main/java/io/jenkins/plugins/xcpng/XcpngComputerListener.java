@@ -73,13 +73,14 @@ public class XcpngComputerListener extends ComputerListener {
      */
     private static void scrub(XcpngAgent agent) {
         // Re-read the cloud here rather than in onOnline: it may have been deleted or renamed between the
-        // agent coming online and this task reaching a worker.
+        // agent coming online and this task reaching a worker. It is only the fallback for an agent with no
+        // connection snapshot; one that has a snapshot is scrubbed over it, cloud or no cloud.
         XcpngCloud cloud = agent.getCloud();
-        if (cloud == null) {
+        if (cloud == null && !agent.hasConnectionSnapshot()) {
             LOGGER.log(
                     Level.WARNING,
-                    () -> "Cloud '" + agent.getCloudName() + "' is gone; cannot scrub the seed secret for agent "
-                            + agent.getNodeName());
+                    () -> "Cloud '" + agent.getCloudName() + "' is gone and agent " + agent.getNodeName()
+                            + " holds no connection details; cannot scrub its seed secret");
             return;
         }
         if (!agent.isIssued()) {
@@ -98,7 +99,9 @@ public class XcpngComputerListener extends ComputerListener {
                     () -> "Agent " + agent.getNodeName() + " reports no VM; nothing to scrub the seed secret from");
             return;
         }
-        try (HypervisorClient client = cloud.openClient()) {
+        // The agent's own connection, as for the clone and the teardown: a VM handle is only valid on the
+        // connection that minted it, so the cloud's current settings could name another pool or none.
+        try (HypervisorClient client = agent.openClientForVm(cloud)) {
             client.clearGuestSecret(new VmRef(vmRef));
             LOGGER.log(Level.FINE, () -> "Scrubbed the seed secret for agent " + agent.getNodeName());
         } catch (RuntimeException e) {

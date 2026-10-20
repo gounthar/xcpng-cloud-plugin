@@ -110,6 +110,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
     private volatile String vmRef;
 
     /**
+     * Raised by the teardown in the same step as it reads {@link #vmRef}, so a clone that comes back after the
+     * teardown has run is refused by {@link #adoptVmRef} rather than stamped onto a node that is gone (#305).
+     * Both are read and written under this agent's monitor; that is the whole handoff. Transient because a
+     * torn-down node is never saved again.
+     */
+    private transient boolean tornDown;
+
+    /**
      * Connection parameters copied off the owning cloud at provision time, so this agent can still reach the
      * pool to destroy its VM when {@link #getCloud()} no longer resolves — the cloud deleted from the
      * configuration, or renamed, which is the same thing to an agent holding a name.
@@ -328,9 +336,41 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
      * to the VM that build is on. {@link Node#save()} writes this node's own {@code config.xml} and nothing
      * else; it is a no-op before the node is registered, which is why the launcher is the only caller.
      */
+    /**
+     * Record a freshly cloned VM as this agent's, unless the teardown has already run.
+     *
+     * <p>The teardown reads {@link #vmRef} once and never again, so a clone stamped after that read would be
+     * started on a node nothing tracks: not the node, which is gone, not the leaked-VM set, and not
+     * {@code maxInstances}. Returns false in that case, and the caller destroys the clone itself.
+     */
+    boolean adoptVmRef(@NonNull String vmRef) {
+        XcpngIssuedAgentStore store = XcpngIssuedAgentStore.get();
+        boolean recorded;
+        synchronized (this) {
+            if (tornDown) {
+                return false;
+            }
+            // The field and the issued record move together. A teardown that saw the new field against the old
+            // record would read this agent as not issued and skip the destroy, leaking the clone.
+            this.vmRef = vmRef;
+            recorded = store.recordVmRef(getNodeName(), vmRef);
+        }
+        // Both saves outside the monitor: each writes a file and fires save listeners, which may take core's
+        // locks, and the teardown only needs the field and the in-memory record.
+        if (recorded) {
+            store.saveVmRef(getNodeName(), vmRef);
+        }
+        saveVmRef();
+        return true;
+    }
+
     void setVmRef(@CheckForNull String vmRef) {
         this.vmRef = vmRef;
         XcpngIssuedAgentStore.get().issueVmRef(getNodeName(), vmRef);
+        saveVmRef();
+    }
+
+    private void saveVmRef() {
         try {
             save();
         } catch (IOException e) {
@@ -559,8 +599,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
 
     private void terminateVm(TaskListener listener) {
         // Read the field once. Everything below branches on it, and the launcher writes it from another
-        // thread, so re-reading could take the destroy branch on a reference that has since gone.
-        final String vmRef = this.vmRef;
+        // thread, so re-reading could take the destroy branch on a reference that has since gone. Read under
+        // the monitor together with raising tornDown, so a clone still in flight is refused by adoptVmRef
+        // rather than adopted after this read has missed it (#305).
+        final String vmRef;
+        synchronized (this) {
+            tornDown = true;
+            vmRef = this.vmRef;
+        }
         if (vmRef == null) {
             // No VM was ever built for this node: the launch failed before the clone, or the node was removed
             // before its computer was ever connected. Distinct from a lost handle, and deliberately said out
@@ -707,6 +753,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     + cloudName + "' is gone, so there is nothing to open a session with.");
         }
         return fallback.openClient();
+    }
+
+    /**
+     * Whether this agent carries its own connection details, so {@link #openClientForVm} can reach its VM
+     * without the owning cloud. False only for an agent persisted before the snapshot existed (#149).
+     */
+    boolean hasConnectionSnapshot() {
+        return poolUrl != null;
     }
 
     @NonNull

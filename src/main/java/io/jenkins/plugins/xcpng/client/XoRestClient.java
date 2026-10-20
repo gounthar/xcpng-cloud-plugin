@@ -71,6 +71,14 @@ public final class XoRestClient implements HypervisorClient {
 
     private static final String API = "/rest/v0";
 
+    /**
+     * System property that lets a plain {@code http://} base URL through (#309), for a lab appliance with no
+     * certificate. Without it such a URL is refused when the client is built, before any request carries the
+     * token. Read with {@link Boolean#getBoolean} on every construction, so it can be set from the script
+     * console; this package does not depend on Jenkins, so not through the core {@code SystemProperties} helper.
+     */
+    public static final String ALLOW_HTTP_PROPERTY = XoRestClient.class.getName() + ".allowHttp";
+
     /** A VM id no VM can have, so {@link #probePatchRoute()} can address the route and touch nothing. */
     static final String PROBE_ID = "00000000-0000-0000-0000-000000000000";
 
@@ -164,20 +172,35 @@ public final class XoRestClient implements HypervisorClient {
      *     or {@link PoolTrust#JVM_DEFAULT} for the JVM trust store.
      * @param poolId uuid of the pool to resolve templates in, or null for any pool the token can see
      * @throws HypervisorException when {@code trust} cannot be honoured, e.g. both modes set or a malformed
-     *     CA certificate.
+     *     CA certificate, or when {@code baseUrl} is plain http and {@link #ALLOW_HTTP_PROPERTY} is not set.
      */
     public XoRestClient(
             @NonNull String baseUrl, @NonNull String token, @NonNull PoolTrust trust, @CheckForNull String poolId) {
-        this(new HttpRestTransport(baseUrl, token, trust), d -> Thread.sleep(d.toMillis()), poolId);
-        // The form validator rejects http, but it is advisory: a JCasC document or a hand-edited
-        // config.xml can still persist an http base URL. Warn here so the cleartext exposure is not
-        // silent. It matters more than it did for XAPI: the token is sent on every single request as a
-        // cookie, so one plaintext round trip hands it over, and it does not expire on its own.
-        if (baseUrl.regionMatches(true, 0, "http://", 0, "http://".length())) {
-            LOGGER.warning("Xen Orchestra URL " + baseUrl + " uses plain http; the authentication token is"
-                    + " sent in cleartext on every request, and no certificate setting is consulted."
-                    + " Use https://.");
+        this(new HttpRestTransport(requireHttps(baseUrl), token, trust), d -> Thread.sleep(d.toMillis()), poolId);
+    }
+
+    /**
+     * Refuses a plain http base URL unless {@link #ALLOW_HTTP_PROPERTY} is set (#309).
+     *
+     * <p>The form validator rejects http, but it is advisory: a JCasC document or a hand-edited config.xml
+     * can still persist an http base URL, and a warning in the log was all that used to stand in the way. It
+     * matters more than it did for XAPI: the token is sent on every single request as a cookie, so one
+     * plaintext round trip hands it over, and it does not expire on its own. Checked here, before the
+     * transport exists, so no request is ever built with it.
+     */
+    private static String requireHttps(@NonNull String baseUrl) {
+        if (!baseUrl.regionMatches(true, 0, "http://", 0, "http://".length())) {
+            return baseUrl;
         }
+        if (!Boolean.getBoolean(ALLOW_HTTP_PROPERTY)) {
+            throw new HypervisorException("Xen Orchestra URL " + baseUrl + " uses plain http, which would send the"
+                    + " authentication token in cleartext on every request. Use https://, or start the controller"
+                    + " with -D" + ALLOW_HTTP_PROPERTY + "=true for a lab appliance with no certificate.");
+        }
+        LOGGER.warning("Xen Orchestra URL " + baseUrl + " uses plain http, allowed by " + ALLOW_HTTP_PROPERTY
+                + "; the authentication token is sent in cleartext on every request, and no certificate setting"
+                + " is consulted.");
+        return baseUrl;
     }
 
     /** For tests: inject a transport that replays recorded responses. */
