@@ -116,19 +116,31 @@ public class XcpngIssuedAgentStore implements Saveable {
 
     /** Record the VM handle the plugin stamped onto an agent it issued. A name it never issued is ignored. */
     void issueVmRef(@NonNull String nodeName, @CheckForNull String vmRef) {
-        Issued updated = issuedByNode.computeIfPresent(nodeName, (k, issued) -> issued.withVmRef(vmRef));
-        if (updated != null) {
-            try {
-                save();
-            } catch (IOException e) {
-                // The clone already exists, so this cannot fail the launch. Until the next successful write the
-                // handle is trusted in memory only: a restart before then refuses this agent's teardown.
-                LOGGER.log(
-                        Level.SEVERE,
-                        e,
-                        () -> "Could not record VM " + vmRef + " for XCP-ng agent " + nodeName + "; if the controller"
-                                + " restarts before its teardown, reclaim the VM with tools/reaper.py");
-            }
+        if (recordVmRef(nodeName, vmRef)) {
+            saveVmRef(nodeName, vmRef);
+        }
+    }
+
+    /**
+     * The in-memory half of {@link #issueVmRef}, for a caller that must update the record under its own monitor:
+     * {@link #save} writes a file and fires save listeners, which may take core's locks. Returns whether a record
+     * changed, in which case the caller owes a {@link #saveVmRef} once it has let go of that monitor.
+     */
+    boolean recordVmRef(@NonNull String nodeName, @CheckForNull String vmRef) {
+        return issuedByNode.computeIfPresent(nodeName, (k, issued) -> issued.withVmRef(vmRef)) != null;
+    }
+
+    void saveVmRef(@NonNull String nodeName, @CheckForNull String vmRef) {
+        try {
+            save();
+        } catch (IOException e) {
+            // The clone already exists, so this cannot fail the launch. Until the next successful write the
+            // handle is trusted in memory only: a restart before then refuses this agent's teardown.
+            LOGGER.log(
+                    Level.SEVERE,
+                    e,
+                    () -> "Could not record VM " + vmRef + " for XCP-ng agent " + nodeName + "; if the controller"
+                            + " restarts before its teardown, reclaim the VM with tools/reaper.py");
         }
     }
 

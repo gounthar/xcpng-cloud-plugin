@@ -750,10 +750,57 @@ public class XcpngCloud extends Cloud {
                     agent.getNetworkName());
             listener.getLogger().println("Cloning XCP-ng template " + template.getTemplateName() + " for this agent.");
             VmRef clone = client.cloneFromTemplate(templateRef, spec);
-            agent.setVmRef(clone.value());
+            if (!agent.adoptVmRef(clone.value())) {
+                discardUnadoptedClone(client, clone, agent, listener);
+                throw new IllegalStateException("Agent " + displayName + " was torn down while its VM was being"
+                        + " cloned; destroyed VM " + clone.value() + " instead of starting it.");
+            }
             client.start(clone);
             listener.getLogger().println("Started XCP-ng VM " + clone.value() + "; waiting for the agent to connect.");
             LOGGER.log(Level.INFO, () -> "Provisioned XCP-ng VM " + clone.value() + " as agent " + displayName);
+        }
+    }
+
+    /**
+     * Destroy a clone that came back to an agent whose teardown had already run (#305), with the client that
+     * made it. Never started, so there is no running domain for the #48 guard to protect. If the destroy
+     * fails the clone goes to the leaked-VM set under the agent's connection snapshot, the same record a
+     * failed teardown leaves, because nothing else in Jenkins knows it exists.
+     */
+    private void discardUnadoptedClone(
+            @NonNull HypervisorClient client,
+            @NonNull VmRef clone,
+            @NonNull XcpngAgent agent,
+            @NonNull TaskListener listener) {
+        LOGGER.log(
+                Level.WARNING,
+                () -> "Agent " + agent.getNodeName() + " was torn down while VM " + clone.value()
+                        + " was being cloned for it; destroying the clone instead of starting it");
+        listener.getLogger()
+                .println("This agent was torn down while its VM was being cloned; destroying XCP-ng VM " + clone.value()
+                        + ".");
+        // A blocking call fails at once on an interrupted thread, and removing a node can interrupt the
+        // launch, so clear the flag for the destroy and restore it after.
+        boolean interrupted = Thread.interrupted();
+        try {
+            client.destroyWithDisks(clone, name);
+        } catch (RuntimeException e) {
+            LOGGER.log(
+                    Level.SEVERE,
+                    e,
+                    () -> "Failed to destroy VM " + clone.value() + ", cloned for torn-down agent "
+                            + agent.getNodeName() + "; recorded it as a leaked VM for the warm-pool maintainer");
+            recordLeakedVm(XcpngLeakedVm.of(
+                    clone.value(),
+                    agent.getBackend(),
+                    agent.getPoolUrl(),
+                    agent.getCredentialsId(),
+                    agent.getCertificateFingerprint(),
+                    agent.getCaCertificates()));
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
