@@ -7,6 +7,7 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -424,7 +425,8 @@ public final class XoRestClient implements HypervisorClient {
      * something rather than erroring, and a sweep then finds no tag on a VM the plugin believes it
      * tagged. Object ids come from XO rather than from an operator and are single segments, so they are
      * deliberately not passed through here -- encoding operator input and leaving server output alone is
-     * the line, and it is worth keeping visible.
+     * the line, and it is worth keeping visible. A VM id that is not a single segment is refused instead,
+     * by {@link #vmPath}: encoding it would address some VM rather than fail.
      */
     @NonNull
     static String encodeSegment(@NonNull String value) {
@@ -642,6 +644,13 @@ public final class XoRestClient implements HypervisorClient {
         if (vm.isBlank()) {
             throw new HypervisorException("create_vm answered success but named no VM: " + created);
         }
+        String refused = unaddressable(vm);
+        if (refused != null) {
+            // Before configure, so nothing addresses it; the self-cleanup below could not either.
+            throw new HypervisorException("create_vm answered with '" + vm + "', " + refused + " A VM named '"
+                    + spec.name() + "' may now exist carrying no owner tag, which no sweep will find; remove it"
+                    + " by hand.");
+        }
 
         // The clone exists now, so anything past this point that throws would leave a VM and its disks
         // behind. Destroy it on any such failure before rethrowing, the same self-cleanup the XAPI backend
@@ -850,11 +859,11 @@ public final class XoRestClient implements HypervisorClient {
         }
         // The seed rides in this one call: it has to be in the VM record before the VM starts,
         // because setting xenstore-data on a running VM does not propagate to the guest.
-        call("PATCH", API + "/vms/" + vm, patch, READ_TIMEOUT);
+        call("PATCH", vmPath(vm), patch, READ_TIMEOUT);
         // Separate, and after: see the javadoc for why the dynamic min cannot ride in the body above.
         ObjectNode pin = MAPPER.createObjectNode();
         pin.put("memoryMin", spec.memoryBytes());
-        call("PATCH", API + "/vms/" + vm, pin, READ_TIMEOUT);
+        call("PATCH", vmPath(vm), pin, READ_TIMEOUT);
     }
 
     /**
@@ -916,15 +925,15 @@ public final class XoRestClient implements HypervisorClient {
             return;
         }
         String ownerTag = OWNER_TAG_PREFIX + owner;
-        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(ownerTag), null, READ_TIMEOUT);
-        JsonNode record = get(API + "/vms/" + vm);
+        call("PUT", vmPath(vm) + "/tags/" + encodeSegment(ownerTag), null, READ_TIMEOUT);
+        JsonNode record = get(vmPath(vm));
         String uuid = record.path("uuid").asText("");
         if (uuid.isBlank()) {
             throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
                     + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
         }
         String selfTag = SELF_TAG_PREFIX + uuid;
-        call("PUT", API + "/vms/" + vm + "/tags/" + encodeSegment(selfTag), null, READ_TIMEOUT);
+        call("PUT", vmPath(vm) + "/tags/" + encodeSegment(selfTag), null, READ_TIMEOUT);
         stripInheritedMarkers(vm, ownerTag, selfTag, record.path("tags"));
     }
 
@@ -951,7 +960,7 @@ public final class XoRestClient implements HypervisorClient {
             }
             for (String tag : foreign) {
                 if (deleted.add(tag)) {
-                    call("DELETE", API + "/vms/" + vm + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+                    call("DELETE", vmPath(vm) + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
                 }
             }
             if (read > 1) {
@@ -962,18 +971,18 @@ public final class XoRestClient implements HypervisorClient {
                     throw new HypervisorException("interrupted while confirming the owner markers on clone " + vm, e);
                 }
             }
-            tags = get(API + "/vms/" + vm).path("tags");
+            tags = get(vmPath(vm)).path("tags");
         }
     }
 
     @Override
     public void start(@NonNull VmRef vm) {
-        call("POST", API + "/vms/" + vm.value() + "/actions/start?sync=true", null, ACTION_TIMEOUT);
+        call("POST", vmPath(vm.value()) + "/actions/start?sync=true", null, ACTION_TIMEOUT);
     }
 
     @Override
     public void stop(@NonNull VmRef vm) {
-        call("POST", API + "/vms/" + vm.value() + "/actions/clean_shutdown?sync=true", null, ACTION_TIMEOUT);
+        call("POST", vmPath(vm.value()) + "/actions/clean_shutdown?sync=true", null, ACTION_TIMEOUT);
     }
 
     /**
@@ -988,13 +997,13 @@ public final class XoRestClient implements HypervisorClient {
     public void clearGuestSecret(@NonNull VmRef vm) {
         ObjectNode patch = MAPPER.createObjectNode();
         patch.putObject("xenStoreData").putNull(GUEST_DATA_PREFIX + "secret");
-        call("PATCH", API + "/vms/" + vm.value(), patch, READ_TIMEOUT);
+        call("PATCH", vmPath(vm.value()), patch, READ_TIMEOUT);
     }
 
     @Override
     @NonNull
     public Optional<String> primaryIpAddress(@NonNull VmRef vm) {
-        JsonNode read = get(API + "/vms/" + vm.value() + "?fields=power_state,mainIpAddress");
+        JsonNode read = get(vmPath(vm.value()) + "?fields=power_state,mainIpAddress");
         if (!"Running".equals(read.path("power_state").asText(""))) {
             return Optional.empty();
         }
@@ -1103,9 +1112,23 @@ public final class XoRestClient implements HypervisorClient {
     @Override
     @NonNull
     public VmState state(@NonNull VmRef vm) {
-        return switch (get(API + "/vms/" + vm.value() + "?fields=power_state")
-                .path("power_state")
-                .asText("")) {
+        // Not through get(): a 404 here has to stay distinguishable. XO's own "no such VM" about this id is
+        // the VM being gone, which the leaked-VM sweep treats as done, and any other 404 is a read that failed.
+        String path = vmPath(vm.value()) + "?fields=power_state";
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("GET", path, null, READ_TIMEOUT);
+        } catch (IOException e) {
+            throw new HypervisorException("GET " + path + ": transport error: " + e.getMessage(), e);
+        }
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), vm.value())) {
+            throw new VmGoneException("Xen Orchestra has no VM " + vm.value());
+        }
+        if (!resp.isSuccess()) {
+            throw failure("GET", path, resp.status(), resp.body());
+        }
+        refuseAsyncAccepted("GET", path, resp, null);
+        return switch (parse("GET " + path, resp.body()).path("power_state").asText("")) {
             case "Halted" -> VmState.HALTED;
             case "Running" -> VmState.RUNNING;
             case "Paused" -> VmState.PAUSED;
@@ -1155,7 +1178,7 @@ public final class XoRestClient implements HypervisorClient {
         if (owner.isBlank()) {
             throw new HypervisorException("refusing to destroy " + vm.value() + ": no owning cloud was named");
         }
-        String path = API + "/vms/" + vm.value() + "?fields=uuid,tags";
+        String path = vmPath(vm.value()) + "?fields=uuid,tags";
         RestTransport.RestResponse resp;
         try {
             resp = transport.send("GET", path, null, READ_TIMEOUT);
@@ -1188,7 +1211,7 @@ public final class XoRestClient implements HypervisorClient {
 
     /** {@code DELETE /vms/{id}}, which on this backend takes the disks too. No ownership check: see the callers. */
     private void deleteVm(@NonNull VmRef vm) {
-        String path = API + "/vms/" + vm.value();
+        String path = vmPath(vm.value());
         RestTransport.RestResponse resp;
         try {
             resp = transport.send("DELETE", path, null, ACTION_TIMEOUT);
@@ -1222,21 +1245,67 @@ public final class XoRestClient implements HypervisorClient {
      * <p>The punctuation check is not decoration. Object ids come from XO and are deliberately not
      * percent-encoded on the way into the path ({@link #encodeSegment}'s contract), so a value carrying a
      * slash, a query or a fragment addresses a different route entirely. That route answers 404, and a bare
-     * status check would have read it as a clean teardown.
+     * status check would have read it as a clean teardown. Both checks live in {@link #vmPath}, which every
+     * verb now goes through; this method stays so destroy runs them before its ownership read.
      */
     private static void refuseForeignHandle(@NonNull VmRef vm) {
-        String ref = vm.value();
-        if (ref.startsWith(VmRef.XAPI_REF_PREFIX)) {
-            throw new HypervisorException("refusing to destroy " + ref + ": that is a XAPI handle, and this is the"
-                    + " Xen Orchestra backend. A VM is only destroyable through the backend that created it;"
-                    + " this appliance would resolve it and delete whatever it names.");
+        vmPath(vm.value());
+    }
+
+    /**
+     * {@code /rest/v0/vms/{id}}, refusing an id that would address anything else (#308). Every path that
+     * takes a VM id is built here, so the check below cannot again end up on one verb only.
+     */
+    @NonNull
+    private static String vmPath(@NonNull String id) {
+        String refused = unaddressable(id);
+        if (refused != null) {
+            throw new HypervisorException("refusing to address '" + id + "': " + refused);
         }
-        // Blank is deliberately not checked: VmRef's own constructor refuses null and blank, so a check
-        // here would be unreachable and no test could make it fire.
-        if (ref.indexOf('/') >= 0 || ref.indexOf('?') >= 0 || ref.indexOf('#') >= 0) {
-            throw new HypervisorException("refusing to destroy '" + ref + "': not a VM id from this backend."
-                    + " It would address a different route, whose 404 reads as an already-destroyed VM.");
+        return API + "/vms/" + id;
+    }
+
+    /**
+     * Why {@code id} cannot go into a path as one segment, or null when it can.
+     *
+     * <p>A deny-list of what changes the route, not an allow-list of what an id has looked like so far. A
+     * slash, a query or a fragment addresses another route outright; a percent-escape or a dot segment can
+     * be decoded or normalised into one on the way; a backslash is a slash to some proxies; whitespace and
+     * control characters are not legal in a path at all. Anything else, {@code :} or {@code @} included, is
+     * a legal path character and goes through. The width matters because of where the clone's id is
+     * checked: after create_vm has made the VM, so every id refused there is a VM left behind, once per
+     * provisioning retry. Every id measured so far was a plain UUID; this does not bet on that.
+     */
+    @CheckForNull
+    private static String unaddressable(@NonNull String id) {
+        // Here and not in vmPath, so the clone's preflight refuses a handle too, with its manual-removal message.
+        if (id.startsWith(VmRef.XAPI_REF_PREFIX)) {
+            return "that is a XAPI handle, and this is the Xen Orchestra backend. A VM is only addressable through"
+                    + " the backend that created it; this appliance would resolve it and act on whatever it names.";
         }
+        // Blank is deliberately not checked on its own: VmRef's constructor refuses it, and the one raw id
+        // read here, create_vm's, is checked for blank before it gets this far.
+        boolean bad = id.equals(".") || id.equals("..");
+        for (int i = 0; i < id.length() && !bad; i++) {
+            char c = id.charAt(i);
+            bad = c == '/' || c == '?' || c == '#' || c == '%' || c == '\\' || c <= ' ' || c == 0x7F;
+        }
+        // Then the parser the transport itself uses. A bracket, a brace, a pipe or a non-ASCII space passes the
+        // list above and makes URI.create throw an unchecked exception at send time; measured on JDK 21, the
+        // ASCII ones are " < > [ \ ] ^ ` { | }. Asking the parser keeps this in step with it rather than with
+        // a list of what it was once seen to reject.
+        if (!bad) {
+            try {
+                String path = API + "/vms/" + id;
+                bad = !URI.create("https://xo" + path).getRawPath().equals(path);
+            } catch (IllegalArgumentException e) {
+                bad = true;
+            }
+        }
+        return bad
+                ? "not a VM id from this backend. It would address a different route, whose 404 reads as a VM"
+                        + " already gone."
+                : null;
     }
 
     /**

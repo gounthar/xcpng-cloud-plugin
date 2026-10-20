@@ -42,19 +42,31 @@ public final class XcpngLeakedVm {
      */
     private final String caCertificates;
 
+    /**
+     * Whether the teardown that recorded this entry was refused by the #48 guard: the pool read the VM
+     * {@code Halted} while its agent was still connected (#306). A held entry is destroyed only once the pool
+     * reads it in a state Xen Orchestra shuts down before deleting. An entry written before this field existed
+     * loads false, which is right: no teardown before it held anything.
+     *
+     * <p>Not part of {@link #equals}: it says how to sweep the VM, not which VM it is.
+     */
+    private final boolean held;
+
     private XcpngLeakedVm(
             @NonNull String vmRef,
             @NonNull XcpngBackend backend,
             @CheckForNull String poolUrl,
             @CheckForNull String credentialsId,
             @CheckForNull String certificateFingerprint,
-            @CheckForNull String caCertificates) {
+            @CheckForNull String caCertificates,
+            boolean held) {
         this.vmRef = Objects.requireNonNull(vmRef, "vmRef");
         this.backend = Objects.requireNonNull(backend, "backend");
         this.poolUrl = poolUrl;
         this.credentialsId = credentialsId;
         this.certificateFingerprint = certificateFingerprint;
         this.caCertificates = caCertificates;
+        this.held = held;
     }
 
     /**
@@ -82,10 +94,16 @@ public final class XcpngLeakedVm {
             @CheckForNull String certificateFingerprint,
             @CheckForNull String caCertificates) {
         if (poolUrl == null) {
-            return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), null, null, null, null);
+            return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), null, null, null, null, false);
         }
         return new XcpngLeakedVm(
-                vmRef, XcpngBackend.resolve(backend), poolUrl, credentialsId, certificateFingerprint, caCertificates);
+                vmRef,
+                XcpngBackend.resolve(backend),
+                poolUrl,
+                credentialsId,
+                certificateFingerprint,
+                caCertificates,
+                false);
     }
 
     /** A leak recorded with the cloud's connection as it is now, for a VM provisioned under that connection. */
@@ -107,7 +125,7 @@ public final class XcpngLeakedVm {
     @NonNull
     static XcpngLeakedVm legacy(@NonNull String vmRef) {
         XcpngBackend inferred = vmRef.startsWith(VmRef.XAPI_REF_PREFIX) ? XcpngBackend.XAPI : XcpngBackend.XO;
-        return new XcpngLeakedVm(vmRef, inferred, null, null, null, null);
+        return new XcpngLeakedVm(vmRef, inferred, null, null, null, null, false);
     }
 
     @NonNull
@@ -139,6 +157,23 @@ public final class XcpngLeakedVm {
     @CheckForNull
     public String getCaCertificates() {
         return caCertificates;
+    }
+
+    /** This entry, held: the sweep reads the VM's state before destroying it. See {@link #isHeld()}. */
+    @NonNull
+    XcpngLeakedVm asHeld() {
+        return held
+                ? this
+                : new XcpngLeakedVm(
+                        vmRef, backend, poolUrl, credentialsId, certificateFingerprint, caCertificates, true);
+    }
+
+    /**
+     * Whether the #48 guard refused this VM's teardown, so a sweep must not delete it while the pool still
+     * reads it {@code Halted} (#306).
+     */
+    boolean isHeld() {
+        return held;
     }
 
     /** Whether this entry carries its own connection, rather than depending on the cloud's current one. */
@@ -193,6 +228,7 @@ public final class XcpngLeakedVm {
     @Override
     public String toString() {
         return vmRef
-                + (hasConnection() ? " (" + backend + " at " + poolUrl + ")" : " (" + backend + ", no connection)");
+                + (hasConnection() ? " (" + backend + " at " + poolUrl + ")" : " (" + backend + ", no connection)")
+                + (held ? " [held]" : "");
     }
 }

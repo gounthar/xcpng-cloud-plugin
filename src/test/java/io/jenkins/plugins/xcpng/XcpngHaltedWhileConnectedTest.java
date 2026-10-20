@@ -86,7 +86,9 @@ class XcpngHaltedWhileConnectedTest {
         Arrays.fill(alwaysHalted, VmState.HALTED);
         fake.scriptStates(VM.value(), alwaysHalted);
 
-        HypervisorException refused = assertThrows(HypervisorException.class, () -> guard(true));
+        // The subtype is what the teardown keys the held record on (#306); a plain HypervisorException here
+        // would be recorded as an ordinary failure and deleted by the next sweep on this same reading.
+        HypervisorException refused = assertThrows(XcpngAgent.HaltedWhileConnectedException.class, () -> guard(true));
 
         assertEquals(13, fake.stateReads(), "the first read plus one per 5 s across 60 s");
         assertEquals(12, sleeps.size());
@@ -118,7 +120,7 @@ class XcpngHaltedWhileConnectedTest {
         answers[0] = VmState.HALTED; // the rest stay null: every re-read throws
         fake.scriptStates(VM.value(), answers);
 
-        assertThrows(HypervisorException.class, () -> guard(true));
+        assertThrows(XcpngAgent.HaltedWhileConnectedException.class, () -> guard(true));
 
         assertEquals(13, fake.stateReads());
     }
@@ -177,7 +179,7 @@ class XcpngHaltedWhileConnectedTest {
         };
 
         assertThrows(
-                HypervisorException.class,
+                XcpngAgent.HaltedWhileConnectedException.class,
                 () -> XcpngAgent.refuseIfHaltedWhileConnected(fake, VM, true, interrupted, WAIT, POLL));
 
         assertTrue(Thread.currentThread().isInterrupted(), "the interrupt must survive the refusal");

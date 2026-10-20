@@ -1,0 +1,15 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+  <div class="jenkins-alert jenkins-alert-warning">
+    <p>${%intro}</p>
+    <j:forEach var="cloud" items="${it.held.entrySet()}">
+      <p>${%cloud(cloud.key)}</p>
+      <ul>
+        <j:forEach var="vm" items="${cloud.value}">
+          <li>${vm}</li>
+        </j:forEach>
+      </ul>
+      <p><code>tools/reaper.py --cloud ${cloud.key} --dom0-check</code></p>
+    </j:forEach>
+  </div>
+</j:jelly>

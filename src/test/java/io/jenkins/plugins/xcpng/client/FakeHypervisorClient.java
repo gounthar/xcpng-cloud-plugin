@@ -54,6 +54,9 @@ public final class FakeHypervisorClient implements HypervisorClient {
      */
     private final Map<String, Deque<Optional<VmState>>> scriptedStates = new HashMap<>();
 
+    /** VMs destroyed, here or out of band, whose state reads answer as XO's 404 does. */
+    private final Set<String> gone = new LinkedHashSet<>();
+
     private int stateReads = 0;
 
     private int cloneCounter = 0;
@@ -149,6 +152,16 @@ public final class FakeHypervisorClient implements HypervisorClient {
         return this;
     }
 
+    /**
+     * Make {@code vm} gone without a {@link #destroyWithDisks} call, the way an operator deleting it by hand
+     * would: its state reads then throw {@link VmGoneException}, and nothing appears in {@link #calls()}.
+     */
+    public synchronized FakeHypervisorClient deleteOutOfBand(String vm) {
+        states.remove(vm);
+        gone.add(vm);
+        return this;
+    }
+
     /** How many times {@link #state} has been called, scripted or not. */
     public synchronized int stateReads() {
         return stateReads;
@@ -241,6 +254,9 @@ public final class FakeHypervisorClient implements HypervisorClient {
         if (scripted != null && !scripted.isEmpty()) {
             return scripted.poll().orElseThrow(() -> new HypervisorException("state: transport error"));
         }
+        if (gone.contains(vm.value())) {
+            throw new VmGoneException("no such VM " + vm.value());
+        }
         return states.getOrDefault(vm.value(), VmState.UNKNOWN);
     }
 
@@ -260,6 +276,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
             throw new HypervisorException("destroy failed");
         }
         states.remove(vm.value());
+        gone.add(vm.value());
     }
 
     @Override

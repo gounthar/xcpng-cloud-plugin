@@ -17,6 +17,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -112,6 +113,13 @@ public class XcpngLeakedVmStore implements Saveable {
      */
     private final transient Set<String> failedOnce = ConcurrentHashMap.newKeySet();
 
+    /**
+     * How many sweeps in a row have kept each held entry (#306), so the one that reaches the threshold can
+     * say so at SEVERE exactly once. Runtime state like {@link #failedOnce}, and forgotten on restart for the
+     * same reason: the count is about this process's log, not about the VM.
+     */
+    private final transient Map<String, Integer> heldSweeps = new ConcurrentHashMap<>();
+
     public XcpngLeakedVmStore() {
         load();
         // Not only in load(): a store whose file does not exist yet still has to pick up a deferral.
@@ -171,6 +179,10 @@ public class XcpngLeakedVmStore implements Saveable {
      * Record a VM a teardown could not destroy. Returns whether it was new, so a duplicate record neither
      * writes the file nor logs again. Persisted at once: the VM outlives the controller process, so a leak
      * recorded before a restart must still be reclaimed after one.
+     *
+     * <p>A held record of a VM already recorded unheld replaces it, and is saved, but does not count as new.
+     * The reverse never happens: once the #48 guard has refused a VM, a later ordinary failure of the same
+     * teardown says nothing about whether the pool still reads it {@code Halted} (#306).
      */
     boolean record(String cloudName, @NonNull XcpngLeakedVm vm) {
         drainPendingMigrations();
@@ -181,12 +193,23 @@ public class XcpngLeakedVmStore implements Saveable {
         // the same one drop() takes, or the two interleave and lose the ref. computeIfAbsent returns the set
         // and releases the lock before the caller adds to it, which leaves exactly that window open.
         boolean[] added = {false};
+        boolean[] upgraded = {false};
         leakedByCloud.compute(cloudName, (key, vms) -> {
             Set<XcpngLeakedVm> target = vms == null ? new CopyOnWriteArraySet<>() : vms;
             added[0] = target.add(vm);
+            // Held is outside equals, so an add that found an equal entry may have found it unheld. Swap it in a
+            // new set rather than remove-then-add on this one: entries() copies the set without this lock, and
+            // could otherwise catch it between the two with the VM in neither.
+            if (!added[0] && vm.isHeld() && target.stream().anyMatch(e -> e.equals(vm) && !e.isHeld())) {
+                Set<XcpngLeakedVm> replaced = new CopyOnWriteArraySet<>(target);
+                replaced.remove(vm);
+                replaced.add(vm);
+                upgraded[0] = true;
+                return replaced;
+            }
             return target;
         });
-        if (added[0]) {
+        if (added[0] || upgraded[0]) {
             saveQuietly();
         }
         return added[0];
@@ -201,6 +224,25 @@ public class XcpngLeakedVmStore implements Saveable {
         }
         Set<XcpngLeakedVm> vms = leakedByCloud.get(cloudName);
         return vms == null ? new LinkedHashSet<>() : new LinkedHashSet<>(vms);
+    }
+
+    /**
+     * Every held entry (#306), keyed by cloud name in name order, for {@link XcpngHeldLeakMonitor}. Across all
+     * clouds rather than the configured ones: an entry outlives a cloud that was renamed or removed, and it is
+     * exactly then that nothing else names it.
+     */
+    @NonNull
+    Map<String, List<XcpngLeakedVm>> held() {
+        drainPendingMigrations();
+        Map<String, List<XcpngLeakedVm>> held = new TreeMap<>();
+        leakedByCloud.forEach((cloudName, vms) -> {
+            List<XcpngLeakedVm> mine =
+                    vms.stream().filter(XcpngLeakedVm::isHeld).toList();
+            if (!mine.isEmpty()) {
+                held.put(cloudName, mine);
+            }
+        });
+        return held;
     }
 
     /** Just the refs of {@link #entries}, for callers that ask which VMs are recorded, not how to reach them. */
@@ -219,6 +261,14 @@ public class XcpngLeakedVmStore implements Saveable {
      */
     boolean firstFailure(String cloudName, @NonNull XcpngLeakedVm vm) {
         return cloudName != null && failedOnce.add(failureKey(cloudName, vm));
+    }
+
+    /**
+     * Count one more sweep that kept the held entry {@code vm}, and return the count, starting at 1. Cleared
+     * by {@link #drop}, so an entry recorded again later starts again.
+     */
+    int keptHeld(String cloudName, @NonNull XcpngLeakedVm vm) {
+        return cloudName == null ? 0 : heldSweeps.merge(failureKey(cloudName, vm), 1, Integer::sum);
     }
 
     private static String failureKey(String cloudName, XcpngLeakedVm vm) {
@@ -248,6 +298,7 @@ public class XcpngLeakedVmStore implements Saveable {
         });
         for (XcpngLeakedVm vm : vms) {
             failedOnce.remove(failureKey(cloudName, vm));
+            heldSweeps.remove(failureKey(cloudName, vm));
         }
         if (changed[0]) {
             saveQuietly();
