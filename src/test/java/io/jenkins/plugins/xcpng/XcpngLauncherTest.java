@@ -11,10 +11,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 import hudson.ExtensionList;
+import hudson.XmlFile;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Saveable;
 import hudson.model.TaskListener;
+import hudson.model.listeners.SaveableListener;
 import hudson.slaves.Cloud;
 import hudson.slaves.ComputerLauncher;
 import hudson.slaves.DumbSlave;
@@ -23,6 +26,7 @@ import hudson.slaves.NodeProvisioner;
 import hudson.slaves.SlaveComputer;
 import io.jenkins.plugins.xcpng.client.FakeHypervisorClient;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
@@ -30,6 +34,7 @@ import java.util.function.Supplier;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /**
@@ -238,6 +243,107 @@ class XcpngLauncherTest {
                     "a node removed under the launcher must not be recorded as a template failure");
         } finally {
             launching.interrupt();
+        }
+    }
+
+    /**
+     * A node torn down while its clone is still in flight must not leave the clone behind (#305).
+     *
+     * <p>The teardown runs first and finds no VM, because the launcher has not stamped one yet; the clone then
+     * comes back. Before the fix the launcher stamped it onto a node that no longer existed and started it, and
+     * nothing in Jenkins knew about the running VM: not the node, not the leaked-VM store, not the instance cap.
+     * The warm-pool drain gets here whenever it retires a spare that is still connecting.
+     */
+    @Test
+    void aCloneThatReturnsAfterItsNodeWasTornDownIsDestroyedNotStarted(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch held = fake.holdClonesUntil(release);
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+        assertTrue(held.await(30, TimeUnit.SECONDS), "the launcher should have reached the clone");
+
+        // What drainSpare does to an idle spare, and an idle spare includes one still connecting.
+        agent.terminate();
+        assertNull(r.jenkins.getNode("xcpng-agent-1"), "the teardown removes the node");
+        release.countDown();
+
+        String clone = "vm/xcpng-agent-1/1";
+        awaitTrue(
+                () -> fake.calls().contains("destroyWithDisks:" + clone),
+                () -> "the clone that came back to a torn-down node must be destroyed: " + fake.calls());
+        assertFalse(
+                fake.calls().contains("start:" + clone),
+                "and never started, since no node is left to connect it: " + fake.calls());
+        assertEquals(List.of("xcpng"), fake.destroyOwners(), "destroyed as this cloud's VM");
+    }
+
+    /**
+     * If destroying that unadopted clone fails, it goes to the leaked-VM set: no node holds it, so the
+     * warm-pool maintainer's sweep is the only thing left that will retry the destroy.
+     */
+    @Test
+    void anUnadoptedCloneWhoseDestroyFailsIsRecordedAsLeaked(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failDestroy();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch held = fake.holdClonesUntil(release);
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+        assertTrue(held.await(30, TimeUnit.SECONDS), "the launcher should have reached the clone");
+
+        agent.terminate();
+        release.countDown();
+
+        String clone = "vm/xcpng-agent-1/1";
+        awaitTrue(
+                () -> cloud.leakedVmRefs().contains(clone),
+                () -> "a clone that could not be destroyed must be recorded as leaked: " + cloud.leakedVmRefs());
+        assertTrue(fake.calls().contains("destroyWithDisks:" + clone), "the destroy was attempted first");
+        assertFalse(fake.calls().contains("start:" + clone), "and the clone was never started: " + fake.calls());
+    }
+
+    /**
+     * Adopting a clone saves the issued-agent store and the node, and neither save may run under the agent's
+     * monitor: a save writes a file and fires save listeners, which may take core's locks, while the teardown
+     * takes that monitor too. Updating the record in memory under the monitor is what keeps the two in step.
+     */
+    @Test
+    void adoptingACloneSavesNothingUnderTheAgentsMonitor(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        SavesUnderAgentMonitor.watched = agent;
+        r.jenkins.addNode(agent);
+
+        awaitTrue(() -> agent.getVmRef() != null, () -> "the launcher should have adopted a clone: " + fake.calls());
+        awaitTrue(() -> !isConnecting(agent), () -> "the launcher should have returned");
+        assertTrue(
+                SavesUnderAgentMonitor.saves.stream().anyMatch(s -> s instanceof XcpngIssuedAgentStore),
+                "the control: the store save was seen at all, so an empty list below means something");
+        assertEquals(
+                List.of(),
+                SavesUnderAgentMonitor.underMonitor,
+                "saved while holding the agent's monitor: " + SavesUnderAgentMonitor.underMonitor);
+    }
+
+    @TestExtension("adoptingACloneSavesNothingUnderTheAgentsMonitor")
+    public static class SavesUnderAgentMonitor extends SaveableListener {
+        static volatile XcpngAgent watched;
+        static final List<Saveable> saves = new CopyOnWriteArrayList<>();
+        static final List<String> underMonitor = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            XcpngAgent agent = watched;
+            if (agent == null || !(o instanceof XcpngIssuedAgentStore || o == agent)) {
+                return;
+            }
+            saves.add(o);
+            if (Thread.holdsLock(agent)) {
+                underMonitor.add(o.getClass().getSimpleName());
+            }
         }
     }
 

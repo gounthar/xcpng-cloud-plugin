@@ -1023,6 +1023,118 @@ class XoRestClientTest {
     }
 
     /**
+     * The same check, on every other verb that puts a VM id into a path (#308). Only destroy used to run it,
+     * and the others concatenated the id as is: a slash or a query there addresses a different route, and a
+     * percent-escape or a dot segment can be decoded or normalised into one on the way. The ids come from XO
+     * itself, so this is defence in depth, which is why nothing may be sent rather than only an exception.
+     */
+    @Test
+    void everyVmVerbRefusesARefThatWouldAddressADifferentRoute() {
+        Map<String, java.util.function.BiConsumer<XoRestClient, VmRef>> verbs = new LinkedHashMap<>();
+        verbs.put("start", XoRestClient::start);
+        verbs.put("stop", XoRestClient::stop);
+        verbs.put("state", XoRestClient::state);
+        verbs.put("clearGuestSecret", XoRestClient::clearGuestSecret);
+        verbs.put("primaryIpAddress", XoRestClient::primaryIpAddress);
+        verbs.put("destroyWithDisks", (client, vm) -> client.destroyWithDisks(vm, OWNER));
+        String[] mangled = {
+            "abc/def",
+            "abc?x=1",
+            "abc#frag",
+            "abc%2Fdef",
+            "..",
+            ".",
+            "abc def",
+            "abc\\def",
+            "abc\ndef",
+            "vm[1]",
+            "a{b}",
+            "a|b",
+            "a\u00a0b"
+        };
+        verbs.forEach((verb, call) -> {
+            for (String ref : mangled) {
+                ScriptedRest t = new ScriptedRest();
+                HypervisorException e = assertThrows(
+                        HypervisorException.class,
+                        () -> call.accept(new XoRestClient(t), new VmRef(ref)),
+                        verb + " must refuse '" + ref + "'");
+                assertTrue(e.getMessage().contains("not a VM id from this backend"), verb + ": " + e.getMessage());
+                assertTrue(t.calls.isEmpty(), verb + " sent a request for '" + ref + "': " + t.calls);
+            }
+            ScriptedRest t = new ScriptedRest();
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> call.accept(new XoRestClient(t), new VmRef("OpaqueRef:9b1f-dead-beef")),
+                    verb + " must refuse a XAPI handle");
+            assertTrue(e.getMessage().contains("XAPI handle"), verb + ": " + e.getMessage());
+            assertTrue(t.calls.isEmpty(), verb + " sent a request for a XAPI handle: " + t.calls);
+        });
+    }
+
+    /**
+     * Control for the refusals above: a real XO id, the shape every fixture here uses, reaches the appliance
+     * on every one of those verbs. Without it, a check that refused everything would pass them all.
+     */
+    @Test
+    void everyVmVerbSendsARealVmId() {
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.addAll(List.of(XoRestClient.OWNER_TAG_PREFIX + OWNER, XoRestClient.SELF_TAG_PREFIX + CLONE_UUID));
+        XoRestClient client = new XoRestClient(t);
+        VmRef vm = new VmRef(CLONE);
+        client.start(vm);
+        client.stop(vm);
+        client.state(vm);
+        client.clearGuestSecret(vm);
+        client.primaryIpAddress(vm);
+        client.destroyWithDisks(vm, OWNER);
+        assertEquals(List.of(CLONE), t.destroyed);
+        assertTrue(t.paths().stream().allMatch(p -> p.contains("/rest/v0/vms/" + CLONE)), t.paths()::toString);
+    }
+
+    /**
+     * The check refuses what changes the route and nothing else. A colon or an at sign is a legal path
+     * character, and an id carrying one is not refused: refusing the clone's id leaves a VM behind on every
+     * provisioning retry, so a check wider than it needs to be is a leak, not extra safety.
+     */
+    @Test
+    void anIdWithOtherLegalPathCharactersIsSent() {
+        // A non-ASCII letter too: the URI parser the transport uses accepts it, so refusing it would be the
+        // over-wide check this test exists to catch.
+        for (String id : new String[] {"a:b@c+d=e", "vm\u00e9"}) {
+            ScriptedRest t = new ScriptedRest();
+            new XoRestClient(t).start(new VmRef(id));
+            assertEquals(List.of("POST /rest/v0/vms/" + id + "/actions/start?sync=true"), t.paths());
+        }
+    }
+
+    /**
+     * The clone's id is the one VM id this client does not get from a caller: it reads it off create_vm's
+     * answer and then addresses the clone with it a dozen times. An id that would address another route is
+     * refused before any of those, and the message says a VM may exist that no sweep will find, because the
+     * owner tag is never written and the self-cleanup cannot address it either.
+     */
+    @Test
+    void cloneRefusesACreatedIdThatWouldAddressADifferentRoute() {
+        // A XAPI handle and a bracket are here because the preflight once missed both: the handle check lived
+        // only in the path builder, and a bracket passed every listed character and then failed URI parsing,
+        // so configure threw without the manual-removal message and the cleanup could not address the clone.
+        for (String created : new String[] {"../" + CLONE, "OpaqueRef:9b1f-dead-beef", "vm[1]"}) {
+            ScriptedRest t = new ScriptedRest();
+            t.createdId = created;
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).cloneFromTemplate(new VmRef(POOL + "/" + TEMPLATE_UUID), spec()),
+                    "'" + created + "' must be refused");
+            assertTrue(e.getMessage().contains("create_vm answered with"), created + ": " + e.getMessage());
+            assertTrue(e.getMessage().contains("agent-1"), "must name the VM to remove by hand: " + e.getMessage());
+            assertTrue(
+                    t.paths().stream().noneMatch(p -> p.contains(created)),
+                    "nothing may address '" + created + "': " + t.paths());
+        }
+    }
+
+    /**
      * The handle a destroy is given is read back from a node's own file, so it is not proof the VM is this
      * plugin's. Only the two markers {@code markOwner} stamps are, and both must be there, exactly. Each case
      * asserts nothing was deleted, not only that it threw: a client that issued the DELETE and then complained
@@ -1794,6 +1906,9 @@ class XoRestClientTest {
          */
         String specBody;
 
+        /** The id {@code create_vm} answers with. */
+        String createdId = CLONE;
+
         /** What {@code GET /networks} lists. The other pool's same-named network comes first, on purpose. */
         final List<Map<String, Object>> networks = new ArrayList<>();
         /** The template record's {@code VIFs}: ids, each answered from {@link #vifs}. */
@@ -1901,7 +2016,7 @@ class XoRestClientTest {
                 return new RestResponse(200, templatesBody != null ? templatesBody : json(templates));
             }
             if (path.startsWith("/rest/v0/pools/") && path.contains("/actions/create_vm")) {
-                return new RestResponse(201, "{\"id\":\"" + CLONE + "\"}");
+                return new RestResponse(201, json(Map.of("id", createdId)));
             }
             if (path.startsWith("/rest/v0/pools")) {
                 return new RestResponse(
