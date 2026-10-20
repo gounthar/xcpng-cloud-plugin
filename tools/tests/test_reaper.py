@@ -32,8 +32,9 @@ def pool(monkeypatch):
         stuck=(),
         vdis_after=None,
         argv=("reaper.py", "--apply", "--include-live"),
+        **fake_kwargs,
     ):
-        fake = FakeXapi(records=records, stuck=stuck, vdis_after=vdis_after)
+        fake = FakeXapi(records=records, stuck=stuck, vdis_after=vdis_after, **fake_kwargs)
         monkeypatch.setattr(reaper, "Xapi", lambda *a, **k: fake)
         monkeypatch.setattr(reaper.sys, "argv", list(argv))
         return fake
@@ -306,6 +307,37 @@ def test_prefix_and_cloud_together_are_refused(monkeypatch):
     with pytest.raises(SystemExit) as caught:
         reaper.main()
     assert caught.value.code == 2
+
+
+# ---- the disk count is taken on the SRs the reaped disks are on (#318) ----
+
+
+def test_a_leak_on_another_sr_than_the_default_is_reported(pool, capsys):
+    """The lab has a local SR per host. The default SR stays flat; the leak is on the other one."""
+    pool(
+        {"vm-1": vm_record(PLUGIN_VM, owner=CLOUD)},
+        disk_srs={"vm-1": "OpaqueRef:sr-b"},
+        sr_counts={"OpaqueRef:sr": (5, 5), "OpaqueRef:sr-b": (3, 4)},
+    )
+    assert reaper.main() == 1
+    err = capsys.readouterr().err
+    assert "Disks were orphaned" in err and "OpaqueRef:sr-b" in err
+
+
+def test_only_the_srs_holding_the_doomed_disks_are_measured(pool):
+    fake = pool(
+        {"vm-1": vm_record(PLUGIN_VM, owner=CLOUD)},
+        disk_srs={"vm-1": "OpaqueRef:sr-b"},
+        sr_counts={"OpaqueRef:sr": (5, 9), "OpaqueRef:sr-b": (3, 3)},
+    )
+    assert reaper.main() == 0, "a count rising on an SR the reap never touched is not this reap's leak"
+    assert {e for e in fake.events if e.startswith("count:")} == {"count:OpaqueRef:sr-b"}
+
+
+def test_the_count_before_is_taken_before_anything_is_destroyed(pool):
+    fake = pool({"vm-1": vm_record(PLUGIN_VM, owner=CLOUD)})
+    reaper.main()
+    assert fake.events.index("count:OpaqueRef:sr") < fake.events.index("destroy:vm-1")
 
 
 # ---- dom0 cross-check: XAPI's power_state can lie (#48) ----
