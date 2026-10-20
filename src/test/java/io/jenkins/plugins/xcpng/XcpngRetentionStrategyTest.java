@@ -164,12 +164,16 @@ class XcpngRetentionStrategyTest {
             @Override
             public void close() {}
         };
+        // The cloud's logger too: a leak recorded by the teardown is reported by the sweep that later gives up on it.
         Logger logger = Logger.getLogger(XcpngAgent.class.getName());
+        Logger cloudLogger = Logger.getLogger(XcpngCloud.class.getName());
         logger.addHandler(handler);
+        cloudLogger.addHandler(handler);
         try {
             body.run();
         } finally {
             logger.removeHandler(handler);
+            cloudLogger.removeHandler(handler);
         }
         return records;
     }
@@ -1038,13 +1042,14 @@ class XcpngRetentionStrategyTest {
     }
 
     /**
-     * The first residual the fix cannot recover: the cloud is gone <em>and</em> its credential has been
-     * deleted from the store, so no client can be opened at all. The node must still go away, and the
-     * operator must be told at SEVERE that {@code tools/reaper.py} is the recovery path — there is no cloud
-     * left to hold the ref in a durable leaked-VM set, so nothing will retry this by itself.
+     * The residual the fix cannot recover: the cloud is gone <em>and</em> its credential has been deleted from
+     * the store, so no client can be opened at all. The node must still go away and the leak is recorded under
+     * the gone cloud's name (#314); the orphan sweep then finds the recorded connection unopenable, gives up, and
+     * tells the operator at SEVERE that {@code tools/reaper.py} is the recovery path. The sweep opens the
+     * connection the production way, and the test store holds no credential, which is the deleted one.
      */
     @Test
-    void terminateNamesTheReaperWhenTheCredentialIsGoneToo(JenkinsRule r) throws Exception {
+    void aGoneCloudsLeakWhoseCredentialIsGoneTooEndsAtTheReaper(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(r, fake);
         XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
@@ -1053,14 +1058,82 @@ class XcpngRetentionStrategyTest {
                 new RecordingConnectionFactory(fake, new IllegalStateException("No XAPI credentials configured")));
         r.jenkins.clouds.remove(cloud);
 
-        List<LogRecord> log = whileCapturingAgentLog(
+        List<LogRecord> teardown = whileCapturingAgentLog(
                 () -> assertDoesNotThrow(agent::terminate, "an unopenable client must not propagate out of teardown"));
 
         assertEquals(0, destroyCount(fake), "no destroy can have been issued: " + fake.calls());
-        assertTrue(
-                logged(log, Level.SEVERE, agent.getVmRef(), "tools/reaper.py"),
-                "an unrecoverable leak must name the VM and the reaper at SEVERE: " + messages(log));
         assertFalse(r.jenkins.getNodes().contains(agent), "the node must still be removed");
+        assertTrue(
+                XcpngLeakedVmStore.get().refs("xcpng").contains(agent.getVmRef()),
+                "the leak must be recorded under the gone cloud's name: " + messages(teardown));
+
+        List<LogRecord> sweep = whileCapturingAgentLog(XcpngCloud::sweepOrphanedLeaks);
+
+        assertTrue(XcpngLeakedVmStore.get().refs("xcpng").isEmpty(), "an unopenable connection is given up on");
+        assertTrue(
+                logged(sweep, Level.SEVERE, agent.getVmRef(), "tools/reaper.py"),
+                "giving up must name the VM and the reaper at SEVERE: " + messages(sweep));
+    }
+
+    /** The case #314 is about: a failed destroy after the cloud is gone is retried, under the name it was tagged with. */
+    @Test
+    void aFailedDestroyAfterTheCloudIsGoneIsRetriedByTheOrphanSweep(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        agent.setConnectionClientFactory(new RecordingConnectionFactory(fake));
+        r.jenkins.clouds.remove(cloud);
+        fake.failDestroy();
+
+        agent.terminate();
+        assertEquals(1, destroyCount(fake), "the fixture must have attempted the destroy: " + fake.calls());
+        assertTrue(XcpngLeakedVmStore.get().refs("xcpng").contains(agent.getVmRef()));
+
+        fake.recoverDestroy();
+        XcpngCloud sweeper = XcpngCloud.orphanSweeper("xcpng");
+        RecordingConnectionFactory recorded = new RecordingConnectionFactory(fake);
+        sweeper.setRecordedConnectionClientFactory(recorded);
+        sweeper.sweepLeakedVms();
+
+        assertEquals(2, destroyCount(fake), fake.calls().toString());
+        assertEquals("xcpng", fake.destroyOwners().get(1), "the owner check runs under the gone cloud's name");
+        assertEquals(POOL_URL, recorded.poolUrl, "over the agent's own connection");
+        assertTrue(XcpngLeakedVmStore.get().refs("xcpng").isEmpty(), "a reclaimed entry leaves the store");
+    }
+
+    /**
+     * Only names no configured cloud carries are swept here; a configured cloud's entries are its own sweep's.
+     * Both entries name a connection that cannot be opened, so a sweep that reaches one gives up and drops it.
+     */
+    @Test
+    void theOrphanSweepLeavesAConfiguredCloudsEntriesAlone(JenkinsRule r) throws Exception {
+        cloudBackedBy(r, new FakeHypervisorClient("jenkins-golden-debian"));
+        XcpngLeakedVm unopenable = XcpngLeakedVm.of(
+                "vm/leaked/1", XcpngBackend.XO, "https://elsewhere.example.test", "deleted-cred", null, null);
+        XcpngLeakedVmStore.get().record("xcpng", unopenable);
+        XcpngLeakedVmStore.get().record("gone", unopenable);
+
+        XcpngCloud.sweepOrphanedLeaks();
+
+        assertTrue(XcpngLeakedVmStore.get().refs("gone").isEmpty(), "control: the removed cloud's entry was swept");
+        assertTrue(XcpngLeakedVmStore.get().refs("xcpng").contains("vm/leaked/1"));
+    }
+
+    /**
+     * An entry with no connection of its own has nothing to be swept over once its cloud is gone. It stays, for a
+     * cloud of that name configured again, and stays quiet: a WARNING every restart for it would be noise.
+     */
+    @Test
+    void theOrphanSweepLeavesAnEntryWithoutAConnection(JenkinsRule r) throws Exception {
+        XcpngLeakedVmStore.get().record("gone", XcpngLeakedVm.legacy("vm/legacy/1"));
+
+        List<LogRecord> log = whileCapturingAgentLog(XcpngCloud::sweepOrphanedLeaks);
+
+        assertTrue(XcpngLeakedVmStore.get().refs("gone").contains("vm/legacy/1"));
+        assertTrue(
+                log.stream().noneMatch(rec -> rec.getLevel().intValue() >= Level.WARNING.intValue()),
+                "nothing to report: " + messages(log));
     }
 
     /**

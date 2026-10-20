@@ -495,12 +495,13 @@ number of waiting builds and what was planned for them.
 - **Deleting a cloud whose credential is also gone leaves its VMs to the reaper.** An agent snapshots
   its cloud's appliance URL, credential ID and TLS-trust setting when it is provisioned, so deleting or
   renaming a cloud while its agents run no longer strands their VMs: teardown resolves the credential
-  from the store and destroys the VM anyway. Two cases still cannot be recovered automatically, and
-  both are logged at SEVERE with the VM reference. If the referenced credential has itself been
-  deleted, or the appliance is unreachable at that moment, there is no cloud left to hold the reference for
-  a later retry — the durable leaked-VM sweep lives on the cloud that was removed. The same applies to
-  an agent provisioned by a version of the plugin older than the snapshot, which reloads with no
-  connection details at all. In both cases `tools/reaper.py` is the recovery path: it selects on the
+  from the store and destroys the VM anyway. A destroy that fails then, because the appliance is
+  unreachable for instance, is kept on the leaked-VM list under the removed cloud's name and retried
+  every minute over the agent's own connection details. Two cases still cannot be recovered
+  automatically, and both are logged at SEVERE with the VM reference. If the referenced credential has
+  itself been deleted, the retry cannot connect and gives up. And an agent provisioned by a version of
+  the plugin older than the snapshot reloads with no connection details at all. In both cases
+  `tools/reaper.py` is the recovery path: it selects on the
   `xcpng-cloud` owner marker stamped into each clone, so it finds these VMs without needing Jenkins to
   still know about them. The marker is on every live agent and warm spare too, so `--apply` refuses to
   run until it is given the controller's node list with `--keep-nodes`, whose VMs it keeps, or told

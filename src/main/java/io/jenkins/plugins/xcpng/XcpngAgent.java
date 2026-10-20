@@ -642,7 +642,8 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         // still covers poolUrl and credentialsId: a cloud repointed at another pool must not have this VM's
         // destroy aimed at it.
         //
-        // The cloud is still consulted for one thing, and only when it exists: recording the leak.
+        // The cloud is still consulted for one thing, and only when it exists: recording the leak. When it is gone
+        // the leak is recorded under its name all the same, for the orphan sweep (#314).
         boolean fromSnapshot = poolUrl != null;
         if (!fromSnapshot && cloud == null) {
             LOGGER.log(
@@ -677,19 +678,30 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                     HALTED_WHILE_CONNECTED_POLL);
             client.destroyWithDisks(new VmRef(vmRef), cloudName);
         } catch (RuntimeException e) {
+            // With this agent's connection, not the cloud's: the sweep must reach the VM the way it was made,
+            // even after the cloud is edited (#223). An agent predating the snapshot records none.
+            XcpngLeakedVm leaked = XcpngLeakedVm.of(
+                    vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates);
+            // Held when the #48 guard is what refused (#306): the sweep would otherwise send the very delete
+            // the guard just refused, on the same Halted reading, a minute later at most.
+            if (e instanceof HaltedWhileConnectedException) {
+                leaked = leaked.asHeld();
+            }
             if (cloud == null) {
-                // Nothing downstream can recover this one: the durable leaked-VM set lives on the cloud that
-                // no longer exists, so say so on the build log rather than recording it nowhere.
+                // Recorded under the gone cloud's name (#314). The store is global, so the entry outlives the
+                // cloud, and XcpngCloud.sweepOrphanedLeaks retries it over the connection snapshot above, which
+                // is the only connection a gone cloud leaves. Reaching here means there is one: an agent
+                // without a snapshot and without a cloud returned before the destroy was attempted.
+                XcpngLeakedVmStore.get().record(cloudName, leaked);
                 LOGGER.log(
                         Level.SEVERE,
                         e,
                         () -> "Failed to destroy VM " + vmRef + " for agent " + getNodeName() + " after cloud '"
-                                + cloudName + "' was removed; no cloud remains to retry it, so reclaim the VM with"
-                                + " tools/reaper.py");
+                                + cloudName + "' was removed; recorded it as a leaked VM, retried over this"
+                                + " agent's connection details");
                 listener.getLogger()
                         .println("Failed to destroy VM " + vmRef + " and cloud '" + cloudName
-                                + "' is gone, so it cannot be retried: " + e.getMessage()
-                                + ". Reclaim it with tools/reaper.py.");
+                                + "' is gone; recorded for later cleanup: " + e.getMessage());
                 return;
             }
             // The base class removes this node in a finally regardless of what happens here, so once we
@@ -704,13 +716,7 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
                             + "; recorded it as a leaked VM for the warm-pool maintainer to reclaim");
             listener.getLogger()
                     .println("Failed to destroy VM " + vmRef + "; recorded for later cleanup: " + e.getMessage());
-            // With this agent's connection, not the cloud's: the sweep must reach the VM the way it was made,
-            // even after the cloud is edited (#223). An agent predating the snapshot records none.
-            XcpngLeakedVm leaked = XcpngLeakedVm.of(
-                    vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates);
-            // Held when the #48 guard is what refused (#306): the sweep would otherwise send the very delete
-            // the guard just refused, on the same Halted reading, a minute later at most.
-            cloud.recordLeakedVm(e instanceof HaltedWhileConnectedException ? leaked.asHeld() : leaked);
+            cloud.recordLeakedVm(leaked);
         }
     }
 

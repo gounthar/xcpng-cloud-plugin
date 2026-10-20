@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -243,6 +244,19 @@ public class XcpngLeakedVmStore implements Saveable {
             }
         });
         return held;
+    }
+
+    /** The cloud names holding at least one entry, in name order, configured or not. */
+    @NonNull
+    Set<String> cloudNames() {
+        drainPendingMigrations();
+        Set<String> names = new TreeSet<>();
+        leakedByCloud.forEach((cloudName, vms) -> {
+            if (!vms.isEmpty()) {
+                names.add(cloudName);
+            }
+        });
+        return names;
     }
 
     /** Just the refs of {@link #entries}, for callers that ask which VMs are recorded, not how to reach them. */
