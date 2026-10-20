@@ -977,7 +977,7 @@ public class XcpngCloud extends Cloud {
         pruneReservations(registered);
         int capacity = Math.max(
                 0,
-                maxInstances - registered.size() - XcpngReservationStore.get().count(name));
+                maxInstances - registered.size() - XcpngReservationStore.get().count(name) - leakedHoldingCapacity());
         for (Map.Entry<String, Integer> pool : warmTargets().entrySet()) {
             String key = pool.getKey();
             int target = pool.getValue();
@@ -1805,8 +1805,39 @@ public class XcpngCloud extends Cloud {
                     0,
                     maxInstances
                             - registered.size()
-                            - XcpngReservationStore.get().count(name));
+                            - XcpngReservationStore.get().count(name)
+                            - leakedHoldingCapacity());
         });
+    }
+
+    /**
+     * Leaked VMs of this cloud that count against {@link #maxInstances} (#312): recorded because a teardown
+     * could not destroy them, so their node is gone while the VM and its disks are still on the pool. Counting
+     * only nodes let a pool that keeps refusing destroys be cloned past the cap, one leak per attempt.
+     *
+     * <p>Every entry counts until the sweep drops it, including one the sweep can never reclaim (an unmarked VM
+     * its ownership check refuses, or a held one): that VM is using the pool as much as any other.
+     * {@link XcpngLeakCapacityMonitor} names the cloud while this is above zero, because a cap filled by leaks
+     * stops provisioning and nothing else would say why. A ref still recorded on a registered agent is that
+     * agent's VM and already counted as its node, so it is not counted twice.
+     */
+    int leakedHoldingCapacity() {
+        Set<String> live = new HashSet<>();
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                String vmRef = agent.getVmRef();
+                if (vmRef != null) {
+                    live.add(vmRef);
+                }
+            }
+        }
+        int leaked = 0;
+        for (String vmRef : XcpngLeakedVmStore.get().refs(name)) {
+            if (!live.contains(vmRef)) {
+                leaked++;
+            }
+        }
+        return leaked;
     }
 
     /**

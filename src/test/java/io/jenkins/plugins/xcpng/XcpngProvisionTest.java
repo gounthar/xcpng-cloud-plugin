@@ -498,6 +498,59 @@ class XcpngProvisionTest {
         assertEquals(2, planned.size());
     }
 
+    /**
+     * A leaked VM's node is gone but the VM is still on the pool, so it holds a slot (#312). The control is the
+     * test above: the same cloud with no leaks plans two.
+     */
+    @Test
+    void leakedVmsCountAgainstTheInstanceCap(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(
+                1,
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .size(),
+                "one leaked VM leaves one slot of two");
+    }
+
+    @Test
+    void leakedVmsCanFillTheInstanceCap(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.recordLeakedVm("vm/leaked/2");
+
+        assertTrue(
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .isEmpty(),
+                "two leaked VMs fill a cap of two");
+    }
+
+    @Test
+    void aLeakedVmStillRecordedOnARegisteredAgentIsNotCountedTwice(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = reloadedSpare(cloud, "xcpng-agent-1");
+        r.jenkins.addNode(agent);
+        cloud.recordLeakedVm("vm/xcpng-agent-1/1");
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(1, cloud.leakedHoldingCapacity(), "the agent's own VM is its node, not a second slot");
+    }
+
+    @Test
+    void leakedVmsHoldWarmPoolSlotsToo(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        reconcileAndSettle(cloud);
+
+        assertEquals(1, warmNodeCount(r), "a warm pool of two under a cap of two, one slot leaked: one spare");
+    }
+
     @Test
     void provisionPlansTrackedNodesCarryingTheActivityId(JenkinsRule r) {
         XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
