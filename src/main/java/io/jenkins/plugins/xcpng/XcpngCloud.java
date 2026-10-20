@@ -1603,7 +1603,8 @@ public class XcpngCloud extends Cloud {
      * and the JNLP secret it must present. The secret is an HMAC of the node name, so it is stable and
      * computable here, before the {@link XcpngAgent} node is added and its computer exists. The URL is
      * omitted when the controller has no root URL configured; the guest then has nothing to dial and the
-     * agent is reclaimed by the idle timeout, which is the right outcome for that misconfiguration.
+     * launcher tears the agent down when its online wait runs out, which is the right outcome for that
+     * misconfiguration.
      */
     @NonNull
     private static Map<String, String> seedFor(@NonNull String nodeName, @NonNull XcpngTemplate template) {

@@ -61,6 +61,13 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
      */
     private transient Predicate<AbstractCloudComputer<?>> idleProbe;
 
+    /**
+     * How long the idle net leaves a computer that is still connecting (#313). Longer than any launch can
+     * legitimately take: the clone and the start are each bounded by the client's 15-minute action timeout,
+     * and the online wait by 5 minutes.
+     */
+    static final int CONNECTING_CEILING_MINUTES = 60;
+
     public XcpngRetentionStrategy(int idleMinutes) {
         super(idleMinutes);
         this.idleMinutes = idleMinutes;
@@ -111,9 +118,19 @@ public class XcpngRetentionStrategy extends CloudRetentionStrategy implements Ex
         // boot, network, or JNLP misconfiguration) is offline forever, and gating on online would leave
         // its VM to leak. Reaping an offline-and-idle computer past the timeout is exactly what the safety
         // net is for, and matches the superclass CloudRetentionStrategy.
+        //
+        // A computer still connecting is the exception (#313). XcpngLauncher.launch blocks through the clone,
+        // the start and the online wait, so core's connect future stays undone for the whole boot, and the
+        // launcher already tears down a clone that does not come online in time. Reaping it at idleMinutes
+        // instead is what made a timeout shorter than boot-to-connect reclaim every agent mid-boot, and the
+        // launcher reads that as a cancellation, so nothing ever said why. The idle clock does not need the
+        // same care once the agent connects: core counts idle time from the connect, not from the clone.
+        // The ceiling is only for a launch thread that hangs, which would otherwise hold its VM forever.
         if (idleMinutes > 0 && idle(computer)) {
             long idleMillis = now() - computer.getIdleStartMilliseconds();
-            if (idleMillis > TimeUnit.MINUTES.toMillis(idleMinutes)) {
+            long limitMinutes =
+                    computer.isConnecting() ? Math.max(idleMinutes, CONNECTING_CEILING_MINUTES) : idleMinutes;
+            if (idleMillis > TimeUnit.MINUTES.toMillis(limitMinutes)) {
                 reap(computer);
             }
         }
