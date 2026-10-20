@@ -7,6 +7,7 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -1257,11 +1258,6 @@ public final class XoRestClient implements HypervisorClient {
      */
     @NonNull
     private static String vmPath(@NonNull String id) {
-        if (id.startsWith(VmRef.XAPI_REF_PREFIX)) {
-            throw new HypervisorException("refusing to address " + id + ": that is a XAPI handle, and this is the"
-                    + " Xen Orchestra backend. A VM is only addressable through the backend that created it;"
-                    + " this appliance would resolve it and act on whatever it names.");
-        }
         String refused = unaddressable(id);
         if (refused != null) {
             throw new HypervisorException("refusing to address '" + id + "': " + refused);
@@ -1282,12 +1278,29 @@ public final class XoRestClient implements HypervisorClient {
      */
     @CheckForNull
     private static String unaddressable(@NonNull String id) {
+        // Here and not in vmPath, so the clone's preflight refuses a handle too, with its manual-removal message.
+        if (id.startsWith(VmRef.XAPI_REF_PREFIX)) {
+            return "that is a XAPI handle, and this is the Xen Orchestra backend. A VM is only addressable through"
+                    + " the backend that created it; this appliance would resolve it and act on whatever it names.";
+        }
         // Blank is deliberately not checked on its own: VmRef's constructor refuses it, and the one raw id
         // read here, create_vm's, is checked for blank before it gets this far.
         boolean bad = id.equals(".") || id.equals("..");
         for (int i = 0; i < id.length() && !bad; i++) {
             char c = id.charAt(i);
             bad = c == '/' || c == '?' || c == '#' || c == '%' || c == '\\' || c <= ' ' || c == 0x7F;
+        }
+        // Then the parser the transport itself uses. A bracket, a brace, a pipe or a non-ASCII space passes the
+        // list above and makes URI.create throw an unchecked exception at send time; measured on JDK 21, the
+        // ASCII ones are " < > [ \ ] ^ ` { | }. Asking the parser keeps this in step with it rather than with
+        // a list of what it was once seen to reject.
+        if (!bad) {
+            try {
+                String path = API + "/vms/" + id;
+                bad = !URI.create("https://xo" + path).getRawPath().equals(path);
+            } catch (IllegalArgumentException e) {
+                bad = true;
+            }
         }
         return bad
                 ? "not a VM id from this backend. It would address a different route, whose 404 reads as a VM"

@@ -1037,7 +1037,20 @@ class XoRestClientTest {
         verbs.put("clearGuestSecret", XoRestClient::clearGuestSecret);
         verbs.put("primaryIpAddress", XoRestClient::primaryIpAddress);
         verbs.put("destroyWithDisks", (client, vm) -> client.destroyWithDisks(vm, OWNER));
-        String[] mangled = {"abc/def", "abc?x=1", "abc#frag", "abc%2Fdef", "..", ".", "abc def", "abc\\def", "abc\ndef"
+        String[] mangled = {
+            "abc/def",
+            "abc?x=1",
+            "abc#frag",
+            "abc%2Fdef",
+            "..",
+            ".",
+            "abc def",
+            "abc\\def",
+            "abc\ndef",
+            "vm[1]",
+            "a{b}",
+            "a|b",
+            "a\u00a0b"
         };
         verbs.forEach((verb, call) -> {
             for (String ref : mangled) {
@@ -1086,10 +1099,13 @@ class XoRestClientTest {
      */
     @Test
     void anIdWithOtherLegalPathCharactersIsSent() {
-        String id = "a:b@c+d=e";
-        ScriptedRest t = new ScriptedRest();
-        new XoRestClient(t).start(new VmRef(id));
-        assertEquals(List.of("POST /rest/v0/vms/" + id + "/actions/start?sync=true"), t.paths());
+        // A non-ASCII letter too: the URI parser the transport uses accepts it, so refusing it would be the
+        // over-wide check this test exists to catch.
+        for (String id : new String[] {"a:b@c+d=e", "vm\u00e9"}) {
+            ScriptedRest t = new ScriptedRest();
+            new XoRestClient(t).start(new VmRef(id));
+            assertEquals(List.of("POST /rest/v0/vms/" + id + "/actions/start?sync=true"), t.paths());
+        }
     }
 
     /**
@@ -1100,16 +1116,22 @@ class XoRestClientTest {
      */
     @Test
     void cloneRefusesACreatedIdThatWouldAddressADifferentRoute() {
-        ScriptedRest t = new ScriptedRest();
-        t.createdId = "../" + CLONE;
-        HypervisorException e = assertThrows(
-                HypervisorException.class,
-                () -> new XoRestClient(t).cloneFromTemplate(new VmRef(POOL + "/" + TEMPLATE_UUID), spec()));
-        assertTrue(e.getMessage().contains("not a VM id from this backend"), e.getMessage());
-        assertTrue(e.getMessage().contains("agent-1"), "must name the VM to remove by hand: " + e.getMessage());
-        assertTrue(
-                t.paths().stream().noneMatch(p -> p.contains(t.createdId)),
-                "nothing may address the refused id: " + t.paths());
+        // A XAPI handle and a bracket are here because the preflight once missed both: the handle check lived
+        // only in the path builder, and a bracket passed every listed character and then failed URI parsing,
+        // so configure threw without the manual-removal message and the cleanup could not address the clone.
+        for (String created : new String[] {"../" + CLONE, "OpaqueRef:9b1f-dead-beef", "vm[1]"}) {
+            ScriptedRest t = new ScriptedRest();
+            t.createdId = created;
+            HypervisorException e = assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).cloneFromTemplate(new VmRef(POOL + "/" + TEMPLATE_UUID), spec()),
+                    "'" + created + "' must be refused");
+            assertTrue(e.getMessage().contains("create_vm answered with"), created + ": " + e.getMessage());
+            assertTrue(e.getMessage().contains("agent-1"), "must name the VM to remove by hand: " + e.getMessage());
+            assertTrue(
+                    t.paths().stream().noneMatch(p -> p.contains(created)),
+                    "nothing may address '" + created + "': " + t.paths());
+        }
     }
 
     /**
