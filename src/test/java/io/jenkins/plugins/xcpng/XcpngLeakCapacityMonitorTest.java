@@ -61,6 +61,26 @@ class XcpngLeakCapacityMonitorTest {
         assertFalse(monitor(r).isActivated());
     }
 
+    /**
+     * A leak no sweep will reclaim gets its own line, since it no longer counts against the cap but still sits on
+     * the pool. A held entry is the fixture: it needs no backend to be in that state.
+     */
+    @Test
+    void aLeakOnlyAPersonCanRemoveIsListedApart(JenkinsRule r) {
+        XcpngCloud cloud = cloud("xcpng-lab");
+        r.jenkins.clouds.add(cloud);
+        XcpngLeakedVmStore.get().record("xcpng-lab", XcpngLeakedVm.legacy("vm-leaked-312"));
+        XcpngLeakedVmStore.get()
+                .record("xcpng-lab", XcpngLeakedVm.of("vm-held-306", cloud).asHeld());
+
+        assertEquals(
+                List.of(
+                        "Cloud xcpng-lab: 1 leaked VM(s) count against Max instances 2",
+                        "Cloud xcpng-lab: 1 leaked VM(s) that cleanup will not delete on its own; they do not count"
+                                + " against Max instances and stay on the pool until removed by hand"),
+                monitor(r).getRows());
+    }
+
     /** The view renders and parses as Jelly, with the row's MessageFormat arguments filled in. */
     @Test
     void theBannerNamesTheCloudAndTheCount(JenkinsRule r) throws Exception {

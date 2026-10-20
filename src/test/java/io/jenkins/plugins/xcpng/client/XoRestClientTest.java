@@ -1153,8 +1153,9 @@ class XoRestClientTest {
         cases.forEach((what, tags) -> {
             ScriptedRest t = new ScriptedRest();
             t.vmTags.addAll(tags);
-            HypervisorException e = assertThrows(
-                    HypervisorException.class,
+            // The type is what the leaked-VM sweep reads to stop counting the entry against the cap (#312).
+            NotOwnedException e = assertThrows(
+                    NotOwnedException.class,
                     () -> new XoRestClient(t).destroyWithDisks(new VmRef(CLONE), OWNER),
                     what + " must be refused");
             assertTrue(e.getMessage().contains("not a VM cloud 'lab' provisioned"), e.getMessage());

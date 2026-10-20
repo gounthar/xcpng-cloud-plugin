@@ -540,6 +540,91 @@ class XcpngProvisionTest {
         assertEquals(1, cloud.leakedHoldingCapacity(), "the agent's own VM is its node, not a second slot");
     }
 
+    /**
+     * A leak the backend refuses as not this cloud's is refused on every sweep, so counting it would hold the slot
+     * for good. The count before the sweep is the control: the same entry holds a slot until the refusal is seen.
+     */
+    @Test
+    void aLeakRefusedAsNotOwnedStopsHoldingASlot(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").refuseDestroyAsNotOwned();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        assertEquals(1, cloud.leakedHoldingCapacity(), "control: before any sweep the entry holds a slot");
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(cloud.leakedVmRefs().contains("vm/leaked/1"), "the entry stays for a person to remove");
+        assertEquals(0, cloud.leakedHoldingCapacity());
+        assertEquals(1, cloud.leakedNeedingAPerson());
+        assertEquals(
+                2,
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .size(),
+                "both slots are free again");
+    }
+
+    /** A refusal is a verdict about the VM as it was; a later failure of another kind makes the entry retryable. */
+    @Test
+    void aRefusedLeakThatLaterFailsOtherwiseHoldsItsSlotAgain(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").refuseDestroyAsNotOwned();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.sweepLeakedVms();
+        assertEquals(0, cloud.leakedHoldingCapacity(), "the fixture must first have seen the refusal");
+
+        fake.recoverDestroy().failDestroy();
+        cloud.sweepLeakedVms();
+
+        assertEquals(1, cloud.leakedHoldingCapacity());
+        assertEquals(0, cloud.leakedNeedingAPerson());
+    }
+
+    /** Dropping an entry forgets its refusal, so the same ref recorded again by a later teardown counts. */
+    @Test
+    void aDroppedRefusalDoesNotFollowTheRefIfItLeaksAgain(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").refuseDestroyAsNotOwned();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.sweepLeakedVms();
+        assertEquals(1, cloud.leakedNeedingAPerson(), "the fixture must first have seen the refusal");
+
+        XcpngLeakedVmStore.get()
+                .drop("xcpng", List.copyOf(XcpngLeakedVmStore.get().entries("xcpng")));
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(1, cloud.leakedHoldingCapacity());
+    }
+
+    /**
+     * One VM recorded under two connection snapshots, because the cloud's settings changed between two teardowns
+     * of it, is one VM and holds one slot.
+     */
+    @Test
+    void oneVmRecordedUnderTwoConnectionsHoldsOneSlot(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.recordLeakedVm(XcpngLeakedVm.legacy("vm/leaked/1"));
+        assertEquals(2, XcpngLeakedVmStore.get().entries("xcpng").size(), "the fixture must hold two entries");
+
+        assertEquals(1, cloud.leakedHoldingCapacity());
+    }
+
+    /** A held entry (#306) waits for a reading that may never come, so it does not hold a slot either. */
+    @Test
+    void aHeldLeakDoesNotHoldASlot(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm(XcpngLeakedVm.of("vm/held/1", cloud).asHeld());
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(1, cloud.leakedHoldingCapacity(), "the plain leak counts, the held one does not");
+        assertEquals(1, cloud.leakedNeedingAPerson());
+    }
+
     @Test
     void leakedVmsHoldWarmPoolSlotsToo(JenkinsRule r) throws Exception {
         XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2, 2);

@@ -67,6 +67,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private boolean resolveFailsAtTransport = false;
     private boolean startFails = false;
     private boolean destroyFails = false;
+    private boolean destroyNotOwned = false;
     private String assignIpOnStart = null;
     private ProvisionSpec lastSpec = null;
 
@@ -143,6 +144,13 @@ public final class FakeHypervisorClient implements HypervisorClient {
      */
     public synchronized FakeHypervisorClient recoverDestroy() {
         this.destroyFails = false;
+        this.destroyNotOwned = false;
+        return this;
+    }
+
+    /** Make {@link #destroyWithDisks} refuse, as the backend does for a VM without this cloud's owner markers. */
+    public synchronized FakeHypervisorClient refuseDestroyAsNotOwned() {
+        this.destroyNotOwned = true;
         return this;
     }
 
@@ -309,6 +317,9 @@ public final class FakeHypervisorClient implements HypervisorClient {
         checkNotInterrupted("destroyWithDisks");
         calls.add("destroyWithDisks:" + vm.value());
         destroyOwners.add(owner);
+        if (destroyNotOwned) {
+            throw new NotOwnedException("refusing to destroy VM " + vm.value() + ": not this cloud's");
+        }
         if (destroyFails) {
             throw new HypervisorException("destroy failed");
         }
