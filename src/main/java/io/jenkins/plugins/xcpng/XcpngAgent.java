@@ -709,6 +709,14 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
         return fallback.openClient();
     }
 
+    /**
+     * Whether this agent carries its own connection details, so {@link #openClientForVm} can reach its VM
+     * without the owning cloud. False only for an agent persisted before the snapshot existed (#149).
+     */
+    boolean hasConnectionSnapshot() {
+        return poolUrl != null;
+    }
+
     @NonNull
     private HypervisorClient openClientFromSnapshot(boolean cloudIsGone) {
         if (connectionClientFactory != null) {
