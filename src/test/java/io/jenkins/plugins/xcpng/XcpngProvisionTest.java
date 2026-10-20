@@ -564,6 +564,62 @@ class XcpngProvisionTest {
         }
     }
 
+    /**
+     * The scrub reaches the VM over the connection the agent was provisioned on, like the clone and the
+     * teardown, so an administrator repointing the cloud while the agent is up does not send it elsewhere.
+     */
+    @Test
+    void onlineScrubsOverTheAgentsConnectionNotTheCloudsCurrentOne(JenkinsRule r) throws Exception {
+        FakeHypervisorClient original = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(original, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
+
+        // The cloud now points at another pool; the agent's snapshot still names the first one.
+        FakeHypervisorClient repointed = new FakeHypervisorClient("jenkins-golden-debian");
+        cloud.setClientFactory(c -> repointed);
+
+        scrubOnOnline(agent.toComputer());
+
+        assertTrue(
+                original.calls().contains("clearGuestSecret:" + agent.getVmRef()),
+                "the scrub must go to the pool the VM was cloned on, calls were " + original.calls());
+        assertTrue(
+                repointed.calls().stream().noneMatch(c -> c.startsWith("clearGuestSecret:")),
+                "the scrub must not reach the cloud's new pool, calls were " + repointed.calls());
+    }
+
+    /** An agent that outlives its cloud still has its own connection details, so its seed is still scrubbed. */
+    @Test
+    void onlineScrubsAnAgentWhoseCloudIsGone(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = provisioned(r, cloud, LINUX_TEMPLATE, "xcpng-agent-1");
+
+        r.jenkins.clouds.remove(cloud);
+        assertNull(agent.getCloud(), "the cloud must be gone for this test to mean anything");
+
+        scrubOnOnline(agent.toComputer());
+
+        assertTrue(
+                fake.calls().contains("clearGuestSecret:" + agent.getVmRef()),
+                "the scrub must go through the agent's snapshot when the cloud is gone, calls were " + fake.calls());
+    }
+
+    private static void scrubOnOnline(Computer computer) throws InterruptedException {
+        ExecutorService scrubs = Executors.newSingleThreadExecutor();
+        XcpngComputerListener listener = new XcpngComputerListener();
+        listener.setScrubExecutor(scrubs);
+        try {
+            listener.onOnline(computer, hudson.model.TaskListener.NULL);
+            scrubs.shutdown();
+            assertTrue(scrubs.awaitTermination(30, TimeUnit.SECONDS), "the scrub should finish");
+        } finally {
+            scrubs.shutdownNow();
+        }
+    }
+
     @Test
     void onlineHandsTheScrubOffTheConnectingThread(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
