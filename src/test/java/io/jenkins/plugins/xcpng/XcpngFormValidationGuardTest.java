@@ -11,6 +11,7 @@ import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.FormValidation;
+import hudson.util.ListBoxModel;
 import hudson.util.Secret;
 import java.util.ArrayList;
 import java.util.List;
@@ -264,6 +265,36 @@ class XcpngFormValidationGuardTest {
         String body = post(r, alice, path, new NameValuePair("poolUrl", "")).getContentAsString();
         assertTrue(isError(body), body);
         assertTrue(body.contains(Messages.XcpngCloud_poolUrl_required()), body);
+    }
+
+    /**
+     * {@code doFillCredentialsIdItems} lists the stored tokens as {@code ACL.SYSTEM2}, so the only thing
+     * between a bystander and every credential id and description on the controller is its own ADMINISTER
+     * branch. The current value passed in is deliberately not the stored token, so the token can only reach
+     * the model through the lookup: the bystander must get the current value alone, and the administrator
+     * must get the token as well.
+     */
+    @Test
+    void aBystanderSeesOnlyTheCurrentCredentialNotTheStoredOnes(JenkinsRule r) throws Exception {
+        addToken();
+        lockDown(r);
+        XcpngCloud.DescriptorImpl cloud = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        String current = "carried-over-credential";
+        asUser(
+                "bob",
+                () -> assertEquals(
+                        List.of(current),
+                        optionValues(cloud.doFillCredentialsIdItems("https://pool.example.test", current)),
+                        "doFillCredentialsIdItems listed stored credentials to a user without ADMINISTER"));
+        asUser("alice", () -> {
+            List<String> values = optionValues(cloud.doFillCredentialsIdItems("https://pool.example.test", current));
+            assertTrue(values.contains(TOKEN_ID), "the administrator was not offered the stored token: " + values);
+            assertTrue(values.contains(current), "the administrator lost the current value: " + values);
+        });
+    }
+
+    private static List<String> optionValues(ListBoxModel model) {
+        return model.stream().map(o -> o.value).toList();
     }
 
     /**
