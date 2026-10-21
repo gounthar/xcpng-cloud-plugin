@@ -18,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArraySet;
@@ -119,6 +120,14 @@ public class XcpngLeakedVmStore implements Saveable {
      * same reason: the count is about this process's log, not about the VM.
      */
     private final transient Map<String, Integer> heldSweeps = new ConcurrentHashMap<>();
+
+    /**
+     * Entries whose last sweep the backend refused because the VM does not carry the cloud's owner markers
+     * (#312). No retry reclaims those, so they do not count against {@code maxInstances}. Runtime state: after a
+     * restart such an entry counts again until the first sweep refuses it, about a minute, which is cheaper than
+     * persisting a verdict that an operator tagging the VM by hand would make stale.
+     */
+    private final transient Set<String> refused = ConcurrentHashMap.newKeySet();
 
     public XcpngLeakedVmStore() {
         load();
@@ -245,6 +254,19 @@ public class XcpngLeakedVmStore implements Saveable {
         return held;
     }
 
+    /** The cloud names holding at least one entry, in name order, configured or not. */
+    @NonNull
+    Set<String> cloudNames() {
+        drainPendingMigrations();
+        Set<String> names = new TreeSet<>();
+        leakedByCloud.forEach((cloudName, vms) -> {
+            if (!vms.isEmpty()) {
+                names.add(cloudName);
+            }
+        });
+        return names;
+    }
+
     /** Just the refs of {@link #entries}, for callers that ask which VMs are recorded, not how to reach them. */
     @NonNull
     Set<String> refs(String cloudName) {
@@ -259,6 +281,23 @@ public class XcpngLeakedVmStore implements Saveable {
      * Whether this is the first failed sweep of {@code vm} since the controller started. Cleared by
      * {@link #drop}, so an entry recorded again later warns again.
      */
+    /** Record whether the last sweep of {@code vm} was refused as not this cloud's (true) or failed otherwise. */
+    void markRefused(String cloudName, @NonNull XcpngLeakedVm vm, boolean notOwned) {
+        if (cloudName == null) {
+            return;
+        }
+        if (notOwned) {
+            refused.add(failureKey(cloudName, vm));
+        } else {
+            refused.remove(failureKey(cloudName, vm));
+        }
+    }
+
+    /** Whether the last sweep of {@code vm} was refused because it does not carry the cloud's owner markers. */
+    boolean isRefused(String cloudName, @NonNull XcpngLeakedVm vm) {
+        return cloudName != null && refused.contains(failureKey(cloudName, vm));
+    }
+
     boolean firstFailure(String cloudName, @NonNull XcpngLeakedVm vm) {
         return cloudName != null && failedOnce.add(failureKey(cloudName, vm));
     }
@@ -299,6 +338,7 @@ public class XcpngLeakedVmStore implements Saveable {
         for (XcpngLeakedVm vm : vms) {
             failedOnce.remove(failureKey(cloudName, vm));
             heldSweeps.remove(failureKey(cloudName, vm));
+            refused.remove(failureKey(cloudName, vm));
         }
         if (changed[0]) {
             saveQuietly();

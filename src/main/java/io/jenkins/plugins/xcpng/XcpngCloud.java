@@ -23,7 +23,9 @@ import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
 import io.jenkins.plugins.xcpng.client.CaCertificates;
 import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
+import io.jenkins.plugins.xcpng.client.CloneLeftBehindException;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.NotOwnedException;
 import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
 import io.jenkins.plugins.xcpng.client.VmGoneException;
@@ -222,6 +224,12 @@ public class XcpngCloud extends Cloud {
      * injects a fake. Transient, like {@link #clientFactory}.
      */
     private transient XcpngAgent.ConnectionClientFactory recordedConnectionClientFactory;
+
+    /**
+     * True only on the stand-in {@link #orphanSweeper} builds for a cloud that is no longer configured. Its own
+     * connection is empty, so it sweeps over recorded connections alone and leaves entries without one.
+     */
+    private transient boolean orphanSweeper;
 
     /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
@@ -749,7 +757,20 @@ public class XcpngCloud extends Cloud {
                     // two disagree about where this VM is.
                     agent.getNetworkName());
             listener.getLogger().println("Cloning XCP-ng template " + template.getTemplateName() + " for this agent.");
-            VmRef clone = client.cloneFromTemplate(templateRef, spec);
+            VmRef clone;
+            try {
+                clone = client.cloneFromTemplate(templateRef, spec);
+            } catch (CloneLeftBehindException e) {
+                // The clone exists and its own cleanup failed (#310). Adopt it before the launcher's teardown
+                // runs, so that teardown retries the destroy and, if that fails too, records the VM as leaked
+                // over this agent's connection, as for any other failed destroy. An agent already torn down
+                // cannot adopt it, so destroy it here as for any other clone that outlived its node (#305).
+                VmRef leftover = e.getVmRef();
+                if (!agent.adoptVmRef(leftover.value())) {
+                    discardUnadoptedClone(client, leftover, agent, listener);
+                }
+                throw e;
+            }
             if (!agent.adoptVmRef(clone.value())) {
                 discardUnadoptedClone(client, clone, agent, listener);
                 throw new IllegalStateException("Agent " + displayName + " was torn down while its VM was being"
@@ -977,7 +998,7 @@ public class XcpngCloud extends Cloud {
         pruneReservations(registered);
         int capacity = Math.max(
                 0,
-                maxInstances - registered.size() - XcpngReservationStore.get().count(name));
+                maxInstances - registered.size() - XcpngReservationStore.get().count(name) - leakedHoldingCapacity());
         for (Map.Entry<String, Integer> pool : warmTargets().entrySet()) {
             String key = pool.getKey();
             int target = pool.getValue();
@@ -1276,6 +1297,11 @@ public class XcpngCloud extends Cloud {
     void sweepLeakedVms() {
         // A snapshot off the store: iterating it cannot throw even if a record lands mid-sweep.
         List<XcpngLeakedVm> pending = new ArrayList<>(XcpngLeakedVmStore.get().entries(name));
+        if (orphanSweeper) {
+            // An entry with no connection of its own could only be swept over the cloud's, and there is none.
+            // Left in the store rather than given up on, for a cloud of this name that may be configured again.
+            pending.removeIf(vm -> !vm.hasConnection());
+        }
         if (pending.isEmpty()) {
             return;
         }
@@ -1316,6 +1342,42 @@ public class XcpngCloud extends Cloud {
             // succeeded. The store drops and persists them in one step.
             XcpngLeakedVmStore.get().drop(name, done);
         }
+    }
+
+    /**
+     * Sweep the leaked entries recorded under names no configured cloud carries any more (#314): a cloud deleted
+     * or renamed while one of its teardowns failed. Called by {@link XcpngWarmPoolMaintainer} after the configured
+     * clouds' own sweeps. Each entry is retried over the connection it recorded, and the destroy still checks the
+     * owner marker under the name the VM was provisioned with, which is the name the entry is filed under.
+     */
+    static void sweepOrphanedLeaks() {
+        Set<String> configured = new HashSet<>();
+        for (Cloud cloud : Jenkins.get().clouds) {
+            if (cloud instanceof XcpngCloud xcpng) {
+                configured.add(xcpng.name);
+            }
+        }
+        for (String cloudName : XcpngLeakedVmStore.get().cloudNames()) {
+            if (configured.contains(cloudName)) {
+                continue;
+            }
+            try {
+                orphanSweeper(cloudName).sweepLeakedVms();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, e, () -> "Leaked-VM sweep failed for removed cloud " + cloudName);
+            }
+        }
+    }
+
+    /**
+     * A cloud of {@code cloudName} with no connection and no templates, never registered, that only sweeps the
+     * leaked entries filed under that name. Package-visible so a test can give it a fake connection factory.
+     */
+    @NonNull
+    static XcpngCloud orphanSweeper(@NonNull String cloudName) {
+        XcpngCloud sweeper = new XcpngCloud(cloudName, null, null, null, 1, List.of());
+        sweeper.orphanSweeper = true;
+        return sweeper;
     }
 
     /**
@@ -1368,7 +1430,12 @@ public class XcpngCloud extends Cloud {
                     client.destroyWithDisks(new VmRef(vm.getVmRef()), name);
                     done.add(vm);
                     LOGGER.log(Level.INFO, () -> "Reclaimed leaked XCP-ng VM " + vm + " for cloud " + name);
+                } catch (NotOwnedException e) {
+                    // No retry changes this answer, so the entry stops holding a slot (#312).
+                    XcpngLeakedVmStore.get().markRefused(name, vm, true);
+                    stillLeaked(vm, e, "is not marked as this cloud's, so it is never destroyed automatically");
                 } catch (RuntimeException e) {
+                    XcpngLeakedVmStore.get().markRefused(name, vm, false);
                     stillLeaked(vm, e, "still could not be destroyed");
                 }
             }
@@ -1603,7 +1670,8 @@ public class XcpngCloud extends Cloud {
      * and the JNLP secret it must present. The secret is an HMAC of the node name, so it is stable and
      * computable here, before the {@link XcpngAgent} node is added and its computer exists. The URL is
      * omitted when the controller has no root URL configured; the guest then has nothing to dial and the
-     * agent is reclaimed by the idle timeout, which is the right outcome for that misconfiguration.
+     * launcher tears the agent down when its online wait runs out, which is the right outcome for that
+     * misconfiguration.
      */
     @NonNull
     private static Map<String, String> seedFor(@NonNull String nodeName, @NonNull XcpngTemplate template) {
@@ -1805,8 +1873,59 @@ public class XcpngCloud extends Cloud {
                     0,
                     maxInstances
                             - registered.size()
-                            - XcpngReservationStore.get().count(name));
+                            - XcpngReservationStore.get().count(name)
+                            - leakedHoldingCapacity());
         });
+    }
+
+    /**
+     * Leaked VMs of this cloud that count against {@link #maxInstances} (#312): recorded because a teardown
+     * could not destroy them, so their node is gone while the VM and its disks are still on the pool. Counting
+     * only nodes let a pool that keeps refusing destroys be cloned past the cap, one leak per attempt.
+     *
+     * <p>Only entries the sweep is still retrying count. A held one (#306) waits for the pool to read it running
+     * and may never; one the backend refused as not this cloud's ({@link NotOwnedException}) is refused on every
+     * sweep. Both need a person, and counting them would let a few such VMs stop provisioning for good, so they
+     * are counted by {@link #leakedNeedingAPerson()} instead. {@link XcpngLeakCapacityMonitor} names the cloud
+     * while either is above zero, because a cap filled by leaks stops provisioning and nothing else would say
+     * why. A ref still recorded on a registered agent is that agent's VM and already counted as its node, so it
+     * is not counted twice.
+     */
+    int leakedHoldingCapacity() {
+        return countLeaked(true);
+    }
+
+    /** Leaked entries of this cloud that no sweep will reclaim on its own: held, or refused as not owned. */
+    int leakedNeedingAPerson() {
+        return countLeaked(false);
+    }
+
+    private int countLeaked(boolean retryable) {
+        Set<String> live = new HashSet<>();
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                String vmRef = agent.getVmRef();
+                if (vmRef != null) {
+                    live.add(vmRef);
+                }
+            }
+        }
+        // Counted by ref, not by entry: a VM id names one VM, and the same id recorded under two connection
+        // snapshots (the cloud's settings changed between two teardowns of it) is still one slot. A ref counts as
+        // retryable while any of its entries is.
+        XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
+        Set<String> retrying = new HashSet<>();
+        Set<String> stuck = new HashSet<>();
+        for (XcpngLeakedVm vm : store.entries(name)) {
+            if (!live.contains(vm.getVmRef())) {
+                (vm.isHeld() || store.isRefused(name, vm) ? stuck : retrying).add(vm.getVmRef());
+            }
+        }
+        if (retryable) {
+            return retrying.size();
+        }
+        stuck.removeAll(retrying);
+        return stuck.size();
     }
 
     /**

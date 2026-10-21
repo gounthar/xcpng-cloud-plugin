@@ -337,7 +337,7 @@ Cloud fields:
 | CA certificate | `caCertificates` | Optional. PEM certificate of the CA that issued the appliance's certificate; several blocks trust several CAs. The appliance is accepted when its certificate chains to one of them and names the host in the URL, and only these CAs are trusted for this cloud, not the JVM's. Survives the appliance's certificate being renewed. Each block must be a CA certificate, and the form refuses a private key. An alternative to the fingerprint: set one or the other. |
 | Backend | `backend` | Optional, and `XO` is the only value that works; it defaults to that. `XAPI` still loads, so a document from an older release does not fail, but a cloud carrying it provisions nothing. |
 | Max instances | `maxInstances` | Upper bound on agents this cloud provisions at once. |
-| Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, **and one that has not connected yet**. That second case is why the value **must exceed the time a clone takes to boot and connect** — an agent that has never come online holds no idle exemption, so too short a value reclaims it mid-boot and no build ever runs (see [Troubleshooting](#troubleshooting)). A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
+| Idle minutes | `idleMinutes` | Minutes before an agent that has not completed a build is reclaimed. Optional; defaults to 10. A build normally reaps its agent on completion (single-use), so this covers the clones that never get that far: one that connects but is never given work, and one that stopped connecting. The clock starts when the agent connects, and an agent still booting is left to the launcher, which gives up on it after 5 minutes offline; so the value does not need to exceed boot time. A launch still running after the larger of this value and 60 minutes is reclaimed anyway. A non-positive value is clamped to the default. Does not apply to online warm-pool spares that have not yet run a build; those are held ready regardless (see [How it works](#how-it-works)). |
 | Templates | `templates` | One or more agent templates (see below). |
 
 Template fields:
@@ -460,10 +460,12 @@ is up.
   the image pinned to a MAC, which `VM.clone` regenerates; see
   [`docs/golden-image.md`](docs/golden-image.md).
 
-**A build never starts and agents are provisioned in a loop.** Check that `idleMinutes` comfortably
-exceeds the time a clone takes to boot and connect. An agent that has never come online holds no idle
-exemption, so a short timeout reclaims it mid-boot, the queue asks for another, and the cycle repeats
-with nothing ever connecting. The default of 10 is fine; a value like 1 is not.
+**A build never starts and agents are provisioned in a loop.** Check the Jenkins log for `Launch of
+agent ... failed` caused by `did not come online within 300000 ms`. The launcher waits 5 minutes for a clone
+to connect and then destroys it, node included, so a template that boots slower than that or never dials
+back (no controller root URL, a guest with no network) loops. Earlier releases also looped when
+`idleMinutes` was shorter than boot time, by reclaiming agents mid-boot; the idle timeout no longer applies
+to an agent that has not connected yet.
 
 **A build waits in the queue and no agent is requested.** Check, in order: that the build's label
 expression matches a template's labels; that the cloud is not already at `maxInstances` (a reloaded agent
@@ -495,12 +497,16 @@ number of waiting builds and what was planned for them.
 - **Deleting a cloud whose credential is also gone leaves its VMs to the reaper.** An agent snapshots
   its cloud's appliance URL, credential ID and TLS-trust setting when it is provisioned, so deleting or
   renaming a cloud while its agents run no longer strands their VMs: teardown resolves the credential
-  from the store and destroys the VM anyway. Two cases still cannot be recovered automatically, and
-  both are logged at SEVERE with the VM reference. If the referenced credential has itself been
-  deleted, or the appliance is unreachable at that moment, there is no cloud left to hold the reference for
-  a later retry — the durable leaked-VM sweep lives on the cloud that was removed. The same applies to
-  an agent provisioned by a version of the plugin older than the snapshot, which reloads with no
-  connection details at all. In both cases `tools/reaper.py` is the recovery path: it selects on the
+  from the store and destroys the VM anyway. A destroy that fails then, because the appliance is
+  unreachable for instance, is kept on the leaked-VM list under the removed cloud's name and retried
+  every minute over the agent's own connection details. Two cases still cannot be recovered
+  automatically, and both are logged at SEVERE with the VM reference. If the referenced credential has
+  itself been deleted, the retry cannot connect and gives up, except on a VM listed as held (one the
+  plugin refused to destroy because it may still be running): that entry stays listed, and it stays even
+  after the VM is removed by hand, since nothing can reach the pool to see that it is gone. And an agent
+  provisioned by a version of the plugin older than the snapshot reloads with no connection details at
+  all. In both cases
+  `tools/reaper.py` is the recovery path: it selects on the
   `xcpng-cloud` owner marker stamped into each clone, so it finds these VMs without needing Jenkins to
   still know about them. The marker is on every live agent and warm spare too, so `--apply` refuses to
   run until it is given the controller's node list with `--keep-nodes`, whose VMs it keeps, or told
