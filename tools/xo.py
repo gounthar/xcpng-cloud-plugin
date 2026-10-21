@@ -122,9 +122,18 @@ class Xo:
         # connection that never upgraded. Read in websocket-client 1.9.0, the version CI
         # installs; a later release added a "Redirect limit exhausted" raise, so this check is
         # also what keeps the behaviour the same across versions the lock file does not pin.
-        self._ws = websocket.create_connection(
-            self.url, sslopt=sslopt, timeout=self.timeout, redirect_limit=0
-        )
+        #
+        # A refused connection, a TLS failure or a reset raises OSError or WebSocketException
+        # here, and both used to escape raw. Every caller handles XoError only (xo_probe and
+        # xo_compare run their cleanup from that one except), so a raw one skipped the
+        # cleanup and left whatever the run had already created. Same rule as the
+        # TRANSPORT wrap in xo_rest.py.
+        try:
+            self._ws = websocket.create_connection(
+                self.url, sslopt=sslopt, timeout=self.timeout, redirect_limit=0
+            )
+        except (websocket.WebSocketException, OSError) as exc:
+            raise XoError("TRANSPORT", f"could not open {self.url}: {exc}") from None
         handshake = getattr(self._ws, "handshake_response", None)
         status = getattr(handshake, "status", None)
         if status != SWITCHING_PROTOCOLS:
@@ -212,8 +221,13 @@ class Xo:
                 "method": method,
                 "params": params if params is not None else {},
             }))
-        except websocket.WebSocketTimeoutException:
+        except (websocket.WebSocketTimeoutException, TimeoutError):
             raise XoError("TIMEOUT", f"{method} could not be sent within {budget}s") from None
+        except (websocket.WebSocketException, OSError) as exc:
+            # After the timeout clause on purpose: WebSocketTimeoutException is a
+            # WebSocketException and TimeoutError is an OSError, and xo_compare tells a
+            # timed-out create apart by the TIMEOUT message to go looking for the VM.
+            raise XoError("TRANSPORT", f"{method} could not be sent: {exc}") from None
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -221,8 +235,16 @@ class Xo:
             self._ws.settimeout(remaining)
             try:
                 frame = self._ws.recv()
-            except websocket.WebSocketTimeoutException:
+            except (websocket.WebSocketTimeoutException, TimeoutError):
                 raise XoError("TIMEOUT", f"{method} did not answer within {budget}s") from None
+            except (websocket.WebSocketException, OSError) as exc:
+                # The request went out, so XO may have acted on it. Said in the message
+                # because the socket is gone and nothing on it can check.
+                raise XoError(
+                    "TRANSPORT",
+                    f"{method} was sent but the connection failed before the answer, so it "
+                    f"may have taken effect: {exc}",
+                ) from None
 
             try:
                 msg = json.loads(frame)

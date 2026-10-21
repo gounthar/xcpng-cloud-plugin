@@ -86,5 +86,7 @@ public class XcpngWarmPoolMaintainer extends AsyncPeriodicWork {
                 }
             }
         }
+        // Then the leaks of clouds that were removed or renamed, which no loop over the configured clouds reaches.
+        XcpngCloud.sweepOrphanedLeaks();
     }
 }

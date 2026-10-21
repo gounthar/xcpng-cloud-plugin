@@ -7,8 +7,13 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * {@link RestTransport} over HTTPS to a Xen Orchestra appliance.
@@ -56,12 +61,27 @@ final class HttpRestTransport implements RestTransport {
         if (jsonBody != null) {
             builder.header("Content-Type", "application/json");
         }
+        // HttpRequest.timeout stops counting once the headers arrive, so an appliance that sends them and
+        // then stalls mid-body would hold this thread for as long as the connection stays open (#320). The
+        // deadline on the future bounds the whole answer, and cancelling it aborts the exchange.
+        CompletableFuture<HttpResponse<String>> pending =
+                http.sendAsync(builder.build(), HttpResponse.BodyHandlers.ofString());
         HttpResponse<String> resp;
         try {
-            resp = http.send(builder.build(), HttpResponse.BodyHandlers.ofString());
+            resp = pending.get(timeout.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            pending.cancel(true);
+            throw new HttpTimeoutException("no complete response from " + method + " " + path + " within " + timeout);
         } catch (InterruptedException e) {
+            pending.cancel(true);
             Thread.currentThread().interrupt();
             throw new IOException("interrupted", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof IOException io) {
+                throw io;
+            }
+            throw new IOException(cause);
         }
         // Unlike the JSON-RPC transport, a non-2xx is not an IOException here. XO puts a readable
         // {"error": ...} envelope on its failures and the client branches on the status, so turning a 404

@@ -3,7 +3,13 @@
   non-positive value is clamped back to 10.
   <p>
     Because every agent is single-use, a build normally reaps its own agent on completion. This timeout
-    is only the safety net for a clone that connects but never receives work.
+    is only the safety net for a clone that connects but never receives work. It counts from the moment
+    the agent connects.
+  </p>
+  <p>
+    It does not cut short an agent that is still booting: the launcher waits up to 5 minutes for a clone to
+    connect, then destroys it. A launch still running after the larger of this timeout and 60 minutes is
+    reclaimed anyway.
   </p>
   <p>
     It does not apply to online warm-pool spares that have not yet run a build: a spare is deliberately
