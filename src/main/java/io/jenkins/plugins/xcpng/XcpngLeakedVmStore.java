@@ -120,6 +120,14 @@ public class XcpngLeakedVmStore implements Saveable {
      */
     private final transient Map<String, Integer> heldSweeps = new ConcurrentHashMap<>();
 
+    /**
+     * Entries whose last sweep the backend refused because the VM does not carry the cloud's owner markers
+     * (#312). No retry reclaims those, so they do not count against {@code maxInstances}. Runtime state: after a
+     * restart such an entry counts again until the first sweep refuses it, about a minute, which is cheaper than
+     * persisting a verdict that an operator tagging the VM by hand would make stale.
+     */
+    private final transient Set<String> refused = ConcurrentHashMap.newKeySet();
+
     public XcpngLeakedVmStore() {
         load();
         // Not only in load(): a store whose file does not exist yet still has to pick up a deferral.
@@ -259,6 +267,23 @@ public class XcpngLeakedVmStore implements Saveable {
      * Whether this is the first failed sweep of {@code vm} since the controller started. Cleared by
      * {@link #drop}, so an entry recorded again later warns again.
      */
+    /** Record whether the last sweep of {@code vm} was refused as not this cloud's (true) or failed otherwise. */
+    void markRefused(String cloudName, @NonNull XcpngLeakedVm vm, boolean notOwned) {
+        if (cloudName == null) {
+            return;
+        }
+        if (notOwned) {
+            refused.add(failureKey(cloudName, vm));
+        } else {
+            refused.remove(failureKey(cloudName, vm));
+        }
+    }
+
+    /** Whether the last sweep of {@code vm} was refused because it does not carry the cloud's owner markers. */
+    boolean isRefused(String cloudName, @NonNull XcpngLeakedVm vm) {
+        return cloudName != null && refused.contains(failureKey(cloudName, vm));
+    }
+
     boolean firstFailure(String cloudName, @NonNull XcpngLeakedVm vm) {
         return cloudName != null && failedOnce.add(failureKey(cloudName, vm));
     }
@@ -299,6 +324,7 @@ public class XcpngLeakedVmStore implements Saveable {
         for (XcpngLeakedVm vm : vms) {
             failedOnce.remove(failureKey(cloudName, vm));
             heldSweeps.remove(failureKey(cloudName, vm));
+            refused.remove(failureKey(cloudName, vm));
         }
         if (changed[0]) {
             saveQuietly();

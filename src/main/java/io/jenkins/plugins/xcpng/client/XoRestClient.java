@@ -1437,7 +1437,7 @@ public final class XoRestClient implements HypervisorClient {
         String ownerTag = OWNER_TAG_PREFIX + owner;
         String selfTag = SELF_TAG_PREFIX + uuid;
         if (uuid.isBlank() || !tags.contains(ownerTag) || !tags.contains(selfTag)) {
-            throw new HypervisorException("refusing to destroy VM " + vm.value() + ": it does not carry both '"
+            throw new NotOwnedException("refusing to destroy VM " + vm.value() + ": it does not carry both '"
                     + ownerTag + "' and '" + SELF_TAG_PREFIX + "<its own uuid>', so it is not a VM cloud '" + owner
                     + "' provisioned. Its tags are " + tags + ".");
         }

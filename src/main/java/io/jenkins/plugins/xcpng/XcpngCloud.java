@@ -25,6 +25,7 @@ import io.jenkins.plugins.xcpng.client.CaCertificates;
 import io.jenkins.plugins.xcpng.client.CertificateFingerprint;
 import io.jenkins.plugins.xcpng.client.CloneLeftBehindException;
 import io.jenkins.plugins.xcpng.client.HypervisorClient;
+import io.jenkins.plugins.xcpng.client.NotOwnedException;
 import io.jenkins.plugins.xcpng.client.PoolTrust;
 import io.jenkins.plugins.xcpng.client.ProvisionSpec;
 import io.jenkins.plugins.xcpng.client.VmGoneException;
@@ -991,7 +992,7 @@ public class XcpngCloud extends Cloud {
         pruneReservations(registered);
         int capacity = Math.max(
                 0,
-                maxInstances - registered.size() - XcpngReservationStore.get().count(name));
+                maxInstances - registered.size() - XcpngReservationStore.get().count(name) - leakedHoldingCapacity());
         for (Map.Entry<String, Integer> pool : warmTargets().entrySet()) {
             String key = pool.getKey();
             int target = pool.getValue();
@@ -1382,7 +1383,12 @@ public class XcpngCloud extends Cloud {
                     client.destroyWithDisks(new VmRef(vm.getVmRef()), name);
                     done.add(vm);
                     LOGGER.log(Level.INFO, () -> "Reclaimed leaked XCP-ng VM " + vm + " for cloud " + name);
+                } catch (NotOwnedException e) {
+                    // No retry changes this answer, so the entry stops holding a slot (#312).
+                    XcpngLeakedVmStore.get().markRefused(name, vm, true);
+                    stillLeaked(vm, e, "is not marked as this cloud's, so it is never destroyed automatically");
                 } catch (RuntimeException e) {
+                    XcpngLeakedVmStore.get().markRefused(name, vm, false);
                     stillLeaked(vm, e, "still could not be destroyed");
                 }
             }
@@ -1819,8 +1825,59 @@ public class XcpngCloud extends Cloud {
                     0,
                     maxInstances
                             - registered.size()
-                            - XcpngReservationStore.get().count(name));
+                            - XcpngReservationStore.get().count(name)
+                            - leakedHoldingCapacity());
         });
+    }
+
+    /**
+     * Leaked VMs of this cloud that count against {@link #maxInstances} (#312): recorded because a teardown
+     * could not destroy them, so their node is gone while the VM and its disks are still on the pool. Counting
+     * only nodes let a pool that keeps refusing destroys be cloned past the cap, one leak per attempt.
+     *
+     * <p>Only entries the sweep is still retrying count. A held one (#306) waits for the pool to read it running
+     * and may never; one the backend refused as not this cloud's ({@link NotOwnedException}) is refused on every
+     * sweep. Both need a person, and counting them would let a few such VMs stop provisioning for good, so they
+     * are counted by {@link #leakedNeedingAPerson()} instead. {@link XcpngLeakCapacityMonitor} names the cloud
+     * while either is above zero, because a cap filled by leaks stops provisioning and nothing else would say
+     * why. A ref still recorded on a registered agent is that agent's VM and already counted as its node, so it
+     * is not counted twice.
+     */
+    int leakedHoldingCapacity() {
+        return countLeaked(true);
+    }
+
+    /** Leaked entries of this cloud that no sweep will reclaim on its own: held, or refused as not owned. */
+    int leakedNeedingAPerson() {
+        return countLeaked(false);
+    }
+
+    private int countLeaked(boolean retryable) {
+        Set<String> live = new HashSet<>();
+        for (Node node : Jenkins.get().getNodes()) {
+            if (node instanceof XcpngAgent agent && name.equals(agent.getCloudName())) {
+                String vmRef = agent.getVmRef();
+                if (vmRef != null) {
+                    live.add(vmRef);
+                }
+            }
+        }
+        // Counted by ref, not by entry: a VM id names one VM, and the same id recorded under two connection
+        // snapshots (the cloud's settings changed between two teardowns of it) is still one slot. A ref counts as
+        // retryable while any of its entries is.
+        XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
+        Set<String> retrying = new HashSet<>();
+        Set<String> stuck = new HashSet<>();
+        for (XcpngLeakedVm vm : store.entries(name)) {
+            if (!live.contains(vm.getVmRef())) {
+                (vm.isHeld() || store.isRefused(name, vm) ? stuck : retrying).add(vm.getVmRef());
+            }
+        }
+        if (retryable) {
+            return retrying.size();
+        }
+        stuck.removeAll(retrying);
+        return stuck.size();
     }
 
     /**
