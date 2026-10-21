@@ -1,0 +1,11 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+  <div class="jenkins-alert jenkins-alert-warning">
+    <p>${%intro}</p>
+    <ul>
+      <j:forEach var="row" items="${it.rows}">
+        <li>${row}</li>
+      </j:forEach>
+    </ul>
+  </div>
+</j:jelly>

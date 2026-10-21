@@ -498,6 +498,144 @@ class XcpngProvisionTest {
         assertEquals(2, planned.size());
     }
 
+    /**
+     * A leaked VM's node is gone but the VM is still on the pool, so it holds a slot (#312). The control is the
+     * test above: the same cloud with no leaks plans two.
+     */
+    @Test
+    void leakedVmsCountAgainstTheInstanceCap(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(
+                1,
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .size(),
+                "one leaked VM leaves one slot of two");
+    }
+
+    @Test
+    void leakedVmsCanFillTheInstanceCap(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.recordLeakedVm("vm/leaked/2");
+
+        assertTrue(
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .isEmpty(),
+                "two leaked VMs fill a cap of two");
+    }
+
+    @Test
+    void aLeakedVmStillRecordedOnARegisteredAgentIsNotCountedTwice(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        XcpngAgent agent = reloadedSpare(cloud, "xcpng-agent-1");
+        r.jenkins.addNode(agent);
+        cloud.recordLeakedVm("vm/xcpng-agent-1/1");
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(1, cloud.leakedHoldingCapacity(), "the agent's own VM is its node, not a second slot");
+    }
+
+    /**
+     * A leak the backend refuses as not this cloud's is refused on every sweep, so counting it would hold the slot
+     * for good. The count before the sweep is the control: the same entry holds a slot until the refusal is seen.
+     */
+    @Test
+    void aLeakRefusedAsNotOwnedStopsHoldingASlot(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").refuseDestroyAsNotOwned();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        assertEquals(1, cloud.leakedHoldingCapacity(), "control: before any sweep the entry holds a slot");
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(cloud.leakedVmRefs().contains("vm/leaked/1"), "the entry stays for a person to remove");
+        assertEquals(0, cloud.leakedHoldingCapacity());
+        assertEquals(1, cloud.leakedNeedingAPerson());
+        assertEquals(
+                2,
+                cloud.provision(new Cloud.CloudState(Label.get("xcpng-linux"), 0), 5)
+                        .size(),
+                "both slots are free again");
+    }
+
+    /** A refusal is a verdict about the VM as it was; a later failure of another kind makes the entry retryable. */
+    @Test
+    void aRefusedLeakThatLaterFailsOtherwiseHoldsItsSlotAgain(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").refuseDestroyAsNotOwned();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.sweepLeakedVms();
+        assertEquals(0, cloud.leakedHoldingCapacity(), "the fixture must first have seen the refusal");
+
+        fake.recoverDestroy().failDestroy();
+        cloud.sweepLeakedVms();
+
+        assertEquals(1, cloud.leakedHoldingCapacity());
+        assertEquals(0, cloud.leakedNeedingAPerson());
+    }
+
+    /** Dropping an entry forgets its refusal, so the same ref recorded again by a later teardown counts. */
+    @Test
+    void aDroppedRefusalDoesNotFollowTheRefIfItLeaksAgain(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").refuseDestroyAsNotOwned();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.sweepLeakedVms();
+        assertEquals(1, cloud.leakedNeedingAPerson(), "the fixture must first have seen the refusal");
+
+        XcpngLeakedVmStore.get()
+                .drop("xcpng", List.copyOf(XcpngLeakedVmStore.get().entries("xcpng")));
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(1, cloud.leakedHoldingCapacity());
+    }
+
+    /**
+     * One VM recorded under two connection snapshots, because the cloud's settings changed between two teardowns
+     * of it, is one VM and holds one slot.
+     */
+    @Test
+    void oneVmRecordedUnderTwoConnectionsHoldsOneSlot(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 3);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+        cloud.recordLeakedVm(XcpngLeakedVm.legacy("vm/leaked/1"));
+        assertEquals(2, XcpngLeakedVmStore.get().entries("xcpng").size(), "the fixture must hold two entries");
+
+        assertEquals(1, cloud.leakedHoldingCapacity());
+    }
+
+    /** A held entry (#306) waits for a reading that may never come, so it does not hold a slot either. */
+    @Test
+    void aHeldLeakDoesNotHoldASlot(JenkinsRule r) {
+        XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm(XcpngLeakedVm.of("vm/held/1", cloud).asHeld());
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        assertEquals(1, cloud.leakedHoldingCapacity(), "the plain leak counts, the held one does not");
+        assertEquals(1, cloud.leakedNeedingAPerson());
+    }
+
+    @Test
+    void leakedVmsHoldWarmPoolSlotsToo(JenkinsRule r) throws Exception {
+        XcpngCloud cloud = warmCloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2, 2);
+        r.jenkins.clouds.add(cloud);
+        cloud.recordLeakedVm("vm/leaked/1");
+
+        reconcileAndSettle(cloud);
+
+        assertEquals(1, warmNodeCount(r), "a warm pool of two under a cap of two, one slot leaked: one spare");
+    }
+
     @Test
     void provisionPlansTrackedNodesCarryingTheActivityId(JenkinsRule r) {
         XcpngCloud cloud = cloudBackedBy(new FakeHypervisorClient("jenkins-golden-debian"), 2);
@@ -2310,6 +2448,45 @@ class XcpngProvisionTest {
 
         assertTrue(
                 cloud.leakedVmRefs().isEmpty(), "the recovered sweep must reclaim the clone: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void aCloneItsOwnCleanupLeftBehindIsDestroyedByTheLaunchTeardown(JenkinsRule r) throws Exception {
+        // #310. The backend created the clone, failed to configure it, and failed to destroy it. Before, it
+        // logged the id and threw an exception that did not carry it, so the agent never learned the VM existed.
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").leaveCloneBehind();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+
+        awaitTrue(
+                () -> fake.calls().contains("destroyWithDisks:vm/xcpng-agent-1/1"),
+                () -> "the launch teardown must reach the clone the backend left behind: " + fake.calls());
+        assertFalse(
+                fake.calls().contains("start:vm/xcpng-agent-1/1"),
+                "a clone that failed to configure must not be started: " + fake.calls());
+        assertTrue(
+                cloud.leakedVmRefs().isEmpty(),
+                "a destroy that worked leaves nothing recorded: " + cloud.leakedVmRefs());
+    }
+
+    @Test
+    void aCloneLeftBehindThatStillCannotBeDestroyedIsRecordedAsLeaked(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian")
+                .leaveCloneBehind()
+                .failDestroy();
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        r.jenkins.clouds.add(cloud);
+
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+
+        awaitTrue(
+                () -> cloud.leakedVmRefs().contains("vm/xcpng-agent-1/1"),
+                () -> "a clone left behind whose teardown also failed must be recorded as leaked: "
+                        + cloud.leakedVmRefs());
     }
 
     @Test
