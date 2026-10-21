@@ -3,6 +3,7 @@ package io.jenkins.plugins.xcpng;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -25,11 +26,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import jenkins.model.Jenkins;
+import org.htmlunit.HttpMethod;
+import org.htmlunit.WebRequest;
+import org.htmlunit.WebResponse;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.kohsuke.stapler.HttpResponses;
 import org.springframework.security.access.AccessDeniedException;
 
 /**
@@ -162,7 +167,7 @@ class XcpngIssuedAgentTest {
     }
 
     @Test
-    void replacingTheNodeFromXmlNeedsAdminister(JenkinsRule r) throws Exception {
+    void replacingTheNodeFromXmlIsRefused(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake);
         r.jenkins.clouds.add(cloud);
@@ -185,12 +190,32 @@ class XcpngIssuedAgentTest {
             assertThrows(AccessDeniedException.class, () -> agent.toComputer().updateByXml(stream(agentXml)));
         }
         try (ACLContext ignored = ACL.as2(User.getById("admin", true).impersonate2())) {
-            assertDoesNotThrow(() -> agent.toComputer().updateByXml(stream(agentXml)));
+            assertThrows(
+                    HttpResponses.HttpResponseException.class,
+                    () -> agent.toComputer().updateByXml(stream(agentXml)));
         }
-        // The replacement comes out of readResolve marked reloaded, so the retention check core runs on
-        // setNode reaps it on another thread. Let that finish, or teardown deletes JENKINS_HOME under the
-        // reap writing the agent's log.
-        awaitTrue(() -> r.jenkins.getNode("xcpng-agent-1") == null, "the replaced agent was never reaped");
+        // The same refusal on the route a client actually takes. errorWithoutStack carries no exception
+        // message, so the text is only visible in the response. An API token skips the crumb, which a raw
+        // XML body has nowhere to carry as a parameter.
+        JenkinsRule.WebClient wc = r.createWebClient().withBasicApiToken("admin");
+        wc.setThrowExceptionOnFailingStatusCode(false);
+        WebRequest post = new WebRequest(
+                new java.net.URI(r.getURL() + "computer/xcpng-agent-1/config.xml").toURL(), HttpMethod.POST);
+        post.setAdditionalHeader("Content-Type", "application/xml");
+        post.setRequestBody(agentXml);
+        WebResponse response = wc.getPage(post).getWebResponse();
+        assertEquals(400, response.getStatusCode(), response.getContentAsString());
+        assertTrue(
+                response.getContentAsString().contains("cannot be replaced from its config.xml"),
+                "the refusal should say why: " + response.getContentAsString());
+        // A replace would have come out of readResolve marked reloaded and been reaped within about a second
+        // (#354). Give it well past that, then check the original agent is still the registered one.
+        Thread.sleep(3_000);
+        assertSame(agent, r.jenkins.getNode("xcpng-agent-1"), "a refused replace must leave the agent in place");
+        assertFalse(agent.isReloaded());
+        assertFalse(
+                fake.calls().stream().anyMatch(c -> c.startsWith("destroy")),
+                "nothing may be destroyed: " + fake.calls());
     }
 
     private static ByteArrayInputStream stream(String xml) {
