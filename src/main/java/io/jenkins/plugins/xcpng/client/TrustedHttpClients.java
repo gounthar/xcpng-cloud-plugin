@@ -18,10 +18,10 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManager;
@@ -53,10 +53,16 @@ final class TrustedHttpClients {
     // pinned client per distinct fingerprint. The pinned map is keyed by fingerprint rather than by URL
     // because the certificate, not the address, is what the client is built around -- two clouds pointing
     // at the same pool share one client, and a re-pinned pool gets a new one.
+    //
+    // Both maps are bounded, least recently used first out (#322); unbounded, every re-pin or CA change
+    // kept a client and its selector thread until restart. Evicting closes nothing: a transport still
+    // holding the client keeps using it, and once none does, the JDK stops its selector thread on its own
+    // (it holds the client only weakly). Measured on JDK 21.0.12: 20 dropped clients, 20 selector threads,
+    // none left after a GC. A cloud whose client was evicted gets a new one on its next call.
     private static final HttpClient SHARED =
             HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
 
-    private static final Map<String, HttpClient> PINNED = new ConcurrentHashMap<>();
+    private static final Map<String, HttpClient> PINNED = boundedCache();
 
     /**
      * One CA-anchored client per distinct set of anchors, keyed by their fingerprints in sorted order. Not
@@ -64,9 +70,34 @@ final class TrustedHttpClients {
      * authorities in the other order, shares a client; and never keyed by a fingerprint alone, which is
      * {@link #PINNED}'s key and means something else entirely.
      */
-    private static final Map<String, HttpClient> ANCHORED = new ConcurrentHashMap<>();
+    private static final Map<String, HttpClient> ANCHORED = boundedCache();
+
+    /** How many pinned, and separately how many CA-anchored, clients are kept (#322). */
+    static final int CACHE_LIMIT = 8;
 
     private TrustedHttpClients() {}
+
+    /**
+     * An access-ordered map that drops its least recently used entry past {@link #CACHE_LIMIT}. Synchronized,
+     * so {@code computeIfAbsent} builds a missing client under the map's lock; that is an SSL context, and
+     * only on a trust setting not seen recently.
+     */
+    private static Map<String, HttpClient> boundedCache() {
+        return Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, HttpClient> eldest) {
+                return size() > CACHE_LIMIT;
+            }
+        });
+    }
+
+    static int pinnedClientCount() {
+        return PINNED.size();
+    }
+
+    static int anchoredClientCount() {
+        return ANCHORED.size();
+    }
 
     /**
      * The client for {@code trust}.
