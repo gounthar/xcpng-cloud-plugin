@@ -490,9 +490,10 @@ number of waiting builds and what was planned for them.
   without this check, since the node and its channel are gone by then; the minute of re-reads is the
   only hold that is guaranteed. An agent that was not connected gives no such evidence, so its VM is
   destroyed on XAPI's word as before. The root cause and frequency are unknown. The operator-side safety net is
-  `tools/reaper.py --dom0-check`, which reads `xl list` directly from dom0 and refuses to reap any VM
-  that XAPI reports `Halted` while Xen still has a live domain for it; run it before and after a batch
-  of provisioning on a shared pool.
+  `tools/reaper.py --dom0-check`, which reads `xl list` directly from the dom0 of every host in the pool
+  and refuses to reap any VM that XAPI reports `Halted` while Xen still has a live domain for it; run it
+  before and after a batch of provisioning on a shared pool. It connects as root over ssh and refuses a
+  host whose key is not in your `known_hosts`, so ssh to each host once first and check the fingerprint.
 
 - **Deleting a cloud whose credential is also gone leaves its VMs to the reaper.** An agent snapshots
   its cloud's appliance URL, credential ID and TLS-trust setting when it is provisioned, so deleting or

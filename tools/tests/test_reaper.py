@@ -319,7 +319,7 @@ def test_prefix_and_cloud_together_are_refused(monkeypatch):
 def _stub_dom0(monkeypatch, live=(), raises=None):
     """Replace the dom0 ssh call with a canned answer (or failure). No network."""
 
-    def fake(host, password):
+    def fake(*args, **kwargs):
         if raises is not None:
             raise raises
         return set(live)
@@ -417,48 +417,161 @@ def test_without_the_flag_dom0_is_never_contacted(pool, monkeypatch):
     assert fake.destroyed == ["vm-1"]
 
 
-# ---- the ssh helper itself ----
+# ---- the ssh helper itself (#317) ----
+
+XL = (
+    "Name                                    ID   Mem VCPUs\tState\tTime(s)\n"
+    "Domain-0                                 0  2048     6     r-----   1234.5\n"
+    "244561b4-1fdf-6739-6fec-006defa76152    18  2048     2     -b----     12.3\n"
+)
+
+
+class _Ssh:
+    """Stands in for subprocess.run: answers each host from a script, and records every call."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        host = next(a.split("@", 1)[1] for a in argv if a.startswith("root@"))
+        mode = "password" if argv[0] == "sshpass" else "key"
+        answer = self.answers[(host, mode)]
+        if isinstance(answer, str) and answer.startswith("ERR:"):
+            raise reaper.subprocess.CalledProcessError(255, argv, stderr=answer[4:])
+        return types.SimpleNamespace(stdout=answer)
+
+
+def _install(monkeypatch, answers, sshpass="/usr/bin/sshpass"):
+    ssh = _Ssh(answers)
+    monkeypatch.setattr(reaper.subprocess, "run", ssh)
+    monkeypatch.setattr(reaper.shutil, "which", lambda _: sshpass)
+    return ssh
 
 
 def test_live_domains_parses_xl_list(monkeypatch):
     """Every `xl list` row past the header contributes its first column as a live domain name."""
-    monkeypatch.setattr(reaper.shutil, "which", lambda _: "/usr/bin/sshpass")
-    xl = (
-        "Name                                    ID   Mem VCPUs\tState\tTime(s)\n"
-        "Domain-0                                 0  2048     6     r-----   1234.5\n"
-        "244561b4-1fdf-6739-6fec-006defa76152    18  2048     2     -b----     12.3\n"
-    )
-    monkeypatch.setattr(
-        reaper.subprocess, "run", lambda *a, **k: types.SimpleNamespace(stdout=xl)
-    )
-
-    assert reaper.live_domains_on_dom0("dom0.invalid", "pw") == {
+    _install(monkeypatch, {("h1", "key"): XL})
+    assert reaper.live_domains_on_dom0(["h1"], "pw") == {
         "Domain-0",
         "244561b4-1fdf-6739-6fec-006defa76152",
     }
 
 
-def test_live_domains_raises_without_sshpass(monkeypatch):
-    """No sshpass means the check cannot run; say so rather than pretend dom0 is clean."""
-    monkeypatch.setattr(reaper.shutil, "which", lambda _: None)
+def test_every_call_checks_the_host_key(monkeypatch):
+    """The password goes to root on dom0. With checking off, whatever answered port 22 got it."""
+    ssh = _install(monkeypatch, {("h1", "key"): "ERR:Permission denied (publickey).", ("h1", "password"): XL})
+    reaper.live_domains_on_dom0(["h1"], "pw")
+    assert len(ssh.calls) == 2, "the fixture must exercise both the key and the password call"
+    for argv, _kwargs in ssh.calls:
+        assert "StrictHostKeyChecking=yes" in argv, argv
+        assert "StrictHostKeyChecking=no" not in argv and "UserKnownHostsFile=/dev/null" not in argv, argv
+
+
+def test_the_key_is_tried_first_and_the_password_is_not_sent(monkeypatch):
+    ssh = _install(monkeypatch, {("h1", "key"): XL})
+    reaper.live_domains_on_dom0(["h1"], "pw")
+    [(argv, kwargs)] = ssh.calls
+    assert argv[0] == "ssh" and "BatchMode=yes" in argv
+    assert "SSHPASS" not in (kwargs.get("env") or {}), "no password in the key attempt's environment"
+
+
+def test_the_password_follows_only_a_refused_key(monkeypatch):
+    ssh = _install(monkeypatch, {("h1", "key"): "ERR:Permission denied (publickey).", ("h1", "password"): XL})
+    assert "Domain-0" in reaper.live_domains_on_dom0(["h1"], "pw")
+    argv, kwargs = ssh.calls[1]
+    assert argv[:2] == ["sshpass", "-e"] and kwargs["env"]["SSHPASS"] == "pw"
+
+
+def test_too_many_offered_keys_is_a_refusal_too(monkeypatch):
+    """What the lab pool answered an ssh agent holding many keys, with no --dom0-identity given."""
+    ssh = _install(
+        monkeypatch,
+        {
+            ("h1", "key"): "ERR:Received disconnect from h1 port 22:2: Too many authentication failures",
+            ("h1", "password"): XL,
+        },
+    )
+    assert "Domain-0" in reaper.live_domains_on_dom0(["h1"], "pw")
+    assert [argv[0] for argv, _ in ssh.calls] == ["ssh", "sshpass"]
+
+
+def test_an_unknown_host_key_never_gets_the_password(monkeypatch):
+    """The case #317 is about: a host that is not the one known_hosts names gets nothing."""
+    ssh = _install(monkeypatch, {("h1", "key"): "ERR:Host key verification failed."})
     with pytest.raises(XapiError) as caught:
-        reaper.live_domains_on_dom0("dom0.invalid", "pw")
+        reaper.live_domains_on_dom0(["h1"], "pw")
+    assert caught.value.message == "DOM0_UNREACHABLE"
+    assert "known_hosts" in str(caught.value)
+    assert [argv[0] for argv, _ in ssh.calls] == ["ssh"], "no password attempt after a host key failure"
+
+
+def test_no_password_means_no_fallback(monkeypatch):
+    ssh = _install(monkeypatch, {("h1", "key"): "ERR:Permission denied (publickey)."})
+    with pytest.raises(XapiError) as caught:
+        reaper.live_domains_on_dom0(["h1"], "")
+    assert caught.value.message == "DOM0_UNREACHABLE"
+    assert len(ssh.calls) == 1
+
+
+def test_the_password_fallback_needs_sshpass(monkeypatch):
+    """No sshpass means the fallback cannot run; say so rather than pretend dom0 is clean."""
+    _install(monkeypatch, {("h1", "key"): "ERR:Permission denied (publickey)."}, sshpass=None)
+    with pytest.raises(XapiError) as caught:
+        reaper.live_domains_on_dom0(["h1"], "pw")
     assert caught.value.message == "DOM0_CHECK_UNAVAILABLE"
 
 
-def test_live_domains_raises_when_ssh_fails(monkeypatch):
-    """A failed ssh must raise (fail closed), not return an empty, reassuring set."""
-    monkeypatch.setattr(reaper.shutil, "which", lambda _: "/usr/bin/sshpass")
+def test_a_key_that_works_needs_no_sshpass(monkeypatch):
+    _install(monkeypatch, {("h1", "key"): XL}, sshpass=None)
+    assert "Domain-0" in reaper.live_domains_on_dom0(["h1"], "pw")
 
-    def boom(*args, **kwargs):
-        raise reaper.subprocess.CalledProcessError(
-            255, "ssh", stderr="Permission denied"
-        )
 
-    monkeypatch.setattr(reaper.subprocess, "run", boom)
-    with pytest.raises(XapiError) as caught:
-        reaper.live_domains_on_dom0("dom0.invalid", "pw")
-    assert caught.value.message == "DOM0_UNREACHABLE"
+def test_every_host_is_read_and_one_unreadable_host_fails_the_check(monkeypatch):
+    """A VM's domain runs on the host it is resident on, so each host's dom0 is read."""
+    other = "Name ID\nvm-on-h2 3 1024 1 -b---- 1.0\n"
+    _install(monkeypatch, {("h1", "key"): XL, ("h2", "key"): other})
+    live = reaper.live_domains_on_dom0(["h1", "h2"], "pw")
+    assert "vm-on-h2" in live and "Domain-0" in live
+
+    _install(monkeypatch, {("h1", "key"): XL, ("h2", "key"): "ERR:Connection timed out"})
+    with pytest.raises(XapiError):
+        reaper.live_domains_on_dom0(["h1", "h2"], "pw")
+
+
+def test_an_identity_is_used_alone(monkeypatch):
+    ssh = _install(monkeypatch, {("h1", "key"): XL})
+    reaper.live_domains_on_dom0(["h1"], "pw", identity="/k/id")
+    argv, _ = ssh.calls[0]
+    assert argv[argv.index("-i") + 1] == "/k/id" and "IdentitiesOnly=yes" in argv
+
+
+def test_a_pool_with_no_hosts_fails_closed():
+    class NoHosts:
+        def call(self, method):
+            return {}
+
+    with pytest.raises(XapiError):
+        reaper.pool_host_addresses(NoHosts())
+
+
+def test_the_check_reads_every_pool_host(pool, monkeypatch):
+    """End to end: the sweep hands the check every host's address, not only the connected one."""
+    seen = {}
+
+    def fake(hosts, password, identity=None):
+        seen["hosts"] = hosts
+        return set()
+
+    monkeypatch.setattr(reaper, "live_domains_on_dom0", fake)
+    fake_pool = pool(
+        {"vm-1": vm_record(PLUGIN_VM, owner=CLOUD, power="Halted")},
+        argv=("reaper.py", "--apply", "--include-live", "--dom0-check"),
+    )
+    fake_pool.hosts = {"OpaqueRef:a": {"address": "10.0.0.2"}, "OpaqueRef:b": {"address": "10.0.0.1"}}
+    assert reaper.main() == 0
+    assert seen["hosts"] == ["10.0.0.1", "10.0.0.2"]
 
 
 # --- #246: an operator's hand-made clone inherits the marker and must survive ---------------

@@ -94,6 +94,8 @@ class FakeXapi:
 
     def __init__(self, records=None, stuck=(), vdis_after=None):
         self.host = "dom0.invalid"
+        # One host by default, at the connected address: the shape of a single-host lab.
+        self.hosts = {"OpaqueRef:host": {"address": "dom0.invalid"}}
         self.records = records or {}
         self.stuck = set(stuck)
         self.destroyed = []
@@ -129,6 +131,8 @@ class FakeXapi:
     def call(self, method, *params):
         if method == "VM.get_all_records":
             return self.records
+        if method == "host.get_all_records":
+            return self.hosts
         raise AssertionError(f"unexpected XAPI call: {method}")
 
 
