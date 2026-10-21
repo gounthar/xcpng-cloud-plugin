@@ -205,6 +205,16 @@ def _live_but_halted(rec, live_names):
     return rec["uuid"] in live_names or rec["name_label"] in live_names
 
 
+def _srs_of(x, disks):
+    """The SRs holding the VDIs in `disks` (VM ref -> VDI refs), in a stable order."""
+    return sorted({x.call("VDI.get_SR", vdi) for vdis in disks.values() for vdi in vdis})
+
+
+def _measure(x, srs):
+    """Free bytes and VDI count of each SR in `srs`, which may be a dict whose keys are the SRs."""
+    return {sr: (x.sr_free_bytes(sr), x.vdi_count(sr)) for sr in srs}
+
+
 def _selector(args):
     """Return (predicate, description) for what this run reaps.
 
@@ -441,10 +451,6 @@ def main():
     match, what = _selector(args)
 
     with Xapi() as x:
-        sr = x.default_sr()
-        free_before = x.sr_free_bytes(sr)
-        vdis_before = x.vdi_count(sr)
-
         doomed = []
         inherited = []
         ambiguous = []
@@ -487,7 +493,6 @@ def main():
         ambiguous.sort(key=lambda rec: rec["name_label"])
         kept.sort(key=lambda rec: rec["name_label"])
 
-        print(f"SR free before : {free_before / 2**30:.2f} GiB   VDIs: {vdis_before}")
         print(f"matching VMs {what}: {len(doomed)} VM(s)")
 
         for rec in kept:
@@ -567,10 +572,25 @@ def main():
         # One VM stuck mid-operation must not abandon the rest of the sweep. This is the
         # safety net; it fails soft, reports what it could not reach, and exits non-zero.
         failed = []
+        disks = {}
         for vm, rec in doomed:
+            try:
+                disks[vm] = x.disk_vdis(vm)
+            except XapiError as e:
+                failed.append(rec["name_label"])
+                print(f"     ERROR: {rec['name_label']!r} not reaped: {e}", file=sys.stderr)
+        # Measured on the SRs the doomed disks are on, which is the only place a leak can show.
+        # The first non-ISO SR used to stand in for them, and on a pool with an SR per host a
+        # leak on the other one left the count flat and the exit code 0 (#318).
+        before = _measure(x, _srs_of(x, disks))
+        for sr, (free, count) in before.items():
+            print(f"SR {sr} free before : {free / 2**30:.2f} GiB   VDIs: {count}")
+        for vm, rec in doomed:
+            if vm not in disks:
+                continue
             name = rec["name_label"]
             try:
-                vdis = x.disk_vdis(vm)
+                vdis = disks[vm]
                 print(
                     f"  {rec['power_state']:8} {name!r} uuid={rec['uuid']} disks={len(vdis)}"
                 )
@@ -585,13 +605,17 @@ def main():
             print("\nDRY RUN - nothing destroyed. Re-run with --apply.")
             return 1 if (failed or refused) else 0
 
-        free_after = x.sr_free_bytes(sr)
-        vdis_after = x.vdi_count(sr)
-        print(f"\nSR free after  : {free_after / 2**30:.2f} GiB   VDIs: {vdis_after}")
-        print(
-            f"reclaimed      : {(free_after - free_before) / 2**30:+.2f} GiB   "
-            f"VDI delta: {vdis_after - vdis_before:+d}"
-        )
+        after = _measure(x, before)
+        grew = []
+        for sr, (free_after, vdis_after) in after.items():
+            free_before, vdis_before = before[sr]
+            print(f"\nSR {sr} free after  : {free_after / 2**30:.2f} GiB   VDIs: {vdis_after}")
+            print(
+                f"reclaimed      : {(free_after - free_before) / 2**30:+.2f} GiB   "
+                f"VDI delta: {vdis_after - vdis_before:+d}"
+            )
+            if vdis_after > vdis_before:
+                grew.append(sr)
 
         rc = 0
         if failed:
@@ -607,8 +631,11 @@ def main():
                 file=sys.stderr,
             )
             rc = 1
-        if vdis_after > vdis_before:
-            print("WARNING: VDI count rose. Disks were orphaned.", file=sys.stderr)
+        if grew:
+            print(
+                f"WARNING: VDI count rose on {', '.join(grew)}. Disks were orphaned.",
+                file=sys.stderr,
+            )
             rc = 1
         return rc
 

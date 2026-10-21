@@ -92,11 +92,16 @@ class FakeXapi:
     in-flight XAPI operation.
     """
 
-    def __init__(self, records=None, stuck=(), vdis_after=None):
+    def __init__(self, records=None, stuck=(), vdis_after=None, disk_srs=None, sr_counts=None):
         self.host = "dom0.invalid"
         # One host by default, at the connected address: the shape of a single-host lab.
         self.hosts = {"OpaqueRef:host": {"address": "dom0.invalid"}}
         self.records = records or {}
+        # Which SR each VM's disk is on (VM ref -> SR), "OpaqueRef:sr" unless named. And, per SR,
+        # the VDI count (before, after) the reap; an SR not named here answers the defaults below.
+        self.disk_srs = disk_srs or {}
+        self.sr_counts = sr_counts or {}
+        self.events = []
         self.stuck = set(stuck)
         self.destroyed = []
         self._vdi_count = 5
@@ -115,6 +120,9 @@ class FakeXapi:
         return 10 * 2**30
 
     def vdi_count(self, sr):
+        self.events.append(f"count:{sr}")
+        if sr in self.sr_counts:
+            return self.sr_counts[sr][1 if self.destroyed else 0]
         if self.destroyed and self._vdis_after is not None:
             return self._vdis_after
         return self._vdi_count
@@ -123,6 +131,7 @@ class FakeXapi:
         return [f"vdi-{vm}"]
 
     def destroy_with_disks(self, vm):
+        self.events.append(f"destroy:{vm}")
         if vm in self.stuck:
             raise XapiError("VM_BAD_POWER_STATE", vm)
         self.destroyed.append(vm)
@@ -131,6 +140,9 @@ class FakeXapi:
     def call(self, method, *params):
         if method == "VM.get_all_records":
             return self.records
+        if method == "VDI.get_SR":
+            vm = params[0][len("vdi-") :]
+            return self.disk_srs.get(vm, "OpaqueRef:sr")
         if method == "host.get_all_records":
             return self.hosts
         raise AssertionError(f"unexpected XAPI call: {method}")
