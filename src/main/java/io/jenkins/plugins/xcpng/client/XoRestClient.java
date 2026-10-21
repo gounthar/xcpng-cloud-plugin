@@ -691,20 +691,28 @@ public final class XoRestClient implements HypervisorClient {
             // teardown blocks on HTTP, which fails immediately on an already-interrupted thread, so an
             // interrupt mid-configure would otherwise leak the very clone this cleanup exists to reclaim.
             boolean interrupted = Thread.interrupted();
+            RuntimeException failure = e;
             try {
                 // Not the public verb: its ownership check would refuse this clone, whose tags configure may
                 // never have reached. The VM was created a moment ago by this very call, which is the proof
                 // of ownership the tags stand in for everywhere else.
                 deleteVm(new VmRef(vm));
             } catch (RuntimeException cleanup) {
-                // Best effort. The original failure is what the caller needs.
+                // The clone is still there, and this is the last place that knows its id: hand it to the
+                // caller rather than only logging it (#310). The original failure stays the cause.
                 LOGGER.warning("could not clean up partly configured clone " + vm + ": " + cleanup.getMessage());
+                failure = new CloneLeftBehindException(
+                        e.getMessage() + "; clone " + vm + " was left behind because its cleanup failed too: "
+                                + cleanup.getMessage(),
+                        new VmRef(vm),
+                        e);
+                failure.addSuppressed(cleanup);
             } finally {
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
             }
-            throw e;
+            throw failure;
         }
         return new VmRef(vm);
     }

@@ -66,6 +66,7 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private int pingSuccessesBeforeFailing = -1;
     private boolean resolveFailsAtTransport = false;
     private boolean startFails = false;
+    private boolean cloneLeftBehind = false;
     private boolean destroyFails = false;
     private String assignIpOnStart = null;
     private ProvisionSpec lastSpec = null;
@@ -120,6 +121,15 @@ public final class FakeHypervisorClient implements HypervisorClient {
     /** Make {@link #start} throw after the clone exists, to test failed-provision cleanup. */
     public synchronized FakeHypervisorClient failStart() {
         this.startFails = true;
+        return this;
+    }
+
+    /**
+     * Make {@link #cloneFromTemplate} create the clone and then throw {@link CloneLeftBehindException} naming
+     * it, the way a backend does when configuring the clone fails and so does its own cleanup (#310).
+     */
+    public synchronized FakeHypervisorClient leaveCloneBehind() {
+        this.cloneLeftBehind = true;
         return this;
     }
 
@@ -246,6 +256,14 @@ public final class FakeHypervisorClient implements HypervisorClient {
                 throw new HypervisorException("cloneFromTemplate interrupted while held");
             }
         }
+        // After the hold, as a backend's configure step fails once the clone exists, so a test can tear the
+        // node down while the clone is in flight and still have it come back left behind.
+        if (leavesCloneBehind()) {
+            throw new CloneLeftBehindException(
+                    "configure failed; clone " + clone.value() + " was left behind",
+                    clone,
+                    new HypervisorException("configure failed"));
+        }
         return clone;
     }
 
@@ -256,6 +274,10 @@ public final class FakeHypervisorClient implements HypervisorClient {
         calls.add("cloneFromTemplate:" + template.value() + "->" + clone.value());
         states.put(clone.value(), VmState.HALTED);
         return clone;
+    }
+
+    private synchronized boolean leavesCloneBehind() {
+        return cloneLeftBehind;
     }
 
     @Override
