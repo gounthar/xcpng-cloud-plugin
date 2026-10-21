@@ -74,6 +74,21 @@ class XcpngRetentionStrategyTest {
         }
     }
 
+    /**
+     * A computer whose launch is still running: offline, with core's connect future not done. Real agents never
+     * connect in these tests, and a launch that blocks would hold a remoting thread for the whole test.
+     */
+    private static final class ConnectingComputer extends XcpngComputer {
+        ConnectingComputer(XcpngAgent agent) {
+            super(agent);
+        }
+
+        @Override
+        public boolean isConnecting() {
+            return true;
+        }
+    }
+
     /** A cloud whose clients are the given fake, registered so agents can resolve it back by name. */
     private static XcpngCloud cloudBackedBy(JenkinsRule r, FakeHypervisorClient fake) {
         return cloudBackedBy(r, fake, "xcpng");
@@ -328,6 +343,84 @@ class XcpngRetentionStrategyTest {
         } finally {
             reaps.shutdownNow();
         }
+    }
+
+    /** Run one check at {@code minutesIdle} past idle start and report whether it destroyed the agent's VM. */
+    private static boolean checkDestroys(
+            FakeHypervisorClient fake,
+            XcpngAgent agent,
+            AbstractCloudComputer<?> computer,
+            int idleMinutes,
+            long minutesIdle)
+            throws InterruptedException {
+        long idleStart = computer.getIdleStartMilliseconds();
+        XcpngRetentionStrategy strategy = new XcpngRetentionStrategy(idleMinutes);
+        strategy.setClock(() -> idleStart + TimeUnit.MINUTES.toMillis(minutesIdle) + 5000L);
+        ExecutorService reaps = Executors.newSingleThreadExecutor();
+        strategy.setReapExecutor(reaps);
+        try {
+            strategy.check(computer);
+            reaps.shutdown();
+            assertTrue(reaps.awaitTermination(30, TimeUnit.SECONDS), "a scheduled reap should finish");
+            return fake.calls().contains("destroyWithDisks:" + agent.getVmRef());
+        } finally {
+            reaps.shutdownNow();
+        }
+    }
+
+    /**
+     * The trap #313 removes: an agent still booting is not reaped at {@code idleMinutes}, however short that is,
+     * because the launcher is still waiting for it and owns its timeout. The control is the same agent, same
+     * clock, on a computer that is not connecting, which the idle net does reap.
+     */
+    @Test
+    void checkLeavesAComputerStillConnectingPastTheIdleTimeout(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+
+        assertFalse(
+                checkDestroys(fake, agent, new ConnectingComputer(agent), 1, 30),
+                "a booting agent must be left to its launcher: " + fake.calls());
+        assertTrue(
+                checkDestroys(fake, agent, assertInstanceOf(AbstractCloudComputer.class, agent.toComputer()), 1, 30),
+                "control: the same idle time reaps a computer that is not connecting");
+    }
+
+    /** A launch that hangs must not hold its VM forever: past the ceiling the idle net takes it anyway. */
+    @Test
+    void checkReapsAComputerStillConnectingPastTheCeiling(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+
+        assertTrue(checkDestroys(
+                fake,
+                agent,
+                new ConnectingComputer(agent),
+                IDLE_MINUTES,
+                XcpngRetentionStrategy.CONNECTING_CEILING_MINUTES));
+    }
+
+    /** The ceiling only ever lengthens the wait: an idle timeout set above it still applies while connecting. */
+    @Test
+    void anIdleTimeoutLongerThanTheCeilingStillAppliesWhileConnecting(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = agent(cloud, "xcpng-agent-1", false);
+        r.jenkins.addNode(agent);
+        int idleMinutes = XcpngRetentionStrategy.CONNECTING_CEILING_MINUTES * 2;
+
+        assertFalse(
+                checkDestroys(
+                        fake,
+                        agent,
+                        new ConnectingComputer(agent),
+                        idleMinutes,
+                        XcpngRetentionStrategy.CONNECTING_CEILING_MINUTES),
+                fake.calls().toString());
     }
 
     /**
