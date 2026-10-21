@@ -2506,6 +2506,29 @@ class XcpngProvisionTest {
         assertTrue(cloud.leakedVmRefs().isEmpty(), "the swept VM must be dropped: " + cloud.leakedVmRefs());
     }
 
+    /**
+     * And the leaks of a removed cloud (#314), which no loop over the configured clouds reaches. The entry names a
+     * connection that cannot be opened, so the sweep gives up and drops it: the drop is the sign it ran. With no
+     * cloud configured at all the tick has nothing else to do, so nothing else could have dropped it.
+     */
+    @Test
+    void theMaintainerSweepsTheLeaksOfARemovedCloud(JenkinsRule r) {
+        XcpngLeakedVmStore.get()
+                .record(
+                        "removed",
+                        XcpngLeakedVm.of(
+                                "vm/leaked/1",
+                                XcpngBackend.XO,
+                                "https://elsewhere.example.test",
+                                "deleted-cred",
+                                null,
+                                null));
+
+        new XcpngWarmPoolMaintainer().execute(TaskListener.NULL);
+
+        assertTrue(XcpngLeakedVmStore.get().refs("removed").isEmpty());
+    }
+
     // ---- A leak is swept over the connection it was recorded with (#223) ----
 
     /**

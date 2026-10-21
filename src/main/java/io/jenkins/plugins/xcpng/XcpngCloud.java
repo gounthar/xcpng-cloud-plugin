@@ -226,6 +226,12 @@ public class XcpngCloud extends Cloud {
     private transient XcpngAgent.ConnectionClientFactory recordedConnectionClientFactory;
 
     /**
+     * True only on the stand-in {@link #orphanSweeper} builds for a cloud that is no longer configured. Its own
+     * connection is empty, so it sweeps over recorded connections alone and leaves entries without one.
+     */
+    private transient boolean orphanSweeper;
+
+    /**
      * Executor for provisioning submits. Null in production, where {@link #provisionExecutor()} falls
      * back to the dedicated {@link #PROVISION_POOL}; a test injects a controllable one. Transient:
      * behaviour, never persisted to {@code config.xml}.
@@ -1291,6 +1297,11 @@ public class XcpngCloud extends Cloud {
     void sweepLeakedVms() {
         // A snapshot off the store: iterating it cannot throw even if a record lands mid-sweep.
         List<XcpngLeakedVm> pending = new ArrayList<>(XcpngLeakedVmStore.get().entries(name));
+        if (orphanSweeper) {
+            // An entry with no connection of its own could only be swept over the cloud's, and there is none.
+            // Left in the store rather than given up on, for a cloud of this name that may be configured again.
+            pending.removeIf(vm -> !vm.hasConnection());
+        }
         if (pending.isEmpty()) {
             return;
         }
@@ -1331,6 +1342,42 @@ public class XcpngCloud extends Cloud {
             // succeeded. The store drops and persists them in one step.
             XcpngLeakedVmStore.get().drop(name, done);
         }
+    }
+
+    /**
+     * Sweep the leaked entries recorded under names no configured cloud carries any more (#314): a cloud deleted
+     * or renamed while one of its teardowns failed. Called by {@link XcpngWarmPoolMaintainer} after the configured
+     * clouds' own sweeps. Each entry is retried over the connection it recorded, and the destroy still checks the
+     * owner marker under the name the VM was provisioned with, which is the name the entry is filed under.
+     */
+    static void sweepOrphanedLeaks() {
+        Set<String> configured = new HashSet<>();
+        for (Cloud cloud : Jenkins.get().clouds) {
+            if (cloud instanceof XcpngCloud xcpng) {
+                configured.add(xcpng.name);
+            }
+        }
+        for (String cloudName : XcpngLeakedVmStore.get().cloudNames()) {
+            if (configured.contains(cloudName)) {
+                continue;
+            }
+            try {
+                orphanSweeper(cloudName).sweepLeakedVms();
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, e, () -> "Leaked-VM sweep failed for removed cloud " + cloudName);
+            }
+        }
+    }
+
+    /**
+     * A cloud of {@code cloudName} with no connection and no templates, never registered, that only sweeps the
+     * leaked entries filed under that name. Package-visible so a test can give it a fake connection factory.
+     */
+    @NonNull
+    static XcpngCloud orphanSweeper(@NonNull String cloudName) {
+        XcpngCloud sweeper = new XcpngCloud(cloudName, null, null, null, 1, List.of());
+        sweeper.orphanSweeper = true;
+        return sweeper;
     }
 
     /**
