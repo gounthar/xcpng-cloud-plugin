@@ -47,6 +47,21 @@ jobs:
           distribution: temurin
           java-version: ${{ matrix.java }}
           cache: maven
+          # The security scan also caches maven through setup-java, so with the default
+          # paths both workflows compute one key. The scan finishes first and saves a
+          # ~/.m2 that holds what its build resolved but not the verify side (spotless,
+          # spotbugs, surefire, packaging), and setup-java never saves over a key it hit.
+          # Every run then fetched ~250 artifacts from Central, and a 502 on one of them
+          # failed the JDK 25 leg of run 39605686132 before any test ran (#352).
+          #
+          # The first three lines are setup-java's own defaults for maven (src/cache.ts
+          # at v6.0.1), kept so a bump in .mvn/extensions.xml still rotates the key.
+          # Hashing this file in as well gives CI a key the scan cannot claim.
+          cache-dependency-path: |
+            **/pom.xml
+            **/.mvn/wrapper/maven-wrapper.properties
+            **/.mvn/extensions.xml
+            .github/workflows/ci.yml
 
       # verify, not test: it also runs the static analysis the parent POM binds and
       # packages the .hpi, which is where index.jelly and config.jelly path errors surface.
