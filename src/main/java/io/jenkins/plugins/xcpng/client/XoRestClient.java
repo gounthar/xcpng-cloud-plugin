@@ -11,6 +11,8 @@ import java.net.URI;
 import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -145,6 +147,23 @@ public final class XoRestClient implements HypervisorClient {
 
     static final Duration STRIP_POLL = Duration.ofMillis(500);
 
+    /** Reads of the VM list when a create's answer was lost (#311): one minute at {@link #LEFT_BEHIND_POLL}. */
+    static final int LEFT_BEHIND_READS = 12;
+
+    static final Duration LEFT_BEHIND_POLL = Duration.ofSeconds(5);
+
+    /**
+     * The create statuses that mean XO refused the request before doing any work, so there is no clone to
+     * look for: bad parameters, and no or not enough authority.
+     */
+    private static final Set<Integer> REFUSED_BEFORE_WORK = Set.of(400, 401, 403, 422);
+
+    /**
+     * How far before the request a found VM's XO creation date may fall: the controller's clock and the
+     * appliance's are not the same clock. Generous, since the other checks carry the weight.
+     */
+    static final Duration CREATION_SKEW = Duration.ofMinutes(5);
+
     /** A wait between two reads. A seam so tests do not sleep; production is {@link Thread#sleep}. */
     @FunctionalInterface
     interface Pause {
@@ -233,22 +252,6 @@ public final class XoRestClient implements HypervisorClient {
      */
     @NonNull
     private JsonNode call(String method, String path, @CheckForNull ObjectNode body, Duration timeout) {
-        return call(method, path, body, timeout, null);
-    }
-
-    /**
-     * As above, with a sentence naming what a refused 202 may have left behind.
-     *
-     * <p>Only the create call passes one. Everywhere else a refused 202 leaves nothing to clean up, and a
-     * consequence that does not apply is worse than none.
-     */
-    @NonNull
-    private JsonNode call(
-            String method,
-            String path,
-            @CheckForNull ObjectNode body,
-            Duration timeout,
-            @CheckForNull String consequence) {
         RestTransport.RestResponse resp;
         try {
             resp = transport.send(method, path, body == null ? null : body.toString(), timeout);
@@ -262,7 +265,7 @@ public final class XoRestClient implements HypervisorClient {
         if (!resp.isSuccess()) {
             throw failure(method, path, resp.status(), resp.body());
         }
-        refuseAsyncAccepted(method, path, resp, consequence);
+        refuseAsyncAccepted(method, path, resp);
         return parse(method + " " + path, resp.body());
     }
 
@@ -286,16 +289,18 @@ public final class XoRestClient implements HypervisorClient {
      * operator is better served by being told their appliance is too old than by the plugin quietly
      * working one way here and another way there.
      */
-    private static void refuseAsyncAccepted(
-            String method, String path, RestTransport.RestResponse resp, @CheckForNull String consequence) {
+    private static void refuseAsyncAccepted(String method, String path, RestTransport.RestResponse resp) {
         if (resp.status() != 202) {
             return;
         }
-        throw new HypervisorException(method + " " + path + ": the appliance answered 202 Accepted, so it started"
+        throw asyncAccepted(method, path);
+    }
+
+    private static HypervisorException asyncAccepted(String method, String path) {
+        return new HypervisorException(method + " " + path + ": the appliance answered 202 Accepted, so it started"
                 + " a background task instead of doing the work. This backend asks every call for"
                 + " ?sync=true and needs Xen Orchestra 6.5.0 or newer; an older appliance ignores the"
-                + " parameter. Upgrade Xen Orchestra."
-                + (consequence == null ? "" : " " + consequence));
+                + " parameter. Upgrade Xen Orchestra.");
     }
 
     @NonNull
@@ -658,17 +663,7 @@ public final class XoRestClient implements HypervisorClient {
         if (recable != null) {
             create.putArray("vifs").add(recable);
         }
-        // The consequence matters only here. A refused 202 throws before any VM id comes back, so the
-        // self-cleanup below never runs -- and XO may still finish the task, leaving a clone with no owner
-        // tag. Jenkins retries provisioning, so that is one untagged VM per attempt, findable by nobody:
-        // the sweeps select on the marker. The operator cannot act on that unless the message says it.
-        JsonNode created = call(
-                "POST",
-                API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true",
-                create,
-                ACTION_TIMEOUT,
-                "The task may still finish and create a VM named '" + spec.name() + "' carrying no owner tag,"
-                        + " which no sweep will find; remove it by hand.");
+        JsonNode created = createVm(handle, create, spec);
         String vm = created.path("id").asText("");
         if (vm.isBlank()) {
             throw new HypervisorException("create_vm answered success but named no VM: " + created);
@@ -691,30 +686,227 @@ public final class XoRestClient implements HypervisorClient {
             // teardown blocks on HTTP, which fails immediately on an already-interrupted thread, so an
             // interrupt mid-configure would otherwise leak the very clone this cleanup exists to reclaim.
             boolean interrupted = Thread.interrupted();
-            RuntimeException failure = e;
             try {
-                // Not the public verb: its ownership check would refuse this clone, whose tags configure may
-                // never have reached. The VM was created a moment ago by this very call, which is the proof
-                // of ownership the tags stand in for everywhere else.
-                deleteVm(new VmRef(vm));
-            } catch (RuntimeException cleanup) {
-                // The clone is still there, and this is the last place that knows its id: hand it to the
-                // caller rather than only logging it (#310). The original failure stays the cause.
-                LOGGER.warning("could not clean up partly configured clone " + vm + ": " + cleanup.getMessage());
-                failure = new CloneLeftBehindException(
-                        e.getMessage() + "; clone " + vm + " was left behind because its cleanup failed too: "
-                                + cleanup.getMessage(),
-                        new VmRef(vm),
-                        e);
-                failure.addSuppressed(cleanup);
+                throw reclaim(new VmRef(vm), spec, e);
             } finally {
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
             }
-            throw failure;
         }
         return new VmRef(vm);
+    }
+
+    /**
+     * {@code POST create_vm}, and the search for the clone when the answer never arrived (#311).
+     *
+     * <p>XO finishes the create after the client has gone. Measured on the lab appliance 2026-10-20: the
+     * socket closed 0.05 s after the request was sent, before XO had sent a byte, and the clone was listed
+     * by name about 5 s later, 3 runs of 3. A timeout, a reset connection, a proxy's 504 or an interrupt
+     * all reach that state, and so does a refused 202, which is XO saying it started the work. Jenkins
+     * retries provisioning, so without this each such failure left one more VM carrying no owner tag,
+     * which no sweep selects. Only the statuses in {@link #REFUSED_BEFORE_WORK} are taken to mean nothing
+     * was made; any other status, a 404 or 409 included, may come from a step after the clone.
+     *
+     * <p>The clone is found by its exact name, and then only taken if XO's own record of it says this create
+     * could have made it ({@link #findLeftBehind}). The caller names every clone {@code xcpng-<template>-}
+     * plus eight random hex characters, so the name is this agent's, though not necessarily this attempt's:
+     * a node reloaded with no VM recorded clones again under the same name, and two matches are left alone.
+     * The search gives up after {@link #LEFT_BEHIND_READS} reads, about a minute: a create that has not
+     * finished by then is still running on an appliance slow enough to have timed us out, and nothing short
+     * of waiting for it would find it. The destroy that follows does not wait for XO's create to settle; what
+     * a DELETE does to a create still running is not measured.
+     */
+    @NonNull
+    private JsonNode createVm(TemplateHandle handle, ObjectNode create, ProvisionSpec spec) {
+        String path = API + "/pools/" + handle.poolId() + "/actions/create_vm?sync=true";
+        HypervisorException failure;
+        Instant sent = Instant.now();
+        try {
+            RestTransport.RestResponse resp = transport.send("POST", path, create.toString(), ACTION_TIMEOUT);
+            if (resp.isSuccess() && resp.status() != 202) {
+                try {
+                    return parse("POST " + path, resp.body());
+                } catch (HypervisorException e) {
+                    // A 2xx that is not JSON is a proxy's page, not XO's answer; the create may have run.
+                    failure = e;
+                }
+            } else if (REFUSED_BEFORE_WORK.contains(resp.status())) {
+                throw failure("POST", path, resp.status(), resp.body());
+            } else {
+                failure = resp.isSuccess()
+                        ? asyncAccepted("POST", path)
+                        : failure("POST", path, resp.status(), resp.body());
+            }
+        } catch (IOException e) {
+            failure = new HypervisorException("POST " + path + ": transport error: " + e.getMessage(), e);
+        }
+        // Cleared for the search and the cleanup, restored after: both block on HTTP, which fails at once
+        // on an interrupted thread, and an interrupt is one of the ways the answer gets lost.
+        boolean interrupted = Thread.interrupted();
+        try {
+            LeftBehind search = findLeftBehind(spec.name(), handle, sent.minus(CREATION_SKEW));
+            if (search.vm() == null) {
+                throw new HypervisorException(
+                        failure.getMessage() + " " + search.outcome() + "; if a VM named '" + spec.name()
+                                + "' appears later it carries no owner tag, which no sweep will find, so remove it"
+                                + " by hand.",
+                        failure);
+            }
+            throw reclaim(search.vm(), spec, failure);
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** The clone a search found, or null with what the search saw instead, for the operator's message. */
+    private record LeftBehind(
+            @CheckForNull VmRef vm, @NonNull String outcome) {}
+
+    /**
+     * The one VM named {@code name} that this create could have made, polling until it appears.
+     *
+     * <p>A name alone does not license a DELETE that takes the disks, nor a stamp that makes the VM ours for
+     * good: anyone who can see the VM list can read the name while the create runs and rename another VM to
+     * it. So a match must also be what XO records for a VM its create route made from this template, now:
+     * on the template's pool, {@code creation.template} the template this call cloned, {@code creation.date}
+     * no earlier than {@code notBefore}, and no owner marker of any cloud. Read on the lab appliance
+     * 2026-10-20, a fresh clone carries {@code creation} with the template's bare id and the date; a VM not
+     * made by that route (10 of the pool's 14) carries no {@code creation} and is never taken. A match that
+     * fails these is reported and left alone, and the search goes on, since the real clone may still come.
+     */
+    private LeftBehind findLeftBehind(String name, TemplateHandle handle, Instant notBefore) {
+        Set<String> refusedMatches = new LinkedHashSet<>();
+        for (int read = 1; read <= LEFT_BEHIND_READS; read++) {
+            List<String> ids = new ArrayList<>();
+            try {
+                for (JsonNode vm : get(API + "/vms?fields=id,name_label,$pool,creation,tags")) {
+                    if (!name.equals(vm.path("name_label").asText(null))) {
+                        continue;
+                    }
+                    String id = vm.path("id").asText("");
+                    String why = notThisCreate(vm, handle, notBefore);
+                    if (why == null) {
+                        ids.add(id);
+                    } else if (refusedMatches.add(id + " (" + why + ")")) {
+                        LOGGER.warning("VM " + id + " is named '" + name + "' but " + why + "; leaving it alone");
+                    }
+                }
+            } catch (RuntimeException e) {
+                LOGGER.warning("could not list VMs while looking for clone '" + name + "': " + e.getMessage());
+            }
+            if (ids.size() == 1) {
+                String refused = unaddressable(ids.get(0));
+                if (refused == null) {
+                    return new LeftBehind(new VmRef(ids.get(0)), "found");
+                }
+                return new LeftBehind(null, "A VM named '" + name + "' exists as '" + ids.get(0) + "', " + refused);
+            }
+            if (ids.size() > 1) {
+                // Possible when a node reloaded with no VM recorded clones again under its own name: both are
+                // then ours, but which one this call made cannot be told apart, so neither is touched.
+                return new LeftBehind(
+                        null, ids.size() + " VMs are named '" + name + "' " + ids + ", so none was" + " destroyed");
+            }
+            if (read < LEFT_BEHIND_READS) {
+                try {
+                    pause.pause(LEFT_BEHIND_POLL);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return new LeftBehind(null, "The search for a VM named '" + name + "' was interrupted");
+                }
+            }
+        }
+        String refused = refusedMatches.isEmpty()
+                ? ""
+                : " (left alone as not made by this create: " + String.join(", ", refusedMatches) + ")";
+        return new LeftBehind(
+                null,
+                "No VM named '" + name + "' that this create made appeared within " + LEFT_BEHIND_READS + " reads"
+                        + refused);
+    }
+
+    /** Why {@code vm} cannot be the clone this create made, or null if it can be. */
+    @CheckForNull
+    private static String notThisCreate(JsonNode vm, TemplateHandle handle, Instant notBefore) {
+        if (!handle.poolId().equals(vm.path("$pool").asText(null))) {
+            return "it is on another pool";
+        }
+        JsonNode creation = vm.path("creation");
+        if (!handle.templateUuid().equals(creation.path("template").asText(null))) {
+            return "XO does not record it as created from template " + handle.templateUuid();
+        }
+        try {
+            if (Instant.parse(creation.path("date").asText("")).isBefore(notBefore)) {
+                return "it was created before this request";
+            }
+        } catch (DateTimeParseException e) {
+            return "its creation date cannot be read";
+        }
+        for (JsonNode tag : vm.path("tags")) {
+            String t = tag.asText("");
+            if (t.startsWith(OWNER_TAG_PREFIX) || t.startsWith(SELF_TAG_PREFIX)) {
+                return "it already carries owner marker '" + t + "'";
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Get rid of a clone this call made and could not finish: destroy it, and if that fails, stamp it as
+     * ours so something else can.
+     *
+     * <p>The public destroy and the leaked-VM sweep both refuse a VM that does not carry both markers, so a
+     * clone left behind untagged used to need an operator. Stamped, the teardown the caller runs next, or the
+     * sweep after it, can reclaim it. The stamp comes only after a failed destroy because a destroy that
+     * works makes it pointless, and a stamp before it would repeat whatever {@link #configure} already spent
+     * on the same tags. It skips the inherited-marker strip: the plugin's ownership check needs both markers
+     * present, not the foreign ones gone. {@code tools/reaper.py --cloud} is stricter and refuses a VM with two
+     * owner markers, so a clone of a marked golden image stays the plugin's to reclaim. Only both failing
+     * leaves a VM for an operator.
+     *
+     * @return the exception to throw: {@code cause} once the clone is gone, else a {@link
+     *     CloneLeftBehindException} naming it
+     */
+    private HypervisorException reclaim(VmRef clone, ProvisionSpec spec, RuntimeException cause) {
+        try {
+            // Not the public verb: this call made the clone, which is the proof of ownership the tags stand
+            // in for everywhere else.
+            deleteVm(clone);
+            return cause instanceof HypervisorException h ? h : new HypervisorException(cause.getMessage(), cause);
+        } catch (RuntimeException cleanup) {
+            // The clone is still there, and this is the last place that knows its id: hand it to the caller
+            // rather than only logging it (#310). The original failure stays the cause.
+            LOGGER.warning("could not clean up clone " + clone.value() + ": " + cleanup.getMessage());
+            RuntimeException stampFailure = null;
+            String owner = spec.owner();
+            String state;
+            if (owner == null || owner.isBlank()) {
+                state = "no owning cloud was named, so it carries no owner tag and no sweep will find it; remove"
+                        + " it by hand";
+            } else {
+                try {
+                    stampMarkers(clone.value(), OWNER_TAG_PREFIX + owner);
+                    state = "it now carries this cloud's owner markers, so a later teardown or sweep can remove it";
+                } catch (RuntimeException e) {
+                    stampFailure = e;
+                    state = "it could not be stamped either (" + e.getMessage() + "), so it carries no owner tag"
+                            + " and no sweep will find it; remove it by hand";
+                }
+            }
+            CloneLeftBehindException left = new CloneLeftBehindException(
+                    cause.getMessage() + "; clone " + clone.value() + " was left behind because its cleanup failed"
+                            + " too: " + cleanup.getMessage() + "; " + state,
+                    clone,
+                    cause);
+            left.addSuppressed(cleanup);
+            if (stampFailure != null) {
+                left.addSuppressed(stampFailure);
+            }
+            return left;
+        }
     }
 
     /**
@@ -962,6 +1154,13 @@ public final class XoRestClient implements HypervisorClient {
             return;
         }
         String ownerTag = OWNER_TAG_PREFIX + owner;
+        JsonNode record = stampMarkers(vm, ownerTag);
+        stripInheritedMarkers(
+                vm, ownerTag, SELF_TAG_PREFIX + record.path("uuid").asText(), record.path("tags"));
+    }
+
+    /** Both markers, without the strip; returns the record read between the two PUTs. */
+    private JsonNode stampMarkers(String vm, String ownerTag) {
         call("PUT", vmPath(vm) + "/tags/" + encodeSegment(ownerTag), null, READ_TIMEOUT);
         JsonNode record = get(vmPath(vm));
         String uuid = record.path("uuid").asText("");
@@ -969,9 +1168,8 @@ public final class XoRestClient implements HypervisorClient {
             throw new HypervisorException("clone " + vm + " reports no uuid, so it cannot be stamped as this"
                     + " plugin's own; refusing rather than leaving a marker a hand-made copy would inherit");
         }
-        String selfTag = SELF_TAG_PREFIX + uuid;
-        call("PUT", vmPath(vm) + "/tags/" + encodeSegment(selfTag), null, READ_TIMEOUT);
-        stripInheritedMarkers(vm, ownerTag, selfTag, record.path("tags"));
+        call("PUT", vmPath(vm) + "/tags/" + encodeSegment(SELF_TAG_PREFIX + uuid), null, READ_TIMEOUT);
+        return record;
     }
 
     /** Delete every marker in {@code tags} that is not this clone's own, then read until none is left. */
@@ -1164,7 +1362,7 @@ public final class XoRestClient implements HypervisorClient {
         if (!resp.isSuccess()) {
             throw failure("GET", path, resp.status(), resp.body());
         }
-        refuseAsyncAccepted("GET", path, resp, null);
+        refuseAsyncAccepted("GET", path, resp);
         return switch (parse("GET " + path, resp.body()).path("power_state").asText("")) {
             case "Halted" -> VmState.HALTED;
             case "Running" -> VmState.RUNNING;
@@ -1257,7 +1455,7 @@ public final class XoRestClient implements HypervisorClient {
         }
         // Checked here too, not only in call(): this verb talks to the transport directly, so it would
         // otherwise read a 202 as a completed teardown and drop the leaked-VM entry for a VM still running.
-        refuseAsyncAccepted("DELETE", path, resp, null);
+        refuseAsyncAccepted("DELETE", path, resp);
         if (resp.isSuccess()) {
             return;
         }
