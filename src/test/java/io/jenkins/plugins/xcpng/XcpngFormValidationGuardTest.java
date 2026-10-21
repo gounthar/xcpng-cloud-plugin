@@ -11,6 +11,7 @@ import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.FormValidation;
+import hudson.util.ListBoxModel;
 import hudson.util.Secret;
 import java.util.ArrayList;
 import java.util.List;
@@ -18,6 +19,7 @@ import java.util.function.Consumer;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
+import org.htmlunit.WebResponse;
 import org.htmlunit.util.NameValuePair;
 import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl;
 import org.junit.jupiter.api.Test;
@@ -223,6 +225,79 @@ class XcpngFormValidationGuardTest {
     }
 
     /**
+     * {@code doTestConnection} is the endpoint the guard matters most on: it resolves a stored credential
+     * and opens a connection with it. A blank URL is the cheapest way past the check into the body, which
+     * answers it before any credential or network is touched, so the administrator's answer proves the
+     * call got through and the bystander's exception proves it did not.
+     */
+    @Test
+    void onlyAnAdministratorReachesTheConnectionTest(JenkinsRule r) {
+        lockDown(r);
+        XcpngCloud.DescriptorImpl cloud = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        asUser(
+                "bob",
+                () -> assertThrows(
+                        AccessDeniedException.class,
+                        () -> cloud.doTestConnection("", TOKEN_ID, null, null, null),
+                        "doTestConnection answered a user without ADMINISTER"));
+        asUser("alice", () -> {
+            FormValidation v = cloud.doTestConnection("", TOKEN_ID, null, null, null);
+            assertEquals(FormValidation.Kind.ERROR, v.kind);
+            assertEquals(Messages.XcpngCloud_poolUrl_required(), v.getMessage());
+        });
+    }
+
+    /**
+     * The same over HTTP, where {@code @RequirePOST} lives: a GET is a 405 even for the administrator, a
+     * POST from the bystander is a 403, and a POST from the administrator reaches the body.
+     */
+    @Test
+    void theConnectionTestTakesAnAdministratorsPostOnly(JenkinsRule r) throws Exception {
+        lockDown(r);
+        String path = "descriptorByName/" + CLOUD + "/testConnection";
+        JenkinsRule.WebClient alice = r.createWebClient().login("alice");
+        alice.assertFails(path + "?poolUrl=", 405);
+
+        JenkinsRule.WebClient bob = r.createWebClient().login("bob");
+        bob.setThrowExceptionOnFailingStatusCode(false);
+        assertEquals(403, post(r, bob, path, new NameValuePair("poolUrl", "")).getStatusCode());
+
+        String body = post(r, alice, path, new NameValuePair("poolUrl", "")).getContentAsString();
+        assertTrue(isError(body), body);
+        assertTrue(body.contains(Messages.XcpngCloud_poolUrl_required()), body);
+    }
+
+    /**
+     * {@code doFillCredentialsIdItems} lists the stored tokens as {@code ACL.SYSTEM2}, so the only thing
+     * between a bystander and every credential id and description on the controller is its own ADMINISTER
+     * branch. The current value passed in is deliberately not the stored token, so the token can only reach
+     * the model through the lookup: the bystander must get the current value alone, and the administrator
+     * must get the token as well.
+     */
+    @Test
+    void aBystanderSeesOnlyTheCurrentCredentialNotTheStoredOnes(JenkinsRule r) throws Exception {
+        addToken();
+        lockDown(r);
+        XcpngCloud.DescriptorImpl cloud = r.jenkins.getDescriptorByType(XcpngCloud.DescriptorImpl.class);
+        String current = "carried-over-credential";
+        asUser(
+                "bob",
+                () -> assertEquals(
+                        List.of(current),
+                        optionValues(cloud.doFillCredentialsIdItems("https://pool.example.test", current)),
+                        "doFillCredentialsIdItems listed stored credentials to a user without ADMINISTER"));
+        asUser("alice", () -> {
+            List<String> values = optionValues(cloud.doFillCredentialsIdItems("https://pool.example.test", current));
+            assertTrue(values.contains(TOKEN_ID), "the administrator was not offered the stored token: " + values);
+            assertTrue(values.contains(current), "the administrator lost the current value: " + values);
+        });
+    }
+
+    private static List<String> optionValues(ListBoxModel model) {
+        return model.stream().map(o -> o.value).toList();
+    }
+
+    /**
      * {@code FormValidation.ok()} renders as an empty {@code <div/>} and an error as
      * {@code <div class="error">}, both over HTTP 200, so the status line says nothing about the verdict
      * and the body has to be read.
@@ -242,15 +317,19 @@ class XcpngFormValidationGuardTest {
      */
     private static String postCheck(
             JenkinsRule r, JenkinsRule.WebClient wc, String descriptor, String method, String value) throws Exception {
-        WebRequest req = new WebRequest(
-                new java.net.URI(r.getURL() + "descriptorByName/" + descriptor + "/" + method).toURL(),
-                HttpMethod.POST);
+        return post(r, wc, "descriptorByName/" + descriptor + "/" + method, new NameValuePair("value", value))
+                .getContentAsString();
+    }
+
+    private static WebResponse post(JenkinsRule r, JenkinsRule.WebClient wc, String path, NameValuePair... fields)
+            throws Exception {
+        WebRequest req = new WebRequest(new java.net.URI(r.getURL() + path).toURL(), HttpMethod.POST);
         // addCrumb sets the parameter list rather than appending to it, so read it back before adding
-        // the field under test; that holds whichever way the harness implements it.
+        // the fields under test; that holds whichever way the harness implements it.
         wc.addCrumb(req);
         List<NameValuePair> params = new ArrayList<>(req.getRequestParameters());
-        params.add(new NameValuePair("value", value));
+        params.addAll(List.of(fields));
         req.setRequestParameters(params);
-        return wc.getPage(req).getWebResponse().getContentAsString();
+        return wc.getPage(req).getWebResponse();
     }
 }
