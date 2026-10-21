@@ -305,6 +305,31 @@ class XcpngLauncherTest {
     }
 
     /**
+     * A clone the backend left behind (#310) that comes back to a node already torn down (#305). No node can
+     * adopt it, so the launch teardown will never see it: the launcher must destroy it itself.
+     */
+    @Test
+    void aCloneLeftBehindForATornDownNodeIsDestroyed(JenkinsRule r) throws Exception {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").leaveCloneBehind();
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch held = fake.holdClonesUntil(release);
+        XcpngCloud cloud = cloudBackedBy(r, fake);
+        XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
+        r.jenkins.addNode(agent);
+        assertTrue(held.await(30, TimeUnit.SECONDS), "the launcher should have reached the clone");
+
+        agent.terminate();
+        release.countDown();
+
+        String clone = "vm/xcpng-agent-1/1";
+        awaitTrue(
+                () -> fake.calls().contains("destroyWithDisks:" + clone),
+                () -> "a left-behind clone with no node to adopt it must be destroyed: " + fake.calls());
+        assertFalse(fake.calls().contains("start:" + clone), "and never started: " + fake.calls());
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "a destroy that worked records nothing: " + cloud.leakedVmRefs());
+    }
+
+    /**
      * Adopting a clone saves the issued-agent store and the node, and neither save may run under the agent's
      * monitor: a save writes a file and fires save listeners, which may take core's locks, while the teardown
      * takes that monitor too. Updating the record in memory under the monitor is what keeps the two in step.

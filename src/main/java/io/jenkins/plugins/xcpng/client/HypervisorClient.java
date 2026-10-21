@@ -37,6 +37,10 @@ public interface HypervisorClient extends AutoCloseable {
     /**
      * Clone a VM from a template and apply {@code spec}. Synchronous from the caller's view: returns
      * only once the clone exists and is addressable, however much task polling that took underneath.
+     *
+     * @throws CloneLeftBehindException if the clone was created but could not be configured, and destroying
+     *     it failed too; it names the VM, which the caller must keep so a teardown can reach it.
+     * @throws HypervisorException on any other failure, which leaves no VM behind.
      */
     @NonNull
     VmRef cloneFromTemplate(@NonNull VmRef template, @NonNull ProvisionSpec spec);

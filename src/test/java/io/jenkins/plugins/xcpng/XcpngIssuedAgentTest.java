@@ -187,6 +187,10 @@ class XcpngIssuedAgentTest {
         try (ACLContext ignored = ACL.as2(User.getById("admin", true).impersonate2())) {
             assertDoesNotThrow(() -> agent.toComputer().updateByXml(stream(agentXml)));
         }
+        // The replacement comes out of readResolve marked reloaded, so the retention check core runs on
+        // setNode reaps it on another thread. Let that finish, or teardown deletes JENKINS_HOME under the
+        // reap writing the agent's log.
+        awaitTrue(() -> r.jenkins.getNode("xcpng-agent-1") == null, "the replaced agent was never reaped");
     }
 
     private static ByteArrayInputStream stream(String xml) {
