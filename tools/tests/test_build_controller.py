@@ -308,6 +308,151 @@ def test_the_marker_the_sweep_matches_is_the_one_the_create_writes(monkeypatch, 
     assert x.destroyed_vdis == ["OpaqueRef:o"]
 
 
+# -- replacing the controller VM (#315) ------------------------------------
+
+
+def controller(uuid="uuid-ctl", marked=True, self_uuid=None, power="Running"):
+    other = {}
+    if marked:
+        other[bc.VM_MARKER_KEY] = bc.VM_MARKER
+        other[bc.VM_SELF_KEY] = self_uuid or uuid
+    return {
+        "uuid": uuid,
+        "name_label": "ctl",
+        "power_state": power,
+        "is_a_template": False,
+        "is_a_snapshot": False,
+        "is_control_domain": False,
+        "other_config": other,
+    }
+
+
+def disk(label, description=bc.VDI_MARKER, vbds_after=None):
+    return {"name_label": label, "name_description": description, "VBDs": vbds_after or []}
+
+
+def replace_pool(vms, vbds=None, vdis=None, shutdown=None):
+    """A pool holding `vms`, each VM's VBDs from `vbds`, VDI records from `vdis`, and no orphans."""
+    vbds = vbds or {}
+    vdis = vdis or {}
+    responses = {
+        "VM.get_all_records": vms,
+        "VDI.get_all_records": {},
+        "VM.get_VBDs": lambda ref: list(vbds.get(ref, {})),
+        "VBD.get_record": lambda b: next(v[b] for v in vbds.values() if b in v),
+        "VDI.get_record": lambda vdi: vdis[vdi],
+    }
+    if shutdown is not None:
+        responses["VM.hard_shutdown"] = shutdown
+    return RecordingXapi(responses)
+
+
+def test_a_vm_that_only_shares_the_name_is_refused():
+    """The default name is jenkins-controller, which anyone's controller on a shared pool may carry."""
+    x = replace_pool({"OpaqueRef:theirs": controller(marked=False)})
+    with pytest.raises(SystemExit, match="does not carry the markers"):
+        bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.methods("VM.hard_shutdown") == [] and x.methods("VM.destroy") == []
+
+
+def test_a_copy_of_our_vm_is_refused():
+    """A copy inherits other_config, purpose tag and all; only the uuid stamp tells it apart."""
+    x = replace_pool({"OpaqueRef:copy": controller(uuid="uuid-copy", self_uuid="uuid-original")})
+    with pytest.raises(SystemExit, match="does not carry the markers"):
+        bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.methods("VM.destroy") == []
+
+
+def test_our_own_vm_is_kept_without_replace():
+    x = replace_pool({"OpaqueRef:ours": controller()})
+    with pytest.raises(SystemExit, match="--replace"):
+        bc.destroy_existing(x, "ctl", "OpaqueRef:sr")
+    assert x.methods("VM.hard_shutdown") == [] and x.methods("VM.destroy") == []
+
+
+def test_one_foreign_vm_of_the_name_protects_ours_too():
+    """Every same-named VM is checked before any is destroyed, so a mixed pool loses neither."""
+    x = replace_pool({"OpaqueRef:ours": controller(), "OpaqueRef:theirs": controller(uuid="u2", marked=False)})
+    with pytest.raises(SystemExit):
+        bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.methods("VM.destroy") == []
+
+
+def test_replace_destroys_only_our_own_unshared_disks():
+    x = replace_pool(
+        {"OpaqueRef:ours": controller()},
+        vbds={
+            "OpaqueRef:ours": {
+                "OpaqueRef:b-root": {"VDI": "OpaqueRef:root", "type": "Disk"},
+                "OpaqueRef:b-cd": {"VDI": "OpaqueRef:tools", "type": "CD"},
+                "OpaqueRef:b-hand": {"VDI": "OpaqueRef:hand", "type": "Disk"},
+                "OpaqueRef:b-shared": {"VDI": "OpaqueRef:shared", "type": "Disk"},
+                "OpaqueRef:b-empty": {"VDI": "OpaqueRef:NULL", "type": "CD"},
+            }
+        },
+        vdis={
+            "OpaqueRef:root": disk("debian-13-genericcloud"),
+            "OpaqueRef:hand": disk("data", description="attached by hand"),
+            "OpaqueRef:shared": disk("ctl-cidata", vbds_after=["OpaqueRef:other-vm-vbd"]),
+        },
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.methods("VM.destroy") == ["VM.destroy"]
+    assert x.destroyed_vdis == ["OpaqueRef:root"], "a CD, a hand-attached disk and a shared one stay"
+
+
+def test_the_disks_are_read_before_the_vm_is_destroyed():
+    """VM.destroy removes the VBDs, and the VDIs behind them become unreachable."""
+    x = replace_pool(
+        {"OpaqueRef:ours": controller()},
+        vbds={"OpaqueRef:ours": {"OpaqueRef:b": {"VDI": "OpaqueRef:root", "type": "Disk"}}},
+        vdis={"OpaqueRef:root": disk("debian-13-genericcloud")},
+    )
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.calls.index("VBD.get_record") < x.calls.index("VM.destroy")
+
+
+def test_a_vm_reading_halted_is_still_shut_down():
+    """power_state has read Halted for a domain dom0 was running (#48); it is not what decides."""
+
+    def already_down(_vm):
+        raise XapiError("VM_BAD_POWER_STATE", ["OpaqueRef:ours", "running", "halted"])
+
+    x = replace_pool({"OpaqueRef:ours": controller(power="Halted")}, shutdown=already_down)
+    bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.methods("VM.hard_shutdown") == ["VM.hard_shutdown"]
+    assert x.methods("VM.destroy") == ["VM.destroy"], "XAPI saying it is already down is the safe refusal"
+
+
+def test_a_shutdown_that_fails_otherwise_stops_the_destroy():
+    def refused(_vm):
+        raise XapiError("OPERATION_NOT_ALLOWED", [])
+
+    x = replace_pool({"OpaqueRef:ours": controller()}, shutdown=refused)
+    with pytest.raises(XapiError):
+        bc.destroy_existing(x, "ctl", "OpaqueRef:sr", replace=True)
+    assert x.methods("VM.destroy") == []
+
+
+def test_the_stamp_build_writes_is_the_one_the_check_reads():
+    """Two halves that must agree; a rename on one side would make every rebuild refuse itself."""
+    other = {}
+    x = RecordingXapi(
+        {
+            "VM.get_uuid": "uuid-new",
+            "VM.add_to_other_config": lambda _vm, key, value: other.__setitem__(key, value),
+        }
+    )
+    bc.stamp_owner(x, "OpaqueRef:new")
+    assert bc.is_own_controller({"uuid": "uuid-new", "other_config": other})
+    assert not bc.is_own_controller({"uuid": "uuid-copy", "other_config": other}), "control: a copy"
+
+
+def test_replace_is_off_by_default():
+    assert bc.parse_args(["--pubkey", "k"]).replace is False
+    assert bc.parse_args(["--pubkey", "k", "--replace"]).replace is True
+
+
 # -- the image checksum -----------------------------------------------------
 
 

@@ -94,6 +94,8 @@ class FakeXapi:
 
     def __init__(self, records=None, stuck=(), vdis_after=None, disk_srs=None, sr_counts=None):
         self.host = "dom0.invalid"
+        # One host by default, at the connected address: the shape of a single-host lab.
+        self.hosts = {"OpaqueRef:host": {"address": "dom0.invalid"}}
         self.records = records or {}
         # Which SR each VM's disk is on (VM ref -> SR), "OpaqueRef:sr" unless named. And, per SR,
         # the VDI count (before, after) the reap; an SR not named here answers the defaults below.
@@ -141,6 +143,8 @@ class FakeXapi:
         if method == "VDI.get_SR":
             vm = params[0][len("vdi-") :]
             return self.disk_srs.get(vm, "OpaqueRef:sr")
+        if method == "host.get_all_records":
+            return self.hosts
         raise AssertionError(f"unexpected XAPI call: {method}")
 
 
