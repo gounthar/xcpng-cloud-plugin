@@ -780,6 +780,50 @@ class XoRestClientTest {
     }
 
     @Test
+    void aCloneIsOnlyHandedBackOnceAReadShowsBothOfItsOwnMarkers() {
+        // #357. Two tag PUTs back to back answer 204 while XO still reads [] or one of the two, for 0.11 to
+        // 0.22 s on the lab appliance (n=3). A start that fails in 30 ms then reaches a destroy whose ownership
+        // check reads that stale list and refuses the plugin's own clone, so the confirmation happens here.
+        ScriptedRest t = new ScriptedRest();
+        t.tagViews.addAll(List.of(List.of(), List.of(), List.of("xcpng-cloud:lab")));
+        List<Duration> pauses = new ArrayList<>();
+        XoRestClient c = new XoRestClient(t, pauses::add);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        assertEquals(
+                List.of(XoRestClient.STRIP_POLL, XoRestClient.STRIP_POLL),
+                pauses,
+                t.paths().toString());
+        // Waiting, not writing: the stamps were accepted, and a stale read is no reason to send them again.
+        t.only("PUT", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud%3Alab");
+        t.only("PUT", "/rest/v0/vms/" + CLONE + "/tags/xcpng-cloud-uuid%3A" + CLONE_UUID);
+        assertEquals(List.of(), t.destroyed, t.paths().toString());
+    }
+
+    @Test
+    void aCloneWhoseOwnMarkersNeverShowFailsTheProvisionAndIsDestroyed() {
+        // Bounded like the strip. A clone XO never shows as ours would be refused by every destroy, so it is
+        // removed now, through cloneFromTemplate's own cleanup, rather than handed to Jenkins.
+        ScriptedRest t = new ScriptedRest();
+        for (int i = 0; i < XoRestClient.STRIP_READS + 5; i++) {
+            t.tagViews.add(List.of("xcpng-cloud:lab"));
+        }
+        List<Duration> pauses = new ArrayList<>();
+        XoRestClient c = new XoRestClient(t, pauses::add);
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class,
+                () -> c.cloneFromTemplate(
+                        c.resolveTemplate("jenkins-agent-debian13-v7"),
+                        new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab")));
+        assertTrue(e.getMessage().contains("xcpng-cloud-uuid:" + CLONE_UUID), e.getMessage());
+        assertEquals(XoRestClient.STRIP_READS - 2, pauses.size(), t.paths().toString());
+        assertEquals(List.of(CLONE), t.destroyed, t.paths().toString());
+    }
+
+    @Test
     void cloneWithNoOwnerStampsNoTag() {
         ScriptedRest t = new ScriptedRest();
         XoRestClient c = new XoRestClient(t);
