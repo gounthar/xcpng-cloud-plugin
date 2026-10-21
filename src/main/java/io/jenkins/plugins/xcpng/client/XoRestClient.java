@@ -141,7 +141,8 @@ public final class XoRestClient implements HypervisorClient {
     /**
      * How many times {@code markOwner} reads the clone's tags looking for a clean set before it gives up, with
      * {@link #STRIP_POLL} between reads: about ten seconds. XO's cache showed a deleted tag for about half a
-     * second on the lab appliance (one measurement, #255), so this is generous on purpose.
+     * second on the lab appliance (one measurement, #255), and two added ones after up to 0.22 s (n=3, #357),
+     * so this is generous on purpose.
      */
     static final int STRIP_READS = 20;
 
@@ -1122,10 +1123,16 @@ public final class XoRestClient implements HypervisorClient {
      * lag. After {@link #STRIP_READS} reads the provision fails and the clone is destroyed, rather than a
      * VM the narrowed sweeps skip being handed to Jenkins.
      *
+     * <p>A clean read must also show both of this clone's own markers (#357). The two PUTs answer 204 while
+     * XO still reads {@code []} or one of the two: 0.11 to 0.22 s on the lab appliance, back to back (n=3,
+     * an existing VM, not a fresh clone). A start that fails takes about 30 ms, so the launcher's teardown
+     * used to read that stale list, and {@code refuseUnlessOwned} refused the plugin's own clone, leaving it
+     * running until the leak sweep. Confirming here, once, means no later read has to wait for it.
+     *
      * <p>What a clean read proves depends on whether anything was deleted. Where something was, it is
      * sound: a stale read would still show the deleted tag, so a read without it is a read that has caught
-     * up. Where nothing was, a clean confirming read is a second sample taken later than the first, and
-     * nothing stronger; XO offers no read that proves its tag list complete. On a clean template that
+     * up. Where nothing was, a read showing both stamps has at least caught up with those two writes; XO
+     * offers no read that proves its tag list complete. On a clean template whose stamps already show, that
      * second read is the whole cost: one GET, no wait.
      *
      * <p>A template is normally clean, so where do inherited markers come from? A golden image made from a
@@ -1172,26 +1179,36 @@ public final class XoRestClient implements HypervisorClient {
         return record;
     }
 
-    /** Delete every marker in {@code tags} that is not this clone's own, then read until none is left. */
+    /**
+     * Delete every marker in {@code tags} that is not this clone's own, then read until none is left and
+     * both of its own show.
+     */
     private void stripInheritedMarkers(String vm, String ownerTag, String selfTag, JsonNode tags) {
         Set<String> deleted = new HashSet<>();
         for (int read = 1; ; read++) {
             List<String> foreign = new ArrayList<>();
+            Set<String> missing = new LinkedHashSet<>(List.of(ownerTag, selfTag));
             for (JsonNode node : tags) {
                 String tag = node.asText("");
+                missing.remove(tag);
                 boolean marker = tag.startsWith(OWNER_TAG_PREFIX) || tag.startsWith(SELF_TAG_PREFIX);
                 if (marker && !tag.equals(ownerTag) && !tag.equals(selfTag)) {
                     foreign.add(tag);
                 }
             }
             // The first pass has only deleted; nothing has confirmed anything yet.
-            if (read > 1 && foreign.isEmpty()) {
+            if (read > 1 && foreign.isEmpty() && missing.isEmpty()) {
                 return;
             }
             if (read >= STRIP_READS) {
-                throw new HypervisorException("clone " + vm + " still carries inherited owner markers " + foreign
-                        + " after " + read + " reads; refusing it rather than handing Jenkins a VM that a"
-                        + " sweep narrowed to one cloud would skip");
+                if (!foreign.isEmpty()) {
+                    throw new HypervisorException("clone " + vm + " still carries inherited owner markers "
+                            + foreign + " after " + read + " reads; refusing it rather than handing Jenkins a VM"
+                            + " that a sweep narrowed to one cloud would skip");
+                }
+                throw new HypervisorException("clone " + vm + " still does not show its own markers " + missing
+                        + " after " + read + " reads; refusing it rather than handing Jenkins a VM that every"
+                        + " teardown would refuse as not this cloud's");
             }
             for (String tag : foreign) {
                 if (deleted.add(tag)) {
