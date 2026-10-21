@@ -427,6 +427,22 @@ class XcpngProvisionTest {
                 fake.calls().toString());
     }
 
+    /**
+     * Adds {@code agent} with its clone held until the add has returned. Core starts the launch before it saves
+     * the node, so a launch that fails at once can remove the node and delete its directory under that save,
+     * and the add throws {@code NoSuchFileException}. A real clone takes seconds; the fake fails in microseconds.
+     */
+    private static void addNodeHoldingTheClone(JenkinsRule r, FakeHypervisorClient fake, XcpngAgent agent)
+            throws Exception {
+        CountDownLatch release = new CountDownLatch(1);
+        fake.holdClonesUntil(release);
+        try {
+            r.jenkins.addNode(agent);
+        } finally {
+            release.countDown();
+        }
+    }
+
     @Test
     void aCloneThatFailsToStartIsDestroyedNotLeaked(JenkinsRule r) throws Exception {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian").failStart();
@@ -434,7 +450,7 @@ class XcpngProvisionTest {
         r.jenkins.clouds.add(cloud);
 
         XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
-        r.jenkins.addNode(agent);
+        addNodeHoldingTheClone(r, fake, agent);
 
         // The clone succeeds and the start throws, so the launcher fails with a VM already on the pool. That
         // VM must not survive the failed launch, and neither must the node it was being built for: a node
@@ -2436,7 +2452,7 @@ class XcpngProvisionTest {
         r.jenkins.clouds.add(cloud);
 
         XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
-        r.jenkins.addNode(agent);
+        addNodeHoldingTheClone(r, fake, agent);
 
         awaitTrue(
                 () -> cloud.leakedVmRefs().contains("vm/xcpng-agent-1/1"),
@@ -2459,7 +2475,7 @@ class XcpngProvisionTest {
         r.jenkins.clouds.add(cloud);
 
         XcpngAgent agent = cloud.createAgent(LINUX_TEMPLATE, "xcpng-agent-1", activityId("xcpng-agent-1"), false);
-        r.jenkins.addNode(agent);
+        addNodeHoldingTheClone(r, fake, agent);
 
         awaitTrue(
                 () -> fake.calls().contains("destroyWithDisks:vm/xcpng-agent-1/1"),
