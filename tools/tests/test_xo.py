@@ -312,6 +312,85 @@ def test_close_drops_the_socket_even_when_closing_it_raises(xo):
     assert xo._ws is None
 
 
+# -- transport failures arrive as XoError (#319) ------------------------------
+#
+# xo_probe and xo_compare run their cleanup from an `except XoError`. Anything else that
+# escapes the client skips it and leaves the run's VMs on the pool, so every way the
+# socket can fail has to come out as XoError, not only the timeout.
+
+TRANSPORT_FAILURES = [
+    (ConnectionRefusedError(111, "Connection refused"), "nothing listening"),
+    (ConnectionResetError(104, "Connection reset by peer"), "the appliance dropped us"),
+    (OSError("[SSL: CERTIFICATE_VERIFY_FAILED]"), "a TLS failure is an OSError"),
+    (websocket.WebSocketConnectionClosedException("socket is already closed."), "closed"),
+    (websocket.WebSocketBadStatusException("Handshake status 502", 502), "a bad handshake"),
+]
+
+
+@pytest.mark.parametrize("exc, why", TRANSPORT_FAILURES, ids=[w for _, w in TRANSPORT_FAILURES])
+def test_a_connection_that_cannot_be_opened_is_an_xo_error(xo, monkeypatch, exc, why):
+    def refuse(*a, **k):
+        raise exc
+
+    monkeypatch.setattr(websocket, "create_connection", refuse)
+    with pytest.raises(XoError) as raised:
+        xo.connect()
+    assert raised.value.message == "TRANSPORT"
+    assert xo.url in str(raised.value)
+
+
+@pytest.mark.parametrize("exc, why", TRANSPORT_FAILURES, ids=[w for _, w in TRANSPORT_FAILURES])
+def test_a_send_that_fails_is_an_xo_error(xo, exc, why):
+    class Broken(FakeWs):
+        def send(self, payload):
+            raise exc
+
+    xo._ws = Broken()
+    with pytest.raises(XoError) as raised:
+        xo.call("vm.create")
+    assert raised.value.message == "TRANSPORT"
+    assert "could not be sent" in str(raised.value)
+
+
+@pytest.mark.parametrize("exc, why", TRANSPORT_FAILURES, ids=[w for _, w in TRANSPORT_FAILURES])
+def test_a_connection_lost_before_the_answer_says_the_call_may_have_happened(xo, exc, why):
+    """The request is out, so a create may have made a VM nobody holds an id for."""
+    xo._ws = FakeWs([exc])
+    with pytest.raises(XoError) as raised:
+        xo.call("vm.create")
+    assert raised.value.message == "TRANSPORT"
+    assert "may have taken effect" in str(raised.value)
+
+
+def test_a_plain_socket_timeout_is_still_a_timeout(xo):
+    """TimeoutError is an OSError. Folding it into TRANSPORT would hide a timed-out create
+    from xo_compare, which looks for the VM only when the message is TIMEOUT."""
+    xo._ws = FakeWs([TimeoutError("timed out")])
+    with pytest.raises(XoError) as raised:
+        xo.call("vm.create")
+    assert raised.value.message == "TIMEOUT"
+
+
+def test_a_send_that_times_out_at_the_socket_is_a_timeout(xo):
+    class Stalled(FakeWs):
+        def send(self, payload):
+            raise TimeoutError("timed out")
+
+    xo._ws = Stalled()
+    with pytest.raises(XoError) as raised:
+        xo.call("vm.create")
+    assert raised.value.message == "TIMEOUT"
+
+
+def test_a_sign_in_lost_mid_answer_closes_the_socket_and_raises_xo_error(xo, monkeypatch):
+    ws = FakeWs([ConnectionResetError(104, "Connection reset by peer")])
+    monkeypatch.setattr(websocket, "create_connection", lambda *a, **k: ws)
+    with pytest.raises(XoError) as raised:
+        xo.connect()
+    assert raised.value.message == "TRANSPORT"
+    assert ws.closed is True and xo._ws is None
+
+
 # -- credentials ------------------------------------------------------------
 
 def test_missing_env_var_is_named(monkeypatch):
