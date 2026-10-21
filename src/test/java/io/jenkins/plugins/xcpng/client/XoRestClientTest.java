@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -613,6 +614,32 @@ class XoRestClientTest {
         assertTrue(
                 t.paths().stream().noneMatch(p -> p.startsWith("DELETE /rest/v0/vms/" + CLONE + "/tags/")),
                 t.paths().toString());
+    }
+
+    @Test
+    void cloneStripsAnInheritedMarkerThatOnlyStartsWithItsOwn() {
+        // #325. A marker is kept only when it equals this clone's own, never when it merely starts with it:
+        // cloud "lab" cloning a template stamped by cloud "lab-2" would otherwise keep "xcpng-cloud:lab-2"
+        // beside its own tag, the two-owner state #255 was opened for. Same for a uuid stamp carrying this
+        // clone's uuid followed by more characters.
+        ScriptedRest t = new ScriptedRest();
+        t.vmTags.addAll(List.of("xcpng-cloud:lab-2", "xcpng-cloud-uuid:" + CLONE_UUID + "-copy"));
+        XoRestClient c = new XoRestClient(t);
+        c.cloneFromTemplate(
+                c.resolveTemplate("jenkins-agent-debian13-v7"),
+                new ProvisionSpec("agent-1", 2, 2048L, null, null, null, Map.of(), "lab"));
+
+        String tags = "/rest/v0/vms/" + CLONE + "/tags/";
+        List<String> deletes =
+                t.paths().stream().filter(p -> p.startsWith("DELETE " + tags)).toList();
+        assertEquals(
+                List.of(
+                        "DELETE " + tags + "xcpng-cloud%3Alab-2",
+                        "DELETE " + tags + "xcpng-cloud-uuid%3A" + CLONE_UUID + "-copy"),
+                deletes,
+                t.paths().toString());
+        assertEquals(
+                Set.of("xcpng-cloud:lab", "xcpng-cloud-uuid:" + CLONE_UUID), Set.copyOf(t.vmTags), t.vmTags.toString());
     }
 
     @Test
