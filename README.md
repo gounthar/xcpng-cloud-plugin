@@ -259,10 +259,15 @@ and says why on its configuration page and in a banner under **Manage Jenkins**.
 3. Press **Test connection** and pin the appliance's certificate if it asks.
 4. Save. Saving is what moves the cloud to Xen Orchestra; nothing is migrated behind your back.
 
-**Drain XAPI-provisioned agents before upgrading if you can.** An agent provisioned over XAPI keeps
-the connection it was provisioned with, and this release cannot open it, so its VM is not destroyed
-when the agent goes. The banner names any such agent. Remove it, then reclaim its VM with
-`tools/reaper.py`, which finds it by the `xcpng-cloud` owner marker without needing Jenkins.
+**Drain XAPI-provisioned agents before upgrading.** An agent provisioned over XAPI keeps the
+connection it was provisioned with, and this release cannot open it. An agent still running at the
+upgrade is torn down during startup, its VM is left running on the pool, and about ten seconds later
+the plugin stops tracking it, so neither the banner nor the node list mentions it. If you could not
+drain, find such VMs with a dry run of `tools/reaper.py`, which selects on the `xcpng-cloud` owner
+marker without needing Jenkins.
+
+The full procedure, including backup, rollback and the reaper commands, is in
+[docs/upgrading-from-xapi.md](docs/upgrading-from-xapi.md).
 
 Under configuration as code, point `poolUrl` and `credentialsId` at the appliance and its token, and
 delete `backend: XAPI` if the document has it. A document written for XAPI usually names no backend at
