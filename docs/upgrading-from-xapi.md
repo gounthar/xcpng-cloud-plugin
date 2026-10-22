@@ -101,8 +101,9 @@ all, because XAPI was the default; after the upgrade such a cloud comes up as Xe
 still selecting the old username/password credential. It is listed in the banner and provisions
 nothing until the credential is fixed.
 
-You can change `plugins.txt` and the configuration in one restart, or upgrade first and switch the
-configuration afterwards. Both worked.
+Changing `plugins.txt` and the configuration in one restart worked, in the run with a build left
+running. Upgrading first and switching the configuration in a later restart worked in the drained
+run. The second order was not tried on an undrained controller.
 
 **Check that the token actually reached the controller.** A secret variable that is empty inside the
 container gets a 401 that reads "The appliance did not accept the token. It may be wrong, revoked or
@@ -118,7 +119,8 @@ re-read `env_file`; recreate the container instead.
 ## If you could not drain
 
 An agent that was running at the upgrade was provisioned over XAPI, and the new release cannot open
-that connection. What happened when a build was left running during the upgrade:
+that connection. What happened in the one lab run where a build was left running during the
+upgrade:
 
 - **The VM kept running.** The build lost its agent at the restart; the VM did not stop.
 - **The plugin tried to destroy it during startup, failed, and logged a SEVERE** from
@@ -127,7 +129,8 @@ that connection. What happened when a build was left running during the upgrade:
   on leaked XCP-ng VM ... its connection can no longer be opened", and from then on nothing in the
   UI mentions it. The agent was torn down during startup, so the banner never listed it either.
 - **Nothing else removed the VM** in the 17 minutes it was watched. The agent inside kept retrying
-  the connection every 10 seconds or so. Nothing in the code goes back to a VM once it has been
+  the connection, about every 10 seconds in that run; that interval is the agent's, not the
+  plugin's. Nothing in the code goes back to a VM once it has been
   given up on, so expect it to stay until you remove it.
 - **The build that was running fails, and its record is not kept.** Its log ends in
   `ClosedChannelException` and `Finished: FAILURE`, but it does not load afterwards.
@@ -136,19 +139,23 @@ New builds were not affected: a build started after the upgrade ran on a new clo
 destroyed as usual.
 
 To clean up, run the reaper from a machine that can reach the pool master. It selects VMs by the
-owner marker the plugin stamps on every clone, and it is a dry run by default:
+owner marker the plugin stamps on every clone, and it is a dry run by default. It reads the pool's
+credentials from the environment; prompting for the password keeps it out of your shell history:
 
 ```bash
-XCPNG_HOST=pool-master.example.com XCPNG_USER=root XCPNG_PASS=... python3 tools/reaper.py
+export XCPNG_HOST=pool-master.example.com XCPNG_USER=root
+read -rsp 'Pool root password: ' XCPNG_PASS && export XCPNG_PASS
+python3 tools/reaper.py
 ```
 
 Check that it lists only VMs you expect to go. Then apply it, passing the controller's current node
-list so that agents still in use are kept:
+list so that agents still in use are kept. The Jenkins API token goes in a netrc file (one line,
+`machine <jenkins host> login <user> password <api token>`, readable only by you) rather than on the
+`curl` command line, where other users can see it in the process list:
 
 ```bash
-curl -gfsu USER:TOKEN "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
-  | XCPNG_HOST=pool-master.example.com XCPNG_USER=root XCPNG_PASS=... \
-    python3 tools/reaper.py --apply --keep-nodes -
+curl -gfs --netrc-file ~/.jenkins-netrc "$JENKINS_URL/computer/api/json?tree=computer[displayName]" \
+  | python3 tools/reaper.py --apply --keep-nodes -
 ```
 
 Run it while the cloud is not provisioning. The reaper's own header explains why, and lists its other
