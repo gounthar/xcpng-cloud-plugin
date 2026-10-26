@@ -4,13 +4,17 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import hudson.Extension;
 import hudson.model.Computer;
+import hudson.model.Node;
 import hudson.model.TaskListener;
 import hudson.slaves.ComputerListener;
 import hudson.slaves.SlaveComputer;
+import java.lang.reflect.Field;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Future;
 import jenkins.model.Jenkins;
+import jenkins.model.NodeListener;
 
 /**
  * Waits out core's launcher threads before {@code JenkinsRule} deletes the temporary home (#328).
@@ -24,8 +28,14 @@ import jenkins.model.Jenkins;
  *
  * <p>The live computer list is not enough on its own. A failed launch removes its node from the launch thread
  * and then keeps going: core writes the failure to the computer's log under the home after the computer has
- * left {@link Jenkins#getComputers()}. So every launch is also recorded as it starts, by {@link Recorder}, and
- * waited on through its own computer.
+ * left {@link Jenkins#getComputers()}. So every computer is also recorded, by {@link Recorder} as its launch starts
+ * and by {@link NodeRecorder} as soon as its node is added, and waited on through its own computer. The second
+ * covers a launch still queued on the pool when the test removes the node: {@code preLaunch} has not run yet, and
+ * the computer has already left the list.
+ *
+ * <p>{@link SlaveComputer#isConnecting()} is not enough either. Core sets the channel before it runs the {@code
+ * onOnline} listeners and writes the last connection-log line, and the computer stops reading as connecting the
+ * moment the channel is set. So the wait is on the launch task itself, the computer's {@code lastConnectActivity}.
  */
 final class AgentLaunches {
 
@@ -33,7 +43,7 @@ final class AgentLaunches {
 
     private AgentLaunches() {}
 
-    /** Wait until no computer is connecting, and fail if one is still connecting after 30 seconds. */
+    /** Wait until no launch task is running, and fail if one is still running after 30 seconds. */
     static void awaitAll() throws InterruptedException {
         try {
             awaitLaunches();
@@ -61,7 +71,8 @@ final class AgentLaunches {
                 }
             }
             for (SlaveComputer slave : launching) {
-                while (slave.isConnecting()) {
+                Future<?> launch = lastConnectActivity(slave);
+                while (launch != null && !launch.isDone()) {
                     waited = true;
                     if (System.currentTimeMillis() > deadline) {
                         fail("core was still launching " + slave.getName() + " when the test ended");
@@ -72,12 +83,47 @@ final class AgentLaunches {
         } while (waited);
     }
 
+    private static final Field LAST_CONNECT_ACTIVITY;
+
+    static {
+        try {
+            LAST_CONNECT_ACTIVITY = SlaveComputer.class.getDeclaredField("lastConnectActivity");
+            LAST_CONNECT_ACTIVITY.setAccessible(true);
+        } catch (NoSuchFieldException e) {
+            throw new ExceptionInInitializerError(
+                    "SlaveComputer.lastConnectActivity is gone; AgentLaunches needs another way to see the launch task");
+        }
+    }
+
+    /** The computer's latest launch task, or null if it was never launched. Private in core, with no getter. */
+    private static Future<?> lastConnectActivity(SlaveComputer slave) {
+        try {
+            return (Future<?>) LAST_CONNECT_ACTIVITY.get(slave);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     /** Records each launch on its own thread, before the launcher runs, so a removed computer is still waited on. */
     @Extension
     public static final class Recorder extends ComputerListener {
         @Override
         public void preLaunch(Computer computer, TaskListener listener) {
             if (computer instanceof SlaveComputer slave) {
+                STARTED.add(slave);
+            }
+        }
+    }
+
+    /**
+     * Records each computer as its node is added. Core has already submitted the launch by then, but {@code preLaunch}
+     * only runs once the pool picks the task up.
+     */
+    @Extension
+    public static final class NodeRecorder extends NodeListener {
+        @Override
+        protected void onCreated(Node node) {
+            if (node.toComputer() instanceof SlaveComputer slave) {
                 STARTED.add(slave);
             }
         }
