@@ -32,6 +32,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
@@ -48,6 +49,12 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
  */
 @WithJenkins
 class XcpngLauncherTest {
+
+    /** Core may still be launching an agent this test added; see {@link AgentLaunches}. */
+    @AfterEach
+    void awaitAgentLaunches() throws InterruptedException {
+        AgentLaunches.awaitAll();
+    }
 
     private static final XcpngTemplate LINUX_TEMPLATE =
             new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);

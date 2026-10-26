@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.htmlunit.html.HtmlPage;
 import org.jenkinsci.plugins.plaincredentials.impl.StringCredentialsImpl;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -41,6 +42,12 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
  */
 @WithJenkins
 class XcpngBackendSelectionTest {
+
+    /** Core may still be launching an agent this test added; see {@link AgentLaunches}. */
+    @AfterEach
+    void awaitAgentLaunches() throws InterruptedException {
+        AgentLaunches.awaitAll();
+    }
 
     private static final String XO_URL = "https://192.168.1.5";
 
@@ -505,6 +512,8 @@ class XcpngBackendSelectionTest {
                 r.jenkins.getExtensionList(XcpngRemovedBackendMonitor.class).get(0);
         XcpngCloud cloud = cloud("lab", XO_URL, XO_CREDENTIAL_ID);
         cloud.setClientFactory(c -> new FakeHypervisorClient("jenkins-golden-debian"));
+        // The fake agents never connect; without this the XO agent's launch is still waiting when the test ends.
+        cloud.setWaitForOnline(false);
         r.jenkins.clouds.add(cloud);
         cloud.setBackend(XcpngBackend.XAPI);
         XcpngAgent agent = cloud.createAgent(

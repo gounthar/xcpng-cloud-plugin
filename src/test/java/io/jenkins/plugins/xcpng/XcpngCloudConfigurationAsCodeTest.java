@@ -36,6 +36,7 @@ import java.util.logging.Handler;
 import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -49,6 +50,12 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
  */
 @WithJenkins
 class XcpngCloudConfigurationAsCodeTest {
+
+    /** Core may still be launching an agent this test added; see {@link AgentLaunches}. */
+    @AfterEach
+    void awaitAgentLaunches() throws InterruptedException {
+        AgentLaunches.awaitAll();
+    }
 
     private static final String YAML = "configuration-as-code.yaml";
 

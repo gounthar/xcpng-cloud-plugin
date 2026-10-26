@@ -35,12 +35,19 @@ import java.util.logging.Level;
 import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 @WithJenkins
 class XcpngCloudTest {
+
+    /** Core may still be launching an agent this test added; see {@link AgentLaunches}. */
+    @AfterEach
+    void awaitAgentLaunches() throws InterruptedException {
+        AgentLaunches.awaitAll();
+    }
 
     /**
      * A syntactically valid pin, used where a test needs the fingerprint to be present rather than

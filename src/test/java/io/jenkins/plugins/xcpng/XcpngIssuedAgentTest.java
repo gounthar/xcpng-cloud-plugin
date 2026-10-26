@@ -30,6 +30,7 @@ import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.htmlunit.WebResponse;
 import org.jenkinsci.plugins.cloudstats.ProvisioningActivity;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
@@ -47,6 +48,12 @@ import org.springframework.security.access.AccessDeniedException;
  */
 @WithJenkins
 class XcpngIssuedAgentTest {
+
+    /** Core may still be launching an agent this test added; see {@link AgentLaunches}. */
+    @AfterEach
+    void awaitAgentLaunches() throws InterruptedException {
+        AgentLaunches.awaitAll();
+    }
 
     private static final XcpngTemplate TEMPLATE = new XcpngTemplate("jenkins-golden-debian", "xcpng-linux", 2, 2048);
 
