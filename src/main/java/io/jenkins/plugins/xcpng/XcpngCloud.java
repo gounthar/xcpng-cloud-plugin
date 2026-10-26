@@ -1316,7 +1316,12 @@ public class XcpngCloud extends Cloud {
         List<XcpngLeakedVm> done = new ArrayList<>();
         try {
             for (XcpngLeakedVm vm : pending) {
-                if (vm.sameConnectionAs(this)) {
+                if (!vm.getBackend().isSupported()) {
+                    // Recorded over the removed XAPI backend (#330): no connection opens it, whether the entry has
+                    // one, has none, or matches a cloud still saved for XAPI. Giving up would drop it from the
+                    // removed-backend banner, the only thing that names it.
+                    keptForAPerson(vm);
+                } else if (vm.sameConnectionAs(this)) {
                     overCurrent.add(vm);
                 } else if (vm.hasConnection()) {
                     overRecorded
@@ -1324,8 +1329,6 @@ public class XcpngCloud extends Cloud {
                             .add(vm);
                 } else if (vm.getBackend() == getBackend()) {
                     overCurrent.add(vm);
-                } else if (!vm.getBackend().isSupported()) {
-                    keptForAPerson(vm);
                 } else {
                     giveUp(
                             vm,
@@ -1416,12 +1419,6 @@ public class XcpngCloud extends Cloud {
                 // and the banner is the only thing still saying the refused VM may be running.
                 if (vm.isHeld()) {
                     stillLeaked(vm, e, "could not open the connection it was recorded with");
-                    continue;
-                }
-                // Nor one recorded over the removed backend (#330): giving up drops it from the removed-backend
-                // banner, the only thing that names it. Every XAPI connection lands here, since none opens.
-                if (!vm.getBackend().isSupported()) {
-                    keptForAPerson(vm);
                     continue;
                 }
                 giveUp(vm, "its connection can no longer be opened: " + e.getMessage());

@@ -123,6 +123,33 @@ class XcpngRemovedBackendLeakTest {
     }
 
     /**
+     * A cloud not yet switched to XO still names XAPI, so its own XAPI entries match its connection. That path
+     * opens the cloud's own connection, which an operator can repair, and only warned: the entry has to get the
+     * same SEVERE naming the reaper, since no repair of a cloud still on XAPI will ever open it.
+     */
+    @Test
+    void anXapiLeakOnACloudStillOnXapiGetsTheSameNotice(JenkinsRule r) {
+        XcpngCloud cloud =
+                new XcpngCloud("xcpng", "https://xapi-pool.example.test", "root-password", null, 2, List.of());
+        cloud.setBackend(XcpngBackend.XAPI);
+        r.jenkins.clouds.add(cloud);
+        XcpngLeakedVm leak = XcpngLeakedVm.of(XAPI_VM, cloud).named("xcpng-linux-1a2b3c4d");
+        assertTrue(leak.sameConnectionAs(cloud), "control: the entry is on the cloud's own connection");
+        cloud.recordLeakedVm(leak);
+
+        List<String> severe = severeLinesDuring(() -> {
+            cloud.sweepLeakedVms();
+            cloud.sweepLeakedVms();
+        });
+
+        assertEquals(Set.of(XAPI_VM), cloud.leakedVmRefs());
+        List<String> kept =
+                severe.stream().filter(line -> line.contains(XAPI_VM)).toList();
+        assertEquals(1, kept.size(), "said once, as on a cloud already moved to XO: " + severe);
+        assertTrue(kept.get(0).contains("tools/reaper.py --cloud xcpng"), kept.get(0));
+    }
+
+    /**
      * Kept, but not against Max instances: the cloud has been moved to XO and provisions again, and an entry no
      * sweep can ever clear would hold its slot for good. It counts as needing a person instead, which is what
      * {@link XcpngLeakCapacityMonitor} reports.

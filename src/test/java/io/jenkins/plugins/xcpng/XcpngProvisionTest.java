@@ -2575,17 +2575,17 @@ class XcpngProvisionTest {
             openedWith.add(backend + " " + poolUrl + " " + credentialsId + " " + trust.certificateFingerprint());
             return recorded;
         });
-        cloud.recordLeakedVm(XcpngLeakedVm.of(
-                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", "AA:BB"));
+        cloud.recordLeakedVm(
+                XcpngLeakedVm.of("vm/leaked-1", XcpngBackend.XO, "https://old.example.test", "cred-old", "AA:BB"));
 
         cloud.sweepLeakedVms();
 
         assertEquals(
-                List.of("XAPI https://old.example.test cred-old AA:BB"),
+                List.of("XO https://old.example.test cred-old AA:BB"),
                 openedWith,
                 "the sweep must open the connection recorded with the ref, in full");
         assertTrue(
-                recorded.calls().contains("destroyWithDisks:OpaqueRef:leaked-1"),
+                recorded.calls().contains("destroyWithDisks:vm/leaked-1"),
                 "the destroy must go to the recorded connection: " + recorded.calls());
         assertTrue(
                 current.calls().isEmpty(),
