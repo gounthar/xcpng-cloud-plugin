@@ -679,9 +679,11 @@ public class XcpngAgent extends AbstractCloudSlave implements TrackedItem {
             client.destroyWithDisks(new VmRef(vmRef), cloudName);
         } catch (RuntimeException e) {
             // With this agent's connection, not the cloud's: the sweep must reach the VM the way it was made,
-            // even after the cloud is edited (#223). An agent predating the snapshot records none.
+            // even after the cloud is edited (#223). An agent predating the snapshot records none. Named, so a
+            // VM no sweep can reach is still one a person can find on the pool (#330).
             XcpngLeakedVm leaked = XcpngLeakedVm.of(
-                    vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates);
+                            vmRef, getBackend(), poolUrl, credentialsId, certificateFingerprint, caCertificates)
+                    .named(getNodeName());
             // Held when the #48 guard is what refused (#306): the sweep would otherwise send the very delete
             // the guard just refused, on the same Halted reading, a minute later at most.
             if (e instanceof HaltedWhileConnectedException) {

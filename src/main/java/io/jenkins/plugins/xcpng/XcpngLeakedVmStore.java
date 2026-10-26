@@ -22,6 +22,7 @@ import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArraySet;
+import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
@@ -189,9 +190,10 @@ public class XcpngLeakedVmStore implements Saveable {
      * writes the file nor logs again. Persisted at once: the VM outlives the controller process, so a leak
      * recorded before a restart must still be reclaimed after one.
      *
-     * <p>A held record of a VM already recorded unheld replaces it, and is saved, but does not count as new.
-     * The reverse never happens: once the #48 guard has refused a VM, a later ordinary failure of the same
-     * teardown says nothing about whether the pool still reads it {@code Halted} (#306).
+     * <p>A record of a VM already recorded can still add to it, and is then saved without counting as new: a
+     * held record makes an unheld entry held, and a named one names an unnamed entry (#330). Neither is ever
+     * taken back. Once the #48 guard has refused a VM, a later ordinary failure of the same teardown says
+     * nothing about whether the pool still reads it {@code Halted} (#306).
      */
     boolean record(String cloudName, @NonNull XcpngLeakedVm vm) {
         drainPendingMigrations();
@@ -206,17 +208,23 @@ public class XcpngLeakedVmStore implements Saveable {
         leakedByCloud.compute(cloudName, (key, vms) -> {
             Set<XcpngLeakedVm> target = vms == null ? new CopyOnWriteArraySet<>() : vms;
             added[0] = target.add(vm);
-            // Held is outside equals, so an add that found an equal entry may have found it unheld. Swap it in a
-            // new set rather than remove-then-add on this one: entries() copies the set without this lock, and
-            // could otherwise catch it between the two with the VM in neither.
-            if (!added[0] && vm.isHeld() && target.stream().anyMatch(e -> e.equals(vm) && !e.isHeld())) {
-                Set<XcpngLeakedVm> replaced = new CopyOnWriteArraySet<>(target);
-                replaced.remove(vm);
-                replaced.add(vm);
-                upgraded[0] = true;
-                return replaced;
+            if (added[0]) {
+                return target;
             }
-            return target;
+            // Held and the node name are outside equals, so an add that found an equal entry may have found one
+            // that says less. Swap it in a new set rather than remove-then-add on this one: entries() copies the
+            // set without this lock, and could otherwise catch it between the two with the VM in neither.
+            XcpngLeakedVm existing =
+                    target.stream().filter(vm::equals).findFirst().orElseThrow();
+            XcpngLeakedVm merged = existing.mergedWith(vm);
+            if (!merged.describedDifferentlyFrom(existing)) {
+                return target;
+            }
+            Set<XcpngLeakedVm> replaced = new CopyOnWriteArraySet<>(target);
+            replaced.remove(existing);
+            replaced.add(merged);
+            upgraded[0] = true;
+            return replaced;
         });
         if (added[0] || upgraded[0]) {
             saveQuietly();
@@ -242,16 +250,28 @@ public class XcpngLeakedVmStore implements Saveable {
      */
     @NonNull
     Map<String, List<XcpngLeakedVm>> held() {
+        return byCloud(XcpngLeakedVm::isHeld);
+    }
+
+    /**
+     * Every entry recorded over the removed XAPI backend (#330), keyed by cloud name in name order, for
+     * {@link XcpngRemovedBackendMonitor}. No sweep can reach these, so this is the only place they are named.
+     */
+    @NonNull
+    Map<String, List<XcpngLeakedVm>> onRemovedBackend() {
+        return byCloud(vm -> !vm.getBackend().isSupported());
+    }
+
+    private Map<String, List<XcpngLeakedVm>> byCloud(Predicate<XcpngLeakedVm> filter) {
         drainPendingMigrations();
-        Map<String, List<XcpngLeakedVm>> held = new TreeMap<>();
+        Map<String, List<XcpngLeakedVm>> matching = new TreeMap<>();
         leakedByCloud.forEach((cloudName, vms) -> {
-            List<XcpngLeakedVm> mine =
-                    vms.stream().filter(XcpngLeakedVm::isHeld).toList();
+            List<XcpngLeakedVm> mine = vms.stream().filter(filter).toList();
             if (!mine.isEmpty()) {
-                held.put(cloudName, mine);
+                matching.put(cloudName, mine);
             }
         });
-        return held;
+        return matching;
     }
 
     /** The cloud names holding at least one entry, in name order, configured or not. */

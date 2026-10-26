@@ -120,7 +120,7 @@ re-read `env_file`; recreate the container instead.
 
 An agent that was running at the upgrade was provisioned over XAPI, and the new release cannot open
 that connection. What happened in the one lab run where a build was left running during the
-upgrade:
+upgrade, on 2.0.0:
 
 - **The VM kept running.** The build lost its agent at the restart; the VM did not stop.
 - **The plugin tried to destroy it during startup, failed, and logged a SEVERE** from
@@ -130,8 +130,15 @@ upgrade:
   UI mentions it. The agent was torn down during startup, so the banner never listed it either.
 - **Nothing else removed the VM** in the 17 minutes it was watched. The agent inside kept retrying
   the connection, about every 10 seconds in that run; that interval is the agent's, not the
-  plugin's. Nothing in the code goes back to a VM once it has been
-  given up on, so expect it to stay until you remove it.
+  plugin's.
+
+Releases after 2.0.0 keep the record instead of forgetting it (#330). The banner under **Manage
+Jenkins** lists each such VM under its cloud, with the agent name, which is also the VM's name on the
+pool, and the reaper command for that cloud. The controller log says the same once per start, at
+SEVERE. The plugin still cannot destroy the VM, and the record does not count against the cloud's
+**Max instances**. This is covered by the plugin's tests; it has not been through the lab run above.
+
+Either way, the VM stays until you remove it.
 - **The build that was running fails, and its record is not kept.** Its log ends in
   `ClosedChannelException` and `Finished: FAILURE`, but it does not load afterwards.
 
@@ -161,7 +168,8 @@ curl -gfs --netrc-file ~/.jenkins-netrc "$JENKINS_URL/computer/api/json?tree=com
 Run it while the cloud is not provisioning. The reaper's own header explains why, and lists its other
 options.
 
-Making the plugin reclaim these VMs through Xen Orchestra itself is tracked in #330.
+Once the VM is gone, click **Forget** beside it in the banner. That only removes the record; it does
+not touch the pool, so do it after the reaper, not instead of it.
 
 ## Rolling back
 

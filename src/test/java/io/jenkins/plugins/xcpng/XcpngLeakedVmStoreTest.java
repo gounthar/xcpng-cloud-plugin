@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.jenkins.plugins.xcpng.client.PoolTrust;
@@ -442,5 +443,60 @@ class XcpngLeakedVmStoreTest {
                         .next()
                         .isHeld(),
                 "the upgrade is saved");
+    }
+
+    /**
+     * The node name is what lets a person find on the pool a VM no sweep can reach (#330), and that VM outlives
+     * restarts by design, so the name has to come back off disk with it.
+     */
+    @Test
+    void aNodeNameSurvivesARestart(JenkinsRule r) {
+        XcpngLeakedVmStore.get().record("xcpng-lab", leak("vm-named").named("xcpng-linux-1a2b3c4d"));
+
+        XcpngLeakedVm reloaded =
+                new XcpngLeakedVmStore().entries("xcpng-lab").iterator().next();
+
+        assertEquals("xcpng-linux-1a2b3c4d", reloaded.getNodeName());
+    }
+
+    /** A file written before the node name existed has no element for it, and loads unnamed rather than failing. */
+    @Test
+    void anEntryWrittenBeforeNodeNameExistedLoadsUnnamed(JenkinsRule r) throws Exception {
+        XcpngLeakedVmStore.get().record("xcpng-lab", leak("vm-old").named("xcpng-linux-old"));
+        File file = new File(Jenkins.get().getRootDir(), STORE_FILE);
+        String written = Files.readString(file.toPath(), StandardCharsets.UTF_8);
+        assertTrue(
+                written.contains("<nodeName>xcpng-linux-old</nodeName>"),
+                "the control: the name must be in the file to remove: " + written);
+        Files.writeString(
+                file.toPath(), written.replaceAll("\\s*<nodeName>[^<]*</nodeName>", ""), StandardCharsets.UTF_8);
+
+        XcpngLeakedVm reloaded =
+                new XcpngLeakedVmStore().entries("xcpng-lab").iterator().next();
+
+        assertEquals("vm-old", reloaded.getVmRef());
+        assertNull(reloaded.getNodeName(), "an entry with no nodeName element is unnamed");
+    }
+
+    /**
+     * A named record of a VM already recorded unnamed names it, and saves that, without counting as new. The
+     * entry here is held, and the named record is not: merging must keep held, which a plain replace would drop.
+     * A later unnamed record must not take the name back either.
+     */
+    @Test
+    void aNamedRecordNamesAnUnnamedEntryAndKeepsItHeld(JenkinsRule r) {
+        XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
+        store.record("xcpng-lab", leak("vm-1").asHeld());
+
+        assertFalse(store.record("xcpng-lab", leak("vm-1").named("xcpng-linux-1")), "the same VM is not new");
+        store.record("xcpng-lab", leak("vm-1"));
+
+        XcpngLeakedVm entry = store.entries("xcpng-lab").iterator().next();
+        assertEquals("xcpng-linux-1", entry.getNodeName());
+        assertTrue(entry.isHeld(), "naming an entry must not unhold it");
+        assertEquals(
+                "xcpng-linux-1",
+                new XcpngLeakedVmStore().entries("xcpng-lab").iterator().next().getNodeName(),
+                "the naming is saved");
     }
 }

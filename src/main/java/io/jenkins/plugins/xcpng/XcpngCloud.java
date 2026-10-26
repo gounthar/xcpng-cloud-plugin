@@ -812,12 +812,13 @@ public class XcpngCloud extends Cloud {
                     () -> "Failed to destroy VM " + clone.value() + ", cloned for torn-down agent "
                             + agent.getNodeName() + "; recorded it as a leaked VM for the warm-pool maintainer");
             recordLeakedVm(XcpngLeakedVm.of(
-                    clone.value(),
-                    agent.getBackend(),
-                    agent.getPoolUrl(),
-                    agent.getCredentialsId(),
-                    agent.getCertificateFingerprint(),
-                    agent.getCaCertificates()));
+                            clone.value(),
+                            agent.getBackend(),
+                            agent.getPoolUrl(),
+                            agent.getCredentialsId(),
+                            agent.getCertificateFingerprint(),
+                            agent.getCaCertificates())
+                    .named(agent.getNodeName()));
         } finally {
             if (interrupted) {
                 Thread.currentThread().interrupt();
@@ -1283,7 +1284,11 @@ public class XcpngCloud extends Cloud {
      * when retrying cannot help -- a connection the cloud has left behind no longer opens at all (the
      * credential or URL it names is gone), or an entry with no connection belongs to a backend the cloud no
      * longer speaks -- and says so once at SEVERE, naming {@code tools/reaper.py}, which finds the VM by its
-     * owner marker. Everything else keeps the entry, with no age limit: a pool that is down, a destroy that
+     * owner marker. One entry is kept although retrying cannot help: one recorded over the removed XAPI backend
+     * (#330). Nothing in this plugin can reach it, but giving up would drop the only record naming a VM that
+     * may still run, so it stays for a person, listed by {@link XcpngRemovedBackendMonitor} until they reclaim
+     * it and forget it there, and said once at SEVERE. Everything else keeps the entry, with no age limit: a
+     * pool that is down, a destroy that
      * fails, and the cloud's own connection failing to open, which is live configuration an operator can
      * repair. The first failure of each entry is logged at WARNING so a stuck entry is visible at the
      * default level, and the repeats at FINE.
@@ -1319,6 +1324,8 @@ public class XcpngCloud extends Cloud {
                             .add(vm);
                 } else if (vm.getBackend() == getBackend()) {
                     overCurrent.add(vm);
+                } else if (!vm.getBackend().isSupported()) {
+                    keptForAPerson(vm);
                 } else {
                     giveUp(
                             vm,
@@ -1409,6 +1416,12 @@ public class XcpngCloud extends Cloud {
                 // and the banner is the only thing still saying the refused VM may be running.
                 if (vm.isHeld()) {
                     stillLeaked(vm, e, "could not open the connection it was recorded with");
+                    continue;
+                }
+                // Nor one recorded over the removed backend (#330): giving up drops it from the removed-backend
+                // banner, the only thing that names it. Every XAPI connection lands here, since none opens.
+                if (!vm.getBackend().isSupported()) {
+                    keptForAPerson(vm);
                     continue;
                 }
                 giveUp(vm, "its connection can no longer be opened: " + e.getMessage());
@@ -1532,6 +1545,29 @@ public class XcpngCloud extends Cloud {
                 Level.SEVERE,
                 () -> "Giving up on leaked XCP-ng VM " + vm + " for cloud " + name + ": " + sentence
                         + ". It may still exist; reclaim it with tools/reaper.py");
+    }
+
+    /**
+     * Keep an entry recorded over the removed XAPI backend (#330), which no sweep can reach. Said at SEVERE on the
+     * first sweep after each controller start, with what a person needs to find the VM, then at FINE.
+     */
+    private void keptForAPerson(@NonNull XcpngLeakedVm vm) {
+        if (!XcpngLeakedVmStore.get().firstFailure(name, vm)) {
+            LOGGER.log(
+                    Level.FINE,
+                    () -> "Leaked XCP-ng VM " + vm + " for cloud " + name + " is on the removed " + vm.getBackend()
+                            + " backend; keeping it for a person");
+            return;
+        }
+        String agent = vm.getNodeName() == null ? "an agent whose name was not recorded" : "agent " + vm.getNodeName();
+        String where = vm.hasConnection() ? "pool " + vm.getPoolUrl() : "a pool that was not recorded";
+        LOGGER.log(
+                Level.SEVERE,
+                () -> "Leaked XCP-ng VM " + vm.getVmRef() + " of " + agent + " for cloud " + name
+                        + " was provisioned over the removed " + vm.getBackend() + " backend at " + where
+                        + ", and this plugin can no longer destroy it. It may still be running. Reclaim it with"
+                        + " tools/reaper.py --cloud " + name + ", which finds it by its owner marker, then click"
+                        + " Forget beside it under Manage Jenkins");
     }
 
     private void stillLeaked(@NonNull XcpngLeakedVm vm, @NonNull RuntimeException e, @NonNull String what) {
@@ -1885,7 +1921,7 @@ public class XcpngCloud extends Cloud {
      *
      * <p>Only entries the sweep is still retrying count. A held one (#306) waits for the pool to read it running
      * and may never; one the backend refused as not this cloud's ({@link NotOwnedException}) is refused on every
-     * sweep. Both need a person, and counting them would let a few such VMs stop provisioning for good, so they
+     * sweep; one recorded over the removed XAPI backend is never swept at all (#330). All three need a person, and counting them would let a few such VMs stop provisioning for good, so they
      * are counted by {@link #leakedNeedingAPerson()} instead. {@link XcpngLeakCapacityMonitor} names the cloud
      * while either is above zero, because a cap filled by leaks stops provisioning and nothing else would say
      * why. A ref still recorded on a registered agent is that agent's VM and already counted as its node, so it
@@ -1895,7 +1931,10 @@ public class XcpngCloud extends Cloud {
         return countLeaked(true);
     }
 
-    /** Leaked entries of this cloud that no sweep will reclaim on its own: held, or refused as not owned. */
+    /**
+     * Leaked entries of this cloud that no sweep will reclaim on its own: held, refused as not owned, or on the
+     * removed backend.
+     */
     int leakedNeedingAPerson() {
         return countLeaked(false);
     }
@@ -1918,7 +1957,10 @@ public class XcpngCloud extends Cloud {
         Set<String> stuck = new HashSet<>();
         for (XcpngLeakedVm vm : store.entries(name)) {
             if (!live.contains(vm.getVmRef())) {
-                (vm.isHeld() || store.isRefused(name, vm) ? stuck : retrying).add(vm.getVmRef());
+                boolean needsAPerson = vm.isHeld()
+                        || store.isRefused(name, vm)
+                        || !vm.getBackend().isSupported();
+                (needsAPerson ? stuck : retrying).add(vm.getVmRef());
             }
         }
         if (retryable) {
