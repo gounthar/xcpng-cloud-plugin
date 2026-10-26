@@ -346,6 +346,26 @@ public class XcpngLeakedVmStore implements Saveable {
     }
 
     /**
+     * Drop entries because an administrator asked to, from a monitor's Forget button, rather than because a sweep
+     * settled them. The VM itself is not touched: nothing will retry it afterwards, which is the point when it is
+     * already gone and the loss when it is not, so the log line names who asked and how to find it on the pool.
+     */
+    void forget(String cloudName, @NonNull Collection<XcpngLeakedVm> vms) {
+        if (vms.isEmpty()) {
+            return;
+        }
+        drop(cloudName, vms);
+        String user = Jenkins.getAuthentication2().getName();
+        for (XcpngLeakedVm vm : vms) {
+            LOGGER.log(
+                    Level.INFO,
+                    () -> "Forgot leaked XCP-ng VM " + vm + " of cloud " + cloudName + " at the request of " + user
+                            + "; it is no longer retried. If it still exists, find it with tools/reaper.py --cloud "
+                            + cloudName);
+        }
+    }
+
+    /**
      * Whether this cloud cannot be keyed, because a hand-edited or truncated {@code config.xml} left it
      * without a {@code <name>}.
      *
