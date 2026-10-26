@@ -131,6 +131,8 @@ upgrade, on 2.0.0:
 - **Nothing else removed the VM** in the 17 minutes it was watched. The agent inside kept retrying
   the connection, about every 10 seconds in that run; that interval is the agent's, not the
   plugin's.
+- **The build that was running fails, and its record is not kept.** Its log ends in
+  `ClosedChannelException` and `Finished: FAILURE`, but it does not load afterwards.
 
 Releases after 2.0.0 keep the record instead of forgetting it (#330). The banner under **Manage
 Jenkins** lists each such VM under its cloud, with the agent name, which is also the VM's name on the
@@ -139,8 +141,6 @@ SEVERE. The plugin still cannot destroy the VM, and the record does not count ag
 **Max instances**. This is covered by the plugin's tests; it has not been through the lab run above.
 
 Either way, the VM stays until you remove it.
-- **The build that was running fails, and its record is not kept.** Its log ends in
-  `ClosedChannelException` and `Finished: FAILURE`, but it does not load afterwards.
 
 New builds were not affected: a build started after the upgrade ran on a new clone, which was
 destroyed as usual.
