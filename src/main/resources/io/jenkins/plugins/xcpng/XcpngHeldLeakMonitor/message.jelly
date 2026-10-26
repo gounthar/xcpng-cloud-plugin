@@ -1,15 +1,23 @@
 <?jelly escape-by-default='true'?>
-<j:jelly xmlns:j="jelly:core">
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
   <div class="jenkins-alert jenkins-alert-warning">
     <p>${%intro}</p>
     <j:forEach var="cloud" items="${it.held.entrySet()}">
       <p>${%cloud(cloud.key)}</p>
       <ul>
         <j:forEach var="vm" items="${cloud.value}">
-          <li>${vm}</li>
+          <li>
+            <form method="post" action="${rootURL}/${it.url}/forget" class="xcpng-forget">
+              ${vm}
+              <input type="hidden" name="cloud" value="${cloud.key}"/>
+              <input type="hidden" name="vmRef" value="${vm.vmRef}"/>
+              <f:submit value="${%forget}"/>
+            </form>
+          </li>
         </j:forEach>
       </ul>
       <p><code>tools/reaper.py --cloud ${cloud.key} --dom0-check</code></p>
     </j:forEach>
+    <p>${%forgetHelp}</p>
   </div>
 </j:jelly>
