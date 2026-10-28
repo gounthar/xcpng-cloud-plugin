@@ -1,5 +1,5 @@
 <?jelly escape-by-default='true'?>
-<j:jelly xmlns:j="jelly:core">
+<j:jelly xmlns:j="jelly:core" xmlns:f="/lib/form">
   <div class="jenkins-alert jenkins-alert-warning">
     <p>${%intro}</p>
     <j:if test="${!it.clouds.isEmpty()}">
@@ -17,6 +17,30 @@
           <li>${name}</li>
         </j:forEach>
       </ul>
+    </j:if>
+    <j:if test="${!it.leaked.isEmpty()}">
+      <p>${%leaked}</p>
+      <j:forEach var="cloud" items="${it.leaked.entrySet()}">
+        <p>${%cloud(cloud.key)}</p>
+        <ul>
+          <j:forEach var="vm" items="${cloud.value}">
+            <li>
+              <form method="post" action="${rootURL}/${it.url}/forget" class="xcpng-forget">
+                <j:choose>
+                  <j:when test="${vm.nodeName != null}">${%leakedNamed(vm.nodeName, vm.vmRef)}</j:when>
+                  <j:otherwise>${%leakedUnnamed(vm.vmRef)}</j:otherwise>
+                </j:choose>
+                <j:if test="${vm.poolUrl != null}"> ${%leakedPool(vm.poolUrl)}</j:if>
+                <input type="hidden" name="cloud" value="${cloud.key}"/>
+                <input type="hidden" name="vmRef" value="${vm.vmRef}"/>
+                <f:submit value="${%forget}"/>
+              </form>
+            </li>
+          </j:forEach>
+        </ul>
+        <p><code>tools/reaper.py --cloud ${cloud.key}</code></p>
+      </j:forEach>
+      <p>${%forgetHelp}</p>
     </j:if>
   </div>
 </j:jelly>

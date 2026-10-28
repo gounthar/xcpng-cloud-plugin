@@ -2440,6 +2440,10 @@ class XcpngProvisionTest {
         assertTrue(
                 cloud.leakedVmRefs().contains(agent.getVmRef()),
                 "the failed teardown must record the VM as leaked: " + cloud.leakedVmRefs());
+        assertEquals(
+                agent.getNodeName(),
+                XcpngLeakedVmStore.get().entries("xcpng").iterator().next().getNodeName(),
+                "and name the agent, so a VM no sweep reaches can still be found on the pool (#330)");
 
         // The pool recovers; the next sweep reissues the destroy and the ref clears.
         fake.recoverDestroy();
@@ -2571,17 +2575,17 @@ class XcpngProvisionTest {
             openedWith.add(backend + " " + poolUrl + " " + credentialsId + " " + trust.certificateFingerprint());
             return recorded;
         });
-        cloud.recordLeakedVm(XcpngLeakedVm.of(
-                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", "AA:BB"));
+        cloud.recordLeakedVm(
+                XcpngLeakedVm.of("vm/leaked-1", XcpngBackend.XO, "https://old.example.test", "cred-old", "AA:BB"));
 
         cloud.sweepLeakedVms();
 
         assertEquals(
-                List.of("XAPI https://old.example.test cred-old AA:BB"),
+                List.of("XO https://old.example.test cred-old AA:BB"),
                 openedWith,
                 "the sweep must open the connection recorded with the ref, in full");
         assertTrue(
-                recorded.calls().contains("destroyWithDisks:OpaqueRef:leaked-1"),
+                recorded.calls().contains("destroyWithDisks:vm/leaked-1"),
                 "the destroy must go to the recorded connection: " + recorded.calls());
         assertTrue(
                 current.calls().isEmpty(),
@@ -2593,10 +2597,11 @@ class XcpngProvisionTest {
      * A ref stored before #223 carries no connection, only a backend read off its shape. This one is an XAPI
      * {@code OpaqueRef} and the cloud speaks XO, so there is nothing here that can destroy it safely: Xen
      * Orchestra resolves an {@code OpaqueRef} wherever it takes a VM id (#223), so the handle is not even
-     * refused politely. It must be given up, and left to {@code tools/reaper.py}.
+     * refused politely. It is kept for a person rather than given up (#330): giving up would drop the only record
+     * of a VM that may still run, and XcpngRemovedBackendMonitor lists it until someone forgets it.
      */
     @Test
-    void aBareRefFromTheOtherBackendIsGivenUpRatherThanSweptHere(JenkinsRule r) {
+    void aBareRefFromTheRemovedBackendIsKeptForAPersonRatherThanSweptHere(JenkinsRule r) {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2); // XO, the default
         r.jenkins.clouds.add(cloud);
@@ -2606,9 +2611,26 @@ class XcpngProvisionTest {
 
         assertTrue(fake.calls().isEmpty(), "an XAPI ref must never be handed to an XO connection: " + fake.calls());
         assertTrue(
-                cloud.leakedVmRefs().isEmpty(),
-                "nothing here can ever destroy it, so it must be given up rather than retried forever: "
-                        + cloud.leakedVmRefs());
+                cloud.leakedVmRefs().contains("OpaqueRef:legacy-1"),
+                "nothing reclaims it, so the entry must stay to name it: " + cloud.leakedVmRefs());
+    }
+
+    /**
+     * The control for the one above: a bare ref of a backend this plugin still speaks, on a cloud left on XAPI,
+     * is still given up. A keep that tested the wrong backend, the cloud's rather than the entry's, would keep it.
+     */
+    @Test
+    void aBareRefFromASupportedBackendOnAnXapiCloudIsStillGivenUp(JenkinsRule r) {
+        FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
+        XcpngCloud cloud = cloudBackedBy(fake, 2);
+        cloud.setBackend(XcpngBackend.XAPI);
+        r.jenkins.clouds.add(cloud);
+        XcpngLeakedVmStore.get().record("xcpng", XcpngLeakedVm.legacy("55703ef8-ca33-ee80-e0d1-f9aee081ab7e"));
+
+        cloud.sweepLeakedVms();
+
+        assertTrue(fake.calls().isEmpty(), "an XO ref must never be handed to an XAPI cloud: " + fake.calls());
+        assertTrue(cloud.leakedVmRefs().isEmpty(), "it must be given up as before: " + cloud.leakedVmRefs());
     }
 
     /** A bare ref whose backend does match is swept over the cloud's current connection: it is all there is. */
@@ -2637,9 +2659,10 @@ class XcpngProvisionTest {
         FakeHypervisorClient fake = new FakeHypervisorClient("jenkins-golden-debian");
         XcpngCloud cloud = cloudBackedBy(fake, 2);
         r.jenkins.clouds.add(cloud);
-        // No recorded-connection seam here: this is the production path, and no such credential exists.
-        cloud.recordLeakedVm(XcpngLeakedVm.of(
-                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-deleted", null));
+        // No recorded-connection seam here: this is the production path, and no such credential exists. XO, so
+        // the entry is not one the removed-backend keep holds back (#330).
+        cloud.recordLeakedVm(
+                XcpngLeakedVm.of("vm/leaked/1", XcpngBackend.XO, "https://old.example.test", "cred-deleted", null));
 
         cloud.sweepLeakedVms();
 
@@ -2665,8 +2688,8 @@ class XcpngProvisionTest {
         cloud.setRecordedConnectionClientFactory((poolUrl, credentialsId, certificateFingerprint, backend) -> {
             throw new IllegalStateException("credential 'cred-old' no longer exists.");
         });
-        cloud.recordLeakedVm(XcpngLeakedVm.of(
-                "OpaqueRef:leaked-1", XcpngBackend.XAPI, "https://old.example.test", "cred-old", null));
+        cloud.recordLeakedVm(
+                XcpngLeakedVm.of("vm/leaked/1", XcpngBackend.XO, "https://old.example.test", "cred-old", null));
 
         List<String> given = new ArrayList<>();
         Logger logger = Logger.getLogger(XcpngCloud.class.getName());

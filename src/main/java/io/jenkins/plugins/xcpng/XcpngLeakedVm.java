@@ -52,6 +52,16 @@ public final class XcpngLeakedVm {
      */
     private final boolean held;
 
+    /**
+     * The name of the agent whose teardown recorded this entry, which is also the VM's name-label on the pool,
+     * or null. An entry written before this field existed loads with null, as does one recorded where no agent
+     * was at hand. It is what lets an administrator find on the pool a VM this plugin can no longer reach, since
+     * the ref alone names nothing a person recognises (#330).
+     *
+     * <p>Not part of {@link #equals}, like {@link #held}: it describes the VM rather than identifying it.
+     */
+    private final String nodeName;
+
     private XcpngLeakedVm(
             @NonNull String vmRef,
             @NonNull XcpngBackend backend,
@@ -59,7 +69,8 @@ public final class XcpngLeakedVm {
             @CheckForNull String credentialsId,
             @CheckForNull String certificateFingerprint,
             @CheckForNull String caCertificates,
-            boolean held) {
+            boolean held,
+            @CheckForNull String nodeName) {
         this.vmRef = Objects.requireNonNull(vmRef, "vmRef");
         this.backend = Objects.requireNonNull(backend, "backend");
         this.poolUrl = poolUrl;
@@ -67,6 +78,7 @@ public final class XcpngLeakedVm {
         this.certificateFingerprint = certificateFingerprint;
         this.caCertificates = caCertificates;
         this.held = held;
+        this.nodeName = nodeName;
     }
 
     /**
@@ -94,7 +106,7 @@ public final class XcpngLeakedVm {
             @CheckForNull String certificateFingerprint,
             @CheckForNull String caCertificates) {
         if (poolUrl == null) {
-            return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), null, null, null, null, false);
+            return new XcpngLeakedVm(vmRef, XcpngBackend.resolve(backend), null, null, null, null, false, null);
         }
         return new XcpngLeakedVm(
                 vmRef,
@@ -103,7 +115,8 @@ public final class XcpngLeakedVm {
                 credentialsId,
                 certificateFingerprint,
                 caCertificates,
-                false);
+                false,
+                null);
     }
 
     /** A leak recorded with the cloud's connection as it is now, for a VM provisioned under that connection. */
@@ -125,7 +138,7 @@ public final class XcpngLeakedVm {
     @NonNull
     static XcpngLeakedVm legacy(@NonNull String vmRef) {
         XcpngBackend inferred = vmRef.startsWith(VmRef.XAPI_REF_PREFIX) ? XcpngBackend.XAPI : XcpngBackend.XO;
-        return new XcpngLeakedVm(vmRef, inferred, null, null, null, null, false);
+        return new XcpngLeakedVm(vmRef, inferred, null, null, null, null, false, null);
     }
 
     @NonNull
@@ -159,13 +172,41 @@ public final class XcpngLeakedVm {
         return caCertificates;
     }
 
+    /** The agent this VM was built for, which is also its name-label on the pool; null when not recorded. */
+    @CheckForNull
+    public String getNodeName() {
+        return nodeName;
+    }
+
     /** This entry, held: the sweep reads the VM's state before destroying it. See {@link #isHeld()}. */
     @NonNull
     XcpngLeakedVm asHeld() {
-        return held
-                ? this
-                : new XcpngLeakedVm(
-                        vmRef, backend, poolUrl, credentialsId, certificateFingerprint, caCertificates, true);
+        return held ? this : with(true, nodeName);
+    }
+
+    /** This entry, naming the agent it was recorded for. See {@link #getNodeName()}. */
+    @NonNull
+    XcpngLeakedVm named(@CheckForNull String nodeName) {
+        return Objects.equals(this.nodeName, nodeName) ? this : with(held, nodeName);
+    }
+
+    /**
+     * This entry with what {@code other}, an equal entry recorded again, adds to it: held if either is, since a
+     * refusal by the #48 guard is never taken back (#306), and the first node name either carries.
+     */
+    @NonNull
+    XcpngLeakedVm mergedWith(@NonNull XcpngLeakedVm other) {
+        return with(held || other.held, nodeName != null ? nodeName : other.nodeName);
+    }
+
+    /** Whether this entry and {@code other} differ in a field {@link #equals} does not compare. */
+    boolean describedDifferentlyFrom(@NonNull XcpngLeakedVm other) {
+        return held != other.held || !Objects.equals(nodeName, other.nodeName);
+    }
+
+    private XcpngLeakedVm with(boolean held, @CheckForNull String nodeName) {
+        return new XcpngLeakedVm(
+                vmRef, backend, poolUrl, credentialsId, certificateFingerprint, caCertificates, held, nodeName);
     }
 
     /**
