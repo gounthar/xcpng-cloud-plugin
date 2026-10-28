@@ -1,0 +1,51 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core" xmlns:l="/lib/layout" xmlns:f="/lib/form">
+  <l:layout title="${%title}" permission="${app.ADMINISTER}">
+    <l:main-panel>
+      <h1>${%title}</h1>
+      <j:set var="entry" value="${preview.entry}"/>
+      <j:set var="vm" value="${preview.vm}"/>
+      <j:if test="${entry != null}">
+        <h2>${%recorded}</h2>
+        <table class="jenkins-table">
+          <tr><td>${%cloud}</td><td>${preview.cloud}</td></tr>
+          <tr><td>${%agent}</td><td>${entry.nodeName != null ? entry.nodeName : '-'}</td></tr>
+          <tr><td>${%ref}</td><td><code>${entry.vmRef}</code></td></tr>
+          <tr><td>${%storedPool}</td><td>${entry.poolUrl != null ? entry.poolUrl : '-'}</td></tr>
+        </table>
+      </j:if>
+      <j:if test="${vm != null}">
+        <h2>${%found}</h2>
+        <table class="jenkins-table">
+          <tr><td>${%name}</td><td>${vm.nameLabel()}</td></tr>
+          <tr><td>${%uuid}</td><td><code>${vm.uuid()}</code></td></tr>
+          <tr><td>${%powerState}</td><td>${vm.powerState()}</td></tr>
+          <tr><td>${%xoPool}</td><td><code>${vm.poolId()}</code></td></tr>
+        </table>
+      </j:if>
+      <j:choose>
+        <j:when test="${preview.reclaimable}">
+          <p>${%poolCheck}</p>
+          <p>${%whatHappens}</p>
+          <form method="post" action="${rootURL}/${it.url}/reclaimConfirm">
+            <input type="hidden" name="cloud" value="${preview.cloud}"/>
+            <input type="hidden" name="vmRef" value="${entry.vmRef}"/>
+            <input type="hidden" name="uuid" value="${vm.uuid()}"/>
+            <f:submit value="${%reclaim}"/>
+          </form>
+        </j:when>
+        <j:otherwise>
+          <div class="jenkins-alert jenkins-alert-warning">
+            <p>${%refused}</p>
+            <ul>
+              <j:forEach var="why" items="${preview.refusals}">
+                <li class="xcpng-refusal">${why}</li>
+              </j:forEach>
+            </ul>
+          </div>
+        </j:otherwise>
+      </j:choose>
+      <p><a href="${rootURL}/manage/">${%back}</a></p>
+    </l:main-panel>
+  </l:layout>
+</j:jelly>

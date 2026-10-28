@@ -35,12 +35,18 @@
                 <input type="hidden" name="vmRef" value="${vm.vmRef}"/>
                 <f:submit value="${%forget}"/>
               </form>
+              <form method="post" action="${rootURL}/${it.url}/reclaim" class="xcpng-reclaim">
+                <input type="hidden" name="cloud" value="${cloud.key}"/>
+                <input type="hidden" name="vmRef" value="${vm.vmRef}"/>
+                <f:submit value="${%reclaim}"/>
+              </form>
             </li>
           </j:forEach>
         </ul>
         <p><code>tools/reaper.py --cloud ${cloud.key}</code></p>
       </j:forEach>
       <p>${%forgetHelp}</p>
+      <p>${%reclaimHelp}</p>
     </j:if>
   </div>
 </j:jelly>

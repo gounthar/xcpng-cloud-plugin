@@ -42,7 +42,8 @@ final class XcpngXapiEraReclaim {
             refused.add(Messages.XcpngXapiEraReclaim_NotXapiEra());
             return refused;
         }
-        if (entry.getNodeName() == null) {
+        String nodeName = entry.getNodeName();
+        if (nodeName == null) {
             refused.add(Messages.XcpngXapiEraReclaim_NoNodeName());
         }
         if (found.isEmpty()) {
@@ -53,7 +54,7 @@ final class XcpngXapiEraReclaim {
         if (!vm.xapiRef().equals(entry.getVmRef())) {
             refused.add(Messages.XcpngXapiEraReclaim_OtherRef(vm.xapiRef()));
         }
-        if (entry.getNodeName() != null && !entry.getNodeName().equals(vm.nameLabel())) {
+        if (nodeName != null && !nodeName.equals(vm.nameLabel())) {
             refused.add(Messages.XcpngXapiEraReclaim_OtherName(vm.nameLabel()));
         }
         if (!cloudName.equals(vm.legacyOwner())) {
