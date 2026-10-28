@@ -66,7 +66,7 @@ import java.util.logging.Logger;
  *
  * <p>Not thread-safe: one client per operation.
  */
-public final class XoRestClient implements HypervisorClient {
+public final class XoRestClient implements HypervisorClient, XapiEraVms {
 
     private static final Logger LOGGER = Logger.getLogger(XoRestClient.class.getName());
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -1411,6 +1411,7 @@ public final class XoRestClient implements HypervisorClient {
      * @throws HypervisorException when {@code xapiRef} is not a XAPI ref, would address another route, or the
      *     read fails or answers a record missing an identifying field
      */
+    @Override
     @NonNull
     public Optional<XapiEraVm> lookUpXapiEraVm(@NonNull String xapiRef) {
         if (!xapiRef.startsWith(VmRef.XAPI_REF_PREFIX)) {
@@ -1460,6 +1461,114 @@ public final class XoRestClient implements HypervisorClient {
                 powerState(record.path("power_state").asText("")),
                 owner.isTextual() ? owner.asText() : null,
                 tags));
+    }
+
+    /**
+     * Stamp this backend's owner markers for {@code owner} on a VM {@link #lookUpXapiEraVm} found (#364), so the
+     * ordinary teardown, and its {@code refuseUnlessOwned} gate, can take it from here. Answers the handle that
+     * teardown addresses it by. The caller decides beforehand that this is the VM to take over; this method makes
+     * sure it still is at the moment of writing, and never takes over someone else's.
+     *
+     * <p>The VM is read again by its id first, because a preview and its confirmation are separate requests:
+     * its uuid and {@code _xapiRef} must still be the ones found, and it must carry no marker of another cloud or
+     * another VM. Otherwise nothing is written. Unlike {@code markOwner}, which strips markers a clone inherited
+     * from its template, a foreign marker here is never removed. On a clone it can only be inherited; on a VM
+     * found by ref it may be someone else's claim, and removing it would be deciding a dispute this plugin cannot
+     * see the other side of.
+     *
+     * <p>Then the two PUTs, each only for a marker the VM does not already carry, and reads until both show,
+     * the way {@code markOwner} confirms its own (#357). A foreign marker turning up in one of those reads
+     * aborts, and the markers this call added are deleted again: they were written on the strength of a read
+     * that turned out not to be the whole story. Markers that never show also abort, and stay where they are,
+     * since a DELETE would be as unconfirmable as the PUT was.
+     *
+     * @throws NotOwnedException when the VM changed since it was found, or carries another cloud's or VM's marker
+     * @throws HypervisorException when a read or a write fails, or the markers do not show
+     */
+    @Override
+    @NonNull
+    public VmRef adoptXapiEraVm(@NonNull XapiEraVm found, @NonNull String owner) {
+        if (owner.isBlank()) {
+            throw new HypervisorException(
+                    "refusing to take over " + found.id().value() + ": no owning cloud was named");
+        }
+        String vm = found.id().value();
+        String path = vmPath(vm);
+        JsonNode record = get(path);
+        String uuid = record.path("uuid").asText("");
+        String ref = record.path("_xapiRef").asText("");
+        if (!uuid.equals(found.uuid()) || !ref.equals(found.xapiRef())) {
+            throw new NotOwnedException("refusing to take over VM " + vm + ": it now reads uuid '" + uuid
+                    + "' and ref '" + ref + "', not the '" + found.uuid() + "' and '" + found.xapiRef()
+                    + "' it was found with. Nothing was written.");
+        }
+        String ownerTag = OWNER_TAG_PREFIX + owner;
+        String selfTag = SELF_TAG_PREFIX + uuid;
+        Set<String> present = tagSet(record.path("tags"));
+        List<String> foreign = foreignMarkers(present, ownerTag, selfTag);
+        if (!foreign.isEmpty()) {
+            throw new NotOwnedException("refusing to take over VM " + vm + ": it carries " + foreign
+                    + ", which names another cloud or another VM. Nothing was written.");
+        }
+        List<String> added = new ArrayList<>();
+        for (String tag : List.of(ownerTag, selfTag)) {
+            if (!present.contains(tag)) {
+                call("PUT", path + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+                added.add(tag);
+            }
+        }
+        for (int read = 1; ; read++) {
+            Set<String> tags = tagSet(get(path).path("tags"));
+            foreign = foreignMarkers(tags, ownerTag, selfTag);
+            if (!foreign.isEmpty()) {
+                NotOwnedException refused = new NotOwnedException("refusing to take over VM " + vm + ": it now carries "
+                        + foreign + ", which names another cloud or another VM. Removing the markers this attempt"
+                        + " added: " + added + ".");
+                for (String tag : added) {
+                    try {
+                        call("DELETE", path + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+                    } catch (HypervisorException e) {
+                        refused.addSuppressed(e);
+                    }
+                }
+                throw refused;
+            }
+            if (tags.contains(ownerTag) && tags.contains(selfTag)) {
+                return found.id();
+            }
+            if (read >= STRIP_READS) {
+                throw new HypervisorException("VM " + vm + " still does not show " + ownerTag + " and " + selfTag
+                        + " after " + read + " reads; it is not taken over, and the entry stays as it was");
+            }
+            try {
+                pause.pause(STRIP_POLL);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new HypervisorException("interrupted while confirming the owner markers on VM " + vm, e);
+            }
+        }
+    }
+
+    @NonNull
+    private static Set<String> tagSet(@NonNull JsonNode tags) {
+        Set<String> set = new LinkedHashSet<>();
+        for (JsonNode tag : tags) {
+            set.add(tag.asText(""));
+        }
+        return set;
+    }
+
+    /** Owner markers and uuid stamps in {@code tags} other than {@code ownerTag} and {@code selfTag}. */
+    @NonNull
+    private static List<String> foreignMarkers(@NonNull Set<String> tags, String ownerTag, String selfTag) {
+        List<String> foreign = new ArrayList<>();
+        for (String tag : tags) {
+            boolean marker = tag.startsWith(OWNER_TAG_PREFIX) || tag.startsWith(SELF_TAG_PREFIX);
+            if (marker && !tag.equals(ownerTag) && !tag.equals(selfTag)) {
+                foreign.add(tag);
+            }
+        }
+        return foreign;
     }
 
     /**

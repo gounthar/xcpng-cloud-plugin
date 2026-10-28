@@ -1317,6 +1317,159 @@ class XoRestClientTest {
         assertTrue(t.destroyed.isEmpty(), t.destroyed::toString);
     }
 
+    // -- adoptXapiEraVm (#364) --------------------------------------------
+
+    private static XapiEraVm foundClone() {
+        return new XapiEraVm(
+                new VmRef(CLONE),
+                CLONE_UUID,
+                XAPI_ERA_REF,
+                "xcpng-jenkins-agent-debian13-v8-60cd9585",
+                POOL,
+                VmState.RUNNING,
+                OWNER,
+                List.of());
+    }
+
+    /** The clone as the ref lookup found it: its uuid and ref, no tags. */
+    private static ScriptedRest xapiEraClone() {
+        ScriptedRest t = new ScriptedRest();
+        t.vmXapiRef = XAPI_ERA_REF;
+        return t;
+    }
+
+    private static final String OWN = XoRestClient.OWNER_TAG_PREFIX + XoRestClientTest.OWNER;
+    private static final String SELF = XoRestClient.SELF_TAG_PREFIX + CLONE_UUID;
+
+    private static List<String> writes(ScriptedRest t) {
+        return t.paths().stream().filter(p -> !p.startsWith("GET ")).toList();
+    }
+
+    /** Both markers, stamped by id, then a read that shows them; the uuid stamp is the record's uuid, not the id. */
+    @Test
+    void adoptingStampsBothMarkersByIdAndConfirmsThem() {
+        ScriptedRest t = xapiEraClone();
+
+        VmRef adopted = new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER);
+
+        assertEquals(new VmRef(CLONE), adopted);
+        assertEquals(List.of(OWN, SELF), t.vmTags);
+        assertEquals(
+                List.of(
+                        "PUT /rest/v0/vms/" + CLONE + "/tags/" + XoRestClient.encodeSegment(OWN),
+                        "PUT /rest/v0/vms/" + CLONE + "/tags/" + XoRestClient.encodeSegment(SELF)),
+                writes(t));
+        assertTrue(t.paths().stream().noneMatch(p -> p.contains("OpaqueRef")), t.paths()::toString);
+    }
+
+    @Test
+    void adoptingAVmThatAlreadyCarriesItsMarkersWritesNothing() {
+        ScriptedRest t = xapiEraClone();
+        t.vmTags.addAll(List.of(OWN, SELF));
+
+        new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER);
+
+        assertEquals(List.of(), writes(t));
+    }
+
+    /** Another cloud's marker, or a uuid stamp naming another VM: refused before anything is written, and kept. */
+    @Test
+    void adoptingRefusesAForeignMarkerWithoutWritingOrRemovingAnything() {
+        for (String foreign : new String[] {
+            XoRestClient.OWNER_TAG_PREFIX + "other-cloud",
+            XoRestClient.OWNER_TAG_PREFIX + OWNER + "-2",
+            XoRestClient.SELF_TAG_PREFIX + CLONE
+        }) {
+            ScriptedRest t = xapiEraClone();
+            t.vmTags.add(foreign);
+
+            assertThrows(
+                    NotOwnedException.class,
+                    () -> new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER),
+                    foreign);
+            assertEquals(List.of(), writes(t), foreign);
+            assertEquals(List.of(foreign), t.vmTags, foreign);
+        }
+    }
+
+    /** The preview and the confirmation are separate requests; a VM that changed in between is not taken over. */
+    @Test
+    void adoptingRefusesAVmThatNoLongerReadsAsTheOneFound() {
+        ScriptedRest otherUuid = xapiEraClone();
+        otherUuid.vmUuid = CLONE;
+        ScriptedRest otherRef = xapiEraClone();
+        otherRef.vmXapiRef = XAPI_ERA_REF + "0";
+        ScriptedRest noRef = xapiEraClone();
+        noRef.vmXapiRef = null;
+        for (ScriptedRest t : List.of(otherUuid, otherRef, noRef)) {
+            assertThrows(
+                    NotOwnedException.class, () -> new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER));
+            assertEquals(List.of(), writes(t));
+        }
+    }
+
+    /**
+     * A foreign marker that a confirming read turns up aborts, and the markers this attempt added come off again.
+     * The first view is the read before writing, which showed nothing.
+     */
+    @Test
+    void aForeignMarkerSeenAfterStampingAbortsAndRemovesWhatWasAdded() {
+        ScriptedRest t = xapiEraClone();
+        String foreign = XoRestClient.OWNER_TAG_PREFIX + "other-cloud";
+        t.tagViews.add(List.of());
+        t.tagViews.add(List.of(OWN, SELF, foreign));
+
+        assertThrows(NotOwnedException.class, () -> new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER));
+
+        assertEquals(List.of(), t.vmTags);
+        assertTrue(
+                writes(t).contains("DELETE /rest/v0/vms/" + CLONE + "/tags/" + XoRestClient.encodeSegment(OWN)),
+                writes(t)::toString);
+        assertTrue(
+                writes(t).stream().noneMatch(p -> p.contains(XoRestClient.encodeSegment(foreign))),
+                writes(t)::toString);
+        assertTrue(t.destroyed.isEmpty(), t.destroyed::toString);
+    }
+
+    /** XO's tag reads lag a PUT (#357); a read showing one marker of two is waited past, not taken as done. */
+    @Test
+    void adoptingWaitsUntilBothMarkersShow() {
+        ScriptedRest t = xapiEraClone();
+        t.tagViews.add(List.of());
+        t.tagViews.add(List.of(OWN));
+        t.tagViews.add(List.of(OWN, SELF));
+
+        new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER);
+
+        assertEquals(3, t.paths().stream().filter(p -> p.startsWith("GET ")).count(), t.paths()::toString);
+    }
+
+    /** Markers that never show are a failure, not a takeover, and nothing is deleted on a read that may be stale. */
+    @Test
+    void markersThatNeverShowFailTheAdoptionWithoutDeletingThem() {
+        ScriptedRest t = xapiEraClone();
+        for (int i = 0; i <= XoRestClient.STRIP_READS; i++) {
+            t.tagViews.add(List.of());
+        }
+
+        HypervisorException e = assertThrows(
+                HypervisorException.class, () -> new XoRestClient(t, d -> {}).adoptXapiEraVm(foundClone(), OWNER));
+
+        assertFalse(e instanceof NotOwnedException, e.getMessage());
+        assertTrue(writes(t).stream().noneMatch(p -> p.startsWith("DELETE")), writes(t)::toString);
+    }
+
+    /** The handle adopted by is XO's id; a ref there is refused like on every other verb, before any request. */
+    @Test
+    void adoptingRefusesARefAsTheHandle() {
+        ScriptedRest t = xapiEraClone();
+        XapiEraVm byRef = new XapiEraVm(
+                new VmRef(XAPI_ERA_REF), CLONE_UUID, XAPI_ERA_REF, "n", POOL, VmState.RUNNING, OWNER, List.of());
+
+        assertThrows(HypervisorException.class, () -> new XoRestClient(t, d -> {}).adoptXapiEraVm(byRef, OWNER));
+        assertTrue(t.calls.isEmpty(), t.calls::toString);
+    }
+
     /**
      * The check refuses what changes the route and nothing else. A colon or an at sign is a legal path
      * character, and an id carrying one is not refused: refusing the clone's id leaves a VM behind on every
@@ -2444,6 +2597,8 @@ class XoRestClientTest {
          * Empty by default, which is the realistic case for a clean template.
          */
         List<String> vmTags = new ArrayList<>();
+        /** The clone's {@code _xapiRef}, as XO reports it on every VM record; null leaves it out. */
+        String vmXapiRef;
         /**
          * What successive GETs of the clone report as its tags, ahead of the truth: each read takes the next
          * view, and once they run out a read reports {@link #vmTags} as it now stands. XO's object cache lags
@@ -2611,6 +2766,9 @@ class XoRestClientTest {
                     vm.put("uuid", vmUuid);
                 }
                 vm.put("tags", tagViews.isEmpty() ? List.copyOf(vmTags) : tagViews.poll());
+                if (vmXapiRef != null) {
+                    vm.put("_xapiRef", vmXapiRef);
+                }
                 if (mainIpAddress != null) {
                     vm.put("mainIpAddress", mainIpAddress);
                 }
