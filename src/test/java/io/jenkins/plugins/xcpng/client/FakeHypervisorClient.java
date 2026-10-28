@@ -21,7 +21,7 @@ import java.util.concurrent.TimeUnit;
  * VBD/VDI/VM teardown ordering that matters inside the real client is tested against JSON fixtures,
  * not here.
  */
-public final class FakeHypervisorClient implements HypervisorClient {
+public final class FakeHypervisorClient implements HypervisorClient, XapiEraVms {
 
     private final Set<String> knownTemplates;
     private final Set<String> knownNetworks = new LinkedHashSet<>();
@@ -71,6 +71,11 @@ public final class FakeHypervisorClient implements HypervisorClient {
     private boolean destroyNotOwned = false;
     private String assignIpOnStart = null;
     private ProvisionSpec lastSpec = null;
+
+    /** What {@link #lookUpXapiEraVm} answers, by ref; a ref not here is XO's no-such-VM answer. */
+    private final Map<String, XapiEraVm> xapiEraVms = new HashMap<>();
+
+    private boolean adoptNotOwned = false;
 
     /** Set by {@link #holdClonesUntil}; read outside the monitor, so volatile. */
     private volatile CountDownLatch cloneEntered = null;
@@ -184,6 +189,26 @@ public final class FakeHypervisorClient implements HypervisorClient {
     public synchronized FakeHypervisorClient deleteOutOfBand(String vm) {
         states.remove(vm);
         gone.add(vm);
+        return this;
+    }
+
+    /** Have {@link #lookUpXapiEraVm} find {@code vm} for {@code xapiRef}, and track it as running. */
+    public synchronized FakeHypervisorClient withXapiEraVm(String xapiRef, XapiEraVm vm) {
+        xapiEraVms.put(xapiRef, vm);
+        states.put(vm.id().value(), VmState.RUNNING);
+        return this;
+    }
+
+    /** From now on, every {@link #state} read of {@code vm} answers {@code state}; scripted answers are dropped. */
+    public synchronized FakeHypervisorClient readAs(String vm, VmState state) {
+        scriptedStates.remove(vm);
+        states.put(vm, state);
+        return this;
+    }
+
+    /** Make {@link #adoptXapiEraVm} refuse, as the backend does for a VM carrying another cloud's marker. */
+    public synchronized FakeHypervisorClient refuseAdoptionAsNotOwned() {
+        this.adoptNotOwned = true;
         return this;
     }
 
@@ -363,6 +388,21 @@ public final class FakeHypervisorClient implements HypervisorClient {
         if (pingFails) {
             throw new HypervisorException("cannot reach pool");
         }
+    }
+
+    @Override
+    public synchronized Optional<XapiEraVm> lookUpXapiEraVm(String xapiRef) {
+        calls.add("lookUpXapiEraVm:" + xapiRef);
+        return Optional.ofNullable(xapiEraVms.get(xapiRef));
+    }
+
+    @Override
+    public synchronized VmRef adoptXapiEraVm(XapiEraVm vm, String owner) {
+        calls.add("adoptXapiEraVm:" + vm.id().value() + "->" + owner);
+        if (adoptNotOwned) {
+            throw new NotOwnedException("fake: " + vm.id().value() + " carries another cloud's marker");
+        }
+        return vm.id();
     }
 
     @Override

@@ -66,7 +66,7 @@ import java.util.logging.Logger;
  *
  * <p>Not thread-safe: one client per operation.
  */
-public final class XoRestClient implements HypervisorClient {
+public final class XoRestClient implements HypervisorClient, XapiEraVms {
 
     private static final Logger LOGGER = Logger.getLogger(XoRestClient.class.getName());
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -1380,13 +1380,195 @@ public final class XoRestClient implements HypervisorClient {
             throw failure("GET", path, resp.status(), resp.body());
         }
         refuseAsyncAccepted("GET", path, resp);
-        return switch (parse("GET " + path, resp.body()).path("power_state").asText("")) {
+        return powerState(parse("GET " + path, resp.body()).path("power_state").asText(""));
+    }
+
+    @NonNull
+    private static VmState powerState(@NonNull String reported) {
+        return switch (reported) {
             case "Halted" -> VmState.HALTED;
             case "Running" -> VmState.RUNNING;
             case "Paused" -> VmState.PAUSED;
             case "Suspended" -> VmState.SUSPENDED;
             default -> VmState.UNKNOWN;
         };
+    }
+
+    /**
+     * Look up the VM a XAPI ref names, by a GET and nothing else (#364). The one call in this class that puts a
+     * XAPI handle into a path, and the reason it may: XO resolves a ref wherever it takes a VM id, which is the
+     * hazard {@link #unaddressable} refuses on every other verb, and a read is the one verb where resolving to the
+     * wrong VM costs nothing. Whatever acts on the answer afterwards goes through {@link XapiEraVm#id()}.
+     *
+     * <p>The ref is the path segment, not a {@code filter=_xapiRef:"..."} query. Measured on the lab appliance
+     * 2026-10-28, a quoted filter value matches as a case-insensitive substring: {@code "OpaqueRef:f0"} matched a
+     * VM whose ref only starts that way. The path lookup is XO's own by-ref index, an exact key.
+     *
+     * <p>Empty only when XO answers its own no-such-VM 404 naming this ref, measured the same day on an all-zero
+     * ref. That means no pool this appliance currently sees holds a VM with this ref, which is not the same as
+     * the VM being gone: XO drops every object of a pool it is not connected to. Every other failure throws.
+     *
+     * @throws HypervisorException when {@code xapiRef} is not a XAPI ref, would address another route, or the
+     *     read fails or answers a record missing an identifying field
+     */
+    @Override
+    @NonNull
+    public Optional<XapiEraVm> lookUpXapiEraVm(@NonNull String xapiRef) {
+        if (!xapiRef.startsWith(VmRef.XAPI_REF_PREFIX)) {
+            throw new HypervisorException("refusing to look up '" + xapiRef + "' as a XAPI ref: it does not start with "
+                    + VmRef.XAPI_REF_PREFIX);
+        }
+        String refused = routeChange(xapiRef);
+        if (refused != null) {
+            throw new HypervisorException("refusing to address '" + xapiRef + "': " + refused);
+        }
+        String path = API + "/vms/" + xapiRef;
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("GET", path, null, READ_TIMEOUT);
+        } catch (IOException e) {
+            throw new HypervisorException("GET " + path + ": transport error: " + e.getMessage(), e);
+        }
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), xapiRef)) {
+            return Optional.empty();
+        }
+        if (!resp.isSuccess()) {
+            throw failure("GET", path, resp.status(), resp.body());
+        }
+        refuseAsyncAccepted("GET", path, resp);
+        JsonNode record = parse("GET " + path, resp.body());
+        String id = record.path("id").asText("");
+        String uuid = record.path("uuid").asText("");
+        String ref = record.path("_xapiRef").asText("");
+        String pool = record.path("$pool").asText("");
+        // Checked here so a malformed answer is a failed read, not a record whose blanks a caller compares. The
+        // id through unaddressable too: it is what a caller will address afterwards, so it must not be a ref.
+        if (id.isBlank() || uuid.isBlank() || ref.isBlank() || pool.isBlank() || unaddressable(id) != null) {
+            throw new HypervisorException("GET " + path + ": the answer does not identify a VM: id '" + id + "', uuid '"
+                    + uuid + "', _xapiRef '" + ref + "', $pool '" + pool + "'");
+        }
+        JsonNode owner = record.path("other").path(OwnerMarker.OWNER_KEY);
+        List<String> tags = new ArrayList<>();
+        for (JsonNode tag : record.path("tags")) {
+            tags.add(tag.asText(""));
+        }
+        return Optional.of(new XapiEraVm(
+                new VmRef(id),
+                uuid,
+                ref,
+                record.path("name_label").asText(""),
+                pool,
+                powerState(record.path("power_state").asText("")),
+                owner.isTextual() ? owner.asText() : null,
+                tags));
+    }
+
+    /**
+     * Stamp this backend's owner markers for {@code owner} on a VM {@link #lookUpXapiEraVm} found (#364), so the
+     * ordinary teardown, and its {@code refuseUnlessOwned} gate, can take it from here. Answers the handle that
+     * teardown addresses it by. The caller decides beforehand that this is the VM to take over; this method makes
+     * sure it still is at the moment of writing, and never takes over someone else's.
+     *
+     * <p>The VM is read again by its id first, because a preview and its confirmation are separate requests:
+     * its uuid and {@code _xapiRef} must still be the ones found, and it must carry no marker of another cloud or
+     * another VM. Otherwise nothing is written. Unlike {@code markOwner}, which strips markers a clone inherited
+     * from its template, a foreign marker here is never removed. On a clone it can only be inherited; on a VM
+     * found by ref it may be someone else's claim, and removing it would be deciding a dispute this plugin cannot
+     * see the other side of.
+     *
+     * <p>Then the two PUTs, each only for a marker the VM does not already carry, and reads until both show,
+     * the way {@code markOwner} confirms its own (#357). A foreign marker turning up in one of those reads
+     * aborts, and the markers this call added are deleted again: they were written on the strength of a read
+     * that turned out not to be the whole story. Markers that never show also abort, and stay where they are,
+     * since a DELETE would be as unconfirmable as the PUT was.
+     *
+     * @throws NotOwnedException when the VM changed since it was found, or carries another cloud's or VM's marker
+     * @throws HypervisorException when a read or a write fails, or the markers do not show
+     */
+    @Override
+    @NonNull
+    public VmRef adoptXapiEraVm(@NonNull XapiEraVm found, @NonNull String owner) {
+        if (owner.isBlank()) {
+            throw new HypervisorException(
+                    "refusing to take over " + found.id().value() + ": no owning cloud was named");
+        }
+        String vm = found.id().value();
+        String path = vmPath(vm);
+        JsonNode record = get(path);
+        String uuid = record.path("uuid").asText("");
+        String ref = record.path("_xapiRef").asText("");
+        if (!uuid.equals(found.uuid()) || !ref.equals(found.xapiRef())) {
+            throw new NotOwnedException("refusing to take over VM " + vm + ": it now reads uuid '" + uuid
+                    + "' and ref '" + ref + "', not the '" + found.uuid() + "' and '" + found.xapiRef()
+                    + "' it was found with. Nothing was written.");
+        }
+        String ownerTag = OWNER_TAG_PREFIX + owner;
+        String selfTag = SELF_TAG_PREFIX + uuid;
+        Set<String> present = tagSet(record.path("tags"));
+        List<String> foreign = foreignMarkers(present, ownerTag, selfTag);
+        if (!foreign.isEmpty()) {
+            throw new NotOwnedException("refusing to take over VM " + vm + ": it carries " + foreign
+                    + ", which names another cloud or another VM. Nothing was written.");
+        }
+        List<String> added = new ArrayList<>();
+        for (String tag : List.of(ownerTag, selfTag)) {
+            if (!present.contains(tag)) {
+                call("PUT", path + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+                added.add(tag);
+            }
+        }
+        for (int read = 1; ; read++) {
+            Set<String> tags = tagSet(get(path).path("tags"));
+            foreign = foreignMarkers(tags, ownerTag, selfTag);
+            if (!foreign.isEmpty()) {
+                NotOwnedException refused = new NotOwnedException("refusing to take over VM " + vm + ": it now carries "
+                        + foreign + ", which names another cloud or another VM. Removing the markers this attempt"
+                        + " added: " + added + ".");
+                for (String tag : added) {
+                    try {
+                        call("DELETE", path + "/tags/" + encodeSegment(tag), null, READ_TIMEOUT);
+                    } catch (HypervisorException e) {
+                        refused.addSuppressed(e);
+                    }
+                }
+                throw refused;
+            }
+            if (tags.contains(ownerTag) && tags.contains(selfTag)) {
+                return found.id();
+            }
+            if (read >= STRIP_READS) {
+                throw new HypervisorException("VM " + vm + " still does not show " + ownerTag + " and " + selfTag
+                        + " after " + read + " reads; it is not taken over, and the entry stays as it was");
+            }
+            try {
+                pause.pause(STRIP_POLL);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new HypervisorException("interrupted while confirming the owner markers on VM " + vm, e);
+            }
+        }
+    }
+
+    @NonNull
+    private static Set<String> tagSet(@NonNull JsonNode tags) {
+        Set<String> set = new LinkedHashSet<>();
+        for (JsonNode tag : tags) {
+            set.add(tag.asText(""));
+        }
+        return set;
+    }
+
+    /** Owner markers and uuid stamps in {@code tags} other than {@code ownerTag} and {@code selfTag}. */
+    @NonNull
+    private static List<String> foreignMarkers(@NonNull Set<String> tags, String ownerTag, String selfTag) {
+        List<String> foreign = new ArrayList<>();
+        for (String tag : tags) {
+            boolean marker = tag.startsWith(OWNER_TAG_PREFIX) || tag.startsWith(SELF_TAG_PREFIX);
+            if (marker && !tag.equals(ownerTag) && !tag.equals(selfTag)) {
+                foreign.add(tag);
+            }
+        }
+        return foreign;
     }
 
     /**
@@ -1535,8 +1717,17 @@ public final class XoRestClient implements HypervisorClient {
             return "that is a XAPI handle, and this is the Xen Orchestra backend. A VM is only addressable through"
                     + " the backend that created it; this appliance would resolve it and act on whatever it names.";
         }
-        // Blank is deliberately not checked on its own: VmRef's constructor refuses it, and the one raw id
-        // read here, create_vm's, is checked for blank before it gets this far.
+        return routeChange(id);
+    }
+
+    /**
+     * Why {@code id} would address a route other than {@code /vms/{id}}, or null when it would not. The half of
+     * {@link #unaddressable} that is about the path's shape; {@link #lookUpXapiEraVm} runs only this half.
+     */
+    @CheckForNull
+    private static String routeChange(@NonNull String id) {
+        // Blank is deliberately not checked on its own: VmRef's constructor refuses it, and the raw ids read
+        // here, create_vm's and the by-ref lookup's, are checked for blank before they get this far.
         boolean bad = id.equals(".") || id.equals("..");
         for (int i = 0; i < id.length() && !bad; i++) {
             char c = id.charAt(i);
