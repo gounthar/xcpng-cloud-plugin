@@ -1,0 +1,20 @@
+{
+  "type": "VM",
+  "name_description": "Jenkins inbound agent: Debian 13, Temurin 21, xe-guest-utilities, cloud-init",
+  "name_label": "xcpng-jenkins-agent-debian13-v8-60cd9585",
+  "other": {
+    "base_template_name": "Debian Trixie 13",
+    "import_task": "OpaqueRef:19c0ec9e-8127-7371-bff7-4f859d00fd13",
+    "mac_seed": "b37aa4f9-3bba-925e-e3ad-19ddf3070d46",
+    "linux_template": "true",
+    "install-methods": "cdrom,nfs,http,ftp",
+    "xcpng-cloud": "LAB-POOL-87"
+  },
+  "power_state": "Running",
+  "tags": [],
+  "id": "d3aa4c31-2d52-6ab0-e766-157f524ea8b4",
+  "uuid": "d3aa4c31-2d52-6ab0-e766-157f524ea8b4",
+  "$pool": "23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec",
+  "$poolId": "23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec",
+  "_xapiRef": "OpaqueRef:47d08d21-17c9-a450-2738-546217643c7d"
+}

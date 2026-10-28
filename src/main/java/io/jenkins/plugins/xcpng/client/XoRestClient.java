@@ -1380,13 +1380,86 @@ public final class XoRestClient implements HypervisorClient {
             throw failure("GET", path, resp.status(), resp.body());
         }
         refuseAsyncAccepted("GET", path, resp);
-        return switch (parse("GET " + path, resp.body()).path("power_state").asText("")) {
+        return powerState(parse("GET " + path, resp.body()).path("power_state").asText(""));
+    }
+
+    @NonNull
+    private static VmState powerState(@NonNull String reported) {
+        return switch (reported) {
             case "Halted" -> VmState.HALTED;
             case "Running" -> VmState.RUNNING;
             case "Paused" -> VmState.PAUSED;
             case "Suspended" -> VmState.SUSPENDED;
             default -> VmState.UNKNOWN;
         };
+    }
+
+    /**
+     * Look up the VM a XAPI ref names, by a GET and nothing else (#364). The one call in this class that puts a
+     * XAPI handle into a path, and the reason it may: XO resolves a ref wherever it takes a VM id, which is the
+     * hazard {@link #unaddressable} refuses on every other verb, and a read is the one verb where resolving to the
+     * wrong VM costs nothing. Whatever acts on the answer afterwards goes through {@link XapiEraVm#id()}.
+     *
+     * <p>The ref is the path segment, not a {@code filter=_xapiRef:"..."} query. Measured on the lab appliance
+     * 2026-10-28, a quoted filter value matches as a case-insensitive substring: {@code "OpaqueRef:f0"} matched a
+     * VM whose ref only starts that way. The path lookup is XO's own by-ref index, an exact key.
+     *
+     * <p>Empty only when XO answers its own no-such-VM 404 naming this ref, measured the same day on an all-zero
+     * ref. That means no pool this appliance currently sees holds a VM with this ref, which is not the same as
+     * the VM being gone: XO drops every object of a pool it is not connected to. Every other failure throws.
+     *
+     * @throws HypervisorException when {@code xapiRef} is not a XAPI ref, would address another route, or the
+     *     read fails or answers a record missing an identifying field
+     */
+    @NonNull
+    public Optional<XapiEraVm> lookUpXapiEraVm(@NonNull String xapiRef) {
+        if (!xapiRef.startsWith(VmRef.XAPI_REF_PREFIX)) {
+            throw new HypervisorException("refusing to look up '" + xapiRef + "' as a XAPI ref: it does not start with "
+                    + VmRef.XAPI_REF_PREFIX);
+        }
+        String refused = routeChange(xapiRef);
+        if (refused != null) {
+            throw new HypervisorException("refusing to address '" + xapiRef + "': " + refused);
+        }
+        String path = API + "/vms/" + xapiRef;
+        RestTransport.RestResponse resp;
+        try {
+            resp = transport.send("GET", path, null, READ_TIMEOUT);
+        } catch (IOException e) {
+            throw new HypervisorException("GET " + path + ": transport error: " + e.getMessage(), e);
+        }
+        if (resp.status() == 404 && isNoSuchObject(resp.body(), xapiRef)) {
+            return Optional.empty();
+        }
+        if (!resp.isSuccess()) {
+            throw failure("GET", path, resp.status(), resp.body());
+        }
+        refuseAsyncAccepted("GET", path, resp);
+        JsonNode record = parse("GET " + path, resp.body());
+        String id = record.path("id").asText("");
+        String uuid = record.path("uuid").asText("");
+        String ref = record.path("_xapiRef").asText("");
+        String pool = record.path("$pool").asText("");
+        // Checked here so a malformed answer is a failed read, not a record whose blanks a caller compares. The
+        // id through unaddressable too: it is what a caller will address afterwards, so it must not be a ref.
+        if (id.isBlank() || uuid.isBlank() || ref.isBlank() || pool.isBlank() || unaddressable(id) != null) {
+            throw new HypervisorException("GET " + path + ": the answer does not identify a VM: id '" + id + "', uuid '"
+                    + uuid + "', _xapiRef '" + ref + "', $pool '" + pool + "'");
+        }
+        JsonNode owner = record.path("other").path(OwnerMarker.OWNER_KEY);
+        List<String> tags = new ArrayList<>();
+        for (JsonNode tag : record.path("tags")) {
+            tags.add(tag.asText(""));
+        }
+        return Optional.of(new XapiEraVm(
+                new VmRef(id),
+                uuid,
+                ref,
+                record.path("name_label").asText(""),
+                pool,
+                powerState(record.path("power_state").asText("")),
+                owner.isTextual() ? owner.asText() : null,
+                tags));
     }
 
     /**
@@ -1535,8 +1608,17 @@ public final class XoRestClient implements HypervisorClient {
             return "that is a XAPI handle, and this is the Xen Orchestra backend. A VM is only addressable through"
                     + " the backend that created it; this appliance would resolve it and act on whatever it names.";
         }
-        // Blank is deliberately not checked on its own: VmRef's constructor refuses it, and the one raw id
-        // read here, create_vm's, is checked for blank before it gets this far.
+        return routeChange(id);
+    }
+
+    /**
+     * Why {@code id} would address a route other than {@code /vms/{id}}, or null when it would not. The half of
+     * {@link #unaddressable} that is about the path's shape; {@link #lookUpXapiEraVm} runs only this half.
+     */
+    @CheckForNull
+    private static String routeChange(@NonNull String id) {
+        // Blank is deliberately not checked on its own: VmRef's constructor refuses it, and the raw ids read
+        // here, create_vm's and the by-ref lookup's, are checked for blank before they get this far.
         boolean bad = id.equals(".") || id.equals("..");
         for (int i = 0; i < id.length() && !bad; i++) {
             char c = id.charAt(i);

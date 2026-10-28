@@ -1188,6 +1188,135 @@ class XoRestClientTest {
         assertTrue(t.paths().stream().allMatch(p -> p.contains("/rest/v0/vms/" + CLONE)), t.paths()::toString);
     }
 
+    // -- lookUpXapiEraVm (#364) -------------------------------------------
+
+    /** The ref 0.3.0 recorded for the clone in {@code xo-vm-by-xapi-ref.json}, on the lab pool 2026-10-28. */
+    private static final String XAPI_ERA_REF = "OpaqueRef:47d08d21-17c9-a450-2738-546217643c7d";
+
+    private static final String XAPI_ERA_UUID = "d3aa4c31-2d52-6ab0-e766-157f524ea8b4";
+
+    private static String fixture(String name) {
+        try (var in = XoRestClientTest.class.getResourceAsStream(name)) {
+            if (in == null) {
+                throw new IllegalStateException("no fixture " + name);
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * The record XO answered for a 0.3.0 clone looked up by its ref, trimmed to the fields that identify it.
+     * The XAPI-era owner marker arrives in {@code other}, not in {@code tags}, which are empty: the XAPI backend
+     * never wrote tags.
+     */
+    @Test
+    void aXapiEraRefIsLookedUpByOneGetOnTheRefItself() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/vms/" + XAPI_ERA_REF, 200, fixture("xo-vm-by-xapi-ref.json"));
+
+        XapiEraVm vm = new XoRestClient(t).lookUpXapiEraVm(XAPI_ERA_REF).orElseThrow();
+
+        assertEquals(new VmRef(XAPI_ERA_UUID), vm.id());
+        assertEquals(XAPI_ERA_UUID, vm.uuid());
+        assertEquals(XAPI_ERA_REF, vm.xapiRef());
+        assertEquals("xcpng-jenkins-agent-debian13-v8-60cd9585", vm.nameLabel());
+        assertEquals("23ac115e-5f9a-0d96-c3b2-fb92f87fd1ec", vm.poolId());
+        assertEquals(VmState.RUNNING, vm.powerState());
+        assertEquals("LAB-POOL-87", vm.legacyOwner());
+        assertEquals(List.of(), vm.tags());
+        // One read, on the ref as the path segment. A filter=_xapiRef:"..." query matches substrings, and any
+        // verb other than GET on a ref acts on whatever XO resolves it to.
+        assertEquals(List.of("GET /rest/v0/vms/" + XAPI_ERA_REF), t.paths());
+    }
+
+    /**
+     * XO's own no-such-VM answer naming the ref, as the lab appliance gave it for an all-zero ref. Empty is
+     * "no pool this appliance sees holds it", which the caller must not read as reclaimed.
+     */
+    @Test
+    void xosOwnNoSuchVmForTheRefIsAnEmptyAnswer() {
+        String unknown = "OpaqueRef:00000000-0000-0000-0000-000000000306";
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/vms/" + unknown, 404, fixture("xo-no-such-vm-by-xapi-ref.json"));
+
+        assertEquals(Optional.empty(), new XoRestClient(t).lookUpXapiEraVm(unknown));
+    }
+
+    /** Any other 404 is a read that failed: a proxy page, an empty body, or XO's envelope about another id. */
+    @Test
+    void aLookupFourOhFourThatIsNotXosOwnForThisRefThrows() {
+        for (String body : new String[] {"<html><body>404 Not Found</body></html>", "", noSuchVm("OpaqueRef:other")}) {
+            ScriptedRest t = new ScriptedRest();
+            t.fail("GET", "/rest/v0/vms/" + XAPI_ERA_REF, 404, body);
+
+            assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).lookUpXapiEraVm(XAPI_ERA_REF),
+                    "a 404 that is not XO's about this ref: " + body);
+        }
+    }
+
+    /** Only a ref goes through this door, and only one that addresses {@code /vms/{ref}} and nothing else. */
+    @Test
+    void theLookupRefusesAnythingButARefOnItsOwnRouteWithoutSendingIt() {
+        for (String bad : new String[] {
+            XAPI_ERA_UUID, "opaqueref:47d08d21", "OpaqueRef:abc/actions/start", "OpaqueRef:abc?x=1", "OpaqueRef:a b"
+        }) {
+            ScriptedRest t = new ScriptedRest();
+            assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).lookUpXapiEraVm(bad),
+                    "'" + bad + "' must be refused");
+            assertTrue(t.calls.isEmpty(), "nothing may be sent for '" + bad + "': " + t.calls);
+        }
+    }
+
+    /**
+     * An answer missing what identifies the VM, or whose id is itself a ref, is a failed read. The id is what a
+     * caller addresses next, so a ref there would walk straight back into the hazard the lookup exists to contain.
+     */
+    @Test
+    void aLookupAnswerThatDoesNotIdentifyAVmThrows() throws IOException {
+        for (String field : new String[] {"id", "uuid", "_xapiRef", "$pool"}) {
+            var record = (com.fasterxml.jackson.databind.node.ObjectNode) M.readTree(fixture("xo-vm-by-xapi-ref.json"));
+            record.remove(field);
+            ScriptedRest t = new ScriptedRest();
+            t.fail("GET", "/rest/v0/vms/" + XAPI_ERA_REF, 200, record.toString());
+            assertThrows(
+                    HypervisorException.class,
+                    () -> new XoRestClient(t).lookUpXapiEraVm(XAPI_ERA_REF),
+                    "an answer without " + field);
+        }
+        var record = (com.fasterxml.jackson.databind.node.ObjectNode) M.readTree(fixture("xo-vm-by-xapi-ref.json"));
+        record.put("id", XAPI_ERA_REF);
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/vms/" + XAPI_ERA_REF, 200, record.toString());
+        assertThrows(HypervisorException.class, () -> new XoRestClient(t).lookUpXapiEraVm(XAPI_ERA_REF));
+    }
+
+    /**
+     * The lookup is a read and opens nothing else: after it, every mutating verb still refuses the same ref
+     * without sending a request. The answer's id is the handle those verbs take.
+     */
+    @Test
+    void aLookupLeavesEveryMutatingVerbRefusingTheRef() {
+        ScriptedRest t = new ScriptedRest();
+        t.fail("GET", "/rest/v0/vms/" + XAPI_ERA_REF, 200, fixture("xo-vm-by-xapi-ref.json"));
+        XoRestClient client = new XoRestClient(t);
+        client.lookUpXapiEraVm(XAPI_ERA_REF).orElseThrow();
+        t.calls.clear();
+
+        VmRef ref = new VmRef(XAPI_ERA_REF);
+        assertThrows(HypervisorException.class, () -> client.destroyWithDisks(ref, "LAB-POOL-87"));
+        assertThrows(HypervisorException.class, () -> client.stop(ref));
+        assertThrows(HypervisorException.class, () -> client.start(ref));
+        assertThrows(HypervisorException.class, () -> client.clearGuestSecret(ref));
+        assertTrue(t.calls.isEmpty(), "a ref reached the appliance on a mutating verb: " + t.calls);
+        assertTrue(t.destroyed.isEmpty(), t.destroyed::toString);
+    }
+
     /**
      * The check refuses what changes the route and nothing else. A colon or an at sign is a legal path
      * character, and an id carrying one is not refused: refusing the clone's id leaves a VM behind on every
