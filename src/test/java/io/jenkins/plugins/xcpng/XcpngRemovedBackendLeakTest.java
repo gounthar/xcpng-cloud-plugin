@@ -230,7 +230,12 @@ class XcpngRemovedBackendLeakTest {
         XcpngLeakedVmStore store = XcpngLeakedVmStore.get();
         store.record("xcpng", xapiLeak(XAPI_VM, "agent-a"));
         store.record("xcpng", xapiLeak("OpaqueRef:xapi-era-2", "agent-b"));
-        store.record("xcpng", XcpngLeakedVm.of(XAPI_VM, XcpngBackend.XO, "https://xo.example.test", "cred", null));
+        // Held, so the warm-pool maintainer's first sweep, 10 s after startup, keeps it. Not held, it has no
+        // credential and that sweep gives up on it, which on a slow machine lands before the Forget below.
+        store.record(
+                "xcpng",
+                XcpngLeakedVm.of(XAPI_VM, XcpngBackend.XO, "https://xo.example.test", "cred", null)
+                        .asHeld());
         store.record("gone-cloud", xapiLeak(XAPI_VM, "agent-a"));
         JenkinsRule.WebClient alice = r.createWebClient().login("alice");
 
