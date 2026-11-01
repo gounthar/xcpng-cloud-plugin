@@ -35,6 +35,6 @@ jobs:
       # labels, so it would draft empty notes. This pair is what upstream's README documents.
       pull-requests: read
     steps:
-      - uses: release-drafter/release-drafter@v7.7.0
+      - uses: release-drafter/release-drafter@v7.10.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
